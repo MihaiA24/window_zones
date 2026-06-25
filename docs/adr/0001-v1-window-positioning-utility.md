@@ -123,3 +123,24 @@ Accepted executor error shape:
 - Actual adapter/API failures are represented as `WindowSystemError::Platform(String)` and wrapped by the executor without interpretation.
 
 Implementation status: this adapter-contract/executor slice is implemented and verified in the platform-neutral Rust core. The verified core includes `WindowSystem`, `FocusedWindow`, `WindowMove`, `execute_action`, wrapping next/previous display behavior, executor error classification, and fake-adapter unit tests. Real OS adapters remain deferred.
+
+## Accepted next slice: config-driven binding dispatcher
+
+The next implementation slice is a platform-neutral dispatcher that connects parsed TOML bindings to the action executor.
+
+This slice includes:
+
+- A new `src/dispatcher.rs` module.
+- A public `dispatch_hotkey(config, hotkey, window_system)` function.
+- Binding lookup by exact `Binding.hotkey` string match.
+- Calling `execute_action(&binding.action, window_system)` for the matched binding.
+- Dispatcher errors for `NoBindingForHotkey { hotkey }` and propagated executor failures.
+- Fake-adapter tests proving known hotkeys dispatch to zone movement, known hotkeys dispatch to display movement, unknown hotkeys return `NoBindingForHotkey`, and executor errors propagate.
+
+For duplicate hotkeys, v1 uses first-match-wins. Duplicate binding validation is deferred.
+
+The dispatcher takes `&AppConfig` directly and uses exact case-sensitive hotkey string matching. Precomputed binding maps, hotkey normalization, case-insensitive matching, indexing, and duplicate validation are deferred.
+
+This slice excludes real global hotkey registration, config file path discovery, config watching/reload, platform-specific hotkey syntax validation, real Windows/X11 APIs, tray/UI work, and Wayland support.
+
+Implementation status: this dispatcher slice is implemented and verified in the platform-neutral Rust core. The verified core includes `dispatch_hotkey`, exact case-sensitive matching against `&AppConfig`, first-match-wins duplicate behavior, dispatch error classification, and fake-adapter unit tests. Real hotkey registration and platform adapters remain deferred.

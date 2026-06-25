@@ -19,5 +19,6 @@ The implemented core slices are platform-neutral only:
 - TOML config parsing
 - a `WindowSystem` adapter contract
 - an `execute_action` executor tested with fake adapters
+- a `dispatch_hotkey` binding dispatcher tested with fake adapters
 
 Platform adapters for real hotkeys, focused-window detection, display enumeration, and move/resize calls are intentionally deferred.
