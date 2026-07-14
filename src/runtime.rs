@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::config::{AppConfig, ConfigError, parse_config};
+use crate::config::{
+    AppConfig, BindingValidationError, ConfigError, parse_config, validate_and_normalize_bindings,
+};
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
+use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
 use crate::window_system::WindowSystem;
-
 const CONFIG_DIRECTORY: &str = "window_zones";
 const CONFIG_FILE: &str = "config.toml";
 
@@ -40,6 +42,12 @@ pub enum ConfigLoadError {
         #[source]
         source: ConfigError,
     },
+    #[error("failed to validate config at {path}: {source}")]
+    Validation {
+        path: PathBuf,
+        #[source]
+        source: BindingValidationError,
+    },
 }
 
 #[derive(Debug)]
@@ -56,6 +64,13 @@ pub enum DispatchState {
     Error(DispatchHotkeyError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyRegistrationState {
+    Unregistered,
+    Registered,
+    Error(HotkeySystemError),
+}
+
 /// Platform-neutral App state created at process startup.
 ///
 /// Startup always produces an App. A missing config uses an empty AppConfig;
@@ -66,26 +81,27 @@ pub struct App {
     config_path: Option<PathBuf>,
     config_state: ConfigState,
     dispatch_state: DispatchState,
+    hotkey_state: HotkeyRegistrationState,
 }
 
 impl App {
-    pub fn start() -> Self {
-        match default_config_path() {
-            Ok(path) => Self::start_at(path),
-            Err(error) => Self::with_config_state(None, ConfigState::Error(error.into())),
-        }
-    }
-
     pub fn start_at(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
 
         match fs::read_to_string(&path) {
             Ok(input) => match parse_config(&input) {
-                Ok(config) => Self {
-                    config,
-                    config_path: Some(path),
-                    config_state: ConfigState::Loaded,
-                    dispatch_state: DispatchState::Idle,
+                Ok(config) => match validate_and_normalize_bindings(config.bindings) {
+                    Ok(bindings) => Self {
+                        config: AppConfig { bindings },
+                        config_path: Some(path),
+                        config_state: ConfigState::Loaded,
+                        dispatch_state: DispatchState::Idle,
+                        hotkey_state: HotkeyRegistrationState::Unregistered,
+                    },
+                    Err(source) => Self::with_config_state(
+                        Some(path.clone()),
+                        ConfigState::Error(ConfigLoadError::Validation { path, source }),
+                    ),
                 },
                 Err(source) => Self::with_config_state(
                     Some(path.clone()),
@@ -118,6 +134,29 @@ impl App {
         &self.dispatch_state
     }
 
+    pub fn hotkey_state(&self) -> &HotkeyRegistrationState {
+        &self.hotkey_state
+    }
+
+    pub fn register_hotkeys<H: HotkeySystem>(
+        &mut self,
+        hotkey_system: &mut H,
+    ) -> Result<(), HotkeySystemError> {
+        let hotkeys: Vec<String> = self
+            .config
+            .bindings
+            .iter()
+            .map(|binding| binding.hotkey.clone())
+            .collect();
+
+        let result = hotkey_system.register_hotkeys(&hotkeys);
+        self.hotkey_state = match &result {
+            Ok(()) => HotkeyRegistrationState::Registered,
+            Err(source) => HotkeyRegistrationState::Error(source.clone()),
+        };
+        result
+    }
+
     pub fn dispatch_hotkey<W: WindowSystem>(
         &mut self,
         hotkey: &str,
@@ -130,12 +169,25 @@ impl App {
         &self.dispatch_state
     }
 
+    pub fn dispatch_next_hotkey<W: WindowSystem, H: HotkeySystem>(
+        &mut self,
+        hotkey_system: &mut H,
+        window_system: &mut W,
+    ) -> Result<&DispatchState, HotkeySystemError> {
+        let Some(HotkeyEvent::Pressed { hotkey }) = hotkey_system.next_hotkey()? else {
+            return Ok(&self.dispatch_state);
+        };
+
+        Ok(self.dispatch_hotkey(&hotkey, window_system))
+    }
+
     fn with_config_state(config_path: Option<PathBuf>, config_state: ConfigState) -> Self {
         Self {
             config: AppConfig::default(),
             config_path,
             config_state,
             dispatch_state: DispatchState::Idle,
+            hotkey_state: HotkeyRegistrationState::Unregistered,
         }
     }
 }
@@ -212,11 +264,20 @@ fn resolve_config_path_for(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        App, CONFIG_FILE, ConfigLoadError, ConfigState, DispatchHotkeyError, DispatchState,
+        HotkeyRegistrationState, Platform, resolve_config_path_for,
+    };
     use crate::{
         Action, Binding, BuiltInZone, DisplayGeometry, ExecuteActionError, FocusedWindow,
-        WindowMove, WindowSystemError,
+        HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowMove, WindowSystem,
+        WindowSystemError,
     };
+    use std::collections::VecDeque;
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn environment<'a>(
         entries: &'a [(&'a str, &'a str)],
@@ -309,7 +370,52 @@ action = { type = "move-to-zone", zone = "left-half" }
         let app = App::start_at(&path);
 
         assert!(matches!(app.config_state(), ConfigState::Loaded));
-        assert_eq!(app.config().bindings.len(), 1);
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn duplicate_bindings_are_rejected_at_startup() {
+        let directory = test_directory("validation_error");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+
+[[bindings]]
+hotkey = "ctrl+alt+left"
+action = { type = "move-to-next-display" }
+"#,
+        )
+        .unwrap();
+
+        let app = App::start_at(&path);
+
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Validation {
+                path: error_path,
+                source,
+            }) => {
+                assert_eq!(error_path, &path);
+                assert_eq!(
+                    source.to_string(),
+                    "duplicate binding for hotkey alt+ctrl+left"
+                );
+            }
+            state => panic!("expected validation error, got {state:?}"),
+        }
+        assert!(app.config().bindings.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -375,6 +481,222 @@ action = { type = "move-to-zone", zone = "left-half" }
         }
     }
 
+    #[derive(Debug)]
+    struct FakeHotkeySystem {
+        registered_hotkeys: Vec<String>,
+        register_error: Option<HotkeySystemError>,
+        events: VecDeque<Result<HotkeyEvent, HotkeySystemError>>,
+    }
+
+    impl FakeHotkeySystem {
+        fn new(events: Vec<Result<HotkeyEvent, HotkeySystemError>>) -> Self {
+            Self {
+                registered_hotkeys: Vec::new(),
+                register_error: None,
+                events: events.into_iter().collect(),
+            }
+        }
+
+        fn with_registration_error(error: HotkeySystemError) -> Self {
+            Self {
+                registered_hotkeys: Vec::new(),
+                register_error: Some(error),
+                events: VecDeque::new(),
+            }
+        }
+    }
+
+    impl HotkeySystem for FakeHotkeySystem {
+        fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+            self.registered_hotkeys = hotkeys.to_vec();
+            match &self.register_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+
+        fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+            self.events.pop_front().transpose()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeWindowSystem {
+        focused_window: Result<Option<FocusedWindow>, WindowSystemError>,
+        displays: Result<Vec<DisplayGeometry>, WindowSystemError>,
+        moves: Vec<WindowMove>,
+        move_error: Option<WindowSystemError>,
+    }
+
+    impl FakeWindowSystem {
+        fn with_focus(display_id: &str, geometry: Rect) -> Self {
+            Self {
+                focused_window: Ok(Some(FocusedWindow::new(display_id, geometry))),
+                displays: Ok(vec![
+                    DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
+                    DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
+                ]),
+                moves: Vec::new(),
+                move_error: None,
+            }
+        }
+    }
+
+    impl WindowSystem for FakeWindowSystem {
+        fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
+            self.focused_window.clone()
+        }
+
+        fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+            self.displays.clone()
+        }
+
+        fn move_focused_window(
+            &mut self,
+            window_move: WindowMove,
+        ) -> Result<(), WindowSystemError> {
+            if let Some(error) = self.move_error.clone() {
+                return Err(error);
+            }
+
+            self.moves.push(window_move);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registers_hotkeys_with_hotkey_adapter() {
+        let directory = test_directory("register_hotkeys");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+[[bindings]]
+hotkey = "Ctrl+Alt+Shift+Right"
+action = { type = "move-to-next-display" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut hotkey_system = FakeHotkeySystem::new(Vec::new());
+
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Unregistered);
+        app.register_hotkeys(&mut hotkey_system).unwrap();
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
+        assert_eq!(
+            hotkey_system.registered_hotkeys,
+            vec![
+                "alt+ctrl+left".to_string(),
+                "alt+ctrl+shift+right".to_string()
+            ]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registration_errors_are_exposed_from_hotkey_adapter() {
+        let directory = test_directory("register_hotkeys_failed");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut hotkey_system = FakeHotkeySystem::with_registration_error(
+            HotkeySystemError::Platform("permission denied".to_string()),
+        );
+        let error = app.register_hotkeys(&mut hotkey_system).unwrap_err();
+
+        assert_eq!(
+            app.hotkey_state(),
+            &HotkeyRegistrationState::Error(HotkeySystemError::Platform(
+                "permission denied".to_string()
+            ))
+        );
+        assert_eq!(
+            error.to_string(),
+            "platform hotkey error: permission denied"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dispatch_next_hotkey_uses_system_events_and_dispatches_known_bindings() {
+        let directory = test_directory("dispatch_from_hotkeys");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(path);
+        let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
+            hotkey: "Ctrl+Alt+Left".to_string(),
+        })]);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let state = app
+            .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
+            .unwrap();
+
+        assert_eq!(state, &DispatchState::Succeeded);
+        assert_eq!(
+            window_system.moves,
+            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dispatch_next_hotkey_ignores_unknown_binding_without_move() {
+        let directory = test_directory("dispatch_unknown_hotkey");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(path);
+        let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
+            hotkey: "Alt+Shift+Right".to_string(),
+        })]);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let state = app
+            .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
+            .unwrap();
+
+        assert_eq!(
+            state,
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Alt+Shift+Right".to_string()
+            })
+        );
+        assert!(window_system.moves.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn no_focused_window_remains_an_explicit_dispatch_state() {
         let directory = test_directory("no_focus");
@@ -420,7 +742,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         assert_eq!(
             app.config().bindings,
             vec![Binding {
-                hotkey: "Ctrl+Alt+Left".to_string(),
+                hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
                     zone: BuiltInZone::LeftHalf,
                 },

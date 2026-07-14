@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, normalize_hotkey};
 use crate::executor::{ExecuteActionError, execute_action};
 use crate::window_system::WindowSystem;
 
@@ -13,21 +13,22 @@ pub enum DispatchHotkeyError {
     ExecuteAction(#[from] ExecuteActionError),
 }
 
-/// Dispatches a received hotkey string using exact, case-sensitive matching
-/// against the parsed app config.
-///
-/// Duplicate hotkeys are first-match-wins for v1. Validation and indexing are
-/// intentionally deferred until config reload and platform hotkey syntax are
-/// introduced.
+/// Dispatches a received hotkey string after normalization and canonicalization.
+/// Matching is deterministic across modifier/key case, spacing, and token order.
 pub fn dispatch_hotkey<W: WindowSystem>(
     config: &AppConfig,
     hotkey: &str,
     window_system: &mut W,
 ) -> Result<(), DispatchHotkeyError> {
+    let normalized_hotkey =
+        normalize_hotkey(hotkey).map_err(|_| DispatchHotkeyError::NoBindingForHotkey {
+            hotkey: hotkey.to_string(),
+        })?;
+
     let binding = config
         .bindings
         .iter()
-        .find(|binding| binding.hotkey == hotkey)
+        .find(|binding| binding.hotkey == normalized_hotkey)
         .ok_or_else(|| DispatchHotkeyError::NoBindingForHotkey {
             hotkey: hotkey.to_string(),
         })?;
@@ -104,12 +105,12 @@ mod tests {
     #[test]
     fn dispatches_known_hotkey_to_zone_movement() {
         let config = config(vec![binding(
-            "Ctrl+Alt+Left",
+            "alt+ctrl+left",
             move_to_zone(BuiltInZone::LeftHalf),
         )]);
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
 
-        dispatch_hotkey(&config, "Ctrl+Alt+Left", &mut fake).unwrap();
+        dispatch_hotkey(&config, "Ctrl + Alt + Left", &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
@@ -120,12 +121,12 @@ mod tests {
     #[test]
     fn dispatches_known_hotkey_to_display_movement() {
         let config = config(vec![binding(
-            "Ctrl+Alt+Shift+Right",
+            "alt+ctrl+shift+right",
             Action::MoveToNextDisplay,
         )]);
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
 
-        dispatch_hotkey(&config, "Ctrl+Alt+Shift+Right", &mut fake).unwrap();
+        dispatch_hotkey(&config, "alt+shift+ctrl+right", &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
@@ -136,17 +137,17 @@ mod tests {
     #[test]
     fn unknown_hotkey_returns_error_without_moving() {
         let config = config(vec![binding(
-            "Ctrl+Alt+Left",
+            "alt+ctrl+left",
             move_to_zone(BuiltInZone::LeftHalf),
         )]);
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
 
-        let err = dispatch_hotkey(&config, "ctrl+alt+left", &mut fake).unwrap_err();
+        let err = dispatch_hotkey(&config, "ctrl+alt+left+right", &mut fake).unwrap_err();
 
         assert_eq!(
             err,
             DispatchHotkeyError::NoBindingForHotkey {
-                hotkey: "ctrl+alt+left".to_string()
+                hotkey: "ctrl+alt+left+right".to_string()
             }
         );
         assert!(fake.moves.is_empty());
@@ -155,12 +156,12 @@ mod tests {
     #[test]
     fn duplicate_hotkeys_use_first_match() {
         let config = config(vec![
-            binding("Ctrl+Alt+X", move_to_zone(BuiltInZone::LeftHalf)),
-            binding("Ctrl+Alt+X", move_to_zone(BuiltInZone::RightHalf)),
+            binding("alt+ctrl+x", move_to_zone(BuiltInZone::LeftHalf)),
+            binding("alt+ctrl+x", move_to_zone(BuiltInZone::RightHalf)),
         ]);
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
 
-        dispatch_hotkey(&config, "Ctrl+Alt+X", &mut fake).unwrap();
+        dispatch_hotkey(&config, "alt+ctrl+x", &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
@@ -171,13 +172,13 @@ mod tests {
     #[test]
     fn executor_errors_are_propagated() {
         let config = config(vec![binding(
-            "Ctrl+Alt+Right",
+            "alt+ctrl+right",
             move_to_zone(BuiltInZone::RightHalf),
         )]);
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
         fake.move_error = Some(WindowSystemError::Platform("denied".to_string()));
 
-        let err = dispatch_hotkey(&config, "Ctrl+Alt+Right", &mut fake).unwrap_err();
+        let err = dispatch_hotkey(&config, "alt+ctrl+right", &mut fake).unwrap_err();
 
         assert_eq!(
             err,
