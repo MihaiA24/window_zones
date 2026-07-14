@@ -610,6 +610,161 @@ action = { type = "move-to-next-display" }
         );
         fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn reload_config_updates_bindings_for_subsequent_dispatches() {
+        let directory = test_directory("reload_dispatches");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+        assert_eq!(
+            window_system.moves,
+            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
+        );
+
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Right"
+action = { type = "move-to-zone", zone = "right-half" }
+"#,
+        )
+        .unwrap();
+
+        let state = app.reload_config();
+        assert!(matches!(state, ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+right".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::RightHalf
+                },
+            }]
+        );
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Right", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+        assert_eq!(
+            window_system.moves,
+            vec![
+                WindowMove::new(Rect::new(0, 0, 960, 1080)),
+                WindowMove::new(Rect::new(960, 0, 960, 1080)),
+            ]
+        );
+        let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert_eq!(
+            state,
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Ctrl+Alt+Left".to_string()
+            })
+        );
+        assert_eq!(window_system.moves.len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reload_parse_error_keeps_last_known_bindings_and_dispatches_them() {
+        let directory = test_directory("reload_parse_error_dispatched");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        fs::write(&path, "bindings = [").unwrap();
+
+        let state = app.reload_config();
+        match state {
+            ConfigState::Error(ConfigLoadError::Parse {
+                path: error_path,
+                source,
+            }) => {
+                assert_eq!(error_path, &path);
+                assert!(source.to_string().contains("invalid TOML config"));
+            }
+            state => panic!("expected parse error, got {state:?}"),
+        }
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+        let state = app.dispatch_hotkey("Ctrl+Alt+Right", &mut window_system);
+        assert_eq!(
+            state,
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Ctrl+Alt+Right".to_string()
+            })
+        );
+        assert_eq!(
+            window_system.moves,
+            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_reload_does_not_corrupt_hotkey_registration_or_dispatch() {
+        let directory = test_directory("reload_malformed_does_not_corrupt_runtime");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
+            hotkey: "Ctrl+Alt+Left".to_string(),
+        })]);
+        app.register_hotkeys(&mut hotkey_system).unwrap();
+        assert_eq!(hotkey_system.registered_hotkeys, vec!["alt+ctrl+left".to_string()]);
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
+
+        fs::write(&path, "bindings = [").unwrap();
+        let state = app.reload_config();
+        match state {
+            ConfigState::Error(ConfigLoadError::Parse { path: error_path, .. }) => {
+                assert_eq!(error_path, &path);
+            }
+            state => panic!("expected parse error, got {state:?}"),
+        }
+
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let dispatch_state = app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system).unwrap();
+        assert_eq!(dispatch_state, &DispatchState::Succeeded);
+        assert_eq!(
+            window_system.moves,
+            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
+        );
+
+        app.register_hotkeys(&mut hotkey_system).unwrap();
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
+        assert_eq!(hotkey_system.registered_hotkeys, vec!["alt+ctrl+left".to_string()]);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[derive(Debug)]
     struct NoFocusedWindow;
