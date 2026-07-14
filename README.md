@@ -8,6 +8,7 @@ See:
 
 - `CONTEXT.md` for domain language.
 - `docs/adr/0001-v1-window-positioning-utility.md` for the accepted v1 boundary and first implementation slice.
+- `docs/adr/0002-runtime-config-reload-atomicity.md` for runtime reload error and atomicity behavior.
 
 ## First slice
 

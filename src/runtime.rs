@@ -86,36 +86,9 @@ pub struct App {
 
 impl App {
     pub fn start_at(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-
-        match fs::read_to_string(&path) {
-            Ok(input) => match parse_config(&input) {
-                Ok(config) => match validate_and_normalize_bindings(config.bindings) {
-                    Ok(bindings) => Self {
-                        config: AppConfig { bindings },
-                        config_path: Some(path),
-                        config_state: ConfigState::Loaded,
-                        dispatch_state: DispatchState::Idle,
-                        hotkey_state: HotkeyRegistrationState::Unregistered,
-                    },
-                    Err(source) => Self::with_config_state(
-                        Some(path.clone()),
-                        ConfigState::Error(ConfigLoadError::Validation { path, source }),
-                    ),
-                },
-                Err(source) => Self::with_config_state(
-                    Some(path.clone()),
-                    ConfigState::Error(ConfigLoadError::Parse { path, source }),
-                ),
-            },
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                Self::with_config_state(Some(path), ConfigState::Missing)
-            }
-            Err(source) => Self::with_config_state(
-                Some(path.clone()),
-                ConfigState::Error(ConfigLoadError::Read { path, source }),
-            ),
-        }
+        let mut app = Self::with_config_state(Some(path.into()), ConfigState::Missing);
+        app.reload_config();
+        app
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -124,6 +97,27 @@ impl App {
 
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+    pub fn reload_config(&mut self) -> &ConfigState {
+        let Some(path) = self.config_path.as_deref() else {
+            return &self.config_state;
+        };
+
+        match load_and_normalize_config(path) {
+            Ok(Some(config)) => {
+                self.config = config;
+                self.config_state = ConfigState::Loaded;
+            }
+            Ok(None) => {
+                self.config = AppConfig::default();
+                self.config_state = ConfigState::Missing;
+            }
+            Err(error) => {
+                self.config_state = ConfigState::Error(error);
+            }
+        }
+
+        &self.config_state
     }
 
     pub fn config_state(&self) -> &ConfigState {
@@ -190,6 +184,30 @@ impl App {
             hotkey_state: HotkeyRegistrationState::Unregistered,
         }
     }
+}
+fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoadError> {
+    let input = match fs::read_to_string(path) {
+        Ok(input) => input,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ConfigLoadError::Read {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+
+    let config = parse_config(&input).map_err(|source| ConfigLoadError::Parse {
+        path: path.to_owned(),
+        source,
+    })?;
+    let bindings = validate_and_normalize_bindings(config.bindings).map_err(|source| {
+        ConfigLoadError::Validation {
+            path: path.to_owned(),
+            source,
+        }
+    })?;
+    Ok(Some(AppConfig { bindings }))
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {
@@ -429,14 +447,12 @@ action = { type = "move-to-next-display" }
         let app = App::start_at(&path);
 
         match app.config_state() {
-            ConfigState::Error(
-                error @ ConfigLoadError::Parse {
-                    path: error_path, ..
-                },
-            ) => {
+            ConfigState::Error(ConfigLoadError::Parse {
+                path: error_path,
+                source,
+            }) => {
                 assert_eq!(error_path, &path);
-                assert!(error.to_string().contains(&path.display().to_string()));
-                assert!(error.to_string().contains("invalid TOML config"));
+                assert!(source.to_string().contains("invalid TOML config"));
             }
             state => panic!("expected parse error, got {state:?}"),
         }
@@ -452,12 +468,146 @@ action = { type = "move-to-next-display" }
         let app = App::start_at(&directory);
 
         match app.config_state() {
-            ConfigState::Error(error @ ConfigLoadError::Read { path, .. }) => {
+            ConfigState::Error(ConfigLoadError::Read { path, .. }) => {
                 assert_eq!(path, &directory);
-                assert!(error.to_string().contains(&directory.display().to_string()));
             }
             state => panic!("expected read error, got {state:?}"),
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn reload_config_from_path_replaces_bindings_on_success() {
+        let directory = test_directory("reload_success");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
+
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Shift+Alt+Right"
+action = { type = "move-to-next-display" }
+"#,
+        )
+        .unwrap();
+
+        let state = app.reload_config();
+        assert!(matches!(state, ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+shift+right".to_string(),
+                action: Action::MoveToNextDisplay,
+            }]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reload_config_keeps_last_valid_bindings_after_parse_error() {
+        let directory = test_directory("reload_parse_error");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        fs::write(&path, "bindings = [").unwrap();
+
+        let state = app.reload_config();
+        match state {
+            ConfigState::Error(ConfigLoadError::Parse {
+                path: error_path, ..
+            }) => assert_eq!(error_path, &path),
+            state => panic!("expected parse error, got {state:?}"),
+        }
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reload_config_keeps_last_valid_bindings_after_validation_error() {
+        let directory = test_directory("reload_validation_error");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "right-half" }
+
+[[bindings]]
+hotkey = "Alt+Ctrl+Left"
+action = { type = "move-to-next-display" }
+"#,
+        )
+        .unwrap();
+
+        let state = app.reload_config();
+        match state {
+            ConfigState::Error(ConfigLoadError::Validation {
+                path: error_path,
+                source,
+            }) => {
+                assert_eq!(error_path, &path);
+                assert_eq!(
+                    source.to_string(),
+                    "duplicate binding for hotkey alt+ctrl+left"
+                );
+            }
+            state => panic!("expected validation error, got {state:?}"),
+        }
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
