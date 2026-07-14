@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::actions::Binding;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub bindings: Vec<Binding>,

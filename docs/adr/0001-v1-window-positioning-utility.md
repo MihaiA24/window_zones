@@ -51,7 +51,7 @@ Implementation status: the first executable slice is implemented in the platform
 
 ## Accepted v1 config shape
 
-V1 config uses TOML. The first executable slice only parses config content; platform-specific config file path resolution is deferred.
+V1 config uses TOML. The first executable slice parsed config content only; the runtime now resolves and loads the platform-standard config path at startup while preserving missing, read-error, and parse-error states.
 
 Hotkey strings remain opaque in the core so platform adapters can validate and register them later. Config action names use kebab-case strings and parse into Rust enums internally. Zones are built-in named zones first; custom user-defined zones are deferred.
 

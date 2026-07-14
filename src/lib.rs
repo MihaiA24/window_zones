@@ -10,6 +10,7 @@ pub mod dispatcher;
 pub mod display_movement;
 pub mod executor;
 pub mod geometry;
+pub mod runtime;
 pub mod window_system;
 pub mod zones;
 
@@ -19,5 +20,8 @@ pub use dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 pub use display_movement::move_window_to_display;
 pub use executor::{ExecuteActionError, execute_action};
 pub use geometry::{DisplayGeometry, Rect};
+pub use runtime::{
+    App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, default_config_path,
+};
 pub use window_system::{FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
 pub use zones::{BuiltInZone, rect_for_zone};

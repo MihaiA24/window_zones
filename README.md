@@ -22,3 +22,12 @@ The implemented core slices are platform-neutral only:
 - a `dispatch_hotkey` binding dispatcher tested with fake adapters
 
 Platform adapters for real hotkeys, focused-window detection, display enumeration, and move/resize calls are intentionally deferred.
+
+## Configuration discovery
+
+`App::start()` resolves one startup config path using this precedence:
+
+- Linux: `$XDG_CONFIG_HOME/window_zones/config.toml` when `$XDG_CONFIG_HOME` is absolute; otherwise `$HOME/.config/window_zones/config.toml`.
+- Windows: `%APPDATA%\window_zones\config.toml` (the roaming application-data directory).
+
+A missing file boots with empty bindings and `ConfigState::Missing`. Discovery, read, and TOML parse failures do not panic; the App keeps empty bindings and exposes an actionable `ConfigState::Error`. `App::start_at(path)` provides an explicit path for launchers and deterministic tests.
