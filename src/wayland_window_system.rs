@@ -10,6 +10,8 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +165,7 @@ fn resolve_wayland_backend_with_env(
         }
 
         return Err(WindowSystemError::Platform(
-            "Detected a Sway session but 'swaymsg' is not available in PATH".to_string(),
+            "Detected a Sway session but 'swaymsg' is not available in PATH as an executable command. Install swaymsg and ensure it is on PATH.".to_string(),
         ));
     }
 
@@ -173,7 +175,7 @@ fn resolve_wayland_backend_with_env(
         }
 
         return Err(WindowSystemError::Platform(
-            "Detected a Hyprland session but 'hyprctl' is not available in PATH".to_string(),
+            "Detected a Hyprland session but 'hyprctl' is not available in PATH as an executable command. Install hyprctl and ensure it is on PATH.".to_string(),
         ));
     }
 
@@ -203,13 +205,11 @@ fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
 
     let usable_display_ids: HashSet<_> =
         displays.iter().map(|display| display.id.as_str()).collect();
-    let display_id = focused
-        .output
-        .filter(|name| usable_display_ids.contains(name.as_str()))
-        .or_else(|| displays.first().map(|display| &display.id))
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "wayland-output-0".to_string());
-
+    let display_id = match focused.output {
+        Some(id) if usable_display_ids.contains(id.as_str()) => id.to_string(),
+        Some(id) => format!("wayland-output-unmatched:{id}"),
+        None => "wayland-output-unknown".to_string(),
+    };
     Ok(Some(FocusedWindow::new(display_id, focused.rect.to_rect())))
 }
 
@@ -279,11 +279,11 @@ fn focused_window_hypr() -> Result<Option<FocusedWindow>, WindowSystemError> {
     let displays = displays_hypr()?;
     let usable_display_ids: HashSet<_> =
         displays.iter().map(|display| display.id.as_str()).collect();
-    let display_id = window
-        .monitor
-        .filter(|name| usable_display_ids.contains(name.as_str()))
-        .or_else(|| displays.first().map(|display| &display.id))
-        .unwrap_or_else(|| "wayland-output-0");
+    let display_id = match window.monitor {
+        Some(id) if usable_display_ids.contains(id.as_str()) => id,
+        Some(id) => format!("wayland-unmatched:{id}"),
+        None => "wayland-output-unknown".to_string(),
+    };
 
     Ok(Some(FocusedWindow::new(display_id, geometry)))
 }
@@ -435,13 +435,23 @@ fn run_command_capture(
 }
 
 fn command_exists(command: &str) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+
     let Some(path) = env::var_os("PATH") else {
         return false;
     };
 
     env::split_paths(&path)
         .map(|entry| entry.join(command))
-        .any(|candidate| candidate.is_file())
+        .any(|candidate| {
+            let Ok(metadata) = candidate.metadata() else {
+                return false;
+            };
+
+            metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0)
+        })
 }
 
 impl SwayRect {

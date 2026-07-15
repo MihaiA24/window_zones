@@ -17,9 +17,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 #[cfg(target_os = "windows")]
-const FALLBACK_DISPLAY_ID: &str = "display-0";
-
-#[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
 pub struct WindowsWindowSystem;
 
@@ -51,10 +48,7 @@ impl WindowsWindowSystem {
         displays.append(&mut callback_state.displays);
 
         if displays.is_empty() {
-            return Ok(vec![DisplayGeometry::new(
-                FALLBACK_DISPLAY_ID.to_string(),
-                Rect::new(0, 0, 0, 0),
-            )]);
+            return Ok(Vec::new());
         }
 
         Ok(displays)
@@ -92,7 +86,7 @@ impl WindowsWindowSystem {
             ));
         }
 
-        Self::display_id_for_monitor(monitor).or_else(|_| Ok(FALLBACK_DISPLAY_ID.to_string()))
+        Self::display_id_for_monitor(monitor)
     }
 }
 
@@ -117,8 +111,7 @@ impl WindowSystem for WindowsWindowSystem {
             .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
 
         let geometry = Rect::new(rect.left, rect.top, width, height);
-        let display_id =
-            Self::display_for_window(hwnd).unwrap_or_else(|_| FALLBACK_DISPLAY_ID.to_string());
+        let display_id = Self::display_for_window(hwnd)?;
 
         Ok(Some(FocusedWindow::new(display_id, geometry)))
     }
@@ -193,13 +186,11 @@ extern "system" fn monitor_enum_callback(
             .iter()
             .position(|character| *character == 0)
             .unwrap_or(info.szDevice.len());
+        if len == 0 {
+            return windows::Win32::Foundation::BOOL(0);
+        }
 
-        let id = if len == 0 {
-            FALLBACK_DISPLAY_ID.to_string()
-        } else {
-            String::from_utf16_lossy(&info.szDevice[..len])
-        };
-
+        let id = String::from_utf16_lossy(&info.szDevice[..len]);
         let area = info.rcWork;
         let width = u32::try_from(area.right - area.left).ok();
         let height = u32::try_from(area.bottom - area.top).ok();
