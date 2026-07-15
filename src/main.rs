@@ -3,6 +3,14 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::sync::mpsc::{self, SyncSender};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::time::Duration;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use tray_item::{IconSource, TrayItem};
+
 use window_zones::{
     App, ConfigState, DispatchState, DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem,
     HotkeySystemError, WindowMove, WindowSystem,
@@ -37,6 +45,7 @@ struct CliArgs {
     command: Command,
     config_path: Option<PathBuf>,
     backend: BackendPreference,
+    show_tray: bool,
 }
 
 #[derive(Debug)]
@@ -59,6 +68,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
     let mut command = Command::Run;
     let mut config_path = None;
     let mut backend = BackendPreference::Auto;
+    let mut show_tray = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -86,6 +96,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
                 index += 1;
             }
             "--dry-run" => backend = BackendPreference::DryRun,
+            "--tray" => show_tray = true,
             "status" => {
                 if !matches!(command, Command::Run) {
                     return ParseStatus::Err("only one command is allowed".to_string());
@@ -140,10 +151,15 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         }
     }
 
+    if show_tray && !matches!(command, Command::Run) {
+        return ParseStatus::Err("--tray is only valid with the `run` command".to_string());
+    }
+
     ParseStatus::Ok(CliArgs {
         command,
         config_path,
         backend,
+        show_tray,
     })
 }
 
@@ -398,20 +414,38 @@ fn is_wayland_session() -> bool {
         || env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
-fn print_status(app: &App) {
-    println!("Runtime status:");
-    println!(
-        "  config path: {}",
-        app.config_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<unresolved>".to_string())
-    );
-    println!("  config state: {:?}", app.config_state());
-    println!("  bindings: {}", app.config().bindings.len());
-    println!("  hotkey state: {:?}", app.hotkey_state());
-    println!("  dispatch state: {:?}", app.dispatch_state());
+fn runtime_status_lines(app: &App) -> Vec<String> {
+    let mut status = vec![
+        "Runtime status:".to_string(),
+        format!(
+            "  config path: {}",
+            app.config_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string())
+        ),
+        format!("  binding count: {}", app.config().bindings.len()),
+        format!("  config state: {:?}", app.config_state()),
+        format!("  hotkey state: {:?}", app.hotkey_state()),
+        format!(
+            "  last action: {}",
+            app.last_dispatch_hotkey().unwrap_or("<none>")
+        ),
+        format!("  dispatch state: {:?}", app.dispatch_state()),
+    ];
+
     if let ConfigState::Error(error) = app.config_state() {
-        println!("  config error: {error}");
+        status.push(format!("  config error: {error}"));
+    }
+    if let DispatchState::Error(error) = app.dispatch_state() {
+        status.push(format!("  dispatch error: {error}"));
+    }
+
+    status
+}
+
+fn print_status(app: &App) {
+    for line in runtime_status_lines(app) {
+        println!("{line}");
     }
 }
 
@@ -449,7 +483,23 @@ fn execute_status(app: App) {
     print_status(&app);
 }
 
-fn execute_run(mut app: App, mut window_system: RuntimeWindowSystem) {
+fn execute_run(app: App, window_system: RuntimeWindowSystem, show_tray: bool) {
+    if show_tray {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            return execute_run_with_tray(app, window_system);
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            eprintln!("Tray mode is not supported on this platform yet.");
+        }
+    }
+
+    execute_run_cli(app, window_system);
+}
+
+fn execute_run_cli(mut app: App, mut window_system: RuntimeWindowSystem) {
     let config_path = app.config_path().map(PathBuf::from);
 
     let mut hotkey_system = CliHotkeySystem::default();
@@ -516,23 +566,149 @@ fn execute_run(mut app: App, mut window_system: RuntimeWindowSystem) {
     println!("Session closed.");
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+enum RuntimeTrayCommand {
+    Reload,
+    Restart,
+    Status,
+    Quit,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
+    let config_path = app.config_path().map(PathBuf::from);
+    let mut hotkey_system = CliHotkeySystem::default();
+
+    if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
+        println!("Hotkey registration initially failed: {error}");
+    } else {
+        println!("Registered {} hotkeys.", app.config().bindings.len());
+    }
+
+    let (tray_tx, tray_rx) = mpsc::sync_channel::<RuntimeTrayCommand>(16);
+    let mut tray = match build_tray_menu(&app, &tray_tx) {
+        Ok(tray) => tray,
+        Err(error) => {
+            eprintln!("Failed to start tray surface: {error}");
+            return;
+        }
+    };
+    let mut status_snapshot = runtime_status_lines(&app);
+
+    println!("Window backend: {}", window_system.name());
+    println!("Tray menu started. Use tray controls to reload/restart/quit.");
+
+    loop {
+        match tray_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RuntimeTrayCommand::Reload) => {
+                println!("Reload requested.");
+                match app.poll_config_changes() {
+                    ConfigState::Error(error) => {
+                        println!("Config reload error: {error}");
+                    }
+                    state => println!("Config state: {:?}", state),
+                }
+            }
+            Ok(RuntimeTrayCommand::Restart) => {
+                app = build_app(config_path.as_ref());
+                println!("Runtime restarted.");
+                if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
+                    println!("Hotkey registration now failed: {error}");
+                }
+            }
+            Ok(RuntimeTrayCommand::Status) => print_status(&app),
+            Ok(RuntimeTrayCommand::Quit) => {
+                println!("Session closed.");
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                println!("Tray channel closed. Session closed.");
+                return;
+            }
+        }
+
+        if let Ok(state) = app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+            if let DispatchState::Error(error) = state {
+                println!("Dispatch failed: {error}");
+            } else if let DispatchState::Succeeded = state {
+                print_dispatch_state(state, &window_system);
+            }
+        }
+
+        let next_snapshot = runtime_status_lines(&app);
+        if status_snapshot != next_snapshot {
+            tray = match build_tray_menu(&app, &tray_tx) {
+                Ok(new_tray) => {
+                    status_snapshot = next_snapshot;
+                    new_tray
+                }
+                Err(error) => {
+                    eprintln!("Failed to refresh tray status: {error}");
+                    tray
+                }
+            };
+        }
+
+        let _ = app.poll_config_changes();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<TrayItem, String> {
+    let mut tray = TrayItem::new("Window Zones", IconSource::Resource(""))
+        .map_err(|error| error.to_string())?;
+
+    for line in runtime_status_lines(app) {
+        tray.add_label(&line).map_err(|error| error.to_string())?;
+    }
+
+    let status_tx = tx.clone();
+    tray.add_menu_item("Show status", move || {
+        let _ = status_tx.send(RuntimeTrayCommand::Status);
+    })
+    .map_err(|error| error.to_string())?;
+
+    let reload_tx = tx.clone();
+    tray.add_menu_item("Reload", move || {
+        let _ = reload_tx.send(RuntimeTrayCommand::Reload);
+    })
+    .map_err(|error| error.to_string())?;
+
+    let restart_tx = tx.clone();
+    tray.add_menu_item("Restart", move || {
+        let _ = restart_tx.send(RuntimeTrayCommand::Restart);
+    })
+    .map_err(|error| error.to_string())?;
+
+    let quit_tx = tx.clone();
+    tray.add_menu_item("Quit", move || {
+        let _ = quit_tx.send(RuntimeTrayCommand::Quit);
+    })
+    .map_err(|error| error.to_string())?;
+
+    Ok(tray)
+}
+
 fn print_help() {
     println!("window_zones: execute configured window movement actions");
     println!("Usage:");
     println!(
-        "  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] status"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] status"
     );
     println!(
-        "  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] dispatch <HOTKEY>"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] dispatch <HOTKEY>"
     );
-    println!("  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] run");
-    println!("  window_zones --help");
-    println!();
+    println!(
+        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] run"
+    );
     println!("Commands:");
-    println!("  status          print runtime state and exit");
-    println!("  dispatch        dispatch a single hotkey and exit");
-    println!("  run             start an interactive session (reload/restart/quit)");
-    println!("  q/quit/exit     leave interactive session");
+    println!("  status           print runtime state and exit");
+    println!("  dispatch         dispatch a single hotkey and exit");
+    println!("  run              start an interactive session (reload/restart/quit)");
+    println!("  run --tray       start optional tray/menu surface (reload/restart/quit)");
+    println!("  q/quit/exit      leave interactive session");
 }
 
 fn main() {
@@ -560,7 +736,7 @@ fn main() {
                 Command::Status => execute_status(app),
                 Command::Dispatch { hotkey } => execute_dispatch(app, window_system, hotkey),
                 Command::Run => {
-                    execute_run(app, window_system);
+                    execute_run(app, window_system, config.show_tray);
                 }
             }
         }
@@ -570,6 +746,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_run_with_tray() {
+        let ParseStatus::Ok(args) = parse(&["run", "--tray"]) else {
+            panic!("expected parsed args");
+        };
+        assert!(matches!(args.command, Command::Run));
+        assert!(args.show_tray);
+    }
+
+    #[test]
+    fn parse_rejects_tray_with_non_run_command() {
+        assert!(matches!(parse(&["status", "--tray"]), ParseStatus::Err(_)));
+        assert!(matches!(
+            parse(&["dispatch", "Ctrl+Alt+Left", "--tray"]),
+            ParseStatus::Err(_)
+        ));
+    }
 
     fn parse(raw: &[&str]) -> ParseStatus {
         let args: Vec<String> = raw.iter().map(|value| (*value).to_string()).collect();
