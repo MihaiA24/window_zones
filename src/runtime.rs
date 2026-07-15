@@ -333,9 +333,6 @@ fn current_platform() -> Platform {
     Platform::Unsupported(env::consts::OS)
 }
 
-fn is_linux_absolute(path: &Path) -> bool {
-    path.as_os_str().as_encoded_bytes().starts_with(b"/")
-}
 fn resolve_config_path_for(
     platform: Platform,
     _get_env: impl Fn(&str) -> Option<OsString>,
@@ -345,7 +342,7 @@ fn resolve_config_path_for(
         Platform::Linux => Ok(_get_env("XDG_CONFIG_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .filter(|path| is_linux_absolute(path))
+            .filter(|path| path.is_absolute())
             .or_else(|| {
                 _get_env("HOME")
                     .filter(|value| !value.is_empty())
