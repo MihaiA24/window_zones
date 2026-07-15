@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
@@ -14,6 +15,13 @@ use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
 use crate::window_system::WindowSystem;
 const CONFIG_DIRECTORY: &str = "window_zones";
 const CONFIG_FILE: &str = "config.toml";
+const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigFileSignature {
+    modified: SystemTime,
+    len: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigPathError {
@@ -82,12 +90,15 @@ pub struct App {
     config_state: ConfigState,
     dispatch_state: DispatchState,
     hotkey_state: HotkeyRegistrationState,
+    last_config_signature: Option<ConfigFileSignature>,
+    reload_deadline: Option<Instant>,
 }
 
 impl App {
     pub fn start_at(path: impl Into<PathBuf>) -> Self {
         let mut app = Self::with_config_state(Some(path.into()), ConfigState::Missing);
         app.reload_config();
+        app.register_config_watcher();
         app
     }
 
@@ -98,6 +109,7 @@ impl App {
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
     }
+
     pub fn reload_config(&mut self) -> &ConfigState {
         let Some(path) = self.config_path.as_deref() else {
             return &self.config_state;
@@ -115,6 +127,40 @@ impl App {
             Err(error) => {
                 self.config_state = ConfigState::Error(error);
             }
+        }
+
+        &self.config_state
+    }
+
+    pub fn poll_config_changes(&mut self) -> &ConfigState {
+        let Some(path) = self.config_path.as_deref() else {
+            return &self.config_state;
+        };
+
+        let now = Instant::now();
+        let signature = match config_file_signature(path) {
+            Ok(signature) => signature,
+            Err(source) => {
+                self.config_state = ConfigState::Error(ConfigLoadError::Read {
+                    path: path.to_owned(),
+                    source,
+                });
+                return &self.config_state;
+            }
+        };
+
+        if self.last_config_signature != signature {
+            self.last_config_signature = signature;
+            self.reload_deadline = Some(now + CONFIG_RELOAD_DEBOUNCE);
+        }
+
+        if let Some(deadline) = self.reload_deadline {
+            if now >= deadline {
+                self.reload_config();
+                self.reload_deadline = None;
+            }
+        } else if self.last_config_signature.is_none() {
+            self.last_config_signature = signature;
         }
 
         &self.config_state
@@ -175,6 +221,13 @@ impl App {
         Ok(self.dispatch_hotkey(&hotkey, window_system))
     }
 
+    fn register_config_watcher(&mut self) {
+        if let Some(path) = self.config_path.as_deref() {
+            self.last_config_signature = config_file_signature(path).ok().flatten();
+            self.reload_deadline = None;
+        }
+    }
+
     fn with_config_state(config_path: Option<PathBuf>, config_state: ConfigState) -> Self {
         Self {
             config: AppConfig::default(),
@@ -182,9 +235,12 @@ impl App {
             config_state,
             dispatch_state: DispatchState::Idle,
             hotkey_state: HotkeyRegistrationState::Unregistered,
+            last_config_signature: None,
+            reload_deadline: None,
         }
     }
 }
+
 fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoadError> {
     let input = match fs::read_to_string(path) {
         Ok(input) => input,
@@ -208,6 +264,19 @@ fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoa
         }
     })?;
     Ok(Some(AppConfig { bindings }))
+}
+
+fn config_file_signature(path: &Path) -> Result<Option<ConfigFileSignature>, io::Error> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    Ok(Some(ConfigFileSignature {
+        modified: metadata.modified()?,
+        len: metadata.len(),
+    }))
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {
@@ -249,36 +318,30 @@ fn resolve_config_path_for(
 ) -> Result<PathBuf, ConfigPathError> {
     let config_root: PathBuf = match platform {
         #[cfg(any(test, target_os = "linux"))]
-        Platform::Linux => Ok(
-            _get_env("XDG_CONFIG_HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .filter(|path| is_linux_absolute(path))
-                .or_else(|| {
-                    _get_env("HOME")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                        .map(|home| home.join(".config"))
-                })
-                .ok_or(ConfigPathError::MissingEnvironment {
-                    platform: "Linux",
-                    variables: "XDG_CONFIG_HOME or HOME",
-                })?,
-        ),
+        Platform::Linux => Ok(_get_env("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| is_linux_absolute(path))
+            .or_else(|| {
+                _get_env("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })
+            .ok_or(ConfigPathError::MissingEnvironment {
+                platform: "Linux",
+                variables: "XDG_CONFIG_HOME or HOME",
+            })?),
         #[cfg(any(test, target_os = "windows"))]
-        Platform::Windows => Ok(
-            _get_env("APPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .ok_or(ConfigPathError::MissingEnvironment {
-                    platform: "Windows",
-                    variables: "APPDATA",
-                })?,
-        ),
+        Platform::Windows => Ok(_get_env("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or(ConfigPathError::MissingEnvironment {
+                platform: "Windows",
+                variables: "APPDATA",
+            })?),
         #[cfg(any(test, not(any(target_os = "linux", target_os = "windows"))))]
-        Platform::Unsupported(platform) => {
-            Err(ConfigPathError::UnsupportedPlatform { platform })
-        }
+        Platform::Unsupported(platform) => Err(ConfigPathError::UnsupportedPlatform { platform }),
     }?;
 
     Ok(config_root.join(CONFIG_DIRECTORY).join(CONFIG_FILE))
@@ -287,8 +350,9 @@ fn resolve_config_path_for(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CONFIG_FILE, ConfigLoadError, ConfigState, DispatchHotkeyError, DispatchState,
-        HotkeyRegistrationState, Platform, resolve_config_path_for,
+        App, CONFIG_FILE, CONFIG_RELOAD_DEBOUNCE, ConfigLoadError, ConfigState,
+        DispatchHotkeyError, DispatchState, HotkeyRegistrationState, Platform,
+        resolve_config_path_for,
     };
     use crate::{
         Action, Binding, BuiltInZone, DisplayGeometry, ExecuteActionError, FocusedWindow,
@@ -300,6 +364,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
 
     fn environment<'a>(
         entries: &'a [(&'a str, &'a str)],
@@ -726,6 +792,196 @@ action = { type = "move-to-zone", zone = "left-half" }
     }
 
     #[test]
+    fn poll_config_changes_reloads_and_updates_bindings() {
+        let directory = test_directory("polling_reload_success");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
+
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Shift+Alt+Right"
+action = { type = "move-to-next-display" }
+"#,
+        )
+        .unwrap();
+
+        let state = app.poll_config_changes();
+        assert!(matches!(state, ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+
+        thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
+        let state = app.poll_config_changes();
+        assert!(matches!(state, ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+shift+right".to_string(),
+                action: Action::MoveToNextDisplay,
+            }]
+        );
+
+        let state = app.dispatch_hotkey("Shift+Alt+Right", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn poll_config_changes_debounces_rapid_successive_writes() {
+        let directory = test_directory("polling_debounce");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Right"
+action = { type = "move-to-zone", zone = "right-half" }
+"#,
+        )
+        .unwrap();
+        app.poll_config_changes();
+
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Shift+Alt+Right"
+action = { type = "move-to-next-display" }
+"#,
+        )
+        .unwrap();
+        app.poll_config_changes();
+
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::LeftHalf
+                },
+            }]
+        );
+
+        thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
+        let state = app.poll_config_changes();
+        assert!(matches!(state, ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+shift+right".to_string(),
+                action: Action::MoveToNextDisplay,
+            }]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn poll_config_changes_survives_read_errors_without_terminating_runtime() {
+        let directory = test_directory("polling_read_error");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        app.poll_config_changes();
+        thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
+        let state = app.poll_config_changes();
+        match state {
+            ConfigState::Error(ConfigLoadError::Read {
+                path: error_path, ..
+            }) => {
+                assert_eq!(error_path, &path);
+            }
+            state => panic!("expected read error, got {state:?}"),
+        }
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+
+        fs::remove_dir_all(&path).unwrap();
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Right"
+action = { type = "move-to-zone", zone = "right-half" }
+"#,
+        )
+        .unwrap();
+
+        app.poll_config_changes();
+        thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
+        let state = app.poll_config_changes();
+        assert!(matches!(state, ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+right".to_string(),
+                action: Action::MoveToZone {
+                    zone: BuiltInZone::RightHalf
+                },
+            }]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn malformed_reload_does_not_corrupt_hotkey_registration_or_dispatch() {
         let directory = test_directory("reload_malformed_does_not_corrupt_runtime");
         fs::create_dir_all(&directory).unwrap();
@@ -744,20 +1000,27 @@ action = { type = "move-to-zone", zone = "left-half" }
             hotkey: "Ctrl+Alt+Left".to_string(),
         })]);
         app.register_hotkeys(&mut hotkey_system).unwrap();
-        assert_eq!(hotkey_system.registered_hotkeys, vec!["alt+ctrl+left".to_string()]);
+        assert_eq!(
+            hotkey_system.registered_hotkeys,
+            vec!["alt+ctrl+left".to_string()]
+        );
         assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
 
         fs::write(&path, "bindings = [").unwrap();
         let state = app.reload_config();
         match state {
-            ConfigState::Error(ConfigLoadError::Parse { path: error_path, .. }) => {
+            ConfigState::Error(ConfigLoadError::Parse {
+                path: error_path, ..
+            }) => {
                 assert_eq!(error_path, &path);
             }
             state => panic!("expected parse error, got {state:?}"),
         }
 
         let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
-        let dispatch_state = app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system).unwrap();
+        let dispatch_state = app
+            .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
+            .unwrap();
         assert_eq!(dispatch_state, &DispatchState::Succeeded);
         assert_eq!(
             window_system.moves,
@@ -766,7 +1029,10 @@ action = { type = "move-to-zone", zone = "left-half" }
 
         app.register_hotkeys(&mut hotkey_system).unwrap();
         assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
-        assert_eq!(hotkey_system.registered_hotkeys, vec!["alt+ctrl+left".to_string()]);
+        assert_eq!(
+            hotkey_system.registered_hotkeys,
+            vec!["alt+ctrl+left".to_string()]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
