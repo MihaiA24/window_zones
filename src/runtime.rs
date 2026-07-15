@@ -245,37 +245,41 @@ fn is_linux_absolute(path: &Path) -> bool {
 
 fn resolve_config_path_for(
     platform: Platform,
-    get_env: impl Fn(&str) -> Option<OsString>,
+    _get_env: impl Fn(&str) -> Option<OsString>,
 ) -> Result<PathBuf, ConfigPathError> {
-    let config_root = match platform {
+    let config_root: PathBuf = match platform {
         #[cfg(any(test, target_os = "linux"))]
-        Platform::Linux => get_env("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| is_linux_absolute(path))
-            .or_else(|| {
-                get_env("HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .map(|home| home.join(".config"))
-            })
-            .ok_or(ConfigPathError::MissingEnvironment {
-                platform: "Linux",
-                variables: "XDG_CONFIG_HOME or HOME",
-            })?,
+        Platform::Linux => Ok(
+            _get_env("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| is_linux_absolute(path))
+                .or_else(|| {
+                    _get_env("HOME")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".config"))
+                })
+                .ok_or(ConfigPathError::MissingEnvironment {
+                    platform: "Linux",
+                    variables: "XDG_CONFIG_HOME or HOME",
+                })?,
+        ),
         #[cfg(any(test, target_os = "windows"))]
-        Platform::Windows => get_env("APPDATA")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .ok_or(ConfigPathError::MissingEnvironment {
-                platform: "Windows",
-                variables: "APPDATA",
-            })?,
+        Platform::Windows => Ok(
+            _get_env("APPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .ok_or(ConfigPathError::MissingEnvironment {
+                    platform: "Windows",
+                    variables: "APPDATA",
+                })?,
+        ),
         #[cfg(any(test, not(any(target_os = "linux", target_os = "windows"))))]
         Platform::Unsupported(platform) => {
-            return Err(ConfigPathError::UnsupportedPlatform { platform });
+            Err(ConfigPathError::UnsupportedPlatform { platform })
         }
-    };
+    }?;
 
     Ok(config_root.join(CONFIG_DIRECTORY).join(CONFIG_FILE))
 }
