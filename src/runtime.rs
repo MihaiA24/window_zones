@@ -95,6 +95,15 @@ pub struct App {
 }
 
 impl App {
+    pub fn start() -> Self {
+        match default_config_path() {
+            Ok(path) => Self::start_at(path),
+            Err(error) => {
+                Self::with_config_state(None, ConfigState::Error(ConfigLoadError::Path(error)))
+            }
+        }
+    }
+
     pub fn start_at(path: impl Into<PathBuf>) -> Self {
         let mut app = Self::with_config_state(Some(path.into()), ConfigState::Missing);
         app.reload_config();
