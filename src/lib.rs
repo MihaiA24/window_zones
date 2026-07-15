@@ -12,6 +12,8 @@ pub mod executor;
 pub mod geometry;
 pub mod hotkey_system;
 pub mod runtime;
+#[cfg(target_os = "linux")]
+pub mod wayland_window_system;
 pub mod window_system;
 pub mod zones;
 
@@ -29,6 +31,8 @@ pub use runtime::{
     App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, HotkeyRegistrationState,
     default_config_path,
 };
+#[cfg(target_os = "linux")]
+pub use wayland_window_system::WaylandWindowSystem;
 pub use window_system::{FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
 pub use zones::{
     BuiltInZone, ZoneDefinition, built_in_zone_from_name, is_built_in_zone_name, rect_for_zone,
