@@ -304,7 +304,12 @@ enum Platform {
     Linux,
     #[cfg(any(test, target_os = "windows"))]
     Windows,
-    #[cfg(any(test, not(any(target_os = "linux", target_os = "windows"))))]
+    #[cfg(any(test, target_os = "macos"))]
+    MacOS,
+    #[cfg(any(
+        test,
+        not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+    ))]
     Unsupported(&'static str),
 }
 
@@ -318,7 +323,12 @@ fn current_platform() -> Platform {
     Platform::Windows
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn current_platform() -> Platform {
+    Platform::MacOS
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn current_platform() -> Platform {
     Platform::Unsupported(env::consts::OS)
 }
@@ -326,7 +336,6 @@ fn current_platform() -> Platform {
 fn is_linux_absolute(path: &Path) -> bool {
     path.as_os_str().as_encoded_bytes().starts_with(b"/")
 }
-
 fn resolve_config_path_for(
     platform: Platform,
     _get_env: impl Fn(&str) -> Option<OsString>,
@@ -355,7 +364,19 @@ fn resolve_config_path_for(
                 platform: "Windows",
                 variables: "APPDATA",
             })?),
-        #[cfg(any(test, not(any(target_os = "linux", target_os = "windows"))))]
+        #[cfg(any(test, target_os = "macos"))]
+        Platform::MacOS => Ok(_get_env("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+            .ok_or(ConfigPathError::MissingEnvironment {
+                platform: "macOS",
+                variables: "HOME",
+            })?),
+        #[cfg(any(
+            test,
+            not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+        ))]
         Platform::Unsupported(platform) => Err(ConfigPathError::UnsupportedPlatform { platform }),
     }?;
 
@@ -431,6 +452,18 @@ mod tests {
         let path = resolve_config_path_for(Platform::Windows, environment(&entries)).unwrap();
 
         assert_eq!(path, PathBuf::from("/roaming/window_zones/config.toml"));
+    }
+
+    #[test]
+    fn macos_uses_home_library_support() {
+        let entries = [("HOME", "/users/bob")];
+
+        let path = resolve_config_path_for(Platform::MacOS, environment(&entries)).unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("/users/bob/Library/Application Support/window_zones/config.toml")
+        );
     }
 
     #[test]

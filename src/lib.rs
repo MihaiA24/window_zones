@@ -11,6 +11,8 @@ pub mod display_movement;
 pub mod executor;
 pub mod geometry;
 pub mod hotkey_system;
+#[cfg(target_os = "macos")]
+pub mod macos_window_system;
 pub mod runtime;
 #[cfg(target_os = "linux")]
 pub mod wayland_window_system;
@@ -31,6 +33,8 @@ pub use display_movement::move_window_to_display;
 pub use executor::{ExecuteActionError, execute_action};
 pub use geometry::{DisplayGeometry, Rect};
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
+#[cfg(target_os = "macos")]
+pub use macos_window_system::MacOSWindowSystem;
 pub use runtime::{
     App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, HotkeyRegistrationState,
     default_config_path,
