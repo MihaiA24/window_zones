@@ -13,6 +13,10 @@ pub mod geometry;
 pub mod hotkey_system;
 pub mod runtime;
 pub mod window_system;
+#[cfg(target_os = "windows")]
+pub mod windows_window_system;
+#[cfg(target_os = "linux")]
+pub mod x11_window_system;
 pub mod zones;
 
 pub use actions::{Action, Binding};
@@ -30,6 +34,11 @@ pub use runtime::{
     default_config_path,
 };
 pub use window_system::{FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
+#[cfg(target_os = "windows")]
+pub use windows_window_system::WindowsWindowSystem;
+#[cfg(target_os = "linux")]
+pub use x11_window_system::X11WindowSystem;
 pub use zones::{
-    BuiltInZone, ZoneDefinition, built_in_zone_from_name, is_built_in_zone_name, rect_for_zone,
+    BuiltInZone, ZoneDefinition, built_in_zone_from_name, is_built_in_zone_name,
+    rect_for_built_in_zone, rect_for_zone,
 };
