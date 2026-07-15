@@ -33,7 +33,7 @@ pub fn dispatch_hotkey<W: WindowSystem>(
             hotkey: hotkey.to_string(),
         })?;
 
-    execute_action(&binding.action, window_system)?;
+    execute_action(&binding.action, &config.zones, window_system)?;
     Ok(())
 }
 
@@ -43,7 +43,8 @@ mod tests {
     use crate::actions::{Action, Binding};
     use crate::geometry::Rect;
     use crate::window_system::{FocusedWindow, WindowMove, WindowSystemError};
-    use crate::{BuiltInZone, DisplayGeometry};
+    use crate::{DisplayGeometry, ZoneDefinition};
+    use std::collections::BTreeMap;
 
     #[derive(Debug)]
     struct FakeWindowSystem {
@@ -75,8 +76,8 @@ mod tests {
         }
     }
 
-    fn config(bindings: Vec<Binding>) -> AppConfig {
-        AppConfig { bindings }
+    fn config(bindings: Vec<Binding>, zones: BTreeMap<String, ZoneDefinition>) -> AppConfig {
+        AppConfig { bindings, zones }
     }
 
     fn binding(hotkey: &str, action: Action) -> Binding {
@@ -86,8 +87,10 @@ mod tests {
         }
     }
 
-    fn move_to_zone(zone: BuiltInZone) -> Action {
-        Action::MoveToZone { zone }
+    fn move_to_zone(zone: &str) -> Action {
+        Action::MoveToZone {
+            zone: zone.to_string(),
+        }
     }
 
     fn fake_with_focus(display_id: &str, geometry: Rect) -> FakeWindowSystem {
@@ -104,10 +107,10 @@ mod tests {
 
     #[test]
     fn dispatches_known_hotkey_to_zone_movement() {
-        let config = config(vec![binding(
-            "alt+ctrl+left",
-            move_to_zone(BuiltInZone::LeftHalf),
-        )]);
+        let config = config(
+            vec![binding("alt+ctrl+left", move_to_zone("left-half"))],
+            BTreeMap::new(),
+        );
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
 
         dispatch_hotkey(&config, "Ctrl + Alt + Left", &mut fake).unwrap();
@@ -119,11 +122,35 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_custom_zone_from_config() {
+        let mut zones = BTreeMap::new();
+        zones.insert(
+            "side".to_string(),
+            ZoneDefinition {
+                x: 0,
+                y: 50,
+                width: 50,
+                height: 50,
+            },
+        );
+
+        let config = config(vec![binding("alt+ctrl+left", move_to_zone("side"))], zones);
+        let mut fake = fake_with_focus("left", Rect::new(0, 0, 1920, 1080));
+
+        dispatch_hotkey(&config, "alt+ctrl+left", &mut fake).unwrap();
+
+        assert_eq!(
+            fake.moves,
+            vec![WindowMove::new(Rect::new(0, 540, 960, 540))]
+        );
+    }
+
+    #[test]
     fn dispatches_known_hotkey_to_display_movement() {
-        let config = config(vec![binding(
-            "alt+ctrl+shift+right",
-            Action::MoveToNextDisplay,
-        )]);
+        let config = config(
+            vec![binding("alt+ctrl+shift+right", Action::MoveToNextDisplay)],
+            BTreeMap::new(),
+        );
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
 
         dispatch_hotkey(&config, "alt+shift+ctrl+right", &mut fake).unwrap();
@@ -136,10 +163,10 @@ mod tests {
 
     #[test]
     fn unknown_hotkey_returns_error_without_moving() {
-        let config = config(vec![binding(
-            "alt+ctrl+left",
-            move_to_zone(BuiltInZone::LeftHalf),
-        )]);
+        let config = config(
+            vec![binding("alt+ctrl+left", move_to_zone("left-half"))],
+            BTreeMap::new(),
+        );
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
 
         let err = dispatch_hotkey(&config, "ctrl+alt+left+right", &mut fake).unwrap_err();
@@ -155,10 +182,13 @@ mod tests {
 
     #[test]
     fn duplicate_hotkeys_use_first_match() {
-        let config = config(vec![
-            binding("alt+ctrl+x", move_to_zone(BuiltInZone::LeftHalf)),
-            binding("alt+ctrl+x", move_to_zone(BuiltInZone::RightHalf)),
-        ]);
+        let config = config(
+            vec![
+                binding("alt+ctrl+x", move_to_zone("left-half")),
+                binding("alt+ctrl+x", Action::MoveToNextDisplay),
+            ],
+            BTreeMap::new(),
+        );
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
 
         dispatch_hotkey(&config, "alt+ctrl+x", &mut fake).unwrap();
@@ -171,12 +201,13 @@ mod tests {
 
     #[test]
     fn executor_errors_are_propagated() {
-        let config = config(vec![binding(
-            "alt+ctrl+right",
-            move_to_zone(BuiltInZone::RightHalf),
-        )]);
         let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
         fake.move_error = Some(WindowSystemError::Platform("denied".to_string()));
+
+        let config = config(
+            vec![binding("alt+ctrl+right", move_to_zone("right-half"))],
+            BTreeMap::new(),
+        );
 
         let err = dispatch_hotkey(&config, "alt+ctrl+right", &mut fake).unwrap_err();
 

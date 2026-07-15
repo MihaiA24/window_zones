@@ -17,8 +17,8 @@ pub mod zones;
 
 pub use actions::{Action, Binding};
 pub use config::{
-    AppConfig, BindingValidationError, ConfigError, normalize_hotkey, parse_config,
-    validate_and_normalize_bindings,
+    AppConfig, BindingValidationError, ConfigError, parse_config,
+    validate_and_normalize_app_config, validate_and_normalize_bindings,
 };
 pub use dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 pub use display_movement::move_window_to_display;
@@ -30,4 +30,6 @@ pub use runtime::{
     default_config_path,
 };
 pub use window_system::{FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
-pub use zones::{BuiltInZone, rect_for_zone};
+pub use zones::{
+    BuiltInZone, ZoneDefinition, built_in_zone_from_name, is_built_in_zone_name, rect_for_zone,
+};

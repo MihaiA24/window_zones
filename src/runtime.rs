@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 use crate::config::{
-    AppConfig, BindingValidationError, ConfigError, parse_config, validate_and_normalize_bindings,
+    AppConfig, BindingValidationError, ConfigError, parse_config, validate_and_normalize_app_config,
 };
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
@@ -257,13 +257,13 @@ fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoa
         path: path.to_owned(),
         source,
     })?;
-    let bindings = validate_and_normalize_bindings(config.bindings).map_err(|source| {
+    let config = validate_and_normalize_app_config(config).map_err(|source| {
         ConfigLoadError::Validation {
             path: path.to_owned(),
             source,
         }
     })?;
-    Ok(Some(AppConfig { bindings }))
+    Ok(Some(config))
 }
 
 fn config_file_signature(path: &Path) -> Result<Option<ConfigFileSignature>, io::Error> {
@@ -355,9 +355,9 @@ mod tests {
         resolve_config_path_for,
     };
     use crate::{
-        Action, Binding, BuiltInZone, DisplayGeometry, ExecuteActionError, FocusedWindow,
-        HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowMove, WindowSystem,
-        WindowSystemError,
+        Action, Binding, DisplayGeometry, ExecuteActionError, FocusedWindow, HotkeyEvent,
+        HotkeySystem, HotkeySystemError, Rect, WindowMove, WindowSystem, WindowSystemError,
+        ZoneDefinition,
     };
     use std::collections::VecDeque;
     use std::env;
@@ -463,9 +463,51 @@ action = { type = "move-to-zone", zone = "left-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_zones_are_loaded_from_config() {
+        let directory = test_directory("custom_zone");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[zones]
+side = { x = 10, y = 0, width = 50, height = 100 }
+
+[[bindings]]
+hotkey = "Ctrl+Alt+Right"
+action = { type = "move-to-zone", zone = "side" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(&path);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        assert_eq!(
+            app.config().zones,
+            std::collections::BTreeMap::from([(
+                "side".to_string(),
+                ZoneDefinition {
+                    x: 10,
+                    y: 0,
+                    width: 50,
+                    height: 100,
+                },
+            )])
+        );
+
+        let state = app.dispatch_hotkey("Ctrl+Alt+Right", &mut window_system);
+        assert_eq!(state, &DispatchState::Succeeded);
+        assert_eq!(
+            window_system.moves,
+            vec![WindowMove::new(Rect::new(192, 0, 960, 1080))]
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -565,7 +607,7 @@ action = { type = "move-to-zone", zone = "left-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
         );
@@ -620,7 +662,7 @@ action = { type = "move-to-zone", zone = "left-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
         );
@@ -674,7 +716,7 @@ action = { type = "move-to-next-display" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
         );
@@ -720,7 +762,7 @@ action = { type = "move-to-zone", zone = "right-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+right".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::RightHalf
+                    zone: "right-half".to_string()
                 },
             }]
         );
@@ -815,7 +857,7 @@ action = { type = "move-to-zone", zone = "left-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
         );
@@ -836,7 +878,7 @@ action = { type = "move-to-next-display" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
         );
@@ -901,7 +943,7 @@ action = { type = "move-to-next-display" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf
+                    zone: "left-half".to_string()
                 },
             }]
         );
@@ -974,7 +1016,7 @@ action = { type = "move-to-zone", zone = "right-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+right".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::RightHalf
+                    zone: "right-half".to_string()
                 },
             }]
         );
@@ -1319,7 +1361,7 @@ action = { type = "move-to-zone", zone = "left-half" }
             vec![Binding {
                 hotkey: "alt+ctrl+left".to_string(),
                 action: Action::MoveToZone {
-                    zone: BuiltInZone::LeftHalf,
+                    zone: "left-half".to_string(),
                 },
             }]
         );

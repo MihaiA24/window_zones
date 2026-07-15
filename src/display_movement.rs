@@ -1,6 +1,5 @@
 use crate::geometry::Rect;
-use crate::zones::{ALL_BUILT_IN_ZONES, rect_for_zone};
-
+use crate::zones::{ALL_BUILT_IN_ZONES, rect_for_built_in_zone};
 pub const KNOWN_ZONE_MATCH_TOLERANCE_PX: i32 = 2;
 
 /// Moves a window from one display usable area to another.
@@ -15,11 +14,11 @@ pub fn move_window_to_display(
 ) -> Rect {
     if let Some(zone) = ALL_BUILT_IN_ZONES.into_iter().find(|zone| {
         current.nearly_equals(
-            rect_for_zone(*zone, source_usable_area),
+            rect_for_built_in_zone(*zone, source_usable_area),
             KNOWN_ZONE_MATCH_TOLERANCE_PX,
         )
     }) {
-        return rect_for_zone(zone, target_usable_area);
+        return rect_for_built_in_zone(zone, target_usable_area);
     }
 
     map_proportionally(current, source_usable_area, target_usable_area)
@@ -56,17 +55,17 @@ fn clamp_position(value: i32, min: i32, max: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zones::BuiltInZone;
+    use crate::zones::{BuiltInZone, rect_for_built_in_zone};
 
     #[test]
     fn preserves_recognized_zone_when_moving_between_displays() {
         let source = Rect::new(0, 0, 1920, 1080);
         let target = Rect::new(1920, 0, 2560, 1440);
-        let current = rect_for_zone(BuiltInZone::LeftHalf, source);
+        let current = rect_for_built_in_zone(BuiltInZone::LeftHalf, source);
 
         assert_eq!(
             move_window_to_display(current, source, target),
-            rect_for_zone(BuiltInZone::LeftHalf, target)
+            rect_for_built_in_zone(BuiltInZone::LeftHalf, target)
         );
     }
 
@@ -78,7 +77,7 @@ mod tests {
 
         assert_eq!(
             move_window_to_display(current, source, target),
-            rect_for_zone(BuiltInZone::LeftHalf, target)
+            rect_for_built_in_zone(BuiltInZone::LeftHalf, target)
         );
     }
 
