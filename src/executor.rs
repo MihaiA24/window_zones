@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
 use crate::actions::Action;
 use crate::display_movement::move_window_to_display;
 use crate::geometry::DisplayGeometry;
 use crate::window_system::{WindowMove, WindowSystem, WindowSystemError};
-use crate::zones::rect_for_zone;
+use crate::zones::{ZoneDefinition, rect_for_zone};
 
 /// Errors the platform-neutral executor can classify before or after calling
 /// the platform adapter.
@@ -18,17 +20,20 @@ pub enum ExecuteActionError {
     NoDisplays,
     #[error("focused window display is missing: {display_id}")]
     FocusedWindowDisplayMissing { display_id: String },
+    #[error("unknown zone: {zone}")]
+    UnknownZone { zone: String },
 }
 
 /// Executes an action by asking the provided window system for current state,
 /// calculating a platform-neutral target rectangle, and applying the move.
 pub fn execute_action<W: WindowSystem>(
     action: &Action,
+    custom_zones: &BTreeMap<String, ZoneDefinition>,
     window_system: &mut W,
 ) -> Result<(), ExecuteActionError> {
-    let focused = window_system
-        .focused_window()?
-        .ok_or(ExecuteActionError::NoFocusedWindow)?;
+    let focused = window_system.focused_window()?;
+    let focused = focused.ok_or(ExecuteActionError::NoFocusedWindow)?;
+
     let displays = window_system.displays()?;
 
     if displays.is_empty() {
@@ -43,9 +48,14 @@ pub fn execute_action<W: WindowSystem>(
         })?;
 
     let target = match action {
-        Action::MoveToZone { zone } => {
-            rect_for_zone(*zone, displays[current_display_index].usable_area)
-        }
+        Action::MoveToZone { zone } => rect_for_zone(
+            zone,
+            displays[current_display_index].usable_area,
+            custom_zones,
+        )
+        .ok_or_else(|| ExecuteActionError::UnknownZone {
+            zone: zone.to_string(),
+        })?,
         Action::MoveToNextDisplay => {
             let target_display = next_display(&displays, current_display_index);
             move_window_to_display(
@@ -83,9 +93,11 @@ fn previous_display(displays: &[DisplayGeometry], current_index: usize) -> &Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use crate::geometry::Rect;
     use crate::window_system::FocusedWindow;
-    use crate::{BuiltInZone, DisplayGeometry};
+    use crate::{DisplayGeometry, ZoneDefinition};
 
     #[derive(Debug)]
     struct FakeWindowSystem {
@@ -129,17 +141,16 @@ mod tests {
         }
     }
 
+    fn move_to_left_half_action() -> (String, BTreeMap<String, ZoneDefinition>) {
+        ("left-half".to_string(), BTreeMap::new())
+    }
+
     #[test]
     fn moves_focused_window_to_zone_on_current_display() {
         let mut fake = fake_with_focus("left", Rect::new(100, 100, 800, 600));
 
-        execute_action(
-            &Action::MoveToZone {
-                zone: BuiltInZone::LeftHalf,
-            },
-            &mut fake,
-        )
-        .unwrap();
+        let (zone, zones) = move_to_left_half_action();
+        execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
@@ -148,10 +159,45 @@ mod tests {
     }
 
     #[test]
+    fn moves_to_custom_zone_from_map() {
+        let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let mut zones = BTreeMap::new();
+        zones.insert(
+            "side".to_string(),
+            ZoneDefinition {
+                x: 50,
+                y: 0,
+                width: 50,
+                height: 100,
+            },
+        );
+
+        execute_action(
+            &crate::Action::MoveToZone {
+                zone: "side".to_string(),
+            },
+            &zones,
+            &mut fake,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fake.moves,
+            vec![WindowMove::new(Rect::new(960, 0, 960, 1080))]
+        );
+    }
+
+    #[test]
     fn moves_to_next_display_preserving_recognized_zone() {
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
 
-        execute_action(&Action::MoveToNextDisplay, &mut fake).unwrap();
+        execute_action(
+            &crate::Action::MoveToNextDisplay,
+            &BTreeMap::new(),
+            &mut fake,
+        )
+        .unwrap();
 
         assert_eq!(
             fake.moves,
@@ -163,7 +209,12 @@ mod tests {
     fn wraps_next_display_from_last_to_first() {
         let mut fake = fake_with_focus("right", Rect::new(1920, 0, 1280, 1440));
 
-        execute_action(&Action::MoveToNextDisplay, &mut fake).unwrap();
+        execute_action(
+            &crate::Action::MoveToNextDisplay,
+            &BTreeMap::new(),
+            &mut fake,
+        )
+        .unwrap();
 
         assert_eq!(
             fake.moves,
@@ -175,7 +226,12 @@ mod tests {
     fn wraps_previous_display_from_first_to_last() {
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
 
-        execute_action(&Action::MoveToPreviousDisplay, &mut fake).unwrap();
+        execute_action(
+            &crate::Action::MoveToPreviousDisplay,
+            &BTreeMap::new(),
+            &mut fake,
+        )
+        .unwrap();
 
         assert_eq!(
             fake.moves,
@@ -188,7 +244,9 @@ mod tests {
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
         fake.focused_window = Ok(None);
 
-        let err = execute_action(&Action::MoveToNextDisplay, &mut fake).unwrap_err();
+        let (zone, zones) = move_to_left_half_action();
+        let err =
+            execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap_err();
 
         assert_eq!(err, ExecuteActionError::NoFocusedWindow);
         assert!(fake.moves.is_empty());
@@ -199,7 +257,9 @@ mod tests {
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
         fake.displays = Ok(Vec::new());
 
-        let err = execute_action(&Action::MoveToNextDisplay, &mut fake).unwrap_err();
+        let (zone, zones) = move_to_left_half_action();
+        let err =
+            execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap_err();
 
         assert_eq!(err, ExecuteActionError::NoDisplays);
         assert!(fake.moves.is_empty());
@@ -209,7 +269,9 @@ mod tests {
     fn returns_missing_focused_display_without_moving() {
         let mut fake = fake_with_focus("missing", Rect::new(0, 0, 960, 1080));
 
-        let err = execute_action(&Action::MoveToNextDisplay, &mut fake).unwrap_err();
+        let (zone, zones) = move_to_left_half_action();
+        let err =
+            execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap_err();
 
         assert_eq!(
             err,
@@ -221,11 +283,34 @@ mod tests {
     }
 
     #[test]
+    fn returns_unknown_zone_without_moving() {
+        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+
+        let err = execute_action(
+            &crate::Action::MoveToZone {
+                zone: "missing-zone".to_string(),
+            },
+            &BTreeMap::new(),
+            &mut fake,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ExecuteActionError::UnknownZone {
+                zone: "missing-zone".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn wraps_platform_errors() {
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
         fake.move_error = Some(WindowSystemError::Platform("denied".to_string()));
 
-        let err = execute_action(&Action::MoveToNextDisplay, &mut fake).unwrap_err();
+        let (zone, zones) = move_to_left_half_action();
+        let err =
+            execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap_err();
 
         assert_eq!(
             err,

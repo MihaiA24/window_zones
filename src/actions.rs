@@ -1,12 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::zones::BuiltInZone;
-
 /// Platform-neutral action requested by a binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Action {
-    MoveToZone { zone: BuiltInZone },
+    MoveToZone { zone: String },
     MoveToNextDisplay,
     MoveToPreviousDisplay,
 }
