@@ -89,6 +89,7 @@ pub struct App {
     config_path: Option<PathBuf>,
     config_state: ConfigState,
     dispatch_state: DispatchState,
+    last_dispatch_hotkey: Option<String>,
     hotkey_state: HotkeyRegistrationState,
     last_config_signature: Option<ConfigFileSignature>,
     reload_deadline: Option<Instant>,
@@ -186,6 +187,9 @@ impl App {
     pub fn hotkey_state(&self) -> &HotkeyRegistrationState {
         &self.hotkey_state
     }
+    pub fn last_dispatch_hotkey(&self) -> Option<&str> {
+        self.last_dispatch_hotkey.as_deref()
+    }
 
     pub fn register_hotkeys<H: HotkeySystem>(
         &mut self,
@@ -211,6 +215,7 @@ impl App {
         hotkey: &str,
         window_system: &mut W,
     ) -> &DispatchState {
+        self.last_dispatch_hotkey = Some(hotkey.to_string());
         self.dispatch_state = match dispatch_hotkey(&self.config, hotkey, window_system) {
             Ok(()) => DispatchState::Succeeded,
             Err(error) => DispatchState::Error(error),
@@ -243,6 +248,7 @@ impl App {
             config_path,
             config_state,
             dispatch_state: DispatchState::Idle,
+            last_dispatch_hotkey: None,
             hotkey_state: HotkeyRegistrationState::Unregistered,
             last_config_signature: None,
             reload_deadline: None,
@@ -448,6 +454,15 @@ mod tests {
         assert!(matches!(app.config_state(), ConfigState::Missing));
         assert!(app.config().bindings.is_empty());
         assert_eq!(app.config_path(), Some(path.as_path()));
+    }
+    #[test]
+    fn dispatch_state_starts_without_last_dispatch_hotkey() {
+        let directory = test_directory("no_last_action");
+        let path = directory.join(CONFIG_FILE);
+
+        let app = App::start_at(&path);
+
+        assert_eq!(app.last_dispatch_hotkey(), None);
     }
 
     #[test]
@@ -1319,6 +1334,74 @@ action = { type = "move-to-zone", zone = "left-half" }
                 hotkey: "Alt+Shift+Right".to_string()
             })
         );
+        assert!(window_system.moves.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dispatch_next_hotkey_tracks_last_hotkey_on_success() {
+        let directory = test_directory("dispatch_last_action_success");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(path);
+        let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
+            hotkey: "Ctrl+Alt+Left".to_string(),
+        })]);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let state = app
+            .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
+            .unwrap();
+
+        assert_eq!(state, &DispatchState::Succeeded);
+        assert_eq!(app.last_dispatch_hotkey(), Some("Ctrl+Alt+Left"));
+        assert_eq!(
+            window_system.moves,
+            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dispatch_next_hotkey_tracks_last_hotkey_on_error() {
+        let directory = test_directory("dispatch_last_action_error");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+
+        let mut app = App::start_at(path);
+        let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
+            hotkey: "Alt+Shift+Right".to_string(),
+        })]);
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        let state = app
+            .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
+            .unwrap();
+
+        assert_eq!(
+            state,
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Alt+Shift+Right".to_string()
+            })
+        );
+        assert_eq!(app.last_dispatch_hotkey(), Some("Alt+Shift+Right"));
         assert!(window_system.moves.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
