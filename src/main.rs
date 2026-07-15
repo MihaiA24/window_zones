@@ -16,11 +16,12 @@ use window_zones::{
     HotkeySystemError, WindowMove, WindowSystem,
 };
 
+#[cfg(target_os = "macos")]
+use window_zones::MacOSWindowSystem;
 #[cfg(target_os = "windows")]
 use window_zones::WindowsWindowSystem;
 #[cfg(target_os = "linux")]
 use window_zones::{WaylandWindowSystem, X11WindowSystem};
-
 #[derive(Debug, Clone, Copy)]
 enum BackendPreference {
     Auto,
@@ -30,6 +31,8 @@ enum BackendPreference {
     Wayland,
     #[cfg(target_os = "windows")]
     Windows,
+    #[cfg(target_os = "macos")]
+    MacOS,
     DryRun,
 }
 
@@ -173,6 +176,8 @@ fn parse_backend_preference(raw: &str) -> Result<BackendPreference, String> {
         "wayland" => Ok(BackendPreference::Wayland),
         #[cfg(target_os = "windows")]
         "windows" => Ok(BackendPreference::Windows),
+        #[cfg(target_os = "macos")]
+        "macos" => Ok(BackendPreference::MacOS),
         value => Err(format!("unsupported backend `{value}` on this platform")),
     }
 }
@@ -186,7 +191,9 @@ enum RuntimeWindowSystem {
     Wayland(WaylandWindowSystem),
     #[cfg(target_os = "windows")]
     Windows(WindowsWindowSystem),
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    MacOS(MacOSWindowSystem),
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     Unsupported,
 }
 
@@ -210,7 +217,11 @@ impl RuntimeWindowSystem {
             BackendPreference::Windows => RuntimeWindowSystem::Windows(WindowsWindowSystem::new()),
             #[cfg(target_os = "windows")]
             BackendPreference::Auto => RuntimeWindowSystem::Windows(WindowsWindowSystem::new()),
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            BackendPreference::MacOS => RuntimeWindowSystem::MacOS(MacOSWindowSystem::new()),
+            #[cfg(target_os = "macos")]
+            BackendPreference::Auto => RuntimeWindowSystem::MacOS(MacOSWindowSystem::new()),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             BackendPreference::Auto => RuntimeWindowSystem::Unsupported,
         }
     }
@@ -224,7 +235,9 @@ impl RuntimeWindowSystem {
             RuntimeWindowSystem::Wayland(_) => None,
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(_) => None,
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            RuntimeWindowSystem::MacOS(_) => None,
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             RuntimeWindowSystem::Unsupported => None,
         }
     }
@@ -238,7 +251,9 @@ impl RuntimeWindowSystem {
             RuntimeWindowSystem::Wayland(_) => "wayland",
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(_) => "windows",
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            RuntimeWindowSystem::MacOS(_) => "macos",
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             RuntimeWindowSystem::Unsupported => "unsupported",
         }
     }
@@ -254,7 +269,9 @@ impl WindowSystem for RuntimeWindowSystem {
             RuntimeWindowSystem::Wayland(system) => system.focused_window(),
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(system) => system.focused_window(),
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            RuntimeWindowSystem::MacOS(system) => system.focused_window(),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             RuntimeWindowSystem::Unsupported => Err(window_zones::WindowSystemError::Platform(
                 "window-system adapter is unsupported on this platform".to_string(),
             )),
@@ -270,7 +287,9 @@ impl WindowSystem for RuntimeWindowSystem {
             RuntimeWindowSystem::Wayland(system) => system.displays(),
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(system) => system.displays(),
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            RuntimeWindowSystem::MacOS(system) => system.displays(),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             RuntimeWindowSystem::Unsupported => Err(window_zones::WindowSystemError::Platform(
                 "window-system adapter is unsupported on this platform".to_string(),
             )),
@@ -289,7 +308,9 @@ impl WindowSystem for RuntimeWindowSystem {
             RuntimeWindowSystem::Wayland(system) => system.move_focused_window(window_move),
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(system) => system.move_focused_window(window_move),
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            RuntimeWindowSystem::MacOS(system) => system.move_focused_window(window_move),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             RuntimeWindowSystem::Unsupported => Err(window_zones::WindowSystemError::Platform(
                 "window-system adapter is unsupported on this platform".to_string(),
             )),
@@ -695,13 +716,13 @@ fn print_help() {
     println!("window_zones: execute configured window movement actions");
     println!("Usage:");
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] status"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] status"
     );
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] dispatch <HOTKEY>"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] dispatch <HOTKEY>"
     );
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|dry-run>] run"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] run"
     );
     println!("Commands:");
     println!("  status           print runtime state and exit");
@@ -723,7 +744,7 @@ fn main() {
             std::process::exit(1);
         }
         ParseStatus::Ok(config) => {
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             if !matches!(config.backend, BackendPreference::DryRun) {
                 eprintln!("Unsupported host OS for live window-system actions. Use --dry-run.");
                 std::process::exit(1);
@@ -794,6 +815,14 @@ mod tests {
         assert!(matches!(parse(&["dispatch"]), ParseStatus::Err(_)));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_accepts_macos_backend() {
+        let ParseStatus::Ok(args) = parse(&["status", "--backend", "macos"]) else {
+            panic!("expected parsed args");
+        };
+        assert!(matches!(args.backend, BackendPreference::MacOS));
+    }
     #[test]
     fn parse_rejects_unknown_flags() {
         assert!(matches!(parse(&["--mystery"]), ParseStatus::Err(_)));
