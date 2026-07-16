@@ -13,8 +13,6 @@ use x11rb::rust_connection::RustConnection;
 
 #[cfg(target_os = "linux")]
 const ACTIVE_WINDOW_ATOM: &str = "_NET_ACTIVE_WINDOW";
-#[cfg(target_os = "linux")]
-const FALLBACK_DISPLAY_ID: &str = "x11-root";
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
@@ -149,10 +147,10 @@ impl WindowSystem for X11WindowSystem {
             .saturating_add(i32::try_from(geometry.height / 2).map_err(|_| {
                 WindowSystemError::Platform("focused window center Y out of range".to_string())
             })?);
-        let display_id = find_display_for_point(&displays, center_x, center_y)
-            .unwrap_or(FALLBACK_DISPLAY_ID)
-            .to_string();
-
+        let display_id = match find_display_for_point(&displays, center_x, center_y) {
+            Some(id) => id.to_string(),
+            None => format!("x11-unmatched:{center_x}:{center_y}"),
+        };
         Ok(Some(FocusedWindow::new(display_id, geometry)))
     }
 
@@ -212,7 +210,7 @@ fn collect_displays(
         })?;
 
     if monitors_reply.number_of_monitors == 0 {
-        return fallback_root_display(conn, root);
+        return Ok(Vec::new());
     }
 
     let displays: Vec<_> = monitors_reply
@@ -257,32 +255,6 @@ fn monitor_id(mut raw_name: Vec<u8>) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn fallback_root_display(
-    conn: &RustConnection,
-    root: Window,
-) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-    let geometry = conn
-        .get_geometry(root)
-        .map_err(|error| {
-            WindowSystemError::Platform(format!("failed to read root geometry: {error}"))
-        })?
-        .reply()
-        .map_err(|error| {
-            WindowSystemError::Platform(format!("failed to read root geometry reply: {error}"))
-        })?;
-
-    Ok(vec![DisplayGeometry::new(
-        FALLBACK_DISPLAY_ID.to_string(),
-        Rect::new(
-            geometry.x as i32,
-            geometry.y as i32,
-            geometry.width,
-            geometry.height,
-        ),
-    )])
-}
-
-#[cfg(target_os = "linux")]
 fn find_display_for_point(displays: &[DisplayGeometry], x: i32, y: i32) -> Option<&str> {
     displays
         .iter()
@@ -301,7 +273,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_point_in_display_and_falls_back_to_first() {
+    fn finds_display_for_point() {
         let displays = vec![
             DisplayGeometry::new("left".to_string(), Rect::new(0, 0, 800, 600)),
             DisplayGeometry::new("right".to_string(), Rect::new(800, 0, 800, 600)),

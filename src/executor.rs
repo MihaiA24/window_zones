@@ -34,7 +34,9 @@ pub fn execute_action<W: WindowSystem>(
     let focused = window_system.focused_window()?;
     let focused = focused.ok_or(ExecuteActionError::NoFocusedWindow)?;
 
-    let displays = window_system.displays()?;
+    let mut displays = window_system.displays()?;
+
+    displays.retain(|display| display.usable_area.width > 0 && display.usable_area.height > 0);
 
     if displays.is_empty() {
         return Err(ExecuteActionError::NoDisplays);
@@ -256,6 +258,21 @@ mod tests {
     fn returns_no_displays_without_moving() {
         let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
         fake.displays = Ok(Vec::new());
+
+        let (zone, zones) = move_to_left_half_action();
+        let err =
+            execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap_err();
+
+        assert_eq!(err, ExecuteActionError::NoDisplays);
+        assert!(fake.moves.is_empty());
+    }
+    #[test]
+    fn returns_no_displays_when_only_zero_sized_displays_without_moving() {
+        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        fake.displays = Ok(vec![
+            DisplayGeometry::new("zero-width", Rect::new(0, 0, 0, 1080)),
+            DisplayGeometry::new("zero-height", Rect::new(10, 10, 640, 0)),
+        ]);
 
         let (zone, zones) = move_to_left_half_action();
         let err =
