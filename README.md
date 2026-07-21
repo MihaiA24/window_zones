@@ -35,6 +35,20 @@ They provide focused-window detection, display enumeration, and move/resize exec
 
 A missing file boots with empty bindings and `ConfigState::Missing`. Discovery, read, and TOML parse failures do not panic; the App keeps empty bindings and exposes an actionable `ConfigState::Error`. `App::start_at(path)` provides an explicit path for launchers and deterministic tests.
 
+## Scripts and runbooks
+
+Use these helper scripts for common workflows:
+
+- `./scripts/install.sh` — build and install the `window_zones` binary.
+- `./scripts/run.sh` — run the binary with safe defaults for quick checks.
+- `./scripts/test.sh` — run formatting, test, and lint checks.
+
+Runbook docs:
+
+- `docs/runbooks/installation.md`
+- `docs/runbooks/running.md`
+- `docs/runbooks/testing.md`
+
 ## macOS adapter caveats
 
 The macOS backend uses AppleScript (`osascript`) and `System Events`.

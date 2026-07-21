@@ -145,13 +145,13 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         index += 1;
     }
 
-    if let Command::Dispatch { hotkey } = &command {
-        if hotkey.is_empty() {
-            return ParseStatus::Err(
-                "`dispatch` requires a hotkey argument, for example `dispatch Ctrl+Alt+Left`"
-                    .to_string(),
-            );
-        }
+    if let Command::Dispatch { hotkey } = &command
+        && hotkey.is_empty()
+    {
+        return ParseStatus::Err(
+            "`dispatch` requires a hotkey argument, for example `dispatch Ctrl+Alt+Left`"
+                .to_string(),
+        );
     }
 
     if show_tray && !matches!(command, Command::Run) {
@@ -736,7 +736,6 @@ fn main() {
     match parse_args() {
         ParseStatus::Help => {
             print_help();
-            return;
         }
         ParseStatus::Err(message) => {
             eprintln!("Error: {message}");

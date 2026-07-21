@@ -29,7 +29,7 @@ impl WaylandWindowSystem {
     }
 
     fn backend() -> Result<WaylandBackend, WindowSystemError> {
-        resolve_wayland_backend_with_env(&|name| env::var_os(name))
+        resolve_wayland_backend_with_env(|name| env::var_os(name))
     }
 
     fn session_error() -> WindowSystemError {
@@ -42,6 +42,12 @@ impl WaylandWindowSystem {
                 "Wayland adapter can only be used when XDG_SESSION_TYPE=wayland or WAYLAND_DISPLAY is set".to_string(),
             )
         }
+    }
+}
+
+impl Default for WaylandWindowSystem {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -145,7 +151,7 @@ fn is_wayland_session() -> bool {
     is_wayland_session_with_env(|name| env::var_os(name))
 }
 
-fn is_wayland_session_with_env(get_env: impl Fn(&str) -> Option<OsString>) -> bool {
+fn is_wayland_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
     get_env("XDG_SESSION_TYPE")
         .and_then(|value| value.to_str().map(|value| value.to_ascii_lowercase()))
         .is_some_and(|value| value == "wayland")
@@ -153,7 +159,7 @@ fn is_wayland_session_with_env(get_env: impl Fn(&str) -> Option<OsString>) -> bo
 }
 
 fn resolve_wayland_backend_with_env(
-    get_env: impl Fn(&str) -> Option<OsString>,
+    get_env: impl for<'a> Fn(&'a str) -> Option<OsString>,
 ) -> Result<WaylandBackend, WindowSystemError> {
     if !is_wayland_session_with_env(&get_env) {
         return Err(WaylandWindowSystem::session_error());
@@ -182,7 +188,7 @@ fn resolve_wayland_backend_with_env(
     Err(WaylandWindowSystem::session_error())
 }
 
-fn is_hyprland_session_with_env(get_env: impl Fn(&str) -> Option<OsString>) -> bool {
+fn is_hyprland_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
     get_env("HYPRLAND_INSTANCE_SIGNATURE").is_some()
         || get_env("XDG_CURRENT_DESKTOP")
             .and_then(|value| value.to_str().map(|value| value.to_ascii_lowercase()))
@@ -190,7 +196,7 @@ fn is_hyprland_session_with_env(get_env: impl Fn(&str) -> Option<OsString>) -> b
 }
 
 fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
-    let tree = run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
+    let tree: SwayTree = run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
     let displays = displays_sway()?;
 
     let Some(focused) = find_focused_sway_node(&tree.nodes)
@@ -205,8 +211,8 @@ fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
 
     let usable_display_ids: HashSet<_> =
         displays.iter().map(|display| display.id.as_str()).collect();
-    let display_id = match focused.output {
-        Some(id) if usable_display_ids.contains(id.as_str()) => id.to_string(),
+    let display_id = match focused.output.as_deref() {
+        Some(id) if usable_display_ids.contains(id) => id.to_string(),
         Some(id) => format!("wayland-output-unmatched:{id}"),
         None => "wayland-output-unknown".to_string(),
     };
@@ -455,7 +461,7 @@ fn command_exists(command: &str) -> bool {
 }
 
 impl SwayRect {
-    fn to_rect(self) -> Rect {
+    fn to_rect(&self) -> Rect {
         Rect::new(self.x, self.y, self.width, self.height)
     }
 }
@@ -465,20 +471,25 @@ mod tests {
     use super::*;
 
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
 
     fn set_env(key: &str, value: Option<&str>) {
-        if let Some(value) = value {
-            env::set_var(key, value);
-        } else {
-            env::remove_var(key);
+        unsafe {
+            if let Some(value) = value {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
         }
     }
 
     fn restore_env(vars: &[(String, Option<OsString>)]) {
         for (key, value) in vars {
-            match value {
-                Some(value) => env::set_var(key, value),
-                None => env::remove_var(key),
+            unsafe {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
             }
         }
     }
@@ -534,11 +545,20 @@ mod tests {
             ("PATH".to_string(), env::var_os("PATH")),
         ];
 
+        let temp_dir =
+            std::env::temp_dir().join(format!("window_zones_wayland_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let swaymsg = temp_dir.join("swaymsg");
+        std::fs::write(&swaymsg, "#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(&swaymsg).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&swaymsg, perms).unwrap();
+
         set_env("XDG_SESSION_TYPE", Some("wayland"));
         set_env("SWAYSOCK", Some("/tmp/sway"));
         set_env("HYPRLAND_INSTANCE_SIGNATURE", Some("1"));
         set_env("WAYLAND_DISPLAY", Some("wayland-0"));
-        set_env("PATH", Some("/bin"));
+        set_env("PATH", Some(temp_dir.to_str().unwrap()));
 
         let backend = resolve_wayland_backend_with_env(|name| env::var_os(name)).unwrap();
         assert_eq!(backend, WaylandBackend::Sway);

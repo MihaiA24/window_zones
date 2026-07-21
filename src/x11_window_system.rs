@@ -5,7 +5,9 @@ use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, Wind
 use std::convert::TryFrom;
 
 #[cfg(target_os = "linux")]
-use x11rb::protocol::randr::{self, ConnectionExt as RandrConnectionExt, MonitorInfo};
+use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
+use x11rb::protocol::randr::{ConnectionExt as RandrConnectionExt, MonitorInfo};
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt as XProtoConnectionExt, Window};
 #[cfg(target_os = "linux")]
@@ -71,10 +73,16 @@ impl X11WindowSystem {
                 ))
             })?;
 
-        if let Some(raw) = reply.value32().next().map(|window| window as Window) {
-            if raw != 0 {
-                return Ok(Some(raw));
-            }
+        let Some(raw) = reply
+            .value32()
+            .and_then(|mut values| values.next())
+            .map(|window| window as Window)
+        else {
+            return Ok(None);
+        };
+
+        if raw != 0 {
+            return Ok(Some(raw));
         }
 
         let focused = conn
@@ -108,12 +116,8 @@ impl X11WindowSystem {
                 WindowSystemError::Platform(format!("failed to read window geometry: {error}"))
             })?;
 
-        let width = u32::try_from(geometry.width).map_err(|_| {
-            WindowSystemError::Platform("window geometry width out of range".to_string())
-        })?;
-        let height = u32::try_from(geometry.height).map_err(|_| {
-            WindowSystemError::Platform("window geometry height out of range".to_string())
-        })?;
+        let width = geometry.width as u32;
+        let height = geometry.height as u32;
 
         Ok(Rect::new(
             geometry.x as i32,
@@ -169,12 +173,8 @@ impl WindowSystem for X11WindowSystem {
 
         let x = window_move.target.x;
         let y = window_move.target.y;
-        let width = u16::try_from(window_move.target.width).map_err(|_| {
-            WindowSystemError::Platform("target window width out of range".to_string())
-        })?;
-        let height = u16::try_from(window_move.target.height).map_err(|_| {
-            WindowSystemError::Platform("target window height out of range".to_string())
-        })?;
+        let width = window_move.target.width;
+        let height = window_move.target.height;
 
         let values = xproto::ConfigureWindowAux::new()
             .x(x)
@@ -209,7 +209,7 @@ fn collect_displays(
             WindowSystemError::Platform(format!("failed to read X11 monitor reply: {error}"))
         })?;
 
-    if monitors_reply.number_of_monitors == 0 {
+    if monitors_reply.monitors.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -225,7 +225,7 @@ fn collect_displays(
 
 #[cfg(target_os = "linux")]
 fn monitor_to_display(index: usize, monitor: MonitorInfo) -> DisplayGeometry {
-    let id = monitor_id(monitor.name.clone()).unwrap_or_else(|| format!("x11-monitor-{index}"));
+    let id = monitor_id(monitor.name).unwrap_or_else(|| format!("x11-monitor-{index}"));
     DisplayGeometry::new(
         id,
         Rect::new(
@@ -238,20 +238,12 @@ fn monitor_to_display(index: usize, monitor: MonitorInfo) -> DisplayGeometry {
 }
 
 #[cfg(target_os = "linux")]
-fn monitor_id(mut raw_name: Vec<u8>) -> Option<String> {
-    if raw_name.is_empty() {
-        return None;
+fn monitor_id(name_atom: x11rb::protocol::xproto::Atom) -> Option<String> {
+    if name_atom == 0 {
+        None
+    } else {
+        Some(format!("x11-monitor-{name_atom}"))
     }
-
-    while raw_name.last().is_some_and(|byte| *byte == 0) {
-        raw_name.pop();
-    }
-
-    let trimmed = String::from_utf8(raw_name)
-        .ok()
-        .filter(|name| !name.is_empty())?;
-
-    Some(trimmed)
 }
 
 #[cfg(target_os = "linux")]
