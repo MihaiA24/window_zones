@@ -2,11 +2,16 @@ use std::collections::VecDeque;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::sync::mpsc::{self, SyncSender};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::thread;
 use std::time::Duration;
+
+mod native_hotkey_system;
+#[cfg(target_os = "linux")]
+mod wayland_hotkey_system;
+use native_hotkey_system::NativeHotkeySystem;
+#[cfg(target_os = "linux")]
+use wayland_hotkey_system::WaylandHotkeySystem;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use tray_item::{IconSource, TrayItem};
@@ -168,7 +173,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
 
 fn parse_backend_preference(raw: &str) -> Result<BackendPreference, String> {
     match raw {
-        "auto" => Ok(BackendPreference::Auto),
+        "auto" | "native" => Ok(BackendPreference::Auto),
         "dry-run" => Ok(BackendPreference::DryRun),
         #[cfg(target_os = "linux")]
         "x11" => Ok(BackendPreference::X11),
@@ -400,6 +405,115 @@ struct CliHotkeySystem {
     events: VecDeque<Result<HotkeyEvent, HotkeySystemError>>,
 }
 
+#[derive(Debug)]
+enum RuntimeHotkeySystem {
+    Cli(CliHotkeySystem),
+    Native(NativeHotkeySystem),
+    #[cfg(target_os = "linux")]
+    Wayland(WaylandHotkeySystem),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeHotkeyMode {
+    Cli,
+    Native,
+    CliFallback,
+}
+
+fn should_fallback_to_cli_hotkeys(backend: BackendPreference) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        should_use_wayland_hotkeys_by_preference(backend) && !WaylandHotkeySystem::is_available()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn should_use_wayland_hotkey_system(backend: BackendPreference) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        should_use_wayland_hotkeys_by_preference(backend) && WaylandHotkeySystem::is_available()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn should_use_wayland_hotkeys_by_preference(backend: BackendPreference) -> bool {
+    is_wayland_session()
+        && matches!(
+            backend,
+            BackendPreference::Auto | BackendPreference::Wayland
+        )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn should_use_wayland_hotkeys_by_preference(_backend: BackendPreference) -> bool {
+    false
+}
+
+fn initial_hotkey_mode(backend: BackendPreference) -> RuntimeHotkeyMode {
+    if matches!(backend, BackendPreference::DryRun) {
+        RuntimeHotkeyMode::Cli
+    } else if should_fallback_to_cli_hotkeys(backend) {
+        RuntimeHotkeyMode::CliFallback
+    } else {
+        RuntimeHotkeyMode::Native
+    }
+}
+
+fn build_hotkey_system(backend: BackendPreference) -> (RuntimeHotkeySystem, RuntimeHotkeyMode) {
+    match initial_hotkey_mode(backend) {
+        RuntimeHotkeyMode::Cli => (
+            RuntimeHotkeySystem::Cli(CliHotkeySystem::default()),
+            RuntimeHotkeyMode::Cli,
+        ),
+        RuntimeHotkeyMode::CliFallback => (
+            RuntimeHotkeySystem::Cli(CliHotkeySystem::default()),
+            RuntimeHotkeyMode::CliFallback,
+        ),
+        RuntimeHotkeyMode::Native => {
+            if should_use_wayland_hotkey_system(backend) {
+                (
+                    RuntimeHotkeySystem::Wayland(WaylandHotkeySystem::new()),
+                    RuntimeHotkeyMode::Native,
+                )
+            } else {
+                (
+                    RuntimeHotkeySystem::Native(NativeHotkeySystem::new()),
+                    RuntimeHotkeyMode::Native,
+                )
+            }
+        }
+    }
+}
+
+impl HotkeySystem for RuntimeHotkeySystem {
+    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        match self {
+            Self::Cli(system) => system.register_hotkeys(hotkeys),
+            Self::Native(system) => system.register_hotkeys(hotkeys),
+            #[cfg(target_os = "linux")]
+            Self::Wayland(system) => system.register_hotkeys(hotkeys),
+        }
+    }
+
+    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        match self {
+            Self::Cli(system) => system.next_hotkey(),
+            Self::Native(system) => system.next_hotkey(),
+            #[cfg(target_os = "linux")]
+            Self::Wayland(system) => system.next_hotkey(),
+        }
+    }
+}
+
 impl CliHotkeySystem {
     fn queue_hotkey(&mut self, hotkey: String) {
         self.events.push_back(Ok(HotkeyEvent::Pressed { hotkey }));
@@ -435,7 +549,73 @@ fn is_wayland_session() -> bool {
         || env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
-fn runtime_status_lines(app: &App) -> Vec<String> {
+fn hotkey_backend_label(backend: RuntimeHotkeyMode) -> &'static str {
+    match backend {
+        RuntimeHotkeyMode::Cli => "cli",
+        RuntimeHotkeyMode::Native => "native",
+        RuntimeHotkeyMode::CliFallback => "cli (fallback: native unavailable)",
+    }
+}
+
+fn register_hotkeys_with_fallback(
+    app: &mut App,
+    backend: BackendPreference,
+    hotkey_system: &mut RuntimeHotkeySystem,
+    hotkey_mode: &mut RuntimeHotkeyMode,
+    context: &str,
+) {
+    if let Err(error) = app.register_hotkeys(hotkey_system) {
+        if matches!(hotkey_mode, RuntimeHotkeyMode::Native)
+            && should_use_wayland_hotkeys_by_preference(backend)
+        {
+            println!("Native hotkey listener is unavailable in this session: {error}");
+            println!("Falling back to CLI hotkey mode for this run.");
+
+            *hotkey_system = RuntimeHotkeySystem::Cli(CliHotkeySystem::default());
+            *hotkey_mode = RuntimeHotkeyMode::CliFallback;
+
+            if let Err(error) = app.register_hotkeys(hotkey_system) {
+                println!("{context} hotkey registration failed in fallback mode: {error}");
+                return;
+            }
+        } else {
+            println!("{context} hotkey registration failed: {error}");
+            return;
+        }
+    }
+
+    println!("Registered {} hotkeys.", app.config().bindings.len());
+}
+
+fn fallback_to_cli_hotkeys_from_dispatch(
+    app: &mut App,
+    backend: BackendPreference,
+    hotkey_system: &mut RuntimeHotkeySystem,
+    hotkey_mode: &mut RuntimeHotkeyMode,
+    context: &str,
+    error: &HotkeySystemError,
+) -> bool {
+    if !matches!(hotkey_mode, RuntimeHotkeyMode::Native)
+        || !should_use_wayland_hotkeys_by_preference(backend)
+    {
+        return false;
+    }
+
+    println!("Native hotkey listener errored during {context}: {error}");
+    println!("Falling back to CLI hotkey mode for this run.");
+
+    *hotkey_system = RuntimeHotkeySystem::Cli(CliHotkeySystem::default());
+    *hotkey_mode = RuntimeHotkeyMode::CliFallback;
+
+    if let Err(error) = app.register_hotkeys(hotkey_system) {
+        println!("{context} hotkey registration failed in fallback mode: {error}");
+        return false;
+    }
+
+    true
+}
+
+fn runtime_status_lines(app: &App, hotkey_mode: RuntimeHotkeyMode) -> Vec<String> {
     let mut status = vec![
         "Runtime status:".to_string(),
         format!(
@@ -447,6 +627,7 @@ fn runtime_status_lines(app: &App) -> Vec<String> {
         format!("  binding count: {}", app.config().bindings.len()),
         format!("  config state: {:?}", app.config_state()),
         format!("  hotkey state: {:?}", app.hotkey_state()),
+        format!("  hotkey backend: {}", hotkey_backend_label(hotkey_mode)),
         format!(
             "  last action: {}",
             app.last_dispatch_hotkey().unwrap_or("<none>")
@@ -464,8 +645,8 @@ fn runtime_status_lines(app: &App) -> Vec<String> {
     status
 }
 
-fn print_status(app: &App) {
-    for line in runtime_status_lines(app) {
+fn print_status(app: &App, hotkey_mode: RuntimeHotkeyMode) {
+    for line in runtime_status_lines(app, hotkey_mode) {
         println!("{line}");
     }
 }
@@ -485,7 +666,7 @@ fn print_dispatch_state(state: &DispatchState, window_system: &RuntimeWindowSyst
 
 fn execute_dispatch(mut app: App, mut window_system: RuntimeWindowSystem, hotkey: String) {
     println!("Using runtime window backend: {}", window_system.name());
-    print_status(&app);
+    print_status(&app, RuntimeHotkeyMode::Cli);
 
     let mut hotkey_system = CliHotkeySystem::default();
     if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
@@ -499,16 +680,25 @@ fn execute_dispatch(mut app: App, mut window_system: RuntimeWindowSystem, hotkey
     }
 }
 
-fn execute_status(app: App) {
-    println!("Using runtime window backend: dry-run for safe inspection");
-    print_status(&app);
+fn execute_status(app: App, backend: BackendPreference) {
+    let hotkey_mode = initial_hotkey_mode(backend);
+    println!(
+        "Using runtime hotkey backend: {}",
+        hotkey_backend_label(hotkey_mode)
+    );
+    print_status(&app, hotkey_mode);
 }
 
-fn execute_run(app: App, window_system: RuntimeWindowSystem, show_tray: bool) {
+fn execute_run(
+    app: App,
+    window_system: RuntimeWindowSystem,
+    show_tray: bool,
+    backend: BackendPreference,
+) {
     if show_tray {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            return execute_run_with_tray(app, window_system);
+            return execute_run_with_tray(app, window_system, backend);
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -517,66 +707,125 @@ fn execute_run(app: App, window_system: RuntimeWindowSystem, show_tray: bool) {
         }
     }
 
-    execute_run_cli(app, window_system);
+    execute_run_cli(app, window_system, backend);
 }
 
-fn execute_run_cli(mut app: App, mut window_system: RuntimeWindowSystem) {
+fn execute_run_cli(
+    mut app: App,
+    mut window_system: RuntimeWindowSystem,
+    backend: BackendPreference,
+) {
     let config_path = app.config_path().map(PathBuf::from);
+    let (mut hotkey_system, mut hotkey_mode) = build_hotkey_system(backend);
 
-    let mut hotkey_system = CliHotkeySystem::default();
-    if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-        println!("Hotkey registration initially failed: {error}");
-    } else {
-        println!("Registered {} hotkeys.", app.config().bindings.len());
+    if matches!(hotkey_mode, RuntimeHotkeyMode::CliFallback) {
+        println!("Native hotkey listener is unavailable in this Wayland session; using CLI mode.");
     }
 
+    register_hotkeys_with_fallback(
+        &mut app,
+        backend,
+        &mut hotkey_system,
+        &mut hotkey_mode,
+        "Hotkey registration initially",
+    );
+
     println!("Window backend: {}", window_system.name());
+    println!("Hotkey backend: {}", hotkey_backend_label(hotkey_mode));
     println!("Interactive session started. type `help` for commands.");
 
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    let mut line = String::new();
+    let (input_tx, input_rx) = mpsc::sync_channel::<String>(16);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let mut line = String::new();
 
-    loop {
+        loop {
+            line.clear();
+            match stdin.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            };
+
+            if input_tx.send(line.clone()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let print_prompt = || {
         print!("window-zones> ");
         io::stdout().flush().expect("stdout flush");
+    };
 
-        line.clear();
-        let bytes = stdin.read_line(&mut line).expect("read stdin");
-        if bytes == 0 {
-            break;
+    print_prompt();
+
+    loop {
+        match input_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                match parse_runtime_input(&line) {
+                    RuntimeInstruction::Empty => {}
+                    RuntimeInstruction::Status => print_status(&app, hotkey_mode),
+                    RuntimeInstruction::Reload => {
+                        println!("Reload requested.");
+                        match app.poll_config_changes() {
+                            ConfigState::Error(error) => {
+                                println!("Config reload error: {error}");
+                            }
+                            state => println!("Config state: {:?}", state),
+                        }
+                    }
+                    RuntimeInstruction::Restart => {
+                        app = build_app(config_path.as_ref());
+                        println!("Runtime restarted.");
+                        register_hotkeys_with_fallback(
+                            &mut app,
+                            backend,
+                            &mut hotkey_system,
+                            &mut hotkey_mode,
+                            "Hotkey registration now",
+                        );
+                    }
+                    RuntimeInstruction::Quit => break,
+                    RuntimeInstruction::Help => print_help(),
+                    RuntimeInstruction::Unknown(message) => {
+                        println!("Unknown command: {message}");
+                        println!("type `help` for usage.");
+                    }
+                    RuntimeInstruction::Dispatch(hotkey) => {
+                        let state = app.dispatch_hotkey(&hotkey, &mut window_system);
+                        print_dispatch_state(state, &window_system);
+                    }
+                }
+
+                print_prompt();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                println!("Input channel closed. Session closed.");
+                break;
+            }
         }
 
-        match parse_runtime_input(&line) {
-            RuntimeInstruction::Empty => continue,
-            RuntimeInstruction::Status => print_status(&app),
-            RuntimeInstruction::Reload => {
-                println!("Reload requested.");
-                match app.poll_config_changes() {
-                    ConfigState::Error(error) => {
-                        println!("Config reload error: {error}");
-                    }
-                    state => println!("Config state: {:?}", state),
+        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+            Ok(DispatchState::Idle) => {}
+            Ok(state) => {
+                if let DispatchState::Error(error) = state {
+                    println!("Dispatch failed: {error}");
+                } else {
+                    print_dispatch_state(state, &window_system);
                 }
             }
-            RuntimeInstruction::Restart => {
-                app = build_app(config_path.as_ref());
-                println!("Runtime restarted.");
-                if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-                    println!("Hotkey registration now failed: {error}");
-                }
-            }
-            RuntimeInstruction::Quit => break,
-            RuntimeInstruction::Help => print_help(),
-            RuntimeInstruction::Unknown(message) => {
-                println!("Unknown command: {message}");
-                println!("type `help` for usage.");
-            }
-            RuntimeInstruction::Dispatch(hotkey) => {
-                hotkey_system.queue_hotkey(hotkey);
-                match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-                    Ok(state) => print_dispatch_state(state, &window_system),
-                    Err(error) => println!("Dispatch failed: {error}"),
+            Err(error) => {
+                if !fallback_to_cli_hotkeys_from_dispatch(
+                    &mut app,
+                    backend,
+                    &mut hotkey_system,
+                    &mut hotkey_mode,
+                    "dispatch polling",
+                    &error,
+                ) {
+                    println!("Dispatch failed: {error}");
                 }
             }
         }
@@ -597,28 +846,39 @@ enum RuntimeTrayCommand {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
+fn execute_run_with_tray(
+    mut app: App,
+    mut window_system: RuntimeWindowSystem,
+    backend: BackendPreference,
+) {
     let config_path = app.config_path().map(PathBuf::from);
-    let mut hotkey_system = CliHotkeySystem::default();
+    let (mut hotkey_system, mut hotkey_mode) = build_hotkey_system(backend);
 
-    if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-        println!("Hotkey registration initially failed: {error}");
-    } else {
-        println!("Registered {} hotkeys.", app.config().bindings.len());
+    if matches!(hotkey_mode, RuntimeHotkeyMode::CliFallback) {
+        println!("Native hotkey listener is unavailable in this Wayland session; using CLI mode.");
     }
 
+    register_hotkeys_with_fallback(
+        &mut app,
+        backend,
+        &mut hotkey_system,
+        &mut hotkey_mode,
+        "Hotkey registration initially",
+    );
+
     let (tray_tx, tray_rx) = mpsc::sync_channel::<RuntimeTrayCommand>(16);
-    let mut tray = match build_tray_menu(&app, &tray_tx) {
+    let mut tray = match build_tray_menu(&app, &tray_tx, hotkey_mode) {
         Ok(tray) => tray,
         Err(error) => {
             eprintln!("Failed to start tray surface: {error}");
             return;
         }
     };
-    let mut status_snapshot = runtime_status_lines(&app);
+    let mut status_snapshot = runtime_status_lines(&app, hotkey_mode);
 
     println!("Window backend: {}", window_system.name());
     println!("Tray menu started. Use tray controls to reload/restart/quit.");
+    println!("Hotkey backend: {}", hotkey_backend_label(hotkey_mode));
 
     loop {
         match tray_rx.recv_timeout(Duration::from_millis(250)) {
@@ -634,11 +894,15 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
             Ok(RuntimeTrayCommand::Restart) => {
                 app = build_app(config_path.as_ref());
                 println!("Runtime restarted.");
-                if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-                    println!("Hotkey registration now failed: {error}");
-                }
+                register_hotkeys_with_fallback(
+                    &mut app,
+                    backend,
+                    &mut hotkey_system,
+                    &mut hotkey_mode,
+                    "Hotkey registration now",
+                );
             }
-            Ok(RuntimeTrayCommand::Status) => print_status(&app),
+            Ok(RuntimeTrayCommand::Status) => print_status(&app, hotkey_mode),
             Ok(RuntimeTrayCommand::Quit) => {
                 println!("Session closed.");
                 return;
@@ -650,17 +914,32 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
             }
         }
 
-        if let Ok(state) = app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-            if let DispatchState::Error(error) = state {
-                println!("Dispatch failed: {error}");
-            } else if let DispatchState::Succeeded = state {
-                print_dispatch_state(state, &window_system);
+        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+            Ok(DispatchState::Idle) => {}
+            Ok(state) => {
+                if let DispatchState::Error(error) = state {
+                    println!("Dispatch failed: {error}");
+                } else if let DispatchState::Succeeded = state {
+                    print_dispatch_state(state, &window_system);
+                }
+            }
+            Err(error) => {
+                if !fallback_to_cli_hotkeys_from_dispatch(
+                    &mut app,
+                    backend,
+                    &mut hotkey_system,
+                    &mut hotkey_mode,
+                    "dispatch polling",
+                    &error,
+                ) {
+                    println!("Dispatch failed: {error}");
+                }
             }
         }
 
-        let next_snapshot = runtime_status_lines(&app);
+        let next_snapshot = runtime_status_lines(&app, hotkey_mode);
         if status_snapshot != next_snapshot {
-            tray = match build_tray_menu(&app, &tray_tx) {
+            tray = match build_tray_menu(&app, &tray_tx, hotkey_mode) {
                 Ok(new_tray) => {
                     status_snapshot = next_snapshot;
                     new_tray
@@ -677,11 +956,15 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<TrayItem, String> {
+fn build_tray_menu(
+    app: &App,
+    tx: &SyncSender<RuntimeTrayCommand>,
+    hotkey_mode: RuntimeHotkeyMode,
+) -> Result<TrayItem, String> {
     let mut tray = TrayItem::new("Window Zones", IconSource::Resource(""))
         .map_err(|error| error.to_string())?;
 
-    for line in runtime_status_lines(app) {
+    for line in runtime_status_lines(app, hotkey_mode) {
         tray.add_label(&line).map_err(|error| error.to_string())?;
     }
 
@@ -716,13 +999,13 @@ fn print_help() {
     println!("window_zones: execute configured window movement actions");
     println!("Usage:");
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] status"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|native|x11|wayland|windows|macos|dry-run>] status"
     );
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] dispatch <HOTKEY>"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|native|x11|wayland|windows|macos|dry-run>] dispatch <HOTKEY>"
     );
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] run"
+        "  window_zones [--tray] [--config <path>] [--backend <auto|native|x11|wayland|windows|macos|dry-run>] run"
     );
     println!("Commands:");
     println!("  status           print runtime state and exit");
@@ -753,10 +1036,10 @@ fn main() {
             let window_system = RuntimeWindowSystem::with_preference(config.backend);
 
             match config.command {
-                Command::Status => execute_status(app),
+                Command::Status => execute_status(app, config.backend),
                 Command::Dispatch { hotkey } => execute_dispatch(app, window_system, hotkey),
                 Command::Run => {
-                    execute_run(app, window_system, config.show_tray);
+                    execute_run(app, window_system, config.show_tray, config.backend);
                 }
             }
         }
@@ -822,6 +1105,14 @@ mod tests {
         };
         assert!(matches!(args.backend, BackendPreference::MacOS));
     }
+    #[test]
+    fn parse_accepts_native_backend_alias() {
+        let ParseStatus::Ok(args) = parse(&["status", "--backend", "native"]) else {
+            panic!("expected parsed args");
+        };
+        assert!(matches!(args.backend, BackendPreference::Auto));
+    }
+
     #[test]
     fn parse_rejects_unknown_flags() {
         assert!(matches!(parse(&["--mystery"]), ParseStatus::Err(_)));

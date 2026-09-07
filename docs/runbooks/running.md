@@ -2,15 +2,17 @@
 
 ## Default run (safe)
 
-The app can manipulate real windows by default. Use dry-run for a safe local sanity check:
+`./scripts/run.sh` intentionally uses `--backend dry-run` and runs `status` for quick validation.
+
+To exercise live runtime behavior, run directly:
 
 ```bash
-./scripts/run.sh
+cargo run -- run --backend native
 ```
 
-This command runs:
-- `--backend dry-run`
-- `status`
+That command uses the native hotkey listener on supported sessions, so configured hotkeys trigger asynchronously while the process is running.
+
+On Wayland, native hotkeys are available when a supported compositor integration exists (currently Sway via `swaymsg`). When supported, global binds are registered through the Wayland backend and dispatched asynchronously while running; otherwise the process falls back to CLI hotkey mode (manual `dispatch`). If the native listener fails after startup (for example, after a compositor restart), runtime falls back to CLI mode for the current session.
 
 If a debug or release binary exists in `target/debug` or `target/release`, `run.sh` uses it directly.
 If no local binary exists, it falls back to `cargo run --release`.
