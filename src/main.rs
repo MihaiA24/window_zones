@@ -479,12 +479,23 @@ fn build_hotkey_system(backend: BackendPreference) -> (RuntimeHotkeySystem, Runt
             RuntimeHotkeyMode::CliFallback,
         ),
         RuntimeHotkeyMode::Native => {
-            if should_use_wayland_hotkey_system(backend) {
-                (
-                    RuntimeHotkeySystem::Wayland(WaylandHotkeySystem::new()),
-                    RuntimeHotkeyMode::Native,
-                )
-            } else {
+            #[cfg(target_os = "linux")]
+            {
+                if should_use_wayland_hotkey_system(backend) {
+                    (
+                        RuntimeHotkeySystem::Wayland(WaylandHotkeySystem::new()),
+                        RuntimeHotkeyMode::Native,
+                    )
+                } else {
+                    (
+                        RuntimeHotkeySystem::Native(NativeHotkeySystem::new()),
+                        RuntimeHotkeyMode::Native,
+                    )
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
                 (
                     RuntimeHotkeySystem::Native(NativeHotkeySystem::new()),
                     RuntimeHotkeyMode::Native,

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
@@ -26,6 +28,7 @@ pub struct WaylandHotkeySystem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaylandHotkeyBackend {
     Sway,
+    Hyprland,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +66,7 @@ impl WaylandHotkeySystem {
                     Arc::clone(&start_error),
                 ) {
                     Ok(runtime) => {
-                        listener_child = Some(runtime.child);
+                        listener_child = runtime.child;
                         listener_thread = Some(runtime.thread);
                     }
                     Err(error) => {
@@ -109,6 +112,10 @@ impl WaylandHotkeySystem {
                 let _ = run_sway_command(&["unbindsym", combo]);
                 run_sway_command(&["bindsym", "--no-repeat", combo, "nop", command])
             }
+            WaylandHotkeyBackend::Hyprland => {
+                let _ = run_hyprctl_unbind_command(combo);
+                run_hyprctl_bind_command(combo, command)
+            }
         }
     }
 
@@ -119,11 +126,16 @@ impl WaylandHotkeySystem {
     ) -> Result<(), HotkeySystemError> {
         match backend {
             WaylandHotkeyBackend::Sway => run_sway_command(&["unbindsym", combo]),
+            WaylandHotkeyBackend::Hyprland => run_hyprctl_unbind_command(combo),
         }
     }
 
     fn binding_for_hotkey(&self, hotkey: &str) -> Option<String> {
-        wayland_binding_from_hotkey(hotkey)
+        match self.backend {
+            Some(WaylandHotkeyBackend::Sway) => wayland_binding_from_hotkey(hotkey),
+            Some(WaylandHotkeyBackend::Hyprland) => hyprland_binding_from_hotkey(hotkey),
+            None => None,
+        }
     }
 }
 
@@ -240,7 +252,7 @@ impl HotkeySystem for WaylandHotkeySystem {
 }
 
 struct WaylandListenerRuntime {
-    child: Arc<Mutex<Child>>,
+    child: Option<Arc<Mutex<Child>>>,
     thread: thread::JoinHandle<()>,
 }
 
@@ -253,6 +265,9 @@ fn spawn_listener(
     match backend {
         WaylandHotkeyBackend::Sway => {
             spawn_sway_listener(event_sender, registered_bindings, start_error)
+        }
+        WaylandHotkeyBackend::Hyprland => {
+            spawn_hyprland_listener(event_sender, registered_bindings, start_error)
         }
     }
 }
@@ -339,12 +354,83 @@ fn spawn_sway_listener(
     });
 
     Ok(WaylandListenerRuntime {
-        child,
+        child: Some(child),
+        thread: handle,
+    })
+}
+
+fn spawn_hyprland_listener(
+    event_sender: mpsc::Sender<HotkeyEvent>,
+    registered_bindings: Arc<Mutex<HashMap<String, BoundBinding>>>,
+    start_error: Arc<Mutex<Option<HotkeySystemError>>>,
+) -> Result<WaylandListenerRuntime, HotkeySystemError> {
+    let socket_path = hyprland_event_socket_path()?;
+    let stream = UnixStream::connect(&socket_path).map_err(|error| {
+        HotkeySystemError::Platform(format!(
+            "failed to connect to hyprland event socket {}: {error}",
+            socket_path.display()
+        ))
+    })?;
+
+    let start_error_for_thread = Arc::clone(&start_error);
+    let registered_bindings_for_thread = Arc::clone(&registered_bindings);
+
+    let handle = thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    *lock_guard(&start_error_for_thread) = Some(HotkeySystemError::Platform(
+                        "hyprland event socket closed unexpectedly".to_string(),
+                    ));
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let Some((event_name, event_data)) = trimmed.split_once(">>") else {
+                        continue;
+                    };
+
+                    if event_name != "custom" {
+                        continue;
+                    }
+
+                    let hotkey = {
+                        let bindings = lock_guard(&registered_bindings_for_thread);
+                        bindings.get(event_data).map(|binding| binding.hotkey.clone())
+                    };
+
+                    if let Some(hotkey) = hotkey {
+                        if event_sender.send(HotkeyEvent::Pressed { hotkey }).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    *lock_guard(&start_error_for_thread) = Some(HotkeySystemError::Platform(
+                        format!("hyprland event socket read failed: {error}"),
+                    ));
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(WaylandListenerRuntime {
+        child: None,
         thread: handle,
     })
 }
 
 fn resolve_wayland_hotkey_backend() -> Result<WaylandHotkeyBackend, HotkeySystemError> {
+
     if !is_wayland_session() {
         return Err(HotkeySystemError::Platform(
             "wayland native hotkey registration is only available in a Wayland session".to_string(),
@@ -362,8 +448,12 @@ fn resolve_wayland_hotkey_backend() -> Result<WaylandHotkeyBackend, HotkeySystem
     }
 
     if is_hyprland_session() {
+        if command_exists("hyprctl") {
+            return Ok(WaylandHotkeyBackend::Hyprland);
+        }
+
         return Err(HotkeySystemError::Platform(
-            "hyprland native hotkey integration is not implemented yet".to_string(),
+            "hyprctl is required for native Wayland hotkeys on Hyprland; install hyprctl and ensure it is on PATH".to_string(),
         ));
     }
 
@@ -387,6 +477,18 @@ fn is_hyprland_session() -> bool {
 }
 
 fn wayland_binding_from_hotkey(hotkey: &str) -> Option<String> {
+    wayland_binding_from_hotkey_with(hotkey, "+", map_sway_modifier_token)
+}
+
+fn hyprland_binding_from_hotkey(hotkey: &str) -> Option<String> {
+    wayland_binding_from_hotkey_with(hotkey, "_", map_hyprland_modifier_token)
+}
+
+fn wayland_binding_from_hotkey_with(
+    hotkey: &str,
+    modifier_join: &str,
+    map_modifier_token: fn(&str) -> Option<&'static str>,
+) -> Option<String> {
     let mut modifiers = Vec::new();
     let mut key = None;
 
@@ -422,19 +524,29 @@ fn wayland_binding_from_hotkey(hotkey: &str) -> Option<String> {
     }
     binding.push(key);
 
-    Some(binding.join("+"))
+    Some(binding.join(modifier_join))
 }
 
 fn is_modifier_token(token: &str) -> bool {
     matches!(token, "ctrl" | "alt" | "shift" | "cmd")
 }
 
-fn map_modifier_token(token: &str) -> Option<&'static str> {
+fn map_sway_modifier_token(token: &str) -> Option<&'static str> {
     match token {
         "ctrl" => Some("Ctrl"),
         "alt" => Some("Alt"),
         "shift" => Some("Shift"),
         "cmd" => Some("Mod4"),
+        _ => None,
+    }
+}
+
+fn map_hyprland_modifier_token(token: &str) -> Option<&'static str> {
+    match token {
+        "ctrl" => Some("CTRL"),
+        "alt" => Some("ALT"),
+        "shift" => Some("SHIFT"),
+        "cmd" => Some("SUPER"),
         _ => None,
     }
 }
@@ -486,20 +598,55 @@ fn map_non_modifier_key(token: &str) -> Option<String> {
 }
 
 fn run_sway_command(args: &[&str]) -> Result<(), HotkeySystemError> {
-    let status = Command::new("swaymsg")
+    run_command("swaymsg", args, "sway command")
+}
+
+fn run_hyprctl_bind_command(combo: &str, command: &str) -> Result<(), HotkeySystemError> {
+    run_hyprctl_command(&["keyword", "bind", &format!("{combo},custom_event,{command}")])
+}
+
+fn run_hyprctl_unbind_command(combo: &str) -> Result<(), HotkeySystemError> {
+    run_hyprctl_command(&["keyword", "unbind", combo])
+}
+
+fn run_hyprctl_command(args: &[&str]) -> Result<(), HotkeySystemError> {
+    run_command("hyprctl", args, "hyprctl")
+}
+
+fn run_command(program: &str, args: &[&str], context: &str) -> Result<(), HotkeySystemError> {
+    let status = Command::new(program)
         .args(args)
         .status()
         .map_err(|error| {
-            HotkeySystemError::Platform(format!("failed to run sway command: {error}"))
+            HotkeySystemError::Platform(format!("failed to run {context}: {error}"))
         })?;
 
     if !status.success() {
         return Err(HotkeySystemError::Platform(format!(
-            "sway command failed: exit status {status}"
+            "{context} failed: exit status {status}"
         )));
     }
 
     Ok(())
+}
+
+fn hyprland_event_socket_path() -> Result<PathBuf, HotkeySystemError> {
+    let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").or_else(|| env::var_os("TMPDIR")) else {
+        return Err(HotkeySystemError::Platform(
+            "no runtime directory found for Hyprland event socket".to_string(),
+        ));
+    };
+
+    let Some(signature) = env::var_os("HYPRLAND_INSTANCE_SIGNATURE") else {
+        return Err(HotkeySystemError::Platform(
+            "HYPRLAND_INSTANCE_SIGNATURE is required for Hyprland event socket access".to_string(),
+        ));
+    };
+
+    Ok(PathBuf::from(runtime_dir)
+        .join("hypr")
+        .join(signature)
+        .join(".socket2.sock"))
 }
 
 fn command_exists(command: &str) -> bool {
@@ -675,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_is_not_supported_yet() {
+    fn hyprland_hotkeys_are_supported_when_hyprctl_is_available() {
         let backups = [
             (
                 "XDG_SESSION_TYPE".to_string(),
@@ -684,6 +831,10 @@ mod tests {
             (
                 "WAYLAND_DISPLAY".to_string(),
                 env::var_os("WAYLAND_DISPLAY"),
+            ),
+            (
+                "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
+                env::var_os("HYPRLAND_INSTANCE_SIGNATURE"),
             ),
             (
                 "XDG_CURRENT_DESKTOP".to_string(),
@@ -699,12 +850,65 @@ mod tests {
 
         set_env("XDG_SESSION_TYPE", Some("wayland"));
         set_env("WAYLAND_DISPLAY", Some("wayland-0"));
+        set_env("HYPRLAND_INSTANCE_SIGNATURE", Some("sig"));
         set_env("XDG_CURRENT_DESKTOP", Some("Hyprland"));
         set_env("PATH", Some(temp_dir.to_str().unwrap()));
 
+        let result = resolve_wayland_hotkey_backend();
+        assert!(matches!(result, Ok(WaylandHotkeyBackend::Hyprland)));
+
+        restore_env(&backups);
+    }
+
+    #[test]
+    fn maps_common_hotkeys_to_hyprland_binds() {
+        assert_eq!(
+            hyprland_binding_from_hotkey("alt+ctrl+left").as_deref(),
+            Some("ALT_CTRL_Left")
+        );
+        assert_eq!(
+            hyprland_binding_from_hotkey("cmd+space").as_deref(),
+            Some("SUPER_space")
+        );
+        assert_eq!(
+            hyprland_binding_from_hotkey("ctrl+shift+f12").as_deref(),
+            Some("CTRL_SHIFT_F12")
+        );
+    }
+
+    #[test]
+    fn rejects_hyprland_without_hyprctl() {
+        let backups = [
+            (
+                "XDG_SESSION_TYPE".to_string(),
+                env::var_os("XDG_SESSION_TYPE"),
+            ),
+            (
+                "WAYLAND_DISPLAY".to_string(),
+                env::var_os("WAYLAND_DISPLAY"),
+            ),
+            (
+                "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
+                env::var_os("HYPRLAND_INSTANCE_SIGNATURE"),
+            ),
+            (
+                "XDG_CURRENT_DESKTOP".to_string(),
+                env::var_os("XDG_CURRENT_DESKTOP"),
+            ),
+            ("PATH".to_string(), env::var_os("PATH")),
+        ];
+
+        set_env("XDG_SESSION_TYPE", Some("wayland"));
+        set_env("WAYLAND_DISPLAY", Some("wayland-0"));
+        set_env("HYPRLAND_INSTANCE_SIGNATURE", Some("sig"));
+        set_env("XDG_CURRENT_DESKTOP", Some("Hyprland"));
+
+        set_env("PATH", Some(""));
+
         assert!(matches!(
             resolve_wayland_hotkey_backend(),
-            Err(HotkeySystemError::Platform(message)) if message.contains("not implemented")
+            Err(HotkeySystemError::Platform(message))
+                if message.contains("hyprctl is required")
         ));
 
         restore_env(&backups);
