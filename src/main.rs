@@ -1,25 +1,27 @@
-use std::collections::VecDeque;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+use std::thread;
+
+use std::sync::mpsc;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::sync::mpsc::{self, SyncSender};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use tray_item::{IconSource, TrayItem};
 
+#[cfg(target_os = "macos")]
+use window_zones::MacOSWindowSystem;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+use window_zones::RdevHotkeySystem;
+#[cfg(target_os = "windows")]
+use window_zones::WindowsWindowSystem;
 use window_zones::{
     App, ConfigState, DispatchState, DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem,
     HotkeySystemError, WindowMove, WindowSystem,
 };
-
-#[cfg(target_os = "macos")]
-use window_zones::MacOSWindowSystem;
-#[cfg(target_os = "windows")]
-use window_zones::WindowsWindowSystem;
 #[cfg(target_os = "linux")]
 use window_zones::{WaylandWindowSystem, X11WindowSystem};
 #[derive(Debug, Clone, Copy)]
@@ -395,29 +397,104 @@ fn parse_runtime_input(line: &str) -> RuntimeInstruction {
 }
 
 #[derive(Debug, Default)]
-struct CliHotkeySystem {
-    registered_hotkeys: Vec<String>,
-    events: VecDeque<Result<HotkeyEvent, HotkeySystemError>>,
-}
-
-impl CliHotkeySystem {
-    fn queue_hotkey(&mut self, hotkey: String) {
-        self.events.push_back(Ok(HotkeyEvent::Pressed { hotkey }));
-    }
-}
+struct CliHotkeySystem;
 
 impl HotkeySystem for CliHotkeySystem {
-    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        self.registered_hotkeys = hotkeys.to_vec();
+    fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         Ok(())
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        match self.events.pop_front() {
-            Some(event) => event.map(Some),
-            None => Ok(None),
+        Ok(None)
+    }
+}
+
+enum RuntimeHotkeySystem {
+    Cli(CliHotkeySystem),
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    Global(RdevHotkeySystem),
+}
+
+impl RuntimeHotkeySystem {
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    fn new() -> Self {
+        Self::Global(RdevHotkeySystem::new())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    fn new() -> Self {
+        Self::Cli(CliHotkeySystem::default())
+    }
+}
+
+impl HotkeySystem for RuntimeHotkeySystem {
+    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        match self {
+            Self::Cli(system) => system.register_hotkeys(hotkeys),
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+            Self::Global(system) => system.register_hotkeys(hotkeys),
         }
     }
+
+    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        match self {
+            Self::Cli(system) => system.next_hotkey(),
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+            Self::Global(system) => system.next_hotkey(),
+        }
+    }
+}
+
+fn configured_hotkeys_for_runtime(app: &App) -> Vec<String> {
+    app.config()
+        .bindings
+        .iter()
+        .map(|binding| binding.hotkey.clone())
+        .collect()
+}
+
+fn rebind_if_configured_hotkeys_changed(
+    app: &mut App,
+    hotkey_system: &mut RuntimeHotkeySystem,
+    cached_hotkeys: &mut Vec<String>,
+    registration_is_valid: &mut bool,
+    event_label: &str,
+) {
+    let target_hotkeys = configured_hotkeys_for_runtime(app);
+
+    if *registration_is_valid && *cached_hotkeys == target_hotkeys {
+        return;
+    }
+
+    match app.register_hotkeys(hotkey_system) {
+        Ok(()) => {
+            *cached_hotkeys = target_hotkeys;
+            *registration_is_valid = true;
+        }
+        Err(error) => {
+            println!("{event_label} failed: {error}");
+            *registration_is_valid = false;
+        }
+    }
+}
+
+fn runtime_instruction_receiver() -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let mut line = String::new();
+
+        while stdin.read_line(&mut line).expect("read stdin") > 0 {
+            if tx.send(line.clone()).is_err() {
+                break;
+            }
+            line.clear();
+        }
+    });
+
+    rx
 }
 
 fn build_app(config_path: Option<&PathBuf>) -> App {
@@ -487,16 +564,8 @@ fn execute_dispatch(mut app: App, mut window_system: RuntimeWindowSystem, hotkey
     println!("Using runtime window backend: {}", window_system.name());
     print_status(&app);
 
-    let mut hotkey_system = CliHotkeySystem::default();
-    if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-        println!("hotkey registration error: {error}");
-    }
-
-    hotkey_system.queue_hotkey(hotkey);
-    match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-        Ok(state) => print_dispatch_state(state, &window_system),
-        Err(error) => println!("Dispatch failed: {error}"),
-    }
+    let state = app.dispatch_hotkey(&hotkey, &mut window_system);
+    print_dispatch_state(state, &window_system);
 }
 
 fn execute_status(app: App) {
@@ -522,66 +591,87 @@ fn execute_run(app: App, window_system: RuntimeWindowSystem, show_tray: bool) {
 
 fn execute_run_cli(mut app: App, mut window_system: RuntimeWindowSystem) {
     let config_path = app.config_path().map(PathBuf::from);
+    let instruction_rx = runtime_instruction_receiver();
 
-    let mut hotkey_system = CliHotkeySystem::default();
-    if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-        println!("Hotkey registration initially failed: {error}");
-    } else {
-        println!("Registered {} hotkeys.", app.config().bindings.len());
-    }
+    let mut hotkey_system = RuntimeHotkeySystem::new();
+    let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
+    let mut hotkeys_are_valid = false;
+    rebind_if_configured_hotkeys_changed(
+        &mut app,
+        &mut hotkey_system,
+        &mut cached_hotkeys,
+        &mut hotkeys_are_valid,
+        "Hotkey registration initially",
+    );
 
     println!("Window backend: {}", window_system.name());
     println!("Interactive session started. type `help` for commands.");
 
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    let mut line = String::new();
+    let mut hotkey_listener_available = true;
 
     loop {
         print!("window-zones> ");
         io::stdout().flush().expect("stdout flush");
 
-        line.clear();
-        let bytes = stdin.read_line(&mut line).expect("read stdin");
-        if bytes == 0 {
-            break;
-        }
-
-        match parse_runtime_input(&line) {
-            RuntimeInstruction::Empty => continue,
-            RuntimeInstruction::Status => print_status(&app),
-            RuntimeInstruction::Reload => {
-                println!("Reload requested.");
-                match app.poll_config_changes() {
-                    ConfigState::Error(error) => {
-                        println!("Config reload error: {error}");
+        match instruction_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => match parse_runtime_input(&line) {
+                RuntimeInstruction::Empty => continue,
+                RuntimeInstruction::Status => print_status(&app),
+                RuntimeInstruction::Reload => {
+                    println!("Reload requested.");
+                    match app.poll_config_changes() {
+                        ConfigState::Error(error) => {
+                            println!("Config reload error: {error}");
+                        }
+                        state => println!("Config state: {:?}", state),
                     }
-                    state => println!("Config state: {:?}", state),
                 }
-            }
-            RuntimeInstruction::Restart => {
-                app = build_app(config_path.as_ref());
-                println!("Runtime restarted.");
-                if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-                    println!("Hotkey registration now failed: {error}");
+                RuntimeInstruction::Restart => {
+                    app = build_app(config_path.as_ref());
+                    cached_hotkeys.clear();
+                    hotkeys_are_valid = false;
+                    println!("Runtime restarted.");
                 }
-            }
-            RuntimeInstruction::Quit => break,
-            RuntimeInstruction::Help => print_help(),
-            RuntimeInstruction::Unknown(message) => {
-                println!("Unknown command: {message}");
-                println!("type `help` for usage.");
-            }
-            RuntimeInstruction::Dispatch(hotkey) => {
-                hotkey_system.queue_hotkey(hotkey);
-                match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-                    Ok(state) => print_dispatch_state(state, &window_system),
-                    Err(error) => println!("Dispatch failed: {error}"),
+                RuntimeInstruction::Quit => break,
+                RuntimeInstruction::Help => print_help(),
+                RuntimeInstruction::Unknown(message) => {
+                    println!("Unknown command: {message}");
+                    println!("type `help` for usage.");
                 }
+                RuntimeInstruction::Dispatch(hotkey) => {
+                    let state = app.dispatch_hotkey(&hotkey, &mut window_system);
+                    print_dispatch_state(state, &window_system);
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                println!("Input stream closed. Session closed.");
+                return;
             }
         }
 
         let _ = app.poll_config_changes();
+        rebind_if_configured_hotkeys_changed(
+            &mut app,
+            &mut hotkey_system,
+            &mut cached_hotkeys,
+            &mut hotkeys_are_valid,
+            "Hotkey registration now",
+        );
+
+        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+            Ok(state) => {
+                if let DispatchState::Error(error) = state {
+                    println!("Dispatch failed: {error}");
+                }
+                hotkey_listener_available = true;
+            }
+            Err(error) if hotkey_listener_available => {
+                println!("Dispatch failed: {error}");
+                hotkey_listener_available = false;
+            }
+            Err(_) => {}
+        }
     }
 
     println!("Session closed.");
@@ -599,13 +689,18 @@ enum RuntimeTrayCommand {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
     let config_path = app.config_path().map(PathBuf::from);
-    let mut hotkey_system = CliHotkeySystem::default();
+    let mut hotkey_system = RuntimeHotkeySystem::new();
+    let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
+    let mut hotkeys_are_valid = false;
+    let mut hotkey_listener_available = true;
 
-    if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-        println!("Hotkey registration initially failed: {error}");
-    } else {
-        println!("Registered {} hotkeys.", app.config().bindings.len());
-    }
+    rebind_if_configured_hotkeys_changed(
+        &mut app,
+        &mut hotkey_system,
+        &mut cached_hotkeys,
+        &mut hotkeys_are_valid,
+        "Hotkey registration initially",
+    );
 
     let (tray_tx, tray_rx) = mpsc::sync_channel::<RuntimeTrayCommand>(16);
     let mut tray = match build_tray_menu(&app, &tray_tx) {
@@ -633,10 +728,9 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
             }
             Ok(RuntimeTrayCommand::Restart) => {
                 app = build_app(config_path.as_ref());
+                cached_hotkeys.clear();
+                hotkeys_are_valid = false;
                 println!("Runtime restarted.");
-                if let Err(error) = app.register_hotkeys(&mut hotkey_system) {
-                    println!("Hotkey registration now failed: {error}");
-                }
             }
             Ok(RuntimeTrayCommand::Status) => print_status(&app),
             Ok(RuntimeTrayCommand::Quit) => {
@@ -650,12 +744,29 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
             }
         }
 
-        if let Ok(state) = app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-            if let DispatchState::Error(error) = state {
-                println!("Dispatch failed: {error}");
-            } else if let DispatchState::Succeeded = state {
-                print_dispatch_state(state, &window_system);
+        let _ = app.poll_config_changes();
+        rebind_if_configured_hotkeys_changed(
+            &mut app,
+            &mut hotkey_system,
+            &mut cached_hotkeys,
+            &mut hotkeys_are_valid,
+            "Hotkey registration now",
+        );
+
+        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+            Ok(state) => {
+                if let DispatchState::Error(error) = state {
+                    println!("Dispatch failed: {error}");
+                } else if let DispatchState::Succeeded = state {
+                    print_dispatch_state(state, &window_system);
+                }
+                hotkey_listener_available = true;
             }
+            Err(error) if hotkey_listener_available => {
+                println!("Dispatch failed: {error}");
+                hotkey_listener_available = false;
+            }
+            Err(_) => {}
         }
 
         let next_snapshot = runtime_status_lines(&app);
@@ -671,8 +782,6 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
                 }
             };
         }
-
-        let _ = app.poll_config_changes();
     }
 }
 

@@ -32,6 +32,8 @@ pub use dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 pub use display_movement::move_window_to_display;
 pub use executor::{ExecuteActionError, execute_action};
 pub use geometry::{DisplayGeometry, Rect};
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub use hotkey_system::RdevHotkeySystem;
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
 #[cfg(target_os = "macos")]
 pub use macos_window_system::MacOSWindowSystem;
