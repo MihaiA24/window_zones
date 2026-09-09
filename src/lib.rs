@@ -42,6 +42,8 @@ pub use gnome_integration::{
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub use hotkey_system::RdevHotkeySystem;
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
+#[cfg(target_os = "macos")]
+pub use macos_window_system::MacOSWindowSystem;
 pub use runtime::{
     App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, HotkeyRegistrationState,
     default_config_path,

@@ -696,7 +696,7 @@ fn execute_status(app: App, backend: RuntimeBackend) {
     if matches!(backend, RuntimeBackend::Gnome) {
         match GnomeWindowSystem::new().capabilities() {
             Ok(capabilities) => println!("GNOME companion capabilities: {capabilities:?}"),
-            Err(error) => println!("GNOME companion unavailable: {error}"),
+            Err(error) => println!("GNOME companion status: {error}"),
         }
     }
     print_status(&app);

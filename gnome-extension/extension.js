@@ -1,7 +1,9 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SERVICE_NAME = 'org.window_zones.Gnome';
@@ -45,6 +47,22 @@ const INTERFACE_XML = `
     </signal>
   </interface>
 </node>`;
+const INTERFACE_INFO = Gio.DBusNodeInfo.new_for_xml(INTERFACE_XML).interfaces[0];
+
+const NON_APPLICATION_WINDOW_TYPES = new Set([
+    Meta.WindowType.DESKTOP,
+    Meta.WindowType.DOCK,
+    Meta.WindowType.MENU,
+    Meta.WindowType.TOOLBAR,
+    Meta.WindowType.DROPDOWN_MENU,
+    Meta.WindowType.POPUP_MENU,
+    Meta.WindowType.TOOLTIP,
+    Meta.WindowType.NOTIFICATION,
+    Meta.WindowType.COMBO,
+    Meta.WindowType.DND,
+    Meta.WindowType.OVERRIDE_OTHER,
+]);
+
 
 const MODIFIER_TOKENS = new Map([
     ['alt', '<Alt>'],
@@ -69,10 +87,24 @@ const KEY_TOKENS = new Map([
     ['home', 'Home'],
     ['end', 'End'],
     ['insert', 'Insert'],
+    ['minus', 'minus'],
+    ['equal', 'equal'],
+    ['comma', 'comma'],
+    ['dot', 'period'],
+    ['slash', 'slash'],
+    ['quote', 'apostrophe'],
+    ['semicolon', 'semicolon'],
+    ['leftbracket', 'bracketleft'],
+    ['rightbracket', 'bracketright'],
+    ['backslash', 'backslash'],
+    ['backquote', 'grave'],
     ['printscreen', 'Print'],
+    ['scrolllock', 'Scroll_Lock'],
+    ['capslock', 'Caps_Lock'],
+    ['numlock', 'Num_Lock'],
     ['pause', 'Pause'],
-    ['menu', 'Menu'],
 ]);
+
 
 function dbusError(name, message) {
     const error = new Error(message);
@@ -123,28 +155,104 @@ function containsPoint(rect, x, y) {
 class WindowZonesService {
     constructor() {
         this._accelerators = new Map();
+        this._allowedKeybindings = new Map();
+        this._controllerSender = null;
+        this._connection = null;
+        this._registrationId = 0;
+        this._ownerWatchId = 0;
+        this._displayIds = new Map();
+        this._nextDisplayId = 1;
         this._acceleratorSignalId = global.display.connect(
             'accelerator-activated',
             (_display, action) => this._emitHotkey(action));
-        this._impl = Gio.DBusExportedObject.wrapJSObject(INTERFACE_XML, this);
     }
 
     export(connection) {
-        this._impl.export(connection, OBJECT_PATH);
+        this._connection = connection;
+        this._registrationId = connection.register_object(
+            OBJECT_PATH,
+            INTERFACE_INFO,
+            this._methodCall.bind(this),
+            null,
+            null);
+        this._ownerWatchId = connection.signal_subscribe(
+            'org.freedesktop.DBus',
+            'org.freedesktop.DBus',
+            'NameOwnerChanged',
+            null,
+            null,
+            Gio.DBusSignalFlags.NONE,
+            (_connection, _sender, _path, _interface, _signal, parameters) => {
+                const [name, _oldOwner, newOwner] = parameters.deep_unpack();
+                if (name === this._controllerSender && newOwner === '') {
+                    this._clearAccelerators();
+                    this._controllerSender = null;
+                }
+            });
     }
 
     destroy() {
-        for (const action of this._accelerators.values())
-            global.display.ungrab_accelerator(action);
-        this._accelerators.clear();
+        this._clearAccelerators();
 
         if (this._acceleratorSignalId !== 0) {
             global.display.disconnect(this._acceleratorSignalId);
             this._acceleratorSignalId = 0;
         }
 
-        this._impl.flush();
-        this._impl.unexport();
+        if (this._connection) {
+            if (this._ownerWatchId !== 0) {
+                this._connection.signal_unsubscribe(this._ownerWatchId);
+                this._ownerWatchId = 0;
+            }
+            if (this._registrationId !== 0) {
+                this._connection.unregister_object(this._registrationId);
+                this._registrationId = 0;
+            }
+        }
+        this._connection = null;
+    }
+
+    _methodCall(_connection, sender, _objectPath, _interfaceName, methodName, parameters, invocation) {
+        try {
+            switch (methodName) {
+            case 'GetCapabilities': {
+                const [capabilities] = this.GetCapabilities();
+                invocation.return_value(new GLib.Variant('(as)', [capabilities]));
+                return;
+            }
+            case 'GetFocusedWindow':
+                invocation.return_value(
+                    new GLib.Variant('(bsiiuu)', this.GetFocusedWindow()));
+                return;
+            case 'GetDisplays': {
+                const [displays] = this.GetDisplays();
+                invocation.return_value(new GLib.Variant('(a(siiuu))', [displays]));
+                return;
+            }
+            case 'MoveFocusedWindow': {
+                const [x, y, width, height] = parameters.deep_unpack();
+                this.MoveFocusedWindow(x, y, width, height);
+                invocation.return_value(new GLib.Variant('()', []));
+                return;
+            }
+            case 'RegisterHotkeys': {
+                const [hotkeys] = parameters.deep_unpack();
+                this._registerHotkeys(sender, hotkeys);
+                invocation.return_value(new GLib.Variant('()', []));
+                return;
+            }
+            default:
+                invocation.return_dbus_error(
+                    'org.freedesktop.DBus.Error.UnknownMethod',
+                    `Unknown method: ${methodName}`);
+            }
+        } catch (error) {
+            const name = typeof error?.name === 'string'
+                && error.name.startsWith('org.window_zones.Gnome.Error.')
+                ? error.name
+                : 'org.freedesktop.DBus.Error.Failed';
+            invocation.return_dbus_error(name, error?.message ?? String(error));
+        }
     }
 
     GetCapabilities() {
@@ -212,7 +320,16 @@ class WindowZonesService {
         window.move_resize_frame(true, x, y, width, height);
     }
 
-    RegisterHotkeys(hotkeys) {
+    _registerHotkeys(sender, hotkeys) {
+        if (!sender)
+            throw dbusError(
+                'org.freedesktop.DBus.Error.AccessDenied',
+                'D-Bus sender is unavailable');
+        if (this._controllerSender !== null && this._controllerSender !== sender)
+            throw dbusError(
+                'org.window_zones.Gnome.Error.Busy',
+                'another App instance owns the registered hotkey set');
+
         const next = new Map();
         const grabbed = [];
 
@@ -221,49 +338,95 @@ class WindowZonesService {
                 if (next.has(hotkey))
                     throw new Error(`duplicate hotkey '${hotkey}'`);
 
+                const existingAction = this._accelerators.get(hotkey);
+                if (existingAction !== undefined) {
+                    next.set(hotkey, existingAction);
+                    continue;
+                }
+
                 const accelerator = canonicalAccelerator(hotkey);
-                const action = global.display.grab_accelerator(accelerator);
+                const action = global.display.grab_accelerator(
+                    accelerator,
+                    Meta.KeyBindingFlags.NONE);
                 if (action === 0)
                     throw new Error(`GNOME rejected hotkey '${hotkey}' (${accelerator})`);
 
-                next.set(hotkey, action);
                 grabbed.push(action);
+                const bindingName = Meta.external_binding_name_for_action(action);
+                Main.wm.allowKeybinding(bindingName, Shell.ActionMode.NORMAL);
+                this._allowedKeybindings.set(action, bindingName);
+                next.set(hotkey, action);
             }
         } catch (error) {
             for (const action of grabbed)
-                global.display.ungrab_accelerator(action);
+                this._ungrabAccelerator(action);
             throw dbusError(
                 'org.window_zones.Gnome.Error.Unsupported',
                 error.message);
         }
 
-        for (const action of this._accelerators.values())
-            global.display.ungrab_accelerator(action);
+        for (const [hotkey, action] of this._accelerators) {
+            if (next.get(hotkey) !== action)
+                this._ungrabAccelerator(action);
+        }
         this._accelerators = next;
+        this._controllerSender = next.size === 0 ? null : sender;
     }
+
+    _ungrabAccelerator(action) {
+        const bindingName = this._allowedKeybindings.get(action);
+        if (bindingName) {
+            Main.wm.allowKeybinding(bindingName, Shell.ActionMode.NONE);
+            this._allowedKeybindings.delete(action);
+        }
+        global.display.ungrab_accelerator(action);
+    }
+
+    _clearAccelerators() {
+        for (const action of this._accelerators.values())
+            this._ungrabAccelerator(action);
+        this._accelerators.clear();
+    }
+
 
     _emitHotkey(action) {
         for (const [hotkey, registeredAction] of this._accelerators) {
             if (registeredAction !== action)
                 continue;
 
-            this._impl.emit_signal(
-                'HotkeyPressed',
-                new GLib.Variant('(s)', [hotkey]));
+            if (this._connection) {
+                this._connection.emit_signal(
+                    null,
+                    OBJECT_PATH,
+                    INTERFACE_NAME,
+                    'HotkeyPressed',
+                    new GLib.Variant('(s)', [hotkey]));
+            }
             return;
         }
     }
 
     _focusedWindow() {
+        if (
+            Main.overview?.visible === true
+            || Main.sessionMode?.isLocked === true
+            || Main.screenShield?.locked === true
+        )
+            return null;
+
         const window = global.display.get_focus_window();
         if (!window || typeof window.get_frame_rect !== 'function')
             return null;
 
-        if (typeof window.get_window_type === 'function') {
-            const windowType = window.get_window_type();
-            if (windowType === Meta.WindowType.DESKTOP || windowType === Meta.WindowType.DOCK)
-                return null;
-        }
+        if (typeof window.get_window_type === 'function'
+            && NON_APPLICATION_WINDOW_TYPES.has(window.get_window_type()))
+            return null;
+        if (
+            typeof global.get_pid === 'function'
+            && typeof window.get_pid === 'function'
+            && window.get_pid() === global.get_pid()
+        )
+            return null;
 
         const frame = window.get_frame_rect();
         if (frame.width <= 0 || frame.height <= 0)
@@ -279,10 +442,18 @@ class WindowZonesService {
         if (typeof Main.layoutManager.getWorkAreaForMonitor !== 'function')
             throw new Error('GNOME work-area API is unavailable');
 
-        return monitors.map((_monitor, index) => ({
-            id: `monitor-${index}`,
-            rect: Main.layoutManager.getWorkAreaForMonitor(index),
-        }));
+        const activeDisplayIds = new Map();
+        const displays = monitors.map((_monitor, index) => {
+            const rect = Main.layoutManager.getWorkAreaForMonitor(index);
+            const key = [rect.x, rect.y, rect.width, rect.height].join(':');
+            let id = this._displayIds.get(key);
+            if (!id)
+                id = `display-${this._nextDisplayId++}`;
+            activeDisplayIds.set(key, id);
+            return {id, rect};
+        });
+        this._displayIds = activeDisplayIds;
+        return displays;
     }
 }
 

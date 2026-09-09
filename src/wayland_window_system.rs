@@ -33,10 +33,6 @@ impl WaylandWindowSystem {
         resolve_wayland_backend()
     }
 
-    pub fn resolve_backend() -> Result<WaylandBackend, WindowSystemError> {
-        resolve_wayland_backend()
-    }
-
     fn session_error_for(is_wayland: bool) -> WindowSystemError {
         if is_wayland {
             WindowSystemError::Platform(

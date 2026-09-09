@@ -30,19 +30,29 @@ type DisplayPayload = (String, i32, i32, u32, u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GnomeIntegrationError {
-    #[error("GNOME companion is unavailable: {message}")]
+    #[error(
+        "GNOME companion is unavailable: {message}; install and enable the GNOME Shell companion, then retry"
+    )]
     Unavailable { message: String },
-    #[error("GNOME companion is incompatible: {message}")]
+    #[error(
+        "GNOME companion is incompatible: {message}; upgrade the GNOME Shell companion for org.window_zones.Gnome1"
+    )]
     Incompatible { message: String },
-    #[error("GNOME companion denied the request: {message}")]
+    #[error(
+        "GNOME companion denied the request: {message}; check session permissions and companion access"
+    )]
     Denied { message: String },
-    #[error("GNOME companion does not support {capability}: {message}")]
+    #[error(
+        "GNOME companion does not support {capability}: {message}; use a companion exposing that capability"
+    )]
     Unsupported { capability: String, message: String },
-    #[error("GNOME companion is busy: {message}")]
+    #[error("GNOME companion is busy: {message}; release the other App controller before retrying")]
     Busy { message: String },
-    #[error("GNOME companion rejected the request: {message}")]
+    #[error(
+        "GNOME companion rejected the request: {message}; restore an eligible focused window or correct the request"
+    )]
     Invalid { message: String },
-    #[error("GNOME companion operation failed: {message}")]
+    #[error("GNOME companion operation failed: {message}; retry the operation")]
     Operation { message: String },
 }
 
@@ -184,8 +194,9 @@ impl GnomeHotkeySystem {
         let connection = connect(self.bus_address.as_deref())?;
         let events = Arc::clone(&self.events);
         let service_lost = Arc::clone(&self.service_lost);
-        let match_rule =
-            MatchRule::new_signal(GNOME_INTERFACE, HOTKEY_SIGNAL).with_path(GNOME_OBJECT_PATH);
+        let match_rule = MatchRule::new_signal(GNOME_INTERFACE, HOTKEY_SIGNAL)
+            .with_path(GNOME_OBJECT_PATH)
+            .with_sender(GNOME_SERVICE_NAME);
 
         connection
             .add_match(match_rule, move |(hotkey,): (String,), _, _| {
@@ -334,7 +345,10 @@ fn classify_dbus_error(error: dbus::Error) -> GnomeIntegrationError {
     match name {
         "org.freedesktop.DBus.Error.ServiceUnknown"
         | "org.freedesktop.DBus.Error.NameHasNoOwner"
-        | "org.freedesktop.DBus.Error.NoReply" => GnomeIntegrationError::Unavailable { message },
+        | "org.freedesktop.DBus.Error.NoReply"
+        | "org.freedesktop.DBus.Error.UnknownObject" => {
+            GnomeIntegrationError::Unavailable { message }
+        }
         "org.freedesktop.DBus.Error.UnknownInterface"
         | "org.freedesktop.DBus.Error.UnknownMethod" => {
             GnomeIntegrationError::Incompatible { message }
@@ -756,6 +770,12 @@ mod tests {
                 "org.freedesktop.DBus.Error.ServiceUnknown",
                 GnomeIntegrationError::Unavailable {
                     message: "missing".to_string(),
+                },
+            ),
+            (
+                "org.freedesktop.DBus.Error.UnknownObject",
+                GnomeIntegrationError::Unavailable {
+                    message: "object removed".to_string(),
                 },
             ),
             (
