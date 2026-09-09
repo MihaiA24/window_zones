@@ -148,7 +148,7 @@ class WindowZonesService {
     }
 
     GetCapabilities() {
-        return [CAPABILITIES];
+        return CAPABILITIES;
     }
 
     GetFocusedWindow() {
@@ -167,13 +167,13 @@ class WindowZonesService {
     }
 
     GetDisplays() {
-        return [this._displayData().map(item => [
+        return this._displayData().map(item => [
             item.id,
             item.rect.x,
             item.rect.y,
             item.rect.width,
             item.rect.height,
-        ])];
+        ]);
     }
 
     MoveFocusedWindow(x, y, width, height) {
@@ -222,7 +222,7 @@ class WindowZonesService {
                     throw new Error(`duplicate hotkey '${hotkey}'`);
 
                 const accelerator = canonicalAccelerator(hotkey);
-                const action = global.display.grab_accelerator(accelerator);
+                const action = global.display.grab_accelerator(accelerator, 0);
                 if (action === 0)
                     throw new Error(`GNOME rejected hotkey '${hotkey}' (${accelerator})`);
 
