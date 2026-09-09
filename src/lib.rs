@@ -10,6 +10,8 @@ pub mod dispatcher;
 pub mod display_movement;
 pub mod executor;
 pub mod geometry;
+#[cfg(target_os = "linux")]
+pub mod gnome_integration;
 pub mod hotkey_system;
 #[cfg(target_os = "macos")]
 pub mod macos_window_system;
@@ -32,17 +34,20 @@ pub use dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 pub use display_movement::move_window_to_display;
 pub use executor::{ExecuteActionError, execute_action};
 pub use geometry::{DisplayGeometry, Rect};
+#[cfg(target_os = "linux")]
+pub use gnome_integration::{
+    GNOME_INTERFACE, GNOME_OBJECT_PATH, GNOME_SERVICE_NAME, GnomeHotkeySystem,
+    GnomeIntegrationError, GnomeWindowSystem,
+};
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub use hotkey_system::RdevHotkeySystem;
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
-#[cfg(target_os = "macos")]
-pub use macos_window_system::MacOSWindowSystem;
 pub use runtime::{
     App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, HotkeyRegistrationState,
     default_config_path,
 };
 #[cfg(target_os = "linux")]
-pub use wayland_window_system::WaylandWindowSystem;
+pub use wayland_window_system::{WaylandBackend, WaylandWindowSystem, resolve_wayland_backend};
 pub use window_system::{FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
 #[cfg(target_os = "windows")]
 pub use windows_window_system::WindowsWindowSystem;

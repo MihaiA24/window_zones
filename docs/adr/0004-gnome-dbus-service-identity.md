@@ -1,0 +1,3 @@
+# GNOME integration uses a stable versioned D-Bus identity
+
+The GNOME Shell companion owns the user-session service `org.window_zones.Gnome`, object `/org/window_zones/Gnome`, and versioned interface `org.window_zones.Gnome1`; the Rust App is the client and does not launch or replace the service owner. Stable names make companion discovery and compatibility failures explicit. For V1, the interface major is strict and capability names gate optional behavior; no separate minor-version negotiation is needed. The user-session bus is the trust boundary; V1 adds no custom authentication or system-bus policy.

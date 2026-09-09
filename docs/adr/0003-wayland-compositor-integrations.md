@@ -31,4 +31,4 @@ Wayland session detection is routing, not a generic window-control implementatio
 - GNOME is implemented first, then the TUI, then KDE.
 - Merge-ready V1 gates are Windows, Linux X11, KDE Wayland, and GNOME Wayland.
 - macOS remains source-compatible but non-blocking; Sway and Hyprland remain constrained backends.
-- V1 validation covers one representative stable GNOME Shell release and one representative stable KDE Plasma/KWin release, with exact versions documented.
+- V1 validation covers GNOME Shell 50 and one representative stable KDE Plasma/KWin release, with exact point versions documented by the manual smoke run.

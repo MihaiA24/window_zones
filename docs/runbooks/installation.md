@@ -6,6 +6,7 @@
   - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
   - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
 - (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
+- For GNOME Wayland, GNOME Shell 50 and `gnome-extensions` are required when using the optional companion; install steps are in `docs/runbooks/gnome-wayland.md`.
 
 ## Steps
 
@@ -39,3 +40,5 @@ $HOME/.local/bin/window_zones --help
 ```
 
 If installation is to a custom location, replace the path accordingly.
+
+For GNOME Wayland installation and extension lifecycle, continue with `docs/runbooks/gnome-wayland.md`.

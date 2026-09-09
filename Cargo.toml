@@ -15,6 +15,11 @@ rdev = "0.5"
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["randr"] }
 tray-item = { version = "0.10", default-features = false, features = ["ksni"] }
+dbus = "0.9"
+parking_lot = "0.12"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+dbus-tree = "0.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tray-item = { version = "0.10" }
