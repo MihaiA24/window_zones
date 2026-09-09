@@ -1,29 +1,41 @@
 # Window Zones
 
-Window Zones is planned as a Rust, cross-platform, Rectangle-style window positioning utility.
+Window Zones is a Rust, cross-platform window positioning utility.
 
-V1 is a background utility, not a replacement window manager. It will listen for configured bindings and move or resize the currently focused OS-managed window into a named zone or onto another display.
+V1 is a background utility, not a replacement window manager. It listens for configured bindings and moves or resizes the currently focused OS-managed window into a named zone or onto another display.
 
 See:
 
 - `CONTEXT.md` for domain language.
-- `docs/adr/0001-v1-window-positioning-utility.md` for the accepted v1 boundary and first implementation slice.
+- `docs/adr/0001-v1-window-positioning-utility.md` for the V1 boundary and first implementation slice.
 - `docs/adr/0002-runtime-config-reload-atomicity.md` for runtime reload error and atomicity behavior.
+- `docs/adr/0003-wayland-compositor-integrations.md` for native Wayland routing and companion integration decisions.
 
-## First slice
+## Implemented today
 
-The implemented core slices are platform-neutral only:
+The platform-neutral core and runtime paths currently include:
 
-- integer pixel geometry
-- built-in zones
-- display-to-display movement calculations
-- TOML config parsing
-- a `WindowSystem` adapter contract
-- an `execute_action` executor tested with fake adapters
-- a `dispatch_hotkey` binding dispatcher tested with fake adapters
+- integer pixel geometry;
+- built-in and validated custom zones;
+- display-to-display movement calculations;
+- TOML config parsing, discovery, reload, and atomic rollback;
+- the `WindowSystem` and `HotkeySystem` adapter contracts;
+- action execution and config-driven dispatch;
+- X11, Windows, and macOS window adapters;
+- constrained Sway and Hyprland Wayland window adapters;
+- global hotkey registration on supported non-Wayland paths;
+- CLI and optional Linux/Windows tray runtime controls.
 
-Platform adapters are available for Linux (X11/Wayland), Windows, and macOS.
-They provide focused-window detection, display enumeration, and move/resize execution.
+## Remaining V1 implementation
+
+- Environment-based Wayland compositor detection with explicit errors for unknown, conflicting, or unavailable integrations; no X11 fallback from Wayland.
+- A versioned user-session D-Bus contract and fake-service tests for compositor capabilities, focused windows, displays, moves, and hotkey events.
+- GNOME Shell compositor companion for native Wayland windows and hotkeys.
+- The `tui` subcommand: a stdlib ANSI dashboard using line-oriented commands.
+- KDE/KWin compositor companion for native Wayland windows and hotkeys.
+- Manual Windows, X11, GNOME, KDE, and TUI smoke verification.
+
+The merge-ready V1 release gates are Windows, Linux X11, KDE Wayland, and GNOME Wayland. macOS remains source-compatible but non-blocking; Sway and Hyprland remain constrained backends.
 
 ## Configuration discovery
 

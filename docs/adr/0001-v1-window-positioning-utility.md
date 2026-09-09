@@ -6,6 +6,10 @@ Date: 2026-06-25
 
 Accepted
 
+## Current status note
+
+Subsequent slices implemented the runtime entrypoint, config discovery/reload, real X11/Windows/macOS adapters, constrained Sway/Hyprland support, tray controls, and global hotkey integration. The historical exclusions below describe the original first-slice boundary; the current merge-ready V1 gates and remaining native Wayland/TUI work are recorded in ADR 0003 and issues #33, #35, and #34.
+
 ## Context
 
 The product should provide Rectangle-style window placement across macOS, Windows, and Linux. The initial feature set includes named zones such as halves, thirds, and two-thirds, moving windows between displays, and user-configurable hotkeys through a config file.
