@@ -797,20 +797,22 @@ fn execute_run_cli(mut app: App, backend: RuntimeBackend, mut window_system: Run
             "Hotkey registration now",
         );
 
-        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-            Ok(state) => {
-                if let DispatchState::Error(error) = state {
-                    println!("Dispatch failed: {error}");
+        if hotkeys_are_valid {
+            match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+                Ok(state) => {
+                    if let DispatchState::Error(error) = state {
+                        println!("Dispatch failed: {error}");
+                    }
+                    hotkey_listener_available = true;
                 }
-                hotkey_listener_available = true;
-            }
-            Err(error) if hotkey_listener_available => {
-                println!("Dispatch failed: {error}");
-                hotkeys_are_valid = false;
-                hotkey_listener_available = false;
-            }
-            Err(_) => {
-                hotkeys_are_valid = false;
+                Err(error) if hotkey_listener_available => {
+                    println!("Dispatch failed: {error}");
+                    hotkeys_are_valid = false;
+                    hotkey_listener_available = false;
+                }
+                Err(_) => {
+                    hotkeys_are_valid = false;
+                }
             }
         }
     }
@@ -902,22 +904,24 @@ fn execute_run_with_tray(
             "Hotkey registration now",
         );
 
-        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-            Ok(state) => {
-                if let DispatchState::Error(error) = state {
-                    println!("Dispatch failed: {error}");
-                } else if let DispatchState::Succeeded = state {
-                    print_dispatch_state(state, &window_system);
+        if hotkeys_are_valid {
+            match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+                Ok(state) => {
+                    if let DispatchState::Error(error) = state {
+                        println!("Dispatch failed: {error}");
+                    } else if let DispatchState::Succeeded = state {
+                        print_dispatch_state(state, &window_system);
+                    }
+                    hotkey_listener_available = true;
                 }
-                hotkey_listener_available = true;
-            }
-            Err(error) if hotkey_listener_available => {
-                println!("Dispatch failed: {error}");
-                hotkeys_are_valid = false;
-                hotkey_listener_available = false;
-            }
-            Err(_) => {
-                hotkeys_are_valid = false;
+                Err(error) if hotkey_listener_available => {
+                    println!("Dispatch failed: {error}");
+                    hotkeys_are_valid = false;
+                    hotkey_listener_available = false;
+                }
+                Err(_) => {
+                    hotkeys_are_valid = false;
+                }
             }
         }
 

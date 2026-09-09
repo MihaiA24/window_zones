@@ -191,7 +191,9 @@ impl GnomeHotkeySystem {
     }
 
     fn connect(&mut self) -> Result<(), GnomeIntegrationError> {
+        self.events.lock().clear();
         let connection = connect(self.bus_address.as_deref())?;
+
         let events = Arc::clone(&self.events);
         let service_lost = Arc::clone(&self.service_lost);
         let match_rule = MatchRule::new_signal(GNOME_INTERFACE, HOTKEY_SIGNAL)
@@ -248,13 +250,19 @@ impl GnomeHotkeySystem {
                 .map_err(classify_dbus_error)
         })();
 
-        if let Err(error) = &result
-            && error.should_reconnect()
-        {
-            self.connection = None;
+        if let Err(error) = &result {
+            if error.should_reconnect() {
+                self.reset_connection();
+            } else {
+                self.events.lock().clear();
+            }
         }
 
         result
+    }
+    fn reset_connection(&mut self) {
+        self.connection = None;
+        self.events.lock().clear();
     }
 }
 
@@ -279,7 +287,7 @@ impl HotkeySystem for GnomeHotkeySystem {
         };
 
         if let Err(error) = process_result {
-            self.connection = None;
+            self.reset_connection();
             return Err(HotkeySystemError::Platform(
                 GnomeIntegrationError::Unavailable {
                     message: format!("failed to process D-Bus events: {error}"),
@@ -289,7 +297,7 @@ impl HotkeySystem for GnomeHotkeySystem {
         }
 
         if self.service_lost.load(Ordering::Relaxed) {
-            self.connection = None;
+            self.reset_connection();
             return Err(HotkeySystemError::Platform(
                 GnomeIntegrationError::Unavailable {
                     message: "GNOME companion service disappeared from the session bus".to_string(),
@@ -761,6 +769,18 @@ mod tests {
         bus.update_state(|state| {
             assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+left".to_string()]);
         });
+    }
+
+    #[test]
+    fn connection_reset_discards_queued_events() {
+        let mut hotkey_system = GnomeHotkeySystem::with_bus_address("unused");
+        hotkey_system.events.lock().push_back(HotkeyEvent::Pressed {
+            hotkey: "ctrl+alt+left".to_string(),
+        });
+
+        hotkey_system.reset_connection();
+
+        assert!(hotkey_system.events.lock().is_empty());
     }
 
     #[test]
