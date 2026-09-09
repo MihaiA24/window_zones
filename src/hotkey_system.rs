@@ -99,6 +99,12 @@ impl RdevHotkeySystem {
         });
     }
 }
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+impl Default for RdevHotkeySystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 impl HotkeySystem for RdevHotkeySystem {
@@ -291,8 +297,8 @@ fn key_token_to_code(token: &str) -> Option<Key> {
             };
         }
 
-        if token.starts_with('f') {
-            let Ok(number) = token[1..].parse::<u8>() else {
+        if let Some(stripped) = token.strip_prefix('f') {
+            let Ok(number) = stripped.parse::<u8>() else {
                 return None;
             };
             return match number {

@@ -396,9 +396,11 @@ fn parse_runtime_input(line: &str) -> RuntimeInstruction {
     }
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 #[derive(Debug, Default)]
 struct CliHotkeySystem;
 
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 impl HotkeySystem for CliHotkeySystem {
     fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         Ok(())
@@ -410,6 +412,7 @@ impl HotkeySystem for CliHotkeySystem {
 }
 
 enum RuntimeHotkeySystem {
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     Cli(CliHotkeySystem),
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     Global(RdevHotkeySystem),
@@ -430,6 +433,7 @@ impl RuntimeHotkeySystem {
 impl HotkeySystem for RuntimeHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         match self {
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             Self::Cli(system) => system.register_hotkeys(hotkeys),
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             Self::Global(system) => system.register_hotkeys(hotkeys),
@@ -438,6 +442,7 @@ impl HotkeySystem for RuntimeHotkeySystem {
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
         match self {
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             Self::Cli(system) => system.next_hotkey(),
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             Self::Global(system) => system.next_hotkey(),
