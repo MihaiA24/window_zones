@@ -216,7 +216,7 @@ class WindowZonesService {
         try {
             switch (methodName) {
             case 'GetCapabilities': {
-                const [capabilities] = this.GetCapabilities();
+                const capabilities = this.GetCapabilities();
                 invocation.return_value(new GLib.Variant('(as)', [capabilities]));
                 return;
             }
@@ -225,7 +225,7 @@ class WindowZonesService {
                     new GLib.Variant('(bsiiuu)', this.GetFocusedWindow()));
                 return;
             case 'GetDisplays': {
-                const [displays] = this.GetDisplays();
+                const displays = this.GetDisplays();
                 invocation.return_value(new GLib.Variant('(a(siiuu))', [displays]));
                 return;
             }
@@ -256,7 +256,7 @@ class WindowZonesService {
     }
 
     GetCapabilities() {
-        return [CAPABILITIES];
+        return CAPABILITIES;
     }
 
     GetFocusedWindow() {
@@ -275,13 +275,13 @@ class WindowZonesService {
     }
 
     GetDisplays() {
-        return [this._displayData().map(item => [
+        return this._displayData().map(item => [
             item.id,
             item.rect.x,
             item.rect.y,
             item.rect.width,
             item.rect.height,
-        ])];
+        ]);
     }
 
     MoveFocusedWindow(x, y, width, height) {
@@ -345,9 +345,7 @@ class WindowZonesService {
                 }
 
                 const accelerator = canonicalAccelerator(hotkey);
-                const action = global.display.grab_accelerator(
-                    accelerator,
-                    Meta.KeyBindingFlags.NONE);
+                const action = global.display.grab_accelerator(accelerator, 0);
                 if (action === 0)
                     throw new Error(`GNOME rejected hotkey '${hotkey}' (${accelerator})`);
 
