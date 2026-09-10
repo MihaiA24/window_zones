@@ -14,8 +14,14 @@ What this verifies:
 
 ## Current repository status
 
-`cargo test --locked` passes 80 tests across the library and binary suites; the doc-test suite has no tests. The full `./scripts/test.sh` verification now passes formatting, tests, doc tests, and clippy with warnings denied.
+The repository test script covers formatting, unit/integration tests, doc tests, and clippy when installed. The GNOME adapter tests start a private `dbus-daemon`; they do not require a running GNOME Shell session.
 
+
+The GNOME extension module can be syntax-checked with:
+
+```bash
+node --check gnome-extension/extension.js
+```
 Merge-ready V1 additionally requires:
 
 - D-Bus contract tests using fake compositor services;

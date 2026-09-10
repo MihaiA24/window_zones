@@ -23,7 +23,9 @@ use window_zones::{
     HotkeySystemError, WindowMove, WindowSystem,
 };
 #[cfg(target_os = "linux")]
-use window_zones::{WaylandWindowSystem, X11WindowSystem};
+use window_zones::{
+    GnomeHotkeySystem, GnomeWindowSystem, WaylandBackend, WaylandWindowSystem, X11WindowSystem,
+};
 #[derive(Debug, Clone, Copy)]
 enum BackendPreference {
     Auto,
@@ -184,6 +186,92 @@ fn parse_backend_preference(raw: &str) -> Result<BackendPreference, String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeBackend {
+    DryRun,
+    #[cfg(target_os = "linux")]
+    X11,
+    #[cfg(target_os = "linux")]
+    Wayland,
+    #[cfg(target_os = "linux")]
+    Gnome,
+    #[cfg(target_os = "windows")]
+    Windows,
+    #[cfg(target_os = "macos")]
+    MacOS,
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    Unsupported,
+}
+
+fn resolve_runtime_backend(preference: BackendPreference) -> Result<RuntimeBackend, String> {
+    #[cfg(target_os = "linux")]
+    {
+        resolve_linux_backend(preference)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(match preference {
+            BackendPreference::DryRun => RuntimeBackend::DryRun,
+            BackendPreference::Windows | BackendPreference::Auto => RuntimeBackend::Windows,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(match preference {
+            BackendPreference::DryRun => RuntimeBackend::DryRun,
+            BackendPreference::MacOS | BackendPreference::Auto => RuntimeBackend::MacOS,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        match preference {
+            BackendPreference::DryRun => Ok(RuntimeBackend::DryRun),
+            BackendPreference::Auto => Ok(RuntimeBackend::Unsupported),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_backend(preference: BackendPreference) -> Result<RuntimeBackend, String> {
+    match preference {
+        BackendPreference::DryRun => Ok(RuntimeBackend::DryRun),
+        BackendPreference::X11 => {
+            if is_wayland_session() {
+                Err("X11 backend is unavailable inside a Wayland session; use the native Wayland compositor integration".to_string())
+            } else {
+                Ok(RuntimeBackend::X11)
+            }
+        }
+        BackendPreference::Wayland => {
+            if !is_wayland_session() {
+                return Err(
+                    "Wayland backend requires XDG_SESSION_TYPE=wayland or WAYLAND_DISPLAY"
+                        .to_string(),
+                );
+            }
+            resolve_wayland_runtime_backend()
+        }
+        BackendPreference::Auto => {
+            if is_wayland_session() {
+                resolve_wayland_runtime_backend()
+            } else {
+                Ok(RuntimeBackend::X11)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_wayland_runtime_backend() -> Result<RuntimeBackend, String> {
+    match window_zones::resolve_wayland_backend().map_err(|error| error.to_string())? {
+        WaylandBackend::Gnome => Ok(RuntimeBackend::Gnome),
+        WaylandBackend::Sway | WaylandBackend::Hyprland => Ok(RuntimeBackend::Wayland),
+    }
+}
+
 #[derive(Debug)]
 enum RuntimeWindowSystem {
     DryRun(DryRunWindowSystem),
@@ -191,6 +279,8 @@ enum RuntimeWindowSystem {
     X11(X11WindowSystem),
     #[cfg(target_os = "linux")]
     Wayland(WaylandWindowSystem),
+    #[cfg(target_os = "linux")]
+    Gnome(GnomeWindowSystem),
     #[cfg(target_os = "windows")]
     Windows(WindowsWindowSystem),
     #[cfg(target_os = "macos")]
@@ -200,31 +290,21 @@ enum RuntimeWindowSystem {
 }
 
 impl RuntimeWindowSystem {
-    fn with_preference(preference: BackendPreference) -> Self {
-        match preference {
-            BackendPreference::DryRun => RuntimeWindowSystem::DryRun(DryRunWindowSystem::new()),
+    fn with_backend(backend: RuntimeBackend) -> Self {
+        match backend {
+            RuntimeBackend::DryRun => RuntimeWindowSystem::DryRun(DryRunWindowSystem::new()),
             #[cfg(target_os = "linux")]
-            BackendPreference::X11 => RuntimeWindowSystem::X11(X11WindowSystem::new()),
+            RuntimeBackend::X11 => RuntimeWindowSystem::X11(X11WindowSystem::new()),
             #[cfg(target_os = "linux")]
-            BackendPreference::Wayland => RuntimeWindowSystem::Wayland(WaylandWindowSystem::new()),
+            RuntimeBackend::Wayland => RuntimeWindowSystem::Wayland(WaylandWindowSystem::new()),
             #[cfg(target_os = "linux")]
-            BackendPreference::Auto => {
-                if is_wayland_session() {
-                    RuntimeWindowSystem::Wayland(WaylandWindowSystem::new())
-                } else {
-                    RuntimeWindowSystem::X11(X11WindowSystem::new())
-                }
-            }
+            RuntimeBackend::Gnome => RuntimeWindowSystem::Gnome(GnomeWindowSystem::new()),
             #[cfg(target_os = "windows")]
-            BackendPreference::Windows => RuntimeWindowSystem::Windows(WindowsWindowSystem::new()),
-            #[cfg(target_os = "windows")]
-            BackendPreference::Auto => RuntimeWindowSystem::Windows(WindowsWindowSystem::new()),
+            RuntimeBackend::Windows => RuntimeWindowSystem::Windows(WindowsWindowSystem::new()),
             #[cfg(target_os = "macos")]
-            BackendPreference::MacOS => RuntimeWindowSystem::MacOS(MacOSWindowSystem::new()),
-            #[cfg(target_os = "macos")]
-            BackendPreference::Auto => RuntimeWindowSystem::MacOS(MacOSWindowSystem::new()),
+            RuntimeBackend::MacOS => RuntimeWindowSystem::MacOS(MacOSWindowSystem::new()),
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            BackendPreference::Auto => RuntimeWindowSystem::Unsupported,
+            RuntimeBackend::Unsupported => RuntimeWindowSystem::Unsupported,
         }
     }
 
@@ -235,6 +315,8 @@ impl RuntimeWindowSystem {
             RuntimeWindowSystem::X11(_) => None,
             #[cfg(target_os = "linux")]
             RuntimeWindowSystem::Wayland(_) => None,
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Gnome(_) => None,
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(_) => None,
             #[cfg(target_os = "macos")]
@@ -251,6 +333,8 @@ impl RuntimeWindowSystem {
             RuntimeWindowSystem::X11(_) => "x11",
             #[cfg(target_os = "linux")]
             RuntimeWindowSystem::Wayland(_) => "wayland",
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Gnome(_) => "gnome-wayland",
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(_) => "windows",
             #[cfg(target_os = "macos")]
@@ -269,6 +353,8 @@ impl WindowSystem for RuntimeWindowSystem {
             RuntimeWindowSystem::X11(system) => system.focused_window(),
             #[cfg(target_os = "linux")]
             RuntimeWindowSystem::Wayland(system) => system.focused_window(),
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Gnome(system) => system.focused_window(),
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(system) => system.focused_window(),
             #[cfg(target_os = "macos")]
@@ -287,6 +373,8 @@ impl WindowSystem for RuntimeWindowSystem {
             RuntimeWindowSystem::X11(system) => system.displays(),
             #[cfg(target_os = "linux")]
             RuntimeWindowSystem::Wayland(system) => system.displays(),
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Gnome(system) => system.displays(),
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(system) => system.displays(),
             #[cfg(target_os = "macos")]
@@ -308,6 +396,8 @@ impl WindowSystem for RuntimeWindowSystem {
             RuntimeWindowSystem::X11(system) => system.move_focused_window(window_move),
             #[cfg(target_os = "linux")]
             RuntimeWindowSystem::Wayland(system) => system.move_focused_window(window_move),
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Gnome(system) => system.move_focused_window(window_move),
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows(system) => system.move_focused_window(window_move),
             #[cfg(target_os = "macos")]
@@ -416,17 +506,31 @@ enum RuntimeHotkeySystem {
     Cli(CliHotkeySystem),
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     Global(RdevHotkeySystem),
+    #[cfg(target_os = "linux")]
+    Gnome(GnomeHotkeySystem),
 }
 
 impl RuntimeHotkeySystem {
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    fn new() -> Self {
-        Self::Global(RdevHotkeySystem::new())
-    }
+    fn new(backend: RuntimeBackend) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            match backend {
+                RuntimeBackend::Gnome => Self::Gnome(GnomeHotkeySystem::new()),
+                _ => Self::Global(RdevHotkeySystem::new()),
+            }
+        }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    fn new() -> Self {
-        Self::Cli(CliHotkeySystem::default())
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let _ = backend;
+            Self::Global(RdevHotkeySystem::new())
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            let _ = backend;
+            Self::Cli(CliHotkeySystem::default())
+        }
     }
 }
 
@@ -437,6 +541,8 @@ impl HotkeySystem for RuntimeHotkeySystem {
             Self::Cli(system) => system.register_hotkeys(hotkeys),
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             Self::Global(system) => system.register_hotkeys(hotkeys),
+            #[cfg(target_os = "linux")]
+            Self::Gnome(system) => system.register_hotkeys(hotkeys),
         }
     }
 
@@ -446,6 +552,8 @@ impl HotkeySystem for RuntimeHotkeySystem {
             Self::Cli(system) => system.next_hotkey(),
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             Self::Global(system) => system.next_hotkey(),
+            #[cfg(target_os = "linux")]
+            Self::Gnome(system) => system.next_hotkey(),
         }
     }
 }
@@ -463,6 +571,7 @@ fn rebind_if_configured_hotkeys_changed(
     hotkey_system: &mut RuntimeHotkeySystem,
     cached_hotkeys: &mut Vec<String>,
     registration_is_valid: &mut bool,
+    last_registration_error: &mut Option<String>,
     event_label: &str,
 ) {
     let target_hotkeys = configured_hotkeys_for_runtime(app);
@@ -475,9 +584,16 @@ fn rebind_if_configured_hotkeys_changed(
         Ok(()) => {
             *cached_hotkeys = target_hotkeys;
             *registration_is_valid = true;
+            if last_registration_error.take().is_some() {
+                println!("{event_label} recovered.");
+            }
         }
         Err(error) => {
-            println!("{event_label} failed: {error}");
+            let message = error.to_string();
+            if last_registration_error.as_deref() != Some(message.as_str()) {
+                println!("{event_label} failed: {message}");
+                *last_registration_error = Some(message);
+            }
             *registration_is_valid = false;
         }
     }
@@ -573,16 +689,29 @@ fn execute_dispatch(mut app: App, mut window_system: RuntimeWindowSystem, hotkey
     print_dispatch_state(state, &window_system);
 }
 
-fn execute_status(app: App) {
-    println!("Using runtime window backend: dry-run for safe inspection");
+fn execute_status(app: App, backend: RuntimeBackend) {
+    let window_system = RuntimeWindowSystem::with_backend(backend);
+    println!("Using runtime window backend: {}", window_system.name());
+    #[cfg(target_os = "linux")]
+    if matches!(backend, RuntimeBackend::Gnome) {
+        match GnomeWindowSystem::new().capabilities() {
+            Ok(capabilities) => println!("GNOME companion capabilities: {capabilities:?}"),
+            Err(error) => println!("GNOME companion status: {error}"),
+        }
+    }
     print_status(&app);
 }
 
-fn execute_run(app: App, window_system: RuntimeWindowSystem, show_tray: bool) {
+fn execute_run(
+    app: App,
+    backend: RuntimeBackend,
+    window_system: RuntimeWindowSystem,
+    show_tray: bool,
+) {
     if show_tray {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            return execute_run_with_tray(app, window_system);
+            return execute_run_with_tray(app, backend, window_system);
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -591,21 +720,23 @@ fn execute_run(app: App, window_system: RuntimeWindowSystem, show_tray: bool) {
         }
     }
 
-    execute_run_cli(app, window_system);
+    execute_run_cli(app, backend, window_system);
 }
 
-fn execute_run_cli(mut app: App, mut window_system: RuntimeWindowSystem) {
+fn execute_run_cli(mut app: App, backend: RuntimeBackend, mut window_system: RuntimeWindowSystem) {
     let config_path = app.config_path().map(PathBuf::from);
     let instruction_rx = runtime_instruction_receiver();
 
-    let mut hotkey_system = RuntimeHotkeySystem::new();
+    let mut hotkey_system = RuntimeHotkeySystem::new(backend);
     let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
     let mut hotkeys_are_valid = false;
+    let mut last_registration_error = None;
     rebind_if_configured_hotkeys_changed(
         &mut app,
         &mut hotkey_system,
         &mut cached_hotkeys,
         &mut hotkeys_are_valid,
+        &mut last_registration_error,
         "Hotkey registration initially",
     );
 
@@ -635,6 +766,7 @@ fn execute_run_cli(mut app: App, mut window_system: RuntimeWindowSystem) {
                     app = build_app(config_path.as_ref());
                     cached_hotkeys.clear();
                     hotkeys_are_valid = false;
+                    last_registration_error = None;
                     println!("Runtime restarted.");
                 }
                 RuntimeInstruction::Quit => break,
@@ -661,21 +793,27 @@ fn execute_run_cli(mut app: App, mut window_system: RuntimeWindowSystem) {
             &mut hotkey_system,
             &mut cached_hotkeys,
             &mut hotkeys_are_valid,
+            &mut last_registration_error,
             "Hotkey registration now",
         );
 
-        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-            Ok(state) => {
-                if let DispatchState::Error(error) = state {
-                    println!("Dispatch failed: {error}");
+        if hotkeys_are_valid {
+            match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+                Ok(state) => {
+                    if let DispatchState::Error(error) = state {
+                        println!("Dispatch failed: {error}");
+                    }
+                    hotkey_listener_available = true;
                 }
-                hotkey_listener_available = true;
+                Err(error) if hotkey_listener_available => {
+                    println!("Dispatch failed: {error}");
+                    hotkeys_are_valid = false;
+                    hotkey_listener_available = false;
+                }
+                Err(_) => {
+                    hotkeys_are_valid = false;
+                }
             }
-            Err(error) if hotkey_listener_available => {
-                println!("Dispatch failed: {error}");
-                hotkey_listener_available = false;
-            }
-            Err(_) => {}
         }
     }
 
@@ -692,11 +830,16 @@ enum RuntimeTrayCommand {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
+fn execute_run_with_tray(
+    mut app: App,
+    backend: RuntimeBackend,
+    mut window_system: RuntimeWindowSystem,
+) {
     let config_path = app.config_path().map(PathBuf::from);
-    let mut hotkey_system = RuntimeHotkeySystem::new();
+    let mut hotkey_system = RuntimeHotkeySystem::new(backend);
     let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
     let mut hotkeys_are_valid = false;
+    let mut last_registration_error = None;
     let mut hotkey_listener_available = true;
 
     rebind_if_configured_hotkeys_changed(
@@ -704,6 +847,7 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
         &mut hotkey_system,
         &mut cached_hotkeys,
         &mut hotkeys_are_valid,
+        &mut last_registration_error,
         "Hotkey registration initially",
     );
 
@@ -735,6 +879,7 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
                 app = build_app(config_path.as_ref());
                 cached_hotkeys.clear();
                 hotkeys_are_valid = false;
+                last_registration_error = None;
                 println!("Runtime restarted.");
             }
             Ok(RuntimeTrayCommand::Status) => print_status(&app),
@@ -755,23 +900,29 @@ fn execute_run_with_tray(mut app: App, mut window_system: RuntimeWindowSystem) {
             &mut hotkey_system,
             &mut cached_hotkeys,
             &mut hotkeys_are_valid,
+            &mut last_registration_error,
             "Hotkey registration now",
         );
 
-        match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-            Ok(state) => {
-                if let DispatchState::Error(error) = state {
-                    println!("Dispatch failed: {error}");
-                } else if let DispatchState::Succeeded = state {
-                    print_dispatch_state(state, &window_system);
+        if hotkeys_are_valid {
+            match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
+                Ok(state) => {
+                    if let DispatchState::Error(error) = state {
+                        println!("Dispatch failed: {error}");
+                    } else if let DispatchState::Succeeded = state {
+                        print_dispatch_state(state, &window_system);
+                    }
+                    hotkey_listener_available = true;
                 }
-                hotkey_listener_available = true;
+                Err(error) if hotkey_listener_available => {
+                    println!("Dispatch failed: {error}");
+                    hotkeys_are_valid = false;
+                    hotkey_listener_available = false;
+                }
+                Err(_) => {
+                    hotkeys_are_valid = false;
+                }
             }
-            Err(error) if hotkey_listener_available => {
-                println!("Dispatch failed: {error}");
-                hotkey_listener_available = false;
-            }
-            Err(_) => {}
         }
 
         let next_snapshot = runtime_status_lines(&app);
@@ -863,14 +1014,21 @@ fn main() {
                 std::process::exit(1);
             }
 
+            let backend = match resolve_runtime_backend(config.backend) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    eprintln!("Backend selection failed: {error}");
+                    std::process::exit(1);
+                }
+            };
             let app = build_app(config.config_path.as_ref());
-            let window_system = RuntimeWindowSystem::with_preference(config.backend);
+            let window_system = RuntimeWindowSystem::with_backend(backend);
 
             match config.command {
-                Command::Status => execute_status(app),
+                Command::Status => execute_status(app, backend),
                 Command::Dispatch { hotkey } => execute_dispatch(app, window_system, hotkey),
                 Command::Run => {
-                    execute_run(app, window_system, config.show_tray);
+                    execute_run(app, backend, window_system, config.show_tray);
                 }
             }
         }

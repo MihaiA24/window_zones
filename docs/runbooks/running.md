@@ -28,6 +28,18 @@ If no local binary exists, it falls back to `cargo run --release`.
 ./scripts/run.sh run --backend dry-run
 ```
 
+## GNOME Wayland
+
+Install and enable the Shell companion before starting the native Wayland backend:
+
+```bash
+./scripts/install.sh --prefix "$HOME/.local"
+$HOME/.local/bin/window_zones --backend auto status
+$HOME/.local/bin/window_zones --backend auto run
+```
+
+Use `docs/runbooks/gnome-wayland.md` for extension installation, reload/restart checks, companion disconnect recovery, and the full two-display smoke checklist.
+
 You can also pass a custom config path:
 
 ```bash

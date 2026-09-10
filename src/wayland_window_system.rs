@@ -1,8 +1,8 @@
 //! Linux Wayland adapter for `WindowSystem`.
 //!
 //! This adapter selects a compositor-specific implementation when Wayland support is
-//! available (currently sway or Hyprland) and returns explicit diagnostics when it is
-//! not.
+//! available (currently GNOME, sway, or Hyprland) and returns explicit diagnostics when
+//! it is not.
 
 use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, WindowSystemError};
 
@@ -15,7 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaylandBackend {
+pub enum WaylandBackend {
+    Gnome,
     Sway,
     Hyprland,
 }
@@ -29,13 +30,13 @@ impl WaylandWindowSystem {
     }
 
     fn backend() -> Result<WaylandBackend, WindowSystemError> {
-        resolve_wayland_backend_with_env(|name| env::var_os(name))
+        resolve_wayland_backend()
     }
 
-    fn session_error() -> WindowSystemError {
-        if is_wayland_session() {
+    fn session_error_for(is_wayland: bool) -> WindowSystemError {
+        if is_wayland {
             WindowSystemError::Platform(
-                "Wayland adapter supports only detected Wayland compositor backends: sway (SWAYSOCK + swaymsg) or hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland + hyprctl)".to_string(),
+                "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
             )
         } else {
             WindowSystemError::Platform(
@@ -54,6 +55,7 @@ impl Default for WaylandWindowSystem {
 impl WindowSystem for WaylandWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
         match WaylandWindowSystem::backend()? {
+            WaylandBackend::Gnome => Err(gnome_backend_error()),
             WaylandBackend::Sway => focused_window_sway(),
             WaylandBackend::Hyprland => focused_window_hypr(),
         }
@@ -61,6 +63,7 @@ impl WindowSystem for WaylandWindowSystem {
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         match WaylandWindowSystem::backend()? {
+            WaylandBackend::Gnome => Err(gnome_backend_error()),
             WaylandBackend::Sway => displays_sway(),
             WaylandBackend::Hyprland => displays_hypr(),
         }
@@ -68,10 +71,17 @@ impl WindowSystem for WaylandWindowSystem {
 
     fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
         match WaylandWindowSystem::backend()? {
+            WaylandBackend::Gnome => Err(gnome_backend_error()),
             WaylandBackend::Sway => move_focused_window_sway(window_move),
             WaylandBackend::Hyprland => move_focused_window_hypr(window_move),
         }
     }
+}
+
+fn gnome_backend_error() -> WindowSystemError {
+    WindowSystemError::Platform(
+        "GNOME Wayland requires the org.window_zones.Gnome companion integration".to_string(),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,8 +157,8 @@ struct HyprMonitor {
     height: u32,
 }
 
-fn is_wayland_session() -> bool {
-    is_wayland_session_with_env(|name| env::var_os(name))
+pub fn resolve_wayland_backend() -> Result<WaylandBackend, WindowSystemError> {
+    resolve_wayland_backend_with_env(|name| env::var_os(name))
 }
 
 fn is_wayland_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
@@ -161,11 +171,30 @@ fn is_wayland_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsStr
 fn resolve_wayland_backend_with_env(
     get_env: impl for<'a> Fn(&'a str) -> Option<OsString>,
 ) -> Result<WaylandBackend, WindowSystemError> {
-    if !is_wayland_session_with_env(&get_env) {
-        return Err(WaylandWindowSystem::session_error());
+    let is_wayland = is_wayland_session_with_env(&get_env);
+    if !is_wayland {
+        return Err(WaylandWindowSystem::session_error_for(is_wayland));
     }
 
-    if get_env("SWAYSOCK").is_some() {
+    let gnome = is_gnome_session_with_env(&get_env);
+    let sway = is_sway_session_with_env(&get_env);
+    let hyprland = is_hyprland_session_with_env(&get_env);
+    let compositor_count = [gnome, sway, hyprland]
+        .into_iter()
+        .filter(|detected| *detected)
+        .count();
+
+    if compositor_count > 1 {
+        return Err(WindowSystemError::Platform(
+            "conflicting Wayland compositor signals; keep only one of GNOME, Sway, or Hyprland session identities".to_string(),
+        ));
+    }
+
+    if gnome {
+        return Ok(WaylandBackend::Gnome);
+    }
+
+    if sway {
         if command_exists("swaymsg") {
             return Ok(WaylandBackend::Sway);
         }
@@ -175,7 +204,7 @@ fn resolve_wayland_backend_with_env(
         ));
     }
 
-    if is_hyprland_session_with_env(&get_env) {
+    if hyprland {
         if command_exists("hyprctl") {
             return Ok(WaylandBackend::Hyprland);
         }
@@ -185,14 +214,41 @@ fn resolve_wayland_backend_with_env(
         ));
     }
 
-    Err(WaylandWindowSystem::session_error())
+    Err(WaylandWindowSystem::session_error_for(is_wayland))
+}
+
+fn is_gnome_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
+    get_env("GNOME_DESKTOP_SESSION_ID").is_some() || desktop_signal_matches(&get_env, "gnome")
+}
+
+fn is_sway_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
+    get_env("SWAYSOCK").is_some() || desktop_signal_matches(&get_env, "sway")
 }
 
 fn is_hyprland_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
-    get_env("HYPRLAND_INSTANCE_SIGNATURE").is_some()
-        || get_env("XDG_CURRENT_DESKTOP")
-            .and_then(|value| value.to_str().map(|value| value.to_ascii_lowercase()))
-            .is_some_and(|value| value == "hyprland")
+    get_env("HYPRLAND_INSTANCE_SIGNATURE").is_some() || desktop_signal_matches(&get_env, "hyprland")
+}
+
+fn desktop_signal_matches(
+    get_env: &impl for<'a> Fn(&'a str) -> Option<OsString>,
+    expected: &str,
+) -> bool {
+    [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+    ]
+    .into_iter()
+    .filter_map(get_env)
+    .filter_map(|value| value.into_string().ok())
+    .flat_map(|value| {
+        value
+            .split([':', ',', ';'])
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>()
+    })
+    .any(|token| token == expected || token.starts_with(&format!("{expected}-")))
 }
 
 fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
@@ -471,7 +527,6 @@ mod tests {
     use super::*;
 
     use std::ffi::OsString;
-    use std::os::unix::fs::PermissionsExt;
 
     fn set_env(key: &str, value: Option<&str>) {
         unsafe {
@@ -527,43 +582,60 @@ mod tests {
     }
 
     #[test]
-    fn sway_backend_is_selected_before_hyprland() {
-        let backups = [
-            (
-                "XDG_SESSION_TYPE".to_string(),
-                env::var_os("XDG_SESSION_TYPE"),
-            ),
-            (
-                "WAYLAND_DISPLAY".to_string(),
-                env::var_os("WAYLAND_DISPLAY"),
-            ),
-            ("SWAYSOCK".to_string(), env::var_os("SWAYSOCK")),
-            (
-                "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
-                env::var_os("HYPRLAND_INSTANCE_SIGNATURE"),
-            ),
-            ("PATH".to_string(), env::var_os("PATH")),
+    fn gnome_backend_is_selected_from_desktop_signal() {
+        let values = [
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "GNOME"),
         ];
+        let backend = resolve_wayland_backend_with_env(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+        .unwrap();
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("window_zones_wayland_{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let swaymsg = temp_dir.join("swaymsg");
-        std::fs::write(&swaymsg, "#!/bin/sh\n").unwrap();
-        let mut perms = std::fs::metadata(&swaymsg).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&swaymsg, perms).unwrap();
+        assert_eq!(backend, WaylandBackend::Gnome);
+    }
 
-        set_env("XDG_SESSION_TYPE", Some("wayland"));
-        set_env("SWAYSOCK", Some("/tmp/sway"));
-        set_env("HYPRLAND_INSTANCE_SIGNATURE", Some("1"));
-        set_env("WAYLAND_DISPLAY", Some("wayland-0"));
-        set_env("PATH", Some(temp_dir.to_str().unwrap()));
+    #[test]
+    fn conflicting_compositor_signals_are_rejected() {
+        let values = [
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("SWAYSOCK", "/tmp/sway"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "instance"),
+        ];
+        let error = resolve_wayland_backend_with_env(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+        .unwrap_err();
 
-        let backend = resolve_wayland_backend_with_env(|name| env::var_os(name)).unwrap();
-        assert_eq!(backend, WaylandBackend::Sway);
+        assert!(matches!(
+            error,
+            WindowSystemError::Platform(message)
+                if message.contains("conflicting Wayland compositor signals")
+        ));
+    }
 
-        restore_env(&backups);
+    #[test]
+    fn unknown_wayland_compositor_is_rejected() {
+        let values = [("XDG_SESSION_TYPE", "wayland")];
+        let error = resolve_wayland_backend_with_env(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WindowSystemError::Platform(message)
+                if message.contains("unknown or conflicting")
+        ));
     }
 
     #[test]

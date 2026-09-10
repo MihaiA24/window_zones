@@ -23,14 +23,12 @@ The platform-neutral core and runtime paths currently include:
 - action execution and config-driven dispatch;
 - X11, Windows, and macOS window adapters;
 - constrained Sway and Hyprland Wayland window adapters;
-- global hotkey registration on supported non-Wayland paths;
+- GNOME Shell 50 companion integration over the versioned user-session D-Bus contract;
+- global hotkey registration on supported non-Wayland paths and GNOME companion paths;
 - CLI and optional Linux/Windows tray runtime controls.
 
 ## Remaining V1 implementation
 
-- Environment-based Wayland compositor detection with explicit errors for unknown, conflicting, or unavailable integrations; no X11 fallback from Wayland.
-- A versioned user-session D-Bus contract and fake-service tests for compositor capabilities, focused windows, displays, moves, and hotkey events.
-- GNOME Shell compositor companion for native Wayland windows and hotkeys.
 - The `tui` subcommand: a stdlib ANSI dashboard using line-oriented commands.
 - KDE/KWin compositor companion for native Wayland windows and hotkeys.
 - Manual Windows, X11, GNOME, KDE, and TUI smoke verification.
@@ -60,6 +58,7 @@ Runbook docs:
 - `docs/runbooks/installation.md`
 - `docs/runbooks/running.md`
 - `docs/runbooks/testing.md`
+- `docs/runbooks/gnome-wayland.md`
 
 ## macOS adapter caveats
 
