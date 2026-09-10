@@ -14,13 +14,16 @@ What this verifies:
 
 ## Current repository status
 
-The repository test script covers formatting, unit/integration tests, doc tests, and clippy when installed. The GNOME adapter tests start a private `dbus-daemon`; they do not require a running GNOME Shell session.
+The repository test script covers formatting, unit/integration tests, doc tests,
+and clippy when installed. The GNOME and KDE adapter contract tests start
+private `dbus-daemon` instances; they do not require a running compositor
+session.
 
-
-The GNOME extension module can be syntax-checked with:
+The compositor scripts can be syntax-checked with:
 
 ```bash
 node --check gnome-extension/extension.js
+node --check kwin-script/contents/code/main.js
 ```
 Merge-ready V1 additionally requires:
 

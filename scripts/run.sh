@@ -17,7 +17,7 @@ elif [[ -x "$PROJECT_ROOT/target/debug/window_zones" ]]; then
   BIN_PATH="$PROJECT_ROOT/target/debug/window_zones"
 elif command -v cargo >/dev/null 2>&1; then
   cd "$PROJECT_ROOT"
-  exec cargo run --locked --release -- "${RUN_ARGS[@]}"
+  exec cargo run --locked --release --bin window_zones -- "${RUN_ARGS[@]}"
 else
   echo "No binary available and cargo is not installed." >&2
   exit 1

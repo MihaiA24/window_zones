@@ -1,8 +1,8 @@
 //! Linux Wayland adapter for `WindowSystem`.
 //!
 //! This adapter selects a compositor-specific implementation when Wayland support is
-//! available (currently GNOME, sway, or Hyprland) and returns explicit diagnostics when
-//! it is not.
+//! available (currently GNOME, KDE Plasma, sway, or Hyprland) and returns explicit
+//! diagnostics when it is not.
 
 use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, WindowSystemError};
 
@@ -17,6 +17,7 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandBackend {
     Gnome,
+    Kde,
     Sway,
     Hyprland,
 }
@@ -36,7 +37,7 @@ impl WaylandWindowSystem {
     fn session_error_for(is_wayland: bool) -> WindowSystemError {
         if is_wayland {
             WindowSystemError::Platform(
-                "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
+                "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), KDE Plasma (KDE_FULL_SESSION/KDE_SESSION_VERSION or KDE desktop variables), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
             )
         } else {
             WindowSystemError::Platform(
@@ -56,6 +57,7 @@ impl WindowSystem for WaylandWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
         match WaylandWindowSystem::backend()? {
             WaylandBackend::Gnome => Err(gnome_backend_error()),
+            WaylandBackend::Kde => Err(kde_backend_error()),
             WaylandBackend::Sway => focused_window_sway(),
             WaylandBackend::Hyprland => focused_window_hypr(),
         }
@@ -64,6 +66,7 @@ impl WindowSystem for WaylandWindowSystem {
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         match WaylandWindowSystem::backend()? {
             WaylandBackend::Gnome => Err(gnome_backend_error()),
+            WaylandBackend::Kde => Err(kde_backend_error()),
             WaylandBackend::Sway => displays_sway(),
             WaylandBackend::Hyprland => displays_hypr(),
         }
@@ -72,6 +75,7 @@ impl WindowSystem for WaylandWindowSystem {
     fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
         match WaylandWindowSystem::backend()? {
             WaylandBackend::Gnome => Err(gnome_backend_error()),
+            WaylandBackend::Kde => Err(kde_backend_error()),
             WaylandBackend::Sway => move_focused_window_sway(window_move),
             WaylandBackend::Hyprland => move_focused_window_hypr(window_move),
         }
@@ -81,6 +85,12 @@ impl WindowSystem for WaylandWindowSystem {
 fn gnome_backend_error() -> WindowSystemError {
     WindowSystemError::Platform(
         "GNOME Wayland requires the org.window_zones.Gnome companion integration".to_string(),
+    )
+}
+
+fn kde_backend_error() -> WindowSystemError {
+    WindowSystemError::Platform(
+        "KDE Plasma Wayland requires the org.window_zones.KWin companion integration".to_string(),
     )
 }
 
@@ -177,16 +187,17 @@ fn resolve_wayland_backend_with_env(
     }
 
     let gnome = is_gnome_session_with_env(&get_env);
+    let kde = is_kde_session_with_env(&get_env);
     let sway = is_sway_session_with_env(&get_env);
     let hyprland = is_hyprland_session_with_env(&get_env);
-    let compositor_count = [gnome, sway, hyprland]
+    let compositor_count = [gnome, kde, sway, hyprland]
         .into_iter()
         .filter(|detected| *detected)
         .count();
 
     if compositor_count > 1 {
         return Err(WindowSystemError::Platform(
-            "conflicting Wayland compositor signals; keep only one of GNOME, Sway, or Hyprland session identities".to_string(),
+            "conflicting Wayland compositor signals; keep only one of GNOME, KDE Plasma, Sway, or Hyprland session identities".to_string(),
         ));
     }
 
@@ -194,11 +205,14 @@ fn resolve_wayland_backend_with_env(
         return Ok(WaylandBackend::Gnome);
     }
 
+    if kde {
+        return Ok(WaylandBackend::Kde);
+    }
+
     if sway {
         if command_exists("swaymsg") {
             return Ok(WaylandBackend::Sway);
         }
-
         return Err(WindowSystemError::Platform(
             "Detected a Sway session but 'swaymsg' is not available in PATH as an executable command. Install swaymsg and ensure it is on PATH.".to_string(),
         ));
@@ -219,6 +233,13 @@ fn resolve_wayland_backend_with_env(
 
 fn is_gnome_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
     get_env("GNOME_DESKTOP_SESSION_ID").is_some() || desktop_signal_matches(&get_env, "gnome")
+}
+
+fn is_kde_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
+    get_env("KDE_FULL_SESSION").is_some()
+        || get_env("KDE_SESSION_VERSION").is_some()
+        || desktop_signal_matches(&get_env, "kde")
+        || desktop_signal_matches(&get_env, "plasma")
 }
 
 fn is_sway_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
@@ -579,6 +600,47 @@ mod tests {
         ));
 
         restore_env(&backups);
+    }
+
+    #[test]
+    fn kde_backend_is_selected_from_plasma_signals_even_with_xwayland_display() {
+        let values = [
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "KDE"),
+            ("KDE_SESSION_VERSION", "6"),
+            ("DISPLAY", ":0"),
+        ];
+        let backend = resolve_wayland_backend_with_env(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+        .unwrap();
+
+        assert_eq!(backend, WaylandBackend::Kde);
+    }
+
+    #[test]
+    fn kde_and_gnome_signals_are_rejected_as_conflicting() {
+        let values = [
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "KDE:GNOME"),
+            ("KDE_SESSION_VERSION", "6"),
+        ];
+        let error = resolve_wayland_backend_with_env(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WindowSystemError::Platform(message)
+                if message.contains("conflicting Wayland compositor signals")
+        ));
     }
 
     #[test]

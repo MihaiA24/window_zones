@@ -21,16 +21,13 @@ The platform-neutral core and runtime paths currently include:
 - TOML config parsing, discovery, reload, and atomic rollback;
 - the `WindowSystem` and `HotkeySystem` adapter contracts;
 - action execution and config-driven dispatch;
-- X11, Windows, and macOS window adapters;
-- constrained Sway and Hyprland Wayland window adapters;
 - GNOME Shell 50 companion integration over the versioned user-session D-Bus contract;
-- global hotkey registration on supported non-Wayland paths and GNOME companion paths;
-- CLI and optional Linux/Windows tray runtime controls.
+- native KDE Plasma Wayland KWin script and companion integration;
+- global hotkey registration on supported non-Wayland paths, GNOME, and KDE companion paths;
+- CLI, stdlib ANSI TUI, and optional Linux/Windows tray runtime controls.
 
-## Remaining V1 implementation
+## Remaining V1 verification
 
-- The `tui` subcommand: a stdlib ANSI dashboard using line-oriented commands.
-- KDE/KWin compositor companion for native Wayland windows and hotkeys.
 - Manual Windows, X11, GNOME, KDE, and TUI smoke verification.
 
 The merge-ready V1 release gates are Windows, Linux X11, KDE Wayland, and GNOME Wayland. macOS remains source-compatible but non-blocking; Sway and Hyprland remain constrained backends.
@@ -53,12 +50,11 @@ Use these helper scripts for common workflows:
 - `./scripts/run.sh` — run the binary with safe defaults for quick checks.
 - `./scripts/test.sh` — run formatting, test, and lint checks.
 
-Runbook docs:
-
 - `docs/runbooks/installation.md`
 - `docs/runbooks/running.md`
 - `docs/runbooks/testing.md`
 - `docs/runbooks/gnome-wayland.md`
+- `docs/runbooks/kde-wayland.md`
 
 ## macOS adapter caveats
 

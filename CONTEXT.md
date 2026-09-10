@@ -14,6 +14,7 @@
 
 - **Companion**: The compositor-owned counterpart to the App that exposes a compositor integration for a desktop session. _Avoid_: helper, backend.
 - **GNOME integration**: The compositor integration for a GNOME Wayland session, consisting of the GNOME Shell companion and its App-facing connection. _Avoid_: generic Wayland backend.
+- **KDE integration**: The compositor integration for a KDE Plasma Wayland session, consisting of the KWin script, Rust companion service, and their App-facing D-Bus connection. _Avoid_: generic Wayland backend.
 
 - **Capability**: A specific operation a compositor integration can provide to the App, such as focused-window discovery, display enumeration, move/resize, or hotkey registration.
 - **Degraded integration**: A present compositor integration that lacks one or more capabilities; actions relying on missing capabilities fail explicitly while available operations remain usable. _Avoid_: unavailable integration.
@@ -35,7 +36,7 @@
 
 - **Hotkey vocabulary**: The App's canonical binding-string form shared with a Companion; the Companion maps it to local accelerator syntax and may reject unsupported entries.
 
-- **Companion-unavailable state**: An App runtime state in which the session resolves to GNOME but its Companion cannot be reached or accepted; configuration remains valid while operations fail explicitly and recovery is retried.
+- **Companion-unavailable state**: An App runtime state in which the resolved GNOME or KDE Companion cannot be reached or accepted; configuration remains valid while operations fail explicitly and recovery is retried.
 
 - **Focused window**: The existing application Window currently eligible for an Action; desktop, overview, lock-screen, and other Shell surfaces are not focused windows.
 

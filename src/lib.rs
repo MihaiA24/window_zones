@@ -13,6 +13,8 @@ pub mod geometry;
 #[cfg(target_os = "linux")]
 pub mod gnome_integration;
 pub mod hotkey_system;
+#[cfg(target_os = "linux")]
+pub mod kwin_integration;
 #[cfg(target_os = "macos")]
 pub mod macos_window_system;
 pub mod runtime;
@@ -42,6 +44,11 @@ pub use gnome_integration::{
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub use hotkey_system::RdevHotkeySystem;
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
+#[cfg(target_os = "linux")]
+pub use kwin_integration::{
+    KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_PROTOCOL_MAJOR, KWIN_SERVICE_NAME, KwinHotkeySystem,
+    KwinIntegrationError, KwinWindowSystem, run_kwin_companion_service,
+};
 #[cfg(target_os = "macos")]
 pub use macos_window_system::MacOSWindowSystem;
 pub use runtime::{
