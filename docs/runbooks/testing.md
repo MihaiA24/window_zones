@@ -50,7 +50,7 @@ in each corresponding Synthetic session.
 | TUI lifecycle (GNOME) | pending | GNOME Shell Wayland Synthetic session | pending | pending | `./scripts/smoke.sh gnome` |
 | TUI lifecycle (X11) | blocking - pass | Same Xvfb + Openbox Synthetic session | Same as Linux X11; `reload`, `restart`, `status`, `dispatch HOTKEY`, `quit` all asserted | 2026-09-11 | `./scripts/smoke.sh x11` |
 | KDE Plasma Wayland | deferred - unverified | KDE Plasma Wayland with KWin 6.x | unverified | — | Run a Smoke run on a real KWin 6.x session; this closes the Release gate. |
-| Windows | deferred - unverified | Windows desktop session | unverified | — | Run the manual verification in `docs/runbooks/windows-smoke.md`; the `windows-latest` CI job holds the compile line meanwhile. This closes the Release gate. |
+| Windows | deferred - unverified; does not build | Windows desktop session | `windows-latest` CI compiles `src/windows_window_system.rs` against `windows` 0.58 with 9 errors (`MONITORINFOEXW` field access, `BOOL` vs `Result` returns), so no Smoke run is possible yet | 2026-09-11 | `windows` job in `.github/workflows/ci.yml`; after it is green, run `docs/runbooks/windows-smoke.md` to close the Release gate. |
 
 ### Minimum verification
 
