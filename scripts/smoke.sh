@@ -309,6 +309,15 @@ hotkey = "Alt+Ctrl+Down"
 action = { type = "move-to-next-display" }
 EOF
 }
+write_x11_valid_config() {
+    write_valid_config
+    cat >>"$CONFIG_PATH" <<'EOF'
+
+[[bindings]]
+hotkey = "Alt+Ctrl+Shift+Right"
+action = { type = "move-to-previous-display" }
+EOF
+}
 
 write_invalid_config() {
     cat >"$CONFIG_PATH" <<'EOF'
@@ -2141,7 +2150,13 @@ run_x11() {
     export XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME"
     export XDG_SESSION_TYPE=x11
     unset WAYLAND_DISPLAY
-    write_valid_config
+    write_x11_valid_config
+    local auto_backend_output=''
+    auto_backend_output=$(env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 \
+        XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" \
+        "$BIN_PATH" --backend auto --config "$CONFIG_PATH" status 2>&1 || true)
+    assert_text 'X11 auto backend resolves x11' 'Using runtime window backend: x11' \
+        "$auto_backend_output"
     local editor_log="$X11_ROOT/editor.log" editor_pid
     editor_pid=$(start_group "$editor_log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
         XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11 HOME="$X11_HOME" \
@@ -2184,8 +2199,15 @@ run_x11() {
         center_x=-1
     fi
     assert_eq 'X11 cross-display observer sees second monitor' 1 "$((center_x >= 1920 && center_x < 3520 ? 1 : 0))"
-    # Move back to the left display before the hotkey baseline; X11 has no
-    # configured previous-display binding in this smoke config.
+    # Put the frame back on the first display as a recognized built-in zone so
+    # previous-display exercises index-0 wrapping to the last display.
+    DISPLAY="$X11_DISPLAY" xdotool windowmove "$WINDOW_ID" 0 0 >/dev/null 2>&1 || true
+    DISPLAY="$X11_DISPLAY" xdotool windowsize "$WINDOW_ID" 1280 1080 >/dev/null 2>&1 || true
+    DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
+    wait_x11_geometry '0,0,1280,1080' 5 >/dev/null || true
+    run_x11_dispatch previous-display alt+ctrl+shift+right '1920,0,1067,1080'
+    x11_assert_geometry 'x11-previous-display' '1920,0,1067,1080'
+    # Move back to the left display before the hotkey baseline.
     DISPLAY="$X11_DISPLAY" xdotool windowmove "$WINDOW_ID" 640 0 >/dev/null 2>&1 || true
     DISPLAY="$X11_DISPLAY" xdotool windowsize "$WINDOW_ID" 640 1080 >/dev/null 2>&1 || true
     DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
@@ -2252,8 +2274,8 @@ run_x11() {
     fi
     send_app status
     sleep 0.3
-    assert_text 'X11 invalid reload preserves previous bindings' 'binding count: 4' "$(<"$run_log")"
-    write_valid_config
+    assert_text 'X11 invalid reload preserves previous bindings' 'binding count: 5' "$(<"$run_log")"
+    write_x11_valid_config
     sleep 0.3
     send_app reload
     sleep 0.5
