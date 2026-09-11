@@ -341,8 +341,10 @@ fn resolve_config_path_for(
         #[cfg(any(test, target_os = "linux"))]
         Platform::Linux => Ok(_get_env("XDG_CONFIG_HOME")
             .filter(|value| !value.is_empty())
+            // XDG absoluteness is POSIX, not host-defined: Path::is_absolute() is false for "/xdg"
+            // when the test suite runs on Windows.
+            .filter(|value| value.as_encoded_bytes().starts_with(b"/"))
             .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
             .or_else(|| {
                 _get_env("HOME")
                     .filter(|value| !value.is_empty())
