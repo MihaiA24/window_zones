@@ -10,6 +10,7 @@ See:
 - `docs/adr/0001-v1-window-positioning-utility.md` for the V1 boundary and first implementation slice.
 - `docs/adr/0002-runtime-config-reload-atomicity.md` for runtime reload error and atomicity behavior.
 - `docs/adr/0003-wayland-compositor-integrations.md` for native Wayland routing and companion integration decisions.
+- `docs/adr/0007-v1-release-gates-and-verification.md` for V1 Release gates and Synthetic session verification.
 
 ## Implemented today
 
@@ -28,9 +29,9 @@ The platform-neutral core and runtime paths currently include:
 
 ## Remaining V1 verification
 
-- Manual Windows, X11, GNOME, KDE, and TUI smoke verification.
-
-The merge-ready V1 release gates are Windows, Linux X11, KDE Wayland, and GNOME Wayland. macOS remains source-compatible but non-blocking; Sway and Hyprland remain constrained backends.
+- Run the GNOME Wayland and Linux X11 blocking Release gates, including TUI lifecycle Smoke runs, in Synthetic sessions.
+- KDE Plasma Wayland and Windows are implemented but deferred and non-blocking until a real KWin 6.x Smoke run and the manual run in `docs/runbooks/windows-smoke.md`, respectively.
+- macOS remains source-compatible and non-blocking; Sway and Hyprland remain constrained backends.
 
 ## Configuration discovery
 
@@ -49,6 +50,7 @@ Use these helper scripts for common workflows:
 - `./scripts/install.sh` — build and install the `window_zones` binary.
 - `./scripts/run.sh` — run the binary with safe defaults for quick checks.
 - `./scripts/test.sh` — run formatting, test, and lint checks.
+- `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs.
 
 - `docs/runbooks/installation.md`
 - `docs/runbooks/running.md`

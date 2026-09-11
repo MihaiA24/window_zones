@@ -49,3 +49,11 @@
 - **Native Wayland support**: An App operation performed through the current compositor's integration; an X11 or XWayland path is not equivalent support.
 
 - **Active controller**: The single App instance currently authorized to own a Companion's registered hotkey set; other App instances may inspect but cannot replace it until disconnect.
+
+- **Release gate**: A platform configuration whose passing Smoke run is required before a release; a gate is _blocking_ when the release cannot ship without that pass, or _deferred_ when the release ships with the integration implemented but unverified. _Avoid_: supported platform.
+
+- **Smoke run**: One execution of the fixed end-to-end check sequence for a Release gate against a single configuration, yielding a pass or a named failure.
+
+- **Verified configuration**: The exact desktop session, compositor, and operating system versions a Smoke run passed against; behavior outside it is unverified rather than assumed.
+
+- **Synthetic session**: A desktop session created solely for verification, with virtual displays and no physical seat; it exercises the same compositor as a user session but cannot evidence physical display or input hardware behavior. _Avoid_: simulated desktop, mock compositor.
