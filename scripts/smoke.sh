@@ -121,6 +121,43 @@ wait_for_text() {
     return 1
 }
 
+count_text() {
+    local file=$1 needle=$2
+    grep -c -- "$needle" "$file" 2>/dev/null || printf '0'
+}
+
+wait_for_new_text() {
+    # A status line only proves anything if it was printed after the event under test, so wait for
+    # an occurrence beyond the ones already in the log.
+    local file=$1 needle=$2 before=$3 timeout_s=${4:-10}
+    local deadline=$((SECONDS + timeout_s))
+    while (( SECONDS < deadline )); do
+        if (( $(count_text "$file" "$needle") > before )); then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+sorted_hotkey() {
+    # Modifier order is the App's canonical choice, not the harness's business; compare token sets.
+    printf '%s' "$1" | tr '+' '\n' | sed '/^$/d' | sort | tr '\n' '+' | sed 's/+$//'
+}
+
+wait_for_reported_action() {
+    local file=$1 label=$2 timeout_s=${3:-10}
+    local deadline=$((SECONDS + timeout_s)) value=''
+    while (( SECONDS < deadline )); do
+        value=$(sed -n "s/^ *$label//p" "$file" 2>/dev/null | grep -v '<none>' | tail -1)
+        if [[ -n "$value" ]]; then
+            break
+        fi
+        sleep 0.2
+    done
+    printf '%s' "$value"
+}
+
 wait_for_file() {
     local file=$1 timeout_s=${2:-30}
     local deadline=$((SECONDS + timeout_s))
@@ -576,12 +613,68 @@ gnome_live_geometry() {
             HEIGHT) height=$value ;;
         esac
     done <<<"$geometry"
+    # A GTK client under XWayland owns its shadow: the X window is _GTK_FRAME_EXTENTS larger on
+    # every side than the frame the compositor places. Inset it so the observer and the Companion
+    # describe the same rectangle.
+    local extents left=0 right=0 top=0 bottom=0
+    extents=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
+        xprop -id "$WINDOW_ID" _GTK_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p')
+    if [[ "$extents" =~ ^([0-9]+),\ ([0-9]+),\ ([0-9]+),\ ([0-9]+)$ ]]; then
+        left=${BASH_REMATCH[1]}
+        right=${BASH_REMATCH[2]}
+        top=${BASH_REMATCH[3]}
+        bottom=${BASH_REMATCH[4]}
+    fi
     if [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ \
         && "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
-        printf '%s,%s,%s,%s' "$x" "$y" "$width" "$height"
+        printf '%s,%s,%s,%s' "$((x + left))" "$((y + top))" \
+            "$((width - left - right))" "$((height - top - bottom))"
     else
         printf 'unavailable'
     fi
+}
+
+gnome_live_zone_targets() {
+    # A live session can drive several monitors and the test window need not open on the first one,
+    # so derive every expectation from the display the Companion reports for the focused window,
+    # and derive the cross-display expectation from the display a next-display move lands on.
+    local focused present display x y w h id
+    local area='' next_area='' found=-1 total=0 index=0
+    focused=$(get_gnome_focused)
+    IFS='|' read -r present display x y w h <<<"$focused"
+    [[ "$present" == 'true' ]] || return 0
+    while IFS='|' read -r id x y w h; do
+        [[ -n "$id" ]] || continue
+        if [[ "$id" == "$display" ]]; then
+            found=$total
+            area="$x|$y|$w|$h"
+        fi
+        total=$((total + 1))
+    done <<<"$GNOME_LIVE_DISPLAY_LINES"
+    (( found >= 0 )) || return 0
+    while IFS='|' read -r id x y w h; do
+        [[ -n "$id" ]] || continue
+        if (( index == (found + 1) % total )); then
+            next_area="$x|$y|$w|$h"
+            GNOME_LIVE_NEXT_DISPLAY_ID="$id"
+        fi
+        index=$((index + 1))
+    done <<<"$GNOME_LIVE_DISPLAY_LINES"
+    GNOME_LIVE_DISPLAY_ID="$display"
+    IFS='|' read -r GNOME_LIVE_X GNOME_LIVE_Y GNOME_LIVE_W GNOME_LIVE_H <<<"$area"
+    GNOME_LIVE_LEFT_HALF="$GNOME_LIVE_X,$GNOME_LIVE_Y,$((GNOME_LIVE_W / 2)),$GNOME_LIVE_H"
+    GNOME_LIVE_CENTER_THIRD="$((GNOME_LIVE_X + GNOME_LIVE_W / 3)),$GNOME_LIVE_Y,$((GNOME_LIVE_W - 2 * (GNOME_LIVE_W / 3))),$GNOME_LIVE_H"
+    GNOME_LIVE_TWO_THIRDS="$GNOME_LIVE_X,$GNOME_LIVE_Y,$((GNOME_LIVE_W - GNOME_LIVE_W / 3)),$GNOME_LIVE_H"
+    GNOME_LIVE_NEXT_TWO_THIRDS=''
+    GNOME_LIVE_NEXT_DISPLAY_ID="${GNOME_LIVE_NEXT_DISPLAY_ID:-}"
+    GNOME_LIVE_DISPLAY_TOTAL=$total
+    if (( total > 1 )) && [[ -n "$next_area" ]]; then
+        local next_x next_y next_w next_h
+        IFS='|' read -r next_x next_y next_w next_h <<<"$next_area"
+        # A cross-display move keeps a recognised zone, so left-two-thirds stays left-two-thirds.
+        GNOME_LIVE_NEXT_TWO_THIRDS="$next_x,$next_y,$((next_w - next_w / 3)),$next_h"
+    fi
+    log "GNOME live zones follow $GNOME_LIVE_DISPLAY_ID ($area); next-display two-thirds: ${GNOME_LIVE_NEXT_TWO_THIRDS:-none}"
 }
 
 gnome_live_active_window() {
@@ -614,20 +707,79 @@ gnome_live_find_window() {
     [[ -n "$WINDOW_ID" ]]
 }
 
+write_uinput_injector() {
+    UINPUT_INJECTOR="$TMP_DIR/uinput_key.py"
+    [[ -s "$UINPUT_INJECTOR" ]] && return 0
+    cat >"$UINPUT_INJECTOR" <<'PY'
+"""Press one accelerator on a kernel virtual keyboard.
+
+Xwayland XTEST events never reach a compositor-level accelerator grab, so the only way to
+evidence real hotkey capture on a seated GNOME session is a device libinput can see.
+"""
+import fcntl, os, struct, sys, time
+
+UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+EV_SYN, EV_KEY, SYN_REPORT = 0, 1, 0
+KEYS = {
+    'ctrl': 29, 'alt': 56, 'shift': 42, 'super': 125, 'cmd': 125,
+    'left': 105, 'right': 106, 'up': 103, 'down': 108, 'pause': 119,
+}
+
+combo = [KEYS[name] for name in sys.argv[1].lower().split('+')]
+fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+try:
+    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+    for code in dict.fromkeys(combo):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, code)
+    os.write(fd, struct.pack('=80sHHHHI' + 'i' * 256,
+                             b'window-zones-smoke', 3, 0x6a6a, 0x6b6b, 1, 0, *([0] * 256)))
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    time.sleep(1.0)  # libinput has to notice the device before it forwards anything
+
+    def emit(etype, code, value):
+        # native 'l' matches the kernel's time fields: 24 bytes on LP64, 16 on 32-bit
+        os.write(fd, struct.pack('llHHi', 0, 0, etype, code, value))
+
+    for code in combo:
+        emit(EV_KEY, code, 1)
+        emit(EV_SYN, SYN_REPORT, 0)
+    time.sleep(0.05)
+    for code in reversed(combo):
+        emit(EV_KEY, code, 0)
+        emit(EV_SYN, SYN_REPORT, 0)
+    time.sleep(0.3)
+    fcntl.ioctl(fd, UI_DEV_DESTROY)
+finally:
+    os.close(fd)
+PY
+}
+
 gnome_live_inject_hotkey() {
     local output='' rc=0
+    if [[ -w /dev/uinput ]]; then
+        write_uinput_injector
+        if output=$(python3 "$UINPUT_INJECTOR" "$GNOME_SAFE_UINPUT_KEY" 2>&1); then
+            rc=0
+        else
+            rc=$?
+        fi
+        log "GNOME live uinput hotkey $GNOME_SAFE_HOTKEY: exit $rc${output:+ output '$output'}"
+        return "$rc"
+    fi
     if output=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
         xdotool key --clearmodifiers "$GNOME_SAFE_XDOT_KEY" 2>&1); then
         rc=0
     else
         rc=$?
     fi
-    log "GNOME live XTEST hotkey $GNOME_SAFE_HOTKEY: exit $rc${output:+ output '$output'}"
+    log "GNOME live XTEST hotkey $GNOME_SAFE_HOTKEY: exit $rc${output:+ output '$output'} (/dev/uinput not writable; XTEST does not reach compositor grabs)"
     return "$rc"
 }
 
 gnome_live_capture() {
-    local label=$1 path="$TMP_DIR/${CURRENT_GATE}-${label}.png"
+    local label=$1
+    local path="$TMP_DIR/${CURRENT_GATE}-${label}.png"
     local capture_log="$TMP_DIR/${CURRENT_GATE}-${label}-ffmpeg.log"
     local geometry width height
     LAST_SHOT=''
@@ -644,7 +796,7 @@ gnome_live_capture() {
             LAST_SHOT="$path"
             log "SCREENSHOT $label: $path (ffmpeg x11grab root ${width}x${height})"
         else
-            log "SCREENSHOT $label: unavailable (ffmpeg x11grab failed; log $capture_log: $(<"$capture_log" 2>/dev/null || true))"
+            log "SCREENSHOT $label: unavailable (ffmpeg x11grab failed; log $capture_log: $(cat "$capture_log" 2>/dev/null || true))"
         fi
     else
         log "SCREENSHOT $label: unavailable (xdotool root geometry unavailable; ffmpeg not attempted)"
@@ -652,7 +804,8 @@ gnome_live_capture() {
 }
 
 gnome_live_focus_baseline() {
-    local timeout_s=${1:-10} deadline=$((SECONDS + timeout_s))
+    local timeout_s=${1:-10}
+    local deadline=$((SECONDS + timeout_s))
     local focused='' observed='' active='' present='' display='' x='' y='' width='' height=''
     GNOME_LIVE_FOCUS_X11=''
     GNOME_LIVE_FOCUS_COMPANION=''
@@ -691,7 +844,8 @@ gnome_live_assert_focus() {
 }
 
 gnome_live_assert_geometry() {
-    local name=$1 expected=$2 deadline=$((SECONDS + 10))
+    local name=$1 expected=$2 expected_display=${3:-$GNOME_LIVE_DISPLAY_ID}
+    local deadline=$((SECONDS + 10))
     local observed_x11='' observed_companion='' focused=''
     local present='' display='' x='' y='' width='' height=''
     local expected_x='' expected_y='' expected_width='' expected_height=''
@@ -704,7 +858,7 @@ gnome_live_assert_geometry() {
         observed_companion="$focused"
         if [[ "$observed_x11" == "$expected" \
             && "$present" == 'true' \
-            && "$display" == "$GNOME_LIVE_DISPLAY_ID" \
+            && "$display" == "$expected_display" \
             && "$x,$y,$width,$height" == "$expected" ]]; then
             break
         fi
@@ -713,7 +867,7 @@ gnome_live_assert_geometry() {
     log "OBSERVED $name: companion='$observed_companion' xdotool='$observed_x11'"
     assert_eq "$name xdotool geometry" "$expected" "$observed_x11"
     assert_eq "$name companion geometry" \
-        "true|$GNOME_LIVE_DISPLAY_ID|$expected_x|$expected_y|$expected_width|$expected_height" \
+        "true|$expected_display|$expected_x|$expected_y|$expected_width|$expected_height" \
         "$observed_companion"
     gnome_live_capture "$name"
 }
@@ -748,7 +902,9 @@ EOF
 }
 
 run_gnome_live_dispatch() {
-    local label=$1 hotkey=$2 out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log" rc=0
+    local label=$1 hotkey=$2 rc=0
+    local out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log"
+    gnome_live_activate_window || true
     if env XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
@@ -898,7 +1054,7 @@ try {
     proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [['alt+ctrl+left', 'alt+ctrl+F25']]), Gio.DBusCallFlags.NONE, 5000, null);
     print('INVALID_ACCEPTED');
 } catch (error) {
-    print(`INVALID_REJECTED ${error.name}`);
+    print(`INVALID_REJECTED ${Gio.DBusError.get_remote_error(error)}`);
 }
 GLib.usleep(15000000);
 EOF
@@ -906,16 +1062,16 @@ EOF
     local monitor_pid helper_pid rc=0
     monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor --session \
         --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome)
-    helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gjs "$helper")
+    helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gjs -m "$helper")
     if ! wait_for_text "$helper_log" 'VALID_OK' 8; then
-        assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(<"$helper_log" 2>/dev/null || true)"
+        assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(cat "$helper_log" 2>/dev/null || true)"
         return 0
     fi
     assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(<"$helper_log")"
     if wait_for_text "$helper_log" 'INVALID_REJECTED' 8; then
         assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(<"$helper_log")"
     else
-        assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(<"$helper_log" 2>/dev/null || true)"
+        assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(cat "$helper_log" 2>/dev/null || true)"
     fi
     if find_gnome_xwayland; then
         : >"$monitor_log"
@@ -924,7 +1080,7 @@ EOF
         if wait_for_text "$monitor_log" 'HotkeyPressed' 5; then
             assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(<"$monitor_log")"
         else
-            assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(<"$monitor_log" 2>/dev/null || true)"
+            assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(cat "$monitor_log" 2>/dev/null || true)"
             log 'Harness limitation GNOME hotkey injection: headless Shell has no physical input seat'
         fi
     else
@@ -941,9 +1097,9 @@ run_gnome_hotkey_and_disconnect() {
     if wait_for_text "$run_log" 'Interactive session started' 15; then
         assert_text 'GNOME run starts' 'Interactive session started' "$(<"$run_log")"
     else
-        assert_text 'GNOME run starts' 'Interactive session started' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'GNOME run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
     fi
-    assert_text 'GNOME hotkeys initially register' 'Hotkey registration initially' "$(<"$run_log" 2>/dev/null || true)"
+    assert_text 'GNOME hotkeys initially register' 'Hotkey registration initially' "$(cat "$run_log" 2>/dev/null || true)"
     : >"$monitor_log"
     local monitor_pid=''
     if monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor \
@@ -957,7 +1113,7 @@ run_gnome_hotkey_and_disconnect() {
                 sleep 0.5
                 assert_text 'GNOME signal resolves configured action' 'last action: alt+ctrl+left' "$(<"$run_log")"
             else
-                assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' "$(<"$monitor_log" 2>/dev/null || true)"
+                assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' "$(cat "$monitor_log" 2>/dev/null || true)"
                 log 'Harness limitation GNOME hotkey injection: headless Shell has no physical input seat'
             fi
         else
@@ -976,7 +1132,7 @@ run_gnome_hotkey_and_disconnect() {
         sleep 0.2
     done
     assert_text 'GNOME companion disable call' 'true' "$disable_out"
-    assert_text 'GNOME disconnect surfaces explicit unavailable state' 'GNOME companion is unavailable' "$(<"$run_log" 2>/dev/null || true)"
+    assert_text 'GNOME disconnect surfaces explicit unavailable state' 'GNOME companion is unavailable' "$(cat "$run_log" 2>/dev/null || true)"
 
     enable_out=$(gnome_shell_call /org/gnome/Shell org.gnome.Shell.Extensions.EnableExtension window-zones@mihai-a24 2>&1 || true)
     deadline=$((SECONDS + 15))
@@ -989,7 +1145,7 @@ run_gnome_hotkey_and_disconnect() {
     if wait_for_text "$run_log" 'Hotkey registration now recovered' 12; then
         assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(<"$run_log")"
     else
-        assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(cat "$run_log" 2>/dev/null || true)"
     fi
     stop_app_cleanly 'GNOME run quits cleanly' "$run_log"
 }
@@ -1000,7 +1156,7 @@ run_tui_lifecycle() {
     if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
         assert_text "$label TUI starts" 'Window Zones TUI' "$(<"$tui_log")"
     else
-        assert_text "$label TUI starts" 'Window Zones TUI' "$(<"$tui_log" 2>/dev/null || true)"
+        assert_text "$label TUI starts" 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
     before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
@@ -1031,7 +1187,7 @@ run_tui_lifecycle() {
     if wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8; then
         assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(<"$tui_log")"
     else
-        assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(<"$tui_log" 2>/dev/null || true)"
+        assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
     send_app quit
@@ -1140,7 +1296,7 @@ try {
         Gio.DBusCallFlags.NONE, 5000, null);
     print('VALID_OK');
 } catch (error) {
-    print(`VALID_FAILED ${error.name} ${error.message}`);
+    print(`VALID_FAILED ${Gio.DBusError.get_remote_error(error)} ${error.message}`);
 }
 GLib.usleep(3000000);
 try {
@@ -1148,7 +1304,7 @@ try {
         Gio.DBusCallFlags.NONE, 5000, null);
     print('INVALID_ACCEPTED');
 } catch (error) {
-    print(`INVALID_REJECTED ${error.name} ${error.message}`);
+    print(`INVALID_REJECTED ${Gio.DBusError.get_remote_error(error)} ${error.message}`);
 }
 GLib.usleep(10000000);
 try {
@@ -1163,12 +1319,12 @@ EOF
         gdbus monitor --session --dest org.window_zones.Gnome \
         --object-path /org/window_zones/Gnome)
     helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-        LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs "$helper")
+        LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper")
     if wait_for_text "$helper_log" 'VALID_OK' 8; then
         assert_text 'GNOME live atomic valid registration' 'VALID_OK' "$(<"$helper_log")"
     else
         assert_text 'GNOME live atomic valid registration' 'VALID_OK' \
-            "$(<"$helper_log" 2>/dev/null || true)"
+            "$(cat "$helper_log" 2>/dev/null || true)"
     fi
 
     gnome_live_inject_hotkey || true
@@ -1184,9 +1340,9 @@ EOF
     else
         assert_text 'GNOME live atomic invalid registration is refused' \
             'INVALID_REJECTED org.window_zones.Gnome.Error.Unsupported' \
-            "$(<"$helper_log" 2>/dev/null || true)"
+            "$(cat "$helper_log" 2>/dev/null || true)"
         assert_text 'GNOME live atomic invalid accelerator is named' 'f25' \
-            "$(<"$helper_log" 2>/dev/null || true)"
+            "$(cat "$helper_log" 2>/dev/null || true)"
     fi
     gnome_live_inject_hotkey || true
     sleep 0.5
@@ -1315,7 +1471,7 @@ run_gnome_live_app_checks() {
         assert_text 'GNOME live App starts' 'Interactive session started' "$(<"$run_log")"
     else
         assert_text 'GNOME live App starts' 'Interactive session started' \
-            "$(<"$run_log" 2>/dev/null || true)"
+            "$(cat "$run_log" 2>/dev/null || true)"
     fi
 
     if [[ -n "${APP_FD:-}" ]]; then
@@ -1326,7 +1482,7 @@ run_gnome_live_app_checks() {
         assert_text 'GNOME live safe hotkeys register' 'hotkey state: Registered' "$(<"$run_log")"
     else
         assert_text 'GNOME live safe hotkeys register' 'hotkey state: Registered' \
-            "$(<"$run_log" 2>/dev/null || true)"
+            "$(cat "$run_log" 2>/dev/null || true)"
     fi
     log "GNOME live safe binding registration verified: $registered ($GNOME_SAFE_LEFT_HOTKEY)"
 
@@ -1367,26 +1523,48 @@ run_gnome_live_app_checks() {
     if [[ -n "${APP_FD:-}" ]]; then
         send_app status
     fi
-    if wait_for_text "$run_log" "last action: $GNOME_SAFE_LEFT_HOTKEY" 10; then
-        assert_text 'GNOME live real hotkey reports action' \
-            "last action: $GNOME_SAFE_LEFT_HOTKEY" "$(<"$run_log")"
-    else
-        assert_text 'GNOME live real hotkey reports action' \
-            "last action: $GNOME_SAFE_LEFT_HOTKEY" "$(<"$run_log" 2>/dev/null || true)"
-    fi
+    # The App reports the canonical binding, which orders modifiers its own way, so compare the
+    # token set rather than the spelling the config happens to use.
+    assert_eq 'GNOME live real hotkey reports action' \
+        "$(sorted_hotkey "$GNOME_SAFE_LEFT_HOTKEY")" \
+        "$(sorted_hotkey "$(wait_for_reported_action "$run_log" 'last action: ' 10)")"
 
-    local disconnect_reason='not exercised: gnome-live never toggles extensions in the user session'
-    skip_assert 'GNOME live companion disable call' "$disconnect_reason"
-    skip_assert 'GNOME live disconnect surfaces explicit unavailable state' "$disconnect_reason"
-    skip_assert 'GNOME live disconnect keeps native backend' "$disconnect_reason"
-    skip_assert 'GNOME live App survives companion disconnect' "$disconnect_reason"
-    skip_assert 'GNOME live companion enable call' "$disconnect_reason"
-    skip_assert 'GNOME live companion service recovery' "$disconnect_reason"
-    skip_assert 'GNOME live extension errors empty after recovery' "$disconnect_reason"
-    skip_assert 'GNOME live companion recovers without App restart' "$disconnect_reason"
-    skip_assert 'GNOME live App PID unchanged after recovery' "$disconnect_reason"
-    log 'SCREENSHOT companion-disconnected: not attempted (live extension toggles are prohibited)'
-    log 'SCREENSHOT companion-recovered: not attempted (live extension toggles are prohibited)'
+    # Disconnect and recovery on the seated session. The toggle is scoped and reverted: the
+    # extension is disabled through GNOME's own D-Bus call and re-enabled before the gate ends,
+    # and gnome_live_finish asserts enabled-extensions came back unchanged.
+    local app_pid_before="${APP_PID:-}" disable_out enable_out errors_after
+    local backend_after='' pid_alive=0 pid_same=0 companion_back=0
+    disable_out=$(gnome_shell_call /org/gnome/Shell \
+        org.gnome.Shell.Extensions.DisableExtension window-zones@mihai-a24 2>&1 || true)
+    log "GNOME live companion disable: $disable_out"
+    assert_text 'GNOME live companion disable call' 'true' "$disable_out"
+    # The App notices the loss on its next poll of the companion, which is not instant.
+    wait_for_text "$run_log" 'GNOME companion is unavailable' 45 || true
+    assert_text 'GNOME live disconnect surfaces explicit unavailable state' \
+        'GNOME companion is unavailable' "$(cat "$run_log" 2>/dev/null || true)"
+    send_app status
+    # Every backend line the App ever printed must still name the native path: no X11 fallback.
+    backend_after=$(sed -n 's/^Window backend: //p' "$run_log" | sort -u | tr '\n' ',' | sed 's/,$//')
+    assert_eq 'GNOME live disconnect keeps native backend' 'gnome-wayland' "$backend_after"
+    kill -0 "$app_pid_before" 2>/dev/null && pid_alive=1
+    assert_eq 'GNOME live App survives companion disconnect' 1 "$pid_alive"
+    gnome_live_capture companion-disconnected
+
+    enable_out=$(gnome_shell_call /org/gnome/Shell \
+        org.gnome.Shell.Extensions.EnableExtension window-zones@mihai-a24 2>&1 || true)
+    log "GNOME live companion enable: $enable_out"
+    assert_text 'GNOME live companion enable call' 'true' "$enable_out"
+    gnome_live_wait_companion 20 && companion_back=1
+    assert_eq 'GNOME live companion service recovery' 1 "$companion_back"
+    errors_after=$(gnome_shell_call /org/gnome/Shell \
+        org.gnome.Shell.Extensions.GetExtensionErrors window-zones@mihai-a24 2>&1 || true)
+    assert_text 'GNOME live extension errors empty after recovery' '[]' "$errors_after"
+    wait_for_text "$run_log" 'Hotkey registration now recovered' 45 || true
+    assert_text 'GNOME live companion recovers without App restart' \
+        'Hotkey registration now recovered' "$(cat "$run_log" 2>/dev/null || true)"
+    kill -0 "$app_pid_before" 2>/dev/null && pid_same=1
+    assert_eq 'GNOME live App PID unchanged after recovery' 1 "$pid_same"
+    gnome_live_capture companion-recovered
 
     run_gnome_live_dispatch config-baseline "$GNOME_SAFE_RIGHT_HOTKEY"
     gnome_live_assert_geometry config-baseline "$GNOME_LIVE_TWO_THIRDS"
@@ -1400,14 +1578,17 @@ run_gnome_live_app_checks() {
             'Config reload error' "$(<"$run_log")"
     else
         assert_text 'GNOME live invalid config exposes actionable error' \
-            'Config reload error' "$(<"$run_log" 2>/dev/null || true)"
+            'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
     fi
+    local bindings_before hotkeys_before
+    bindings_before=$(count_text "$run_log" 'binding count: 4')
+    hotkeys_before=$(count_text "$run_log" 'hotkey state: Registered')
     send_app status
-    sleep 0.3
-    assert_text 'GNOME live invalid reload preserves previous bindings' \
-        'binding count: 4' "$(<"$run_log" 2>/dev/null || true)"
-    assert_text 'GNOME live invalid reload keeps hotkeys registered' \
-        'hotkey state: Registered' "$(<"$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'binding count: 4' "$bindings_before" 10 || true
+    assert_eq 'GNOME live invalid reload preserves previous bindings' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 4') > bindings_before ? 1 : 0 ))"
+    assert_eq 'GNOME live invalid reload keeps hotkeys registered' 1 \
+        "$(( $(count_text "$run_log" 'hotkey state: Registered') > hotkeys_before ? 1 : 0 ))"
     gnome_live_activate_window || true
     gnome_live_inject_hotkey || true
     deadline=$((SECONDS + 10))
@@ -1429,12 +1610,13 @@ run_gnome_live_app_checks() {
         assert_text 'GNOME live valid config recovers' 'Config state: Loaded' "$(<"$run_log")"
     else
         assert_text 'GNOME live valid config recovers' 'Config state: Loaded' \
-            "$(<"$run_log" 2>/dev/null || true)"
+            "$(cat "$run_log" 2>/dev/null || true)"
     fi
+    bindings_before=$(count_text "$run_log" 'binding count: 4')
     send_app status
-    sleep 0.3
-    assert_text 'GNOME live valid config restores bindings' \
-        'binding count: 4' "$(<"$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'binding count: 4' "$bindings_before" 10 || true
+    assert_eq 'GNOME live valid config restores bindings' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 4') > bindings_before ? 1 : 0 ))"
     stop_app_cleanly 'GNOME live App quits cleanly' "$run_log"
 }
 
@@ -1446,7 +1628,7 @@ run_gnome_live_tui_lifecycle() {
         assert_text 'GNOME live TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
     else
         assert_text 'GNOME live TUI starts' 'Window Zones TUI' \
-            "$(<"$tui_log" 2>/dev/null || true)"
+            "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
     before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
@@ -1475,13 +1657,9 @@ run_gnome_live_tui_lifecycle() {
 
     gnome_live_activate_window || true
     send_app "dispatch $GNOME_SAFE_LEFT_HOTKEY"
-    if wait_for_text "$tui_log" "Last action: $GNOME_SAFE_LEFT_HOTKEY" 10; then
-        assert_text 'GNOME live TUI dispatch' "Last action: $GNOME_SAFE_LEFT_HOTKEY" \
-            "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI dispatch' "Last action: $GNOME_SAFE_LEFT_HOTKEY" \
-            "$(<"$tui_log" 2>/dev/null || true)"
-    fi
+    assert_eq 'GNOME live TUI dispatch' \
+        "$(sorted_hotkey "$GNOME_SAFE_LEFT_HOTKEY")" \
+        "$(sorted_hotkey "$(wait_for_reported_action "$tui_log" 'Last action: ' 10)")"
 
     send_app quit
     close_app_input
@@ -1617,6 +1795,8 @@ run_gnome_live() {
     GNOME_SAFE_RIGHT_HOTKEY="${GNOME_SAFE_HOTKEYS[2]}"
     GNOME_SAFE_NEXT_HOTKEY="${GNOME_SAFE_HOTKEYS[3]}"
     GNOME_SAFE_XDOT_KEY="${GNOME_SAFE_XDOT_KEYS[0]}"
+    GNOME_SAFE_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY"
+    GNOME_SAFE_UINPUT_KEY="$GNOME_SAFE_LEFT_HOTKEY"
 
     local line auth
     while IFS= read -r line; do
@@ -1638,13 +1818,14 @@ run_gnome_live() {
     log "GNOME live Xwayland observer: DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
     assert_text 'GNOME live Xwayland auth discovered' '.mutter-Xwaylandauth.' "$GNOME_XAUTHORITY"
 
-    local displays_raw display_lines display_count first_display
+    local displays_raw display_lines display_count first_display second_display
     displays_raw=$(gnome_call GetDisplays 2>&1 || true)
     display_lines=$(parse_gnome_displays "$displays_raw" || true)
     display_count=$(printf '%s\n' "$display_lines" | sed '/^$/d' | wc -l | tr -d ' ')
     log "GNOME live GetDisplays raw: $displays_raw"
     log "GNOME live parsed displays: $display_lines"
-    assert_eq 'GNOME live display count' 1 "$display_count"
+    GNOME_LIVE_DISPLAY_LINES="$display_lines"
+    assert_eq 'GNOME live reports at least one display' 1 "$(( display_count >= 1 ? 1 : 0 ))"
     first_display=$(printf '%s\n' "$display_lines" | sed -n '1p')
     if [[ ! "$first_display" =~ ^([^|]+)\|(-?[0-9]+)\|(-?[0-9]+)\|([0-9]+)\|([0-9]+)$ ]]; then
         assert_text 'GNOME live usable display geometry' '|' "$first_display"
@@ -1659,6 +1840,8 @@ run_gnome_live() {
     GNOME_LIVE_CENTER_THIRD="$((GNOME_LIVE_X + GNOME_LIVE_W / 3)),$GNOME_LIVE_Y,$((GNOME_LIVE_W - 2 * (GNOME_LIVE_W / 3))),$GNOME_LIVE_H"
     GNOME_LIVE_TWO_THIRDS="$GNOME_LIVE_X,$GNOME_LIVE_Y,$((GNOME_LIVE_W - GNOME_LIVE_W / 3)),$GNOME_LIVE_H"
     log "GNOME live usable area from GetDisplays: id=$GNOME_LIVE_DISPLAY_ID x=$GNOME_LIVE_X y=$GNOME_LIVE_Y w=$GNOME_LIVE_W h=$GNOME_LIVE_H"
+    GNOME_LIVE_NEXT_TWO_THIRDS=''
+    GNOME_LIVE_DISPLAY_TOTAL="$display_count"
     write_gnome_live_valid_config
 
     local editor_launcher="$GNOME_ROOT/launch-editor.sh"
@@ -1685,6 +1868,7 @@ EOF
     gnome_live_activate_window || true
     gnome_live_focus_baseline 10 || true
     gnome_live_assert_focus
+    gnome_live_zone_targets
     local editor_backend=''
     editor_backend=$(tr '\0' '\n' <"/proc/$EDITOR_PID/environ" 2>/dev/null \
         | sed -n '/^GDK_BACKEND=/p' | sed -n '1p' || true)
@@ -1702,7 +1886,20 @@ EOF
     gnome_live_assert_geometry 'GNOME live center-third' "$GNOME_LIVE_CENTER_THIRD"
     run_gnome_live_dispatch left-two-thirds "$GNOME_SAFE_RIGHT_HOTKEY"
     gnome_live_assert_geometry 'GNOME live left-two-thirds' "$GNOME_LIVE_TWO_THIRDS"
-    log "SKIP GNOME live cross-display move: not applicable; live session has one physical HDMI-1 monitor and GetDisplays reported $display_count display"
+    if [[ -n "$GNOME_LIVE_NEXT_TWO_THIRDS" ]]; then
+        run_gnome_live_dispatch next-display "$GNOME_SAFE_NEXT_HOTKEY"
+        gnome_live_assert_geometry 'GNOME live cross-display move' \
+            "$GNOME_LIVE_NEXT_TWO_THIRDS" "$GNOME_LIVE_NEXT_DISPLAY_ID"
+        if (( GNOME_LIVE_DISPLAY_TOTAL == 2 )); then
+            # Two displays wrap, so a second move returns the window and leaves the later checks
+            # on the display they were computed for.
+            run_gnome_live_dispatch next-display-wrap "$GNOME_SAFE_NEXT_HOTKEY"
+            gnome_live_assert_geometry 'GNOME live cross-display move wraps back' "$GNOME_LIVE_TWO_THIRDS"
+        fi
+    else
+        skip_assert 'GNOME live cross-display move' \
+            "not exercised: live session reports $display_count display"
+    fi
 
     run_gnome_live_conflicting_binding
     run_gnome_live_atomic_registration
@@ -1769,7 +1966,7 @@ EOF
             log 'Harness limitation GNOME extension CLI could not enable window-zones@mihai-a24'
         fi
     else
-        assert_text 'GNOME session bus address' 'unix:' "$(<"$shell_log" 2>/dev/null || true)"
+        assert_text 'GNOME session bus address' 'unix:' "$(cat "$shell_log" 2>/dev/null || true)"
         return 0
     fi
     local service_list='' deadline=$((SECONDS + 30))
@@ -1824,7 +2021,7 @@ EOF
         if kill -0 "$editor_pid" 2>/dev/null; then
             assert_text 'GNOME test window launched' 'running editor pid' "running editor pid $editor_pid"
         else
-            assert_text 'GNOME test window launched' 'Text Editor' "$(<"$editor_log" 2>/dev/null || true)"
+            assert_text 'GNOME test window launched' 'Text Editor' "$(cat "$editor_log" 2>/dev/null || true)"
         fi
     fi
     # A headless Shell has no seat: GetFocusedWindow stays false and grab_accelerator rejects every
@@ -1870,7 +2067,7 @@ EOF
     if wait_for_text "$run_log" 'Config reload error' 8; then
         assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(<"$run_log")"
     else
-        assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
     fi
     send_app status
     sleep 0.3
@@ -2005,13 +2202,13 @@ run_x11() {
     if wait_for_text "$run_log" 'Interactive session started' 15; then
         assert_text 'X11 run starts' 'Interactive session started' "$(<"$run_log")"
     else
-        assert_text 'X11 run starts' 'Interactive session started' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'X11 run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
     fi
     send_app status
     if wait_for_text "$run_log" 'hotkey state: Registered' 8; then
         assert_text 'X11 hotkeys initially register' 'hotkey state: Registered' "$(<"$run_log")"
     else
-        assert_text 'X11 hotkeys initially register' 'hotkey state: Registered' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'X11 hotkeys initially register' 'hotkey state: Registered' "$(cat "$run_log" 2>/dev/null || true)"
     fi
     local app_display=''
     app_display=$(tr '\0' '\n' <"/proc/$APP_PID/environ" 2>/dev/null | sed -n '/^DISPLAY=/p' | sed -n '1p' || true)
@@ -2036,7 +2233,7 @@ run_x11() {
         real_hotkey_action_ok=1
         assert_text 'X11 real hotkey reports action' 'last action: alt+ctrl+left' "$(<"$run_log")"
     else
-        assert_text 'X11 real hotkey reports action' 'last action: alt+ctrl+left' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'X11 real hotkey reports action' 'last action: alt+ctrl+left' "$(cat "$run_log" 2>/dev/null || true)"
     fi
     log "X11 real-hotkey attempts: $hotkey_attempts"
     if (( real_hotkey_geometry_ok == 0 || real_hotkey_action_ok == 0 )); then
@@ -2051,7 +2248,7 @@ run_x11() {
     if wait_for_text "$run_log" 'Config reload error' 8; then
         assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(<"$run_log")"
     else
-        assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(<"$run_log" 2>/dev/null || true)"
+        assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
     fi
     send_app status
     sleep 0.3
