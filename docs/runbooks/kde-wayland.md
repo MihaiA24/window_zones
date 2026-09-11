@@ -120,3 +120,10 @@ runtime unregister operation. Window Zones replaces the configured active set
 and sends an empty set when no bindings remain; removed shortcut callbacks
 become inactive. Disable/re-enable the script after binding removal or upgrades
 to let KWin clean up stale global-accelerator entries.
+
+## Nested KWin gate
+
+`./scripts/smoke.sh kde-live` runs this checklist mechanically against a real KWin nested inside whatever compositor is already running. It needs the `kwin` package (`kwin_wayland`, `kpackagetool6`, `kwriteconfig6`) and touches nothing in the current session: private session bus, private `HOME` and XDG directories, its own script package and `kwinrc`, two virtual outputs, and its own Xwayland.
+
+It is not a substitute for this checklist on a seated Plasma session. A nested `kwin_wayland` runs `Session::Type::Noop`, so the outer compositor owns the login seat; the gate's accelerator capture goes through nested Xwayland XTEST into KWin's EIS input path, which evidences compositor dispatch rather than physical-seat input. Three limitations are recorded as named skips rather than silently passed: seated accelerator capture, Plasma panel exclusion (the nested fixture runs no `plasmashell`), and negative-coordinate output movement (KWin places the two virtual outputs side by side at non-negative origins).
+
