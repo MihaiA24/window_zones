@@ -100,7 +100,7 @@ $HOME/.local/bin/window_zones --backend auto --config ./path/to/config.toml run
 
 ## Manual smoke checklist
 
-Record the observed result for each item:
+Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
 
 1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, and `hotkeys`.
 2. With a normal focused window, move it to left half, right half, a third, two-thirds, maximize, and the next/previous display. Verify frame coordinates, sizes, and usable-area boundaries on two displays, including a display with negative global coordinates.

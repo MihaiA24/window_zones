@@ -57,3 +57,7 @@
 - **Verified configuration**: The exact desktop session, compositor, and operating system versions a Smoke run passed against; behavior outside it is unverified rather than assumed.
 
 - **Synthetic session**: A desktop session created solely for verification, with virtual displays and no physical seat; it exercises the same compositor as a user session but cannot evidence physical display or input hardware behavior. _Avoid_: simulated desktop, mock compositor.
+
+- **Gate status**: The recorded outcome of a Release gate: _pending_ when no Smoke run is on record, _blocking - pass_, _blocking - fail_, or _deferred - unverified_; an integration that does not build is not deferred, it is unimplemented.
+
+- **Seated session**: A desktop session attached to a login seat with real input devices and a screen; focus, placement, and accelerator capture can only be observed there, which is what a Synthetic session cannot provide. _Avoid_: real session, physical session.
