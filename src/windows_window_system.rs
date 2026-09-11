@@ -5,11 +5,11 @@ use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, Wind
 use std::convert::TryFrom;
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
-    MonitorFromWindow,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MONITORINFOEXW, MonitorFromWindow,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -56,12 +56,17 @@ impl WindowsWindowSystem {
 
     fn display_id_for_monitor(handle: HMONITOR) -> Result<String, WindowSystemError> {
         let mut info = MONITORINFOEXW {
-            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            monitorInfo: MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         unsafe {
-            GetMonitorInfoW(handle, &mut info).ok()?;
+            GetMonitorInfoW(handle, &mut info.monitorInfo)
+                .ok()
+                .map_err(|error| WindowSystemError::Platform(error.to_string()))?;
         }
 
         let len = info
@@ -94,7 +99,7 @@ impl WindowsWindowSystem {
 impl WindowSystem for WindowsWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
         let hwnd = unsafe { GetForegroundWindow() };
-        if hwnd.0 == 0 {
+        if hwnd.0.is_null() {
             return Ok(None);
         }
 
@@ -122,7 +127,7 @@ impl WindowSystem for WindowsWindowSystem {
 
     fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
         let hwnd = unsafe { GetForegroundWindow() };
-        if hwnd.0 == 0 {
+        if hwnd.0.is_null() {
             return Err(WindowSystemError::Platform("no focused window".to_string()));
         }
 
@@ -131,7 +136,7 @@ impl WindowSystem for WindowsWindowSystem {
         let height = i32::try_from(window_move.target.height)
             .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
 
-        let moved = unsafe {
+        unsafe {
             SetWindowPos(
                 hwnd,
                 HWND::default(),
@@ -141,12 +146,7 @@ impl WindowSystem for WindowsWindowSystem {
                 height,
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
             )
-        };
-
-        if !moved.as_bool() {
-            return Err(WindowSystemError::Platform(
-                "SetWindowPos failed".to_string(),
-            ));
+            .map_err(|_| WindowSystemError::Platform("SetWindowPos failed".to_string()))?;
         }
 
         Ok(())
@@ -176,11 +176,14 @@ extern "system" fn monitor_enum_callback(
 ) -> windows::Win32::Foundation::BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut MonitorEnumState) };
     let mut info = MONITORINFOEXW {
-        cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
-    if unsafe { GetMonitorInfoW(h_monitor, &mut info) }.as_bool() {
+    if unsafe { GetMonitorInfoW(h_monitor, &mut info.monitorInfo) }.as_bool() {
         let len = info
             .szDevice
             .iter()
@@ -191,7 +194,7 @@ extern "system" fn monitor_enum_callback(
         }
 
         let id = String::from_utf16_lossy(&info.szDevice[..len]);
-        let area = info.rcWork;
+        let area = info.monitorInfo.rcWork;
         let width = u32::try_from(area.right - area.left).ok();
         let height = u32::try_from(area.bottom - area.top).ok();
         if let (Some(width), Some(height)) = (width, height) {
