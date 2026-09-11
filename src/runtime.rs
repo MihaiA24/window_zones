@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 use crate::config::{
-    AppConfig, BindingValidationError, ConfigError, parse_config, validate_and_normalize_app_config,
+    AppConfig, BindingValidationError, ConfigError, normalize_hotkey, parse_config,
+    validate_and_normalize_app_config,
 };
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
@@ -215,7 +216,10 @@ impl App {
         hotkey: &str,
         window_system: &mut W,
     ) -> &DispatchState {
-        self.last_dispatch_hotkey = Some(hotkey.to_string());
+        // State names the canonical binding, so a Companion hotkey event and a manual `dispatch`
+        // of the same binding report one spelling instead of two.
+        self.last_dispatch_hotkey =
+            Some(normalize_hotkey(hotkey).unwrap_or_else(|_| hotkey.to_string()));
         self.dispatch_state = match dispatch_hotkey(&self.config, hotkey, window_system) {
             Ok(()) => DispatchState::Succeeded,
             Err(error) => DispatchState::Error(error),
@@ -1395,7 +1399,7 @@ action = { type = "move-to-zone", zone = "left-half" }
             .unwrap();
 
         assert_eq!(state, &DispatchState::Succeeded);
-        assert_eq!(app.last_dispatch_hotkey(), Some("Ctrl+Alt+Left"));
+        assert_eq!(app.last_dispatch_hotkey(), Some("alt+ctrl+left"));
         assert_eq!(
             window_system.moves,
             vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
@@ -1433,7 +1437,7 @@ action = { type = "move-to-zone", zone = "left-half" }
                 hotkey: "Alt+Shift+Right".to_string()
             })
         );
-        assert_eq!(app.last_dispatch_hotkey(), Some("Alt+Shift+Right"));
+        assert_eq!(app.last_dispatch_hotkey(), Some("alt+shift+right"));
         assert!(window_system.moves.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
