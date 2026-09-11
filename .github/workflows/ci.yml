@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libx11-dev libxtst-dev libxi-dev pkg-config
+      - name: Check scripts
+        run: |
+          bash -n scripts/*.sh
+          node --check gnome-extension/extension.js
+          node --check kwin-script/contents/code/main.js
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --locked
+      - name: Run doc tests
+        run: cargo test --locked --doc
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # Manual Windows smoke verification is deferred; this job only proves the cfg(windows) code compiles and unit-tests.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: cargo test --locked
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings

@@ -1,5 +1,7 @@
 # Testing Runbook
 
+## Local gate
+
 ```bash
 ./scripts/test.sh
 ```
@@ -10,16 +12,14 @@ What this verifies:
 - `cargo test --locked` (unit + integration tests)
 - `cargo test --locked --doc` (doc tests)
 - `cargo clippy --locked --all-targets --all-features` (only if clippy is installed)
+- `bash -n scripts/*.sh` (shell syntax, including the 2000-line Smoke harness)
 - `node --check gnome-extension/extension.js`
 - `node --check kwin-script/contents/code/main.js`
 
-
-## Current repository status
-
 The repository test script covers formatting, unit/integration tests, doc tests,
-and clippy when installed. The GNOME and KDE adapter contract tests start
-private `dbus-daemon` instances; they do not require a running compositor
-session.
+and clippy when installed. The GNOME and KDE adapter contract tests use fake
+compositor services on private `dbus-daemon` instances; they do not require a
+running compositor session.
 
 The compositor scripts can be syntax-checked with:
 
@@ -27,15 +27,35 @@ The compositor scripts can be syntax-checked with:
 node --check gnome-extension/extension.js
 node --check kwin-script/contents/code/main.js
 ```
-Merge-ready V1 additionally requires:
 
-- D-Bus contract tests using fake compositor services;
-- one manual GNOME Wayland smoke run;
-- one manual KDE Plasma Wayland smoke run;
-- one manual Windows and one manual X11 smoke run;
-- TUI launch, reload, dispatch, restart, and quit smoke coverage.
+## V1 verification matrix
+
+This matrix is the record of record for V1 Release gate status. Both blocking gates, GNOME Wayland and Linux X11, are `blocking - pass` together with their TUI lifecycle rows; KDE Plasma Wayland and Windows are `deferred - unverified`. Release gate status is exactly one of `pending`, `blocking - pass`, `blocking - fail`, or `deferred - unverified`.
+
+Run the GNOME Wayland or Linux X11 Smoke run with:
+```bash
+./scripts/smoke.sh gnome       # headless Synthetic GNOME session: Companion load, Capability negotiation, display enumeration, usable-area math
+./scripts/smoke.sh gnome-live  # seated live GNOME session: focused window, placement, real accelerator capture, Companion disconnect/recovery, TUI lifecycle
+./scripts/smoke.sh x11
+```
+The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit in each corresponding Synthetic or seated session.
+
+`gnome-live` has two prerequisites on the seated session:
+
+- The Companion must be active: `window-zones@mihai-a24` in `org.gnome.shell enabled-extensions` **and** `org.gnome.shell disable-user-extensions` set to `false`. The master switch suppresses the extension even when it is listed, which reads exactly like an extension that refuses to load.
+- `/dev/uinput` must be writable by the user running the gate, because real accelerator capture is evidenced with a kernel virtual keyboard. Xwayland XTEST injection is not delivered to compositor accelerator grabs on GNOME 50, so `xdotool` cannot carry this check; with `/dev/uinput` unavailable the gate falls back to XTEST and the hotkey checks fail. Grant it for the run with `sudo chmod 0666 /dev/uinput`, or persistently with a udev rule such as `KERNEL=="uinput", MODE="0660", GROUP="input"` plus membership in `input`.
+
+| Gate | Status | Environment | Verified configuration | Date | How to reproduce |
+|---|---|---|---|---|---|
+| GNOME Wayland | blocking - pass | Synthetic session: `gnome-shell --headless` with virtual monitors 1920x1080 and 1600x900, isolated dconf/data/runtime dirs on a private session bus. Seated session: the live GNOME session with two physical monitors (HDMI-1 2560x1440 at 0,0 and DP-1 3440x1440 at 2560,0), `gnome-text-editor` on XWayland as the test window, `xdotool` as the independent observer, and a `/dev/uinput` virtual keyboard as the input source | CachyOS, kernel 7.2.4-1-cachyos; GNOME Shell 50.4; mutter 50.4. Synthetic: 23 assertions, 0 failures, run twice — Companion bus ownership, `GetCapabilities`, both virtual displays with the 32px panel excluded, config reload/retention/recovery; six seat-dependent checks recorded as skipped. Seated: 72 assertions, 0 failures, run twice — focused-window discovery agreeing with `xdotool` to the pixel, left-half `0,0,1280,1440`, center-third `853,0,854,1440`, left-two-thirds `0,0,1707,1440`, cross-display move to `2560,32,2294,1408` on `display-2` and back, real accelerator capture through the kernel virtual keyboard, atomic registration with a rejected set preserving the previous one, Companion disconnect and recovery without an App restart, and invalid-config reload retaining the last valid bindings | 2026-09-11 | `./scripts/smoke.sh gnome` and `./scripts/smoke.sh gnome-live` |
+| Linux X11 | blocking - pass | Xvfb 3520x1080 split by `xrandr --setmonitor` into logical monitors 1920x1080 and 1600x1080, Openbox as EWMH window manager, `gnome-text-editor` as the test window | CachyOS, kernel 7.2.4-1-cachyos; X.Org X Server 1.21.1.24 (xorg-server 21.1.24-1.1); Openbox 3.6.1; xdotool 4.20260303.1 | 2026-09-11 | `./scripts/smoke.sh x11` — 42 assertions, 0 failures, run twice |
+| TUI lifecycle (GNOME) | blocking - pass | Same Synthetic session and same seated live GNOME session | TUI launch, `reload`, `restart`, `status`, `dispatch HOTKEY`, and `quit` asserted in both halves; the seated run also asserts the dashboard reports the dispatched binding | 2026-09-11 | `./scripts/smoke.sh gnome` and `./scripts/smoke.sh gnome-live` |
+| TUI lifecycle (X11) | blocking - pass | Same Xvfb + Openbox Synthetic session | Same as Linux X11; `reload`, `restart`, `status`, `dispatch HOTKEY`, `quit` all asserted | 2026-09-11 | `./scripts/smoke.sh x11` |
+| KDE Plasma Wayland | deferred - unverified | KDE Plasma Wayland with KWin 6.x | unverified | — | Run a Smoke run on a real KWin 6.x session; this closes the Release gate. |
+| Windows | deferred - unverified | Windows desktop session | `windows` CI job compiles and unit-tests `src/windows_window_system.rs` against `windows` 0.58; the Release gate closes with the manual run in `docs/runbooks/windows-smoke.md`. | 2026-09-11 | `windows` job in `.github/workflows/ci.yml`; run `docs/runbooks/windows-smoke.md` to close the Release gate. |
 
 ### Minimum verification
+
 If you only need fast feedback:
 
 ```bash

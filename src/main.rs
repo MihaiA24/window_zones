@@ -247,17 +247,25 @@ fn resolve_runtime_backend(preference: BackendPreference) -> Result<RuntimeBacke
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_backend(preference: BackendPreference) -> Result<RuntimeBackend, String> {
+    resolve_linux_backend_in_session(preference, is_wayland_session())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_backend_in_session(
+    preference: BackendPreference,
+    is_wayland: bool,
+) -> Result<RuntimeBackend, String> {
     match preference {
         BackendPreference::DryRun => Ok(RuntimeBackend::DryRun),
         BackendPreference::X11 => {
-            if is_wayland_session() {
+            if is_wayland {
                 Err("X11 backend is unavailable inside a Wayland session; use the native Wayland compositor integration".to_string())
             } else {
                 Ok(RuntimeBackend::X11)
             }
         }
         BackendPreference::Wayland => {
-            if !is_wayland_session() {
+            if !is_wayland {
                 return Err(
                     "Wayland backend requires XDG_SESSION_TYPE=wayland or WAYLAND_DISPLAY"
                         .to_string(),
@@ -266,7 +274,7 @@ fn resolve_linux_backend(preference: BackendPreference) -> Result<RuntimeBackend
             resolve_wayland_runtime_backend()
         }
         BackendPreference::Auto => {
-            if is_wayland_session() {
+            if is_wayland {
                 resolve_wayland_runtime_backend()
             } else {
                 Ok(RuntimeBackend::X11)
@@ -1639,6 +1647,25 @@ action = { type = "move-to-zone", zone = "left-half" }
         assert_eq!(
             RuntimeWindowSystem::with_backend(RuntimeBackend::Kde).name(),
             "kde-wayland"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_routing_never_crosses_session_protocols() {
+        assert_eq!(
+            resolve_linux_backend_in_session(BackendPreference::Auto, false),
+            Ok(RuntimeBackend::X11)
+        );
+        assert_eq!(
+            resolve_linux_backend_in_session(BackendPreference::X11, false),
+            Ok(RuntimeBackend::X11)
+        );
+        assert!(resolve_linux_backend_in_session(BackendPreference::X11, true).is_err());
+        assert!(resolve_linux_backend_in_session(BackendPreference::Wayland, false).is_err());
+        assert_eq!(
+            resolve_linux_backend_in_session(BackendPreference::DryRun, true),
+            Ok(RuntimeBackend::DryRun)
         );
     }
 }
