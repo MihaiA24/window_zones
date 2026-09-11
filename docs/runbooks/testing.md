@@ -10,6 +10,8 @@ What this verifies:
 - `cargo test --locked` (unit + integration tests)
 - `cargo test --locked --doc` (doc tests)
 - `cargo clippy --locked --all-targets --all-features` (only if clippy is installed)
+- `node --check gnome-extension/extension.js`
+- `node --check kwin-script/contents/code/main.js`
 
 
 ## Current repository status

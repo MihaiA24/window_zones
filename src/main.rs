@@ -605,9 +605,9 @@ fn configured_hotkeys_for_runtime(app: &App) -> Vec<String> {
         .collect()
 }
 
-fn rebind_if_configured_hotkeys_changed(
+fn rebind_if_configured_hotkeys_changed<H: HotkeySystem>(
     app: &mut App,
-    hotkey_system: &mut RuntimeHotkeySystem,
+    hotkey_system: &mut H,
     cached_hotkeys: &mut Vec<String>,
     registration_is_valid: &mut bool,
     last_registration_error: &mut Option<String>,
@@ -797,66 +797,70 @@ struct TuiCapabilityStatus {
     diagnostic: Option<String>,
 }
 
-fn tui_capability_status(backend: RuntimeBackend) -> TuiCapabilityStatus {
+fn tui_capability_status(_backend: RuntimeBackend) -> TuiCapabilityStatus {
     #[cfg(target_os = "linux")]
-    {
-        let mut status = TuiCapabilityStatus {
-            window: "focused-window, displays, move-resize".to_string(),
-            hotkey: "hotkeys".to_string(),
-            diagnostic: None,
-        };
-
-        if matches!(backend, RuntimeBackend::Gnome | RuntimeBackend::Kde) {
-            let capabilities = match backend {
-                RuntimeBackend::Gnome => GnomeWindowSystem::new()
-                    .capabilities()
-                    .map_err(|error| error.to_string()),
-                RuntimeBackend::Kde => KwinWindowSystem::new()
-                    .capabilities()
-                    .map_err(|error| error.to_string()),
-                _ => unreachable!("companion capabilities only apply to companion backends"),
-            };
-            match capabilities {
-                Ok(capabilities) => {
-                    let window_capabilities = capabilities
-                        .iter()
-                        .filter(|capability| capability.as_str() != "hotkeys")
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    status.window = if window_capabilities.is_empty() {
-                        "<none>".to_string()
-                    } else {
-                        window_capabilities.join(", ")
-                    };
-                    status.hotkey = if capabilities
-                        .iter()
-                        .any(|capability| capability == "hotkeys")
-                    {
-                        "hotkeys".to_string()
-                    } else {
-                        "<none>".to_string()
-                    };
-                }
-                Err(error) => {
-                    status.window = "unavailable".to_string();
-                    status.hotkey = "unavailable".to_string();
-                    status.diagnostic = Some(error);
-                }
-            }
-        }
-
-        status
-    }
+    let companion_capabilities = match _backend {
+        RuntimeBackend::Gnome => Some(
+            GnomeWindowSystem::new()
+                .capabilities()
+                .map_err(|error| error.to_string()),
+        ),
+        RuntimeBackend::Kde => Some(
+            KwinWindowSystem::new()
+                .capabilities()
+                .map_err(|error| error.to_string()),
+        ),
+        _ => None,
+    };
 
     #[cfg(not(target_os = "linux"))]
-    {
-        let _ = backend;
-        TuiCapabilityStatus {
-            window: "focused-window, displays, move-resize".to_string(),
-            hotkey: "hotkeys".to_string(),
-            diagnostic: None,
+    let companion_capabilities: Option<Result<Vec<String>, String>> = None;
+
+    tui_capability_status_from(companion_capabilities)
+}
+
+fn tui_capability_status_from(
+    companion_capabilities: Option<Result<Vec<String>, String>>,
+) -> TuiCapabilityStatus {
+    let mut status = TuiCapabilityStatus {
+        window: "focused-window, displays, move-resize".to_string(),
+        hotkey: "hotkeys".to_string(),
+        diagnostic: None,
+    };
+
+    let Some(capabilities) = companion_capabilities else {
+        return status;
+    };
+
+    match capabilities {
+        Ok(capabilities) => {
+            let window_capabilities = capabilities
+                .iter()
+                .filter(|capability| capability.as_str() != "hotkeys")
+                .cloned()
+                .collect::<Vec<_>>();
+            status.window = if window_capabilities.is_empty() {
+                "<none>".to_string()
+            } else {
+                window_capabilities.join(", ")
+            };
+            status.hotkey = if capabilities
+                .iter()
+                .any(|capability| capability == "hotkeys")
+            {
+                "hotkeys".to_string()
+            } else {
+                "<none>".to_string()
+            };
+        }
+        Err(error) => {
+            status.window = "unavailable".to_string();
+            status.hotkey = "unavailable".to_string();
+            status.diagnostic = Some(error);
         }
     }
+
+    status
 }
 
 fn tui_hotkey_mode(backend: RuntimeBackend) -> &'static str {
@@ -1349,6 +1353,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::VecDeque, fs, path::PathBuf};
 
     #[test]
     fn parses_run_with_tray() {
@@ -1433,5 +1438,207 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_flags() {
         assert!(matches!(parse(&["--mystery"]), ParseStatus::Err(_)));
+    }
+    #[derive(Debug)]
+    struct FakeHotkeySystem {
+        registration_calls: usize,
+        registered_hotkeys: Vec<String>,
+        outcomes: VecDeque<Result<(), HotkeySystemError>>,
+    }
+
+    impl FakeHotkeySystem {
+        fn new(outcomes: Vec<Result<(), HotkeySystemError>>) -> Self {
+            Self {
+                registration_calls: 0,
+                registered_hotkeys: Vec::new(),
+                outcomes: outcomes.into(),
+            }
+        }
+    }
+
+    impl HotkeySystem for FakeHotkeySystem {
+        fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+            self.registration_calls += 1;
+            self.registered_hotkeys = hotkeys.to_vec();
+            self.outcomes.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+            Ok(None)
+        }
+    }
+
+    fn write_test_config(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "window_zones_main_{}_{}.toml",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn tui_capability_status_distinguishes_complete_degraded_and_unavailable_companions() {
+        let complete = tui_capability_status_from(Some(Ok(vec![
+            "focused-window".to_string(),
+            "displays".to_string(),
+            "move-resize".to_string(),
+            "hotkeys".to_string(),
+        ])));
+        assert_eq!(complete.window, "focused-window, displays, move-resize");
+        assert_eq!(complete.hotkey, "hotkeys");
+        assert_eq!(complete.diagnostic, None);
+
+        let degraded = tui_capability_status_from(Some(Ok(vec!["focused-window".to_string()])));
+        assert_eq!(degraded.window, "focused-window");
+        assert_eq!(degraded.hotkey, "<none>");
+        assert_eq!(degraded.diagnostic, None);
+
+        let unavailable =
+            tui_capability_status_from(Some(Err("GNOME companion unavailable".to_string())));
+        assert_eq!(unavailable.window, "unavailable");
+        assert_eq!(unavailable.hotkey, "unavailable");
+        assert_eq!(
+            unavailable.diagnostic.as_deref(),
+            Some("GNOME companion unavailable")
+        );
+
+        let dry_run = tui_capability_status(RuntimeBackend::DryRun);
+        assert_eq!(dry_run.window, "focused-window, displays, move-resize");
+        assert_eq!(dry_run.hotkey, "hotkeys");
+        assert_eq!(dry_run.diagnostic, None);
+    }
+
+    #[test]
+    fn tui_error_precedence_prefers_runtime_errors_over_companion_diagnostics() {
+        let capability_status = TuiCapabilityStatus {
+            window: "unavailable".to_string(),
+            hotkey: "unavailable".to_string(),
+            diagnostic: Some("companion unavailable".to_string()),
+        };
+
+        let missing_path = std::env::temp_dir().join(format!(
+            "window_zones_main_missing_{}.toml",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&missing_path);
+        let missing_app = App::start_at(missing_path);
+        assert_eq!(
+            tui_last_error(&missing_app, &capability_status),
+            "companion unavailable"
+        );
+
+        let config_path = write_test_config("error_precedence", "bindings = [");
+        let mut app = App::start_at(&config_path);
+        assert!(tui_last_error(&app, &capability_status).starts_with("config: "));
+
+        let mut hotkeys = FakeHotkeySystem::new(vec![Err(HotkeySystemError::Platform(
+            "permission denied".to_string(),
+        ))]);
+        assert!(app.register_hotkeys(&mut hotkeys).is_err());
+        assert!(tui_last_error(&app, &capability_status).starts_with("hotkey registration: "));
+
+        let mut window_system = DryRunWindowSystem::new();
+        app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
+        assert!(tui_last_error(&app, &capability_status).starts_with("dispatch: "));
+
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn rebind_retries_failed_registration_and_skips_unchanged_valid_sets() {
+        let config_path = write_test_config(
+            "rebind",
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        );
+        let mut app = App::start_at(&config_path);
+        let mut hotkeys = FakeHotkeySystem::new(vec![
+            Err(HotkeySystemError::Platform("unavailable".to_string())),
+            Ok(()),
+        ]);
+        let mut cached_hotkeys = Vec::new();
+        let mut registration_is_valid = false;
+        let mut last_registration_error = None;
+
+        rebind_if_configured_hotkeys_changed(
+            &mut app,
+            &mut hotkeys,
+            &mut cached_hotkeys,
+            &mut registration_is_valid,
+            &mut last_registration_error,
+            "test registration",
+        );
+        assert_eq!(hotkeys.registration_calls, 1);
+        assert!(!registration_is_valid);
+        assert!(cached_hotkeys.is_empty());
+        assert_eq!(
+            last_registration_error.as_deref(),
+            Some("platform hotkey error: unavailable")
+        );
+
+        rebind_if_configured_hotkeys_changed(
+            &mut app,
+            &mut hotkeys,
+            &mut cached_hotkeys,
+            &mut registration_is_valid,
+            &mut last_registration_error,
+            "test registration",
+        );
+        assert_eq!(hotkeys.registration_calls, 2);
+        assert!(registration_is_valid);
+        assert_eq!(cached_hotkeys, vec!["alt+ctrl+left".to_string()]);
+        assert!(last_registration_error.is_none());
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
+
+        rebind_if_configured_hotkeys_changed(
+            &mut app,
+            &mut hotkeys,
+            &mut cached_hotkeys,
+            &mut registration_is_valid,
+            &mut last_registration_error,
+            "test registration",
+        );
+        assert_eq!(hotkeys.registration_calls, 2);
+
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn tui_reports_dry_run_and_global_hotkey_modes() {
+        assert_eq!(tui_hotkey_mode(RuntimeBackend::DryRun), "dry-run");
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(tui_hotkey_mode(RuntimeBackend::X11), "global");
+            assert_eq!(tui_hotkey_mode(RuntimeBackend::Wayland), "global");
+            assert_eq!(tui_hotkey_mode(RuntimeBackend::Gnome), "gnome-companion");
+            assert_eq!(tui_hotkey_mode(RuntimeBackend::Kde), "kwin-companion");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_window_backend_names_identify_native_linux_paths() {
+        assert_eq!(
+            RuntimeWindowSystem::with_backend(RuntimeBackend::X11).name(),
+            "x11"
+        );
+        assert_eq!(
+            RuntimeWindowSystem::with_backend(RuntimeBackend::Wayland).name(),
+            "wayland"
+        );
+        assert_eq!(
+            RuntimeWindowSystem::with_backend(RuntimeBackend::Gnome).name(),
+            "gnome-wayland"
+        );
+        assert_eq!(
+            RuntimeWindowSystem::with_backend(RuntimeBackend::Kde).name(),
+            "kde-wayland"
+        );
     }
 }
