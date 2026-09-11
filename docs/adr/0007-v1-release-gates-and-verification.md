@@ -29,13 +29,15 @@ where a Synthetic session physically cannot carry the check:
 
 The split is forced by the platform, not by preference. A headless GNOME Shell has no seat: `GetFocusedWindow` stays false even after `window.activate()` succeeds, `global.display.grab_accelerator` rejects every accelerator, and `org.gnome.Shell.Screenshot` returns `AccessDenied`. GNOME 50 also removed the nested backend (`gnome-shell --wayland` inside a session takes the native path and fails with `EBUSY: Failed to take control of the session`, and `--devkit` is the headless backend without a packaged viewer), so there is no seated Synthetic GNOME session to run instead.
 
-Each Smoke run uses the real binary against the real compositor or window manager and asserts observable geometry with exact integer values. The out-of-band observer differs per gate: X11 uses `xdotool` against the X server plus an `ffmpeg`/`x11grab` capture, and the seated GNOME gate uses an XWayland test client observed through `xdotool`, because the GNOME Shell screenshot API refuses non-portal callers even in a seated session.
+Each Smoke run uses the real binary against the real compositor or window manager and asserts observable geometry with exact integer values. The out-of-band observer differs per gate: X11 uses `xdotool` against the X server plus an `ffmpeg`/`x11grab` capture, and the seated GNOME gate uses an XWayland test client observed through `xdotool`, because the GNOME Shell screenshot API refuses non-portal callers even in a seated session. A GTK client under XWayland owns its shadow, so the observer insets the X geometry by `_GTK_FRAME_EXTENTS` before comparing it with the frame the Companion reports.
 
-Together these evidence Companion protocol and capability behavior, X11 EWMH and RandR behavior, geometry and Usable area calculations, and hotkey capture. They cannot evidence physical display hardware, real multi-monitor topologies, or GNOME display-to-display movement, which needs two monitors on a seated session and is unavailable on the single-monitor verification host.
+Real accelerator capture is injected through a `/dev/uinput` virtual keyboard rather than `xdotool`. Xwayland XTEST events are not delivered to compositor-level accelerator grabs on GNOME 50: with an accelerator registered and confirmed, injected XTEST key events produce no activation signal, while the same accelerator fires from a kernel virtual keyboard. The seated gate therefore requires a writable `/dev/uinput`.
+
+Together these evidence Companion protocol and capability behavior, X11 EWMH and RandR behavior, geometry and Usable area calculations, hotkey capture, and Companion disconnect and recovery. They cannot evidence display hardware beyond the two monitors on the verification host, nor compositor versions other than the recorded Verified configuration.
 
 ## Consequences
 
-- The V1 release claim is end-to-end verification of the GNOME Wayland and Linux X11 blocking Release gates in their documented Synthetic sessions, including the TUI lifecycle checks recorded in the matrix.
+- The V1 release claim is end-to-end verification of the GNOME Wayland and Linux X11 blocking Release gates, X11 entirely in a Synthetic session and GNOME across a Synthetic session plus the seated live session, including the TUI lifecycle checks recorded in the matrix.
 - V1 does not claim that KDE Plasma Wayland or Windows are verified; both ship as implemented, deferred, and non-blocking until their specified triggers pass.
 - Synthetic sessions provide repeatable compositor and geometry evidence without claiming hardware coverage or full-desktop layout behavior.
 - `docs/runbooks/testing.md` is the record of record for Release gate status, Verified configuration, dates, and reproduction commands.
@@ -44,4 +46,4 @@ Together these evidence Companion protocol and capability behavior, X11 EWMH and
 
 - Installing full Plasma or maintaining a KDE VM was rejected because no KWin session is available on this machine and installing a separate desktop or VM solely for this verification was not accepted.
 - Building a Windows VM or running the binary under wine was rejected because no Windows runtime is available and the verification contract requires a real Windows run; the manual runbook and `windows-latest` compile job are the interim path.
-- Verifying only on the live GNOME session was rejected because it has one physical monitor, its tiling extensions interfere with placement, and changing the extension requires a logout before Wayland can load it.
+- Verifying only on the live GNOME session was rejected because its tiling extensions interfere with placement. The seated gate is run with `enabled-extensions` narrowed to the Companion, an operator step recorded in `docs/runbooks/gnome-wayland.md`; the gate itself asserts the extension state it found is the extension state it leaves.

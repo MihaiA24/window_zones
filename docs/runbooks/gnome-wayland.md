@@ -100,6 +100,17 @@ $HOME/.local/bin/window_zones --backend auto --config ./path/to/config.toml run
 
 ## Manual smoke checklist
 
+Before the seated run, prepare the session:
+
+```bash
+gsettings set org.gnome.shell disable-user-extensions false
+gsettings get org.gnome.shell enabled-extensions      # save this list
+gsettings set org.gnome.shell enabled-extensions "['window-zones@mihai-a24']"
+sudo chmod 0666 /dev/uinput                           # real accelerator capture
+```
+
+The master switch has to be off: with `disable-user-extensions true` the Companion stays `INACTIVE` and `EnableExtension` still returns `true`, which looks exactly like a broken extension. Narrowing `enabled-extensions` keeps tiling extensions from moving the test window. `/dev/uinput` is required because Xwayland XTEST events never reach a compositor accelerator grab on GNOME 50. Restore the saved list and `sudo chmod 0600 /dev/uinput` afterwards.
+
 Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
 
 1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, and `hotkeys`.
