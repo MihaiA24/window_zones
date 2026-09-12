@@ -2,10 +2,10 @@
 
 ## Prerequisites
 - Rust toolchain with `cargo` in `PATH`.
-- On Linux, `pkg-config` and D-Bus development headers are required for tray
-  and KWin companion support:
-  - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
-  - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
+- On Linux, `pkg-config` and D-Bus, X11, XTest, and Xi development libraries are
+  required for tray, KWin companion, and global hotkey support:
+  - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev libx11-dev libxtst-dev libxi-dev`
+  - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel libX11-devel libXtst-devel libXi-devel`
 - (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
 - For GNOME Wayland, GNOME Shell 50 and `gnome-extensions` are required when
   using the optional companion; install steps are in
@@ -32,6 +32,8 @@
 ```bash
 ./scripts/install.sh --debug
 ```
+
+Add `--autostart` to install or replace `~/.config/autostart/window_zones.desktop`, which starts the installed `window_zones run` listener at desktop login.
 
 On Linux, install the KDE companion binary as a second step:
 

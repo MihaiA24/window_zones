@@ -29,6 +29,6 @@ Wayland session detection is routing, not a generic window-control implementatio
 - GNOME uses a GNOME Shell extension; KDE uses a KWin script or plugin.
 - Companion installation is opt-in through explicit install flags or commands.
 - GNOME is implemented first, then the TUI, then KDE.
-- Merge-ready V1 gates are Windows, Linux X11, KDE Wayland, and GNOME Wayland.
-- macOS remains source-compatible but non-blocking; Sway and Hyprland remain constrained backends.
+- Merge-ready V1 gates were Windows, Linux X11, KDE Wayland, and GNOME Wayland; superseded by ADR 0007 (blocking: GNOME Wayland and Linux X11; deferred: KDE Wayland and Windows).
+- macOS, Sway, and Hyprland are ungated integrations (ADR 0008); Sway and Hyprland use compositor-bound dispatch instead of App-owned global hotkeys.
 - V1 validation covers GNOME Shell 50 and one representative stable KDE Plasma/KWin release, with exact point versions documented by the manual smoke run.

@@ -118,8 +118,13 @@ KWin integration is reported as an explicit runtime error with remediation.
 KWin's documented JavaScript API exposes shortcut registration but no reliable
 runtime unregister operation. Window Zones replaces the configured active set
 and sends an empty set when no bindings remain; removed shortcut callbacks
-become inactive. Disable/re-enable the script after binding removal or upgrades
-to let KWin clean up stale global-accelerator entries.
+become inactive and an empty set releases the App's Active controller claim.
+Before touching any QAction the script asks KGlobalAccel `action(int)` who
+would win each requested accelerator; if any is held by another action the
+whole set is rejected with `KWin rejected shortcut '<hotkey>': accelerator is
+already held by '<action>'` and the previous set stays active. Disable/re-enable
+the script after binding removal or upgrades to let KWin clean up stale
+global-accelerator entries.
 
 ## Nested KWin gate
 
@@ -130,5 +135,5 @@ It is not a substitute for this checklist on a seated Plasma session. KWin's nes
 Its first run found two defects, both fixed:
 
 - `workspace.clientArea(KWin.WorkArea, output, desktop)` ignores the output and returns the desktop-wide union, so every display reported the same rectangle and zones were computed against all monitors joined. The per-output area is `KWin.MaximizeArea`.
-- KWin's scripting `registerShortcut` returns success for any callable handler: it hands the sequence to KGlobalAccel and discards the result, so an accelerator another action already owns is accepted and then never fires. The runtime now asks KGlobalAccel which action holds the key and reports registration as failed when it is not ours.
+- KWin's scripting `registerShortcut` returns success for any callable handler: it hands the sequence to KGlobalAccel and discards the result, so an accelerator another action already owns is accepted and then never fires. The script now preflights every accelerator through KGlobalAccel `action(int)` (the dispatch winner, unlike the unordered `getGlobalShortcutsByKey`) before any registration and the companion re-verifies the winner read-only.
 

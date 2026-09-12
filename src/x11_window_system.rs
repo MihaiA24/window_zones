@@ -102,9 +102,54 @@ impl X11WindowSystem {
         }
     }
 
+    fn frame_extents(conn: &RustConnection, window: Window) -> Result<[u32; 4], WindowSystemError> {
+        let atom = conn
+            .intern_atom(false, b"_NET_FRAME_EXTENTS")
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to intern frame extents atom: {error}"))
+            })?
+            .reply()
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to read frame extents atom: {error}"))
+            })?
+            .atom;
+        let reply = conn
+            .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 4)
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to query frame extents: {error}"))
+            })?
+            .reply()
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to read frame extents: {error}"))
+            })?;
+
+        if reply.type_ == u32::from(AtomEnum::NONE) {
+            return Ok([0; 4]);
+        }
+        reply
+            .value32()
+            .filter(|_| {
+                reply.type_ == u32::from(AtomEnum::CARDINAL)
+                    && reply.value_len == 4
+                    && reply.bytes_after == 0
+            })
+            .and_then(|mut values| {
+                Some([
+                    values.next()?,
+                    values.next()?,
+                    values.next()?,
+                    values.next()?,
+                ])
+            })
+            .ok_or_else(|| {
+                WindowSystemError::Platform("invalid _NET_FRAME_EXTENTS property".to_string())
+            })
+    }
+
     fn focused_window_geometry(
         conn: &RustConnection,
         window: Window,
+        root: Window,
     ) -> Result<Rect, WindowSystemError> {
         let geometry = conn
             .get_geometry(window)
@@ -116,14 +161,31 @@ impl X11WindowSystem {
                 WindowSystemError::Platform(format!("failed to read window geometry: {error}"))
             })?;
 
-        let width = geometry.width as u32;
-        let height = geometry.height as u32;
+        let origin = conn
+            .translate_coordinates(window, root, 0, 0)
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to translate window origin: {error}"))
+            })?
+            .reply()
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to read window origin: {error}"))
+            })?;
+        let [left, right, top, bottom] = Self::frame_extents(conn, window)?;
+        let invalid_frame =
+            || WindowSystemError::Platform("window frame geometry is out of range".to_string());
 
         Ok(Rect::new(
-            geometry.x as i32,
-            geometry.y as i32,
-            width,
-            height,
+            i32::try_from(i64::from(origin.dst_x) - i64::from(left))
+                .map_err(|_| invalid_frame())?,
+            i32::try_from(i64::from(origin.dst_y) - i64::from(top)).map_err(|_| invalid_frame())?,
+            u32::from(geometry.width)
+                .checked_add(left)
+                .and_then(|width| width.checked_add(right))
+                .ok_or_else(invalid_frame)?,
+            u32::from(geometry.height)
+                .checked_add(top)
+                .and_then(|height| height.checked_add(bottom))
+                .ok_or_else(invalid_frame)?,
         ))
     }
 }
@@ -139,23 +201,8 @@ impl WindowSystem for X11WindowSystem {
             None => return Ok(None),
         };
 
-        let geometry = Self::focused_window_geometry(&conn, window)?;
-        let displays = collect_displays(&conn, root)?;
-        let center_x = geometry
-            .x
-            .saturating_add(i32::try_from(geometry.width / 2).map_err(|_| {
-                WindowSystemError::Platform("focused window center X out of range".to_string())
-            })?);
-        let center_y = geometry
-            .y
-            .saturating_add(i32::try_from(geometry.height / 2).map_err(|_| {
-                WindowSystemError::Platform("focused window center Y out of range".to_string())
-            })?);
-        let display_id = match find_display_for_point(&displays, center_x, center_y) {
-            Some(id) => id.to_string(),
-            None => format!("x11-unmatched:{center_x}:{center_y}"),
-        };
-        Ok(Some(FocusedWindow::new(display_id, geometry)))
+        let geometry = Self::focused_window_geometry(&conn, window, root)?;
+        Ok(Some(FocusedWindow::new(geometry)))
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
@@ -171,17 +218,66 @@ impl WindowSystem for X11WindowSystem {
         let window = Self::active_window_id(&conn, root)?
             .ok_or_else(|| WindowSystemError::Platform("no focused window".to_string()))?;
 
+        let [left, right, top, bottom] = Self::frame_extents(&conn, window)?;
+        let invalid_size = || {
+            WindowSystemError::Platform("target size does not contain the window frame".to_string())
+        };
         let x = window_move.target.x;
         let y = window_move.target.y;
-        let width = window_move.target.width;
-        let height = window_move.target.height;
+        let width = window_move
+            .target
+            .width
+            .checked_sub(left)
+            .and_then(|width| width.checked_sub(right))
+            .filter(|width| *width > 0)
+            .ok_or_else(invalid_size)?;
+        let height = window_move
+            .target
+            .height
+            .checked_sub(top)
+            .and_then(|height| height.checked_sub(bottom))
+            .filter(|height| *height > 0)
+            .ok_or_else(invalid_size)?;
+
+        let mut atoms = [0; 3];
+        for (atom, name) in atoms.iter_mut().zip([
+            "_NET_WM_STATE",
+            "_NET_WM_STATE_MAXIMIZED_HORZ",
+            "_NET_WM_STATE_MAXIMIZED_VERT",
+        ]) {
+            *atom = conn
+                .intern_atom(false, name.as_bytes())
+                .map_err(|error| {
+                    WindowSystemError::Platform(format!("failed to intern {name}: {error}"))
+                })?
+                .reply()
+                .map_err(|error| {
+                    WindowSystemError::Platform(format!("failed to read {name} atom: {error}"))
+                })?
+                .atom;
+        }
+        let [state, maximized_horz, maximized_vert] = atoms;
+        let event = xproto::ClientMessageEvent::new(
+            32,
+            window,
+            state,
+            [0, maximized_horz, maximized_vert, 2, 0],
+        );
+        conn.send_event(
+            false,
+            root,
+            xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .map_err(|error| {
+            WindowSystemError::Platform(format!("failed to unmaximize focused window: {error}"))
+        })?;
 
         let values = xproto::ConfigureWindowAux::new()
             .x(x)
             .y(y)
             .width(width)
-            .height(height)
-            .border_width(0);
+            .height(height);
 
         conn.configure_window(window, &values).map_err(|error| {
             WindowSystemError::Platform(format!("failed to configure focused window: {error}"))
@@ -195,6 +291,7 @@ impl WindowSystem for X11WindowSystem {
 }
 
 #[cfg(target_os = "linux")]
+/// Uses RandR monitor bounds; panels and struts are not subtracted.
 fn collect_displays(
     conn: &RustConnection,
     root: Window,
@@ -243,36 +340,5 @@ fn monitor_id(name_atom: x11rb::protocol::xproto::Atom) -> Option<String> {
         None
     } else {
         Some(format!("x11-monitor-{name_atom}"))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn find_display_for_point(displays: &[DisplayGeometry], x: i32, y: i32) -> Option<&str> {
-    displays
-        .iter()
-        .find(|display| point_in_rect(x, y, display.usable_area))
-        .map(|display| display.id.as_str())
-}
-
-#[cfg(target_os = "linux")]
-fn point_in_rect(x: i32, y: i32, rect: Rect) -> bool {
-    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
-}
-
-#[cfg(test)]
-#[cfg(target_os = "linux")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_display_for_point() {
-        let displays = vec![
-            DisplayGeometry::new("left".to_string(), Rect::new(0, 0, 800, 600)),
-            DisplayGeometry::new("right".to_string(), Rect::new(800, 0, 800, 600)),
-        ];
-
-        assert_eq!(find_display_for_point(&displays, 10, 10), Some("left"));
-        assert_eq!(find_display_for_point(&displays, 1200, 10), Some("right"));
-        assert_eq!(find_display_for_point(&displays, 2000, 10), None);
     }
 }

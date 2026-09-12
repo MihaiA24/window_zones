@@ -19,7 +19,7 @@ V1 has two blocking Release gates:
 - GNOME Wayland.
 - Linux X11.
 
-KDE Plasma Wayland and Windows are implemented but deferred and explicitly non-blocking. The KDE Release gate closes when a Smoke run passes on a real KWin 6.x session. The Windows Release gate closes when the manual run in `docs/runbooks/windows-smoke.md` passes; the `windows-latest` GitHub Actions job holds the compile line in the meantime. macOS remains source-compatible and non-blocking, and Sway and Hyprland remain constrained integrations.
+KDE Plasma Wayland and Windows are implemented but deferred and explicitly non-blocking. The KDE Release gate closes when a Smoke run passes on a real KWin 6.x session. The Windows Release gate closes when the manual run in `docs/runbooks/windows-smoke.md` passes; the `windows-latest` GitHub Actions job holds the compile line in the meantime. macOS, Sway, and Hyprland are ungated integrations (ADR 0008): source-compatible, built in CI, no Smoke run on record.
 
 Verification uses Synthetic sessions rather than user desktop sessions, except
 where a Synthetic session physically cannot carry the check:
@@ -31,7 +31,7 @@ The split is forced by the platform, not by preference. A headless GNOME Shell h
 
 Each Smoke run uses the real binary against the real compositor or window manager and asserts observable geometry with exact integer values. The out-of-band observer differs per gate: X11 uses `xdotool` against the X server plus an `ffmpeg`/`x11grab` capture, and the seated GNOME gate uses an XWayland test client observed through `xdotool`, because the GNOME Shell screenshot API refuses non-portal callers even in a seated session. A GTK client under XWayland owns its shadow, so the observer insets the X geometry by `_GTK_FRAME_EXTENTS` before comparing it with the frame the Companion reports.
 
-Real accelerator capture is injected through a `/dev/uinput` virtual keyboard rather than `xdotool`. Xwayland XTEST events are not delivered to compositor-level accelerator grabs on GNOME 50: with an accelerator registered and confirmed, injected XTEST key events produce no activation signal, while the same accelerator fires from a kernel virtual keyboard. The seated gate therefore requires a writable `/dev/uinput`.
+Real accelerator capture is injected through a `/dev/uinput` virtual keyboard rather than `xdotool`. Xwayland XTEST events are not delivered to compositor-level accelerator grabs on GNOME 50: with an accelerator registered and confirmed, injected XTEST key events produce no activation signal, while the same accelerator fires from a kernel virtual keyboard. The seated gate therefore requires a writable `/dev/uinput` and fails, with remediation printed, when it is not writable; there is no XTEST fallback.
 
 Together these evidence Companion protocol and capability behavior, X11 EWMH and RandR behavior, geometry and Usable area calculations, hotkey capture, and Companion disconnect and recovery. They cannot evidence display hardware beyond the two monitors on the verification host, nor compositor versions other than the recorded Verified configuration.
 
