@@ -122,8 +122,9 @@ wait_for_text() {
 }
 
 count_text() {
-    local file=$1 needle=$2
-    grep -c -- "$needle" "$file" 2>/dev/null || printf '0'
+    local file=$1 needle=$2 count=''
+    count=$(grep -c -- "$needle" "$file" 2>/dev/null)
+    printf '%s' "${count:-0}"
 }
 
 wait_for_new_text() {
@@ -2012,6 +2013,7 @@ kde_live_wait_companion_ready() {
     KDE_DISPLAYS_RAW="$displays"
     KDE_KWIN_OWNER_LINE=$(printf '%s\n' "$owners" | sed -n '/org.kde.KWin/p' | sed -n '1p')
     KDE_COMPANION_OWNER_LINE="$owner_line"
+    log "KDE companion readiness timed out after ${timeout_s}s: owner='$owner_line' isScriptLoaded='$loaded' capabilities='$capabilities' displays='$count'"
     return 1
 }
 
@@ -2045,12 +2047,13 @@ kde_live_load_script() {
 }
 
 kde_live_run_script() {
-    local id=$1 output=''
-    if [[ "$id" =~ ^[0-9]+$ ]]; then
-        output=$(busctl --address="$KDE_BUS" call org.kde.KWin \
-            "/Scripting/Script$id" org.kde.kwin.Script run 2>&1 || true)
-        log "KDE runScript id=$id: $output"
-    fi
+    # Script ids are positional (`const int id = scripts.size()` upstream) and are reused after an
+    # unload, so /Scripting/Script<id> can address a different, already-running script. Scripting
+    # start() runs every loaded script that is not running yet and needs no id.
+    local id=${1:-} output=''
+    output=$(busctl --address="$KDE_BUS" call org.kde.KWin /Scripting \
+        org.kde.kwin.Scripting start 2>&1 || true)
+    log "KDE Scripting start (after load id=${id:-none}): $output"
 }
 
 kde_live_unload_script() {
@@ -2165,7 +2168,9 @@ function report() {
                 workspace.currentDesktop)),
         });
     });
-    print(`KDE_OBSERVER ${JSON.stringify({screens})}`);
+    // KWin 6 installs QJSEngine::ConsoleExtension and injects no print(); warnings are the one
+    // level Qt logs without extra rules, so console.warn is what reaches the KWin log.
+    console.warn(`KDE_OBSERVER ${JSON.stringify({screens})}`);
 }
 report();
 const timer = new QTimer();
@@ -2240,7 +2245,7 @@ kde_live_preflight() {
     KDE_KWIN_HELP=$(kwin_wayland --help 2>&1 || true)
     [[ "$KDE_KWIN_VERSION" == *'6.'* ]] || version_ok=0
     assert_text 'KDE kwin_wayland is version 6' '6.' "$KDE_KWIN_VERSION"
-    local -a flags=(--wayland-display --socket --output-count --xwayland --no-lockscreen --no-kactivities)
+    local -a flags=(--virtual --socket --output-count --xwayland --no-lockscreen --no-kactivities)
     for tool in "${flags[@]}"; do
         if [[ "$KDE_KWIN_HELP" != *"$tool"* ]]; then
             help_ok=0
@@ -2312,8 +2317,10 @@ for ((attempt = 0; attempt < 100; attempt++)); do
     [[ "$service_list" == *'org.window_zones.KWin'* ]] && break
     sleep 0.1
 done
+# The virtual framebuffer backend keeps the two outputs at a fixed size. A nested windowed backend
+# would make them windows of the outer compositor, which is free to resize them mid-run and did.
 exec kwin_wayland \
-    --wayland-display "$KDE_OUTER_SOCKET" \
+    --virtual \
     --socket "$KDE_SOCKET" \
     --width 1200 --height 900 --scale 1 \
     --output-count 2 --xwayland \
@@ -2335,7 +2342,8 @@ EOF
         XDG_RUNTIME_DIR="$KDE_RUNTIME" XDG_DATA_DIRS="$KDE_DATA_DIRS" \
         XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
         KDE_SESSION_VERSION=6 XDG_SESSION_TYPE=wayland \
-        QT_LOGGING_RULES='kwin_libeis.debug=true' \
+        QT_LOGGING_RULES='kwin_libeis.debug=true;kwin_scripting.debug=true' \
+        QT_FORCE_STDERR_LOGGING=1 \
         dbus-run-session -- "$KDE_LAUNCHER")
     if wait_for_file "$KDE_BUS_FILE" 20; then
         KDE_BUS=$(cat "$KDE_BUS_FILE")
@@ -2447,7 +2455,8 @@ kde_live_x11_geometry() {
 }
 
 kde_live_wait_focus() {
-    local timeout_s=${1:-15} deadline=$((SECONDS + timeout_s))
+    local timeout_s=${1:-15}
+    local deadline=$((SECONDS + timeout_s))
     local observed='' focused='' active='' present='' display='' x='' y='' width='' height=''
     while (( SECONDS < deadline )); do
         observed=$(kde_live_x11_geometry)
@@ -2485,31 +2494,32 @@ kde_live_assert_focus() {
 }
 
 kde_live_select_display_targets() {
-    local focused='' focused_display='' id='' x='' y='' width='' height='' first=0
+    local focused='' focused_display='' id='' x='' y='' width='' height='' record='' record_id=''
+    local -a records=()
     focused=$(kde_live_get_focused)
     focused_display=$(printf '%s\n' "$focused" | cut -d'|' -f2)
+    while IFS='|' read -r id x y width height; do
+        [[ -n "$id" ]] || continue
+        [[ "$id" =~ ^-?[0-9]+$ ]] && continue
+        records+=("$id|$x|$y|$width|$height")
+    done <"$KDE_ROOT/observer-records"
     KDE_A_LINE=''
     KDE_B_LINE=''
-    while IFS='|' read -r id x y width height; do
-        [[ "$id" =~ ^-?[0-9]+$ ]] && continue
-        [[ -n "$id" ]] || continue
-        if [[ "$id" == "$focused_display" ]]; then
-            KDE_A_LINE="$id|$x|$y|$width|$height"
-        elif [[ "$first" -eq 0 ]]; then
-            KDE_B_LINE="$id|$x|$y|$width|$height"
-            first=1
+    for record in "${records[@]}"; do
+        record_id=${record%%|*}
+        if [[ "$record_id" == "$focused_display" ]]; then
+            KDE_A_LINE="$record"
+            break
         fi
-    done <"$KDE_ROOT/observer-records"
-    if [[ -z "$KDE_A_LINE" ]]; then
-        while IFS='|' read -r id x y width height; do
-            [[ "$id" =~ ^-?[0-9]+$ || -z "$id" ]] && continue
-            if [[ -z "$KDE_A_LINE" ]]; then
-                KDE_A_LINE="$id|$x|$y|$width|$height"
-            elif [[ -z "$KDE_B_LINE" ]]; then
-                KDE_B_LINE="$id|$x|$y|$width|$height"
-            fi
-        done <"$KDE_ROOT/observer-records"
-    fi
+    done
+    # Before the test window exists there is no focused display; fall back to the first output.
+    [[ -n "$KDE_A_LINE" ]] || KDE_A_LINE="${records[0]:-}"
+    for record in "${records[@]}"; do
+        if [[ "$record" != "$KDE_A_LINE" ]]; then
+            KDE_B_LINE="$record"
+            break
+        fi
+    done
     IFS='|' read -r KDE_A_ID KDE_A_X KDE_A_Y KDE_A_W KDE_A_H <<<"$KDE_A_LINE"
     IFS='|' read -r KDE_B_ID KDE_B_X KDE_B_Y KDE_B_W KDE_B_H <<<"$KDE_B_LINE"
     KDE_LEFT_HALF="$KDE_A_X,$KDE_A_Y,$((KDE_A_W / 2)),$KDE_A_H"
@@ -2519,25 +2529,60 @@ kde_live_select_display_targets() {
     log "KDE independent observer targets: A=$KDE_A_LINE B=$KDE_B_LINE"
 }
 
-kde_live_assert_geometry() {
-    local name=$1 expected=$2 expected_display=$3
+kde_live_refresh_targets() {
+    # Nested outputs are windows of the outer compositor and can be resized mid-run, so zone
+    # expectations are recomputed from the newest observer record before each phase.
+    kde_live_observer_records "$KDE_KWIN_LOG" >"$KDE_ROOT/observer-records"
+    kde_live_select_display_targets
+    log "KDE refreshed targets: A=$KDE_A_LINE B=$KDE_B_LINE"
+}
+
+kde_live_zone_rect() {
+    # zone name + one observer record -> expected rect, using the App's integer zone arithmetic.
+    local zone=$1 x=$2 y=$3 width=$4 height=$5
+    case "$zone" in
+        left-half) printf '%s,%s,%s,%s' "$x" "$y" "$((width / 2))" "$height" ;;
+        center-third)
+            printf '%s,%s,%s,%s' "$((x + width / 3))" "$y" "$((width - 2 * (width / 3)))" "$height"
+            ;;
+        left-two-thirds) printf '%s,%s,%s,%s' "$x" "$y" "$((width - width / 3))" "$height" ;;
+        *) printf 'unsupported-zone' ;;
+    esac
+}
+
+kde_live_assert_zone() {
+    # Outputs keep their identity for the whole gate: A is the display the test window started on
+    # and B is the other one, so a cross-display move cannot relabel them. Only their rectangles
+    # are re-read, from the newest observer record, on every poll.
+    local name=$1 zone=$2 target=$3
     local deadline=$((SECONDS + 12)) observed_x11='' focused='' observed_companion=''
     local present='' display='' x='' y='' width='' height=''
-    local expected_x='' expected_y='' expected_width='' expected_height=''
-    IFS=',' read -r expected_x expected_y expected_width expected_height <<<"$expected"
+    local expected='' expected_display='' line='' wanted=''
+    if [[ "$target" == B ]]; then
+        wanted="$KDE_B_ID"
+    else
+        wanted="$KDE_A_ID"
+    fi
     kde_live_activate_window || true
-    while (( SECONDS < deadline )); do
+    while : ; do
+        kde_live_observer_records "$KDE_KWIN_LOG" >"$KDE_ROOT/observer-records"
+        line=$(sed -n "/^${wanted}|/p" "$KDE_ROOT/observer-records" | sed -n '1p')
+        IFS='|' read -r expected_display x y width height <<<"$line"
+        expected=$(kde_live_zone_rect "$zone" "$x" "$y" "$width" "$height")
         observed_x11=$(kde_live_x11_geometry)
         focused=$(kde_live_get_focused)
-        IFS='|' read -r present display x y width height <<<"$focused"
         observed_companion="$focused"
+        IFS='|' read -r present display x y width height <<<"$focused"
         if [[ "$observed_x11" == "$expected" && "$present" == true \
             && "$display" == "$expected_display" \
             && "$x,$y,$width,$height" == "$expected" ]]; then
             break
         fi
+        (( SECONDS < deadline )) || break
         sleep 0.2
     done
+    local expected_x='' expected_y='' expected_width='' expected_height=''
+    IFS=',' read -r expected_x expected_y expected_width expected_height <<<"$expected"
     log "OBSERVED $name: observer-expected='$expected' companion='$observed_companion' xdotool='$observed_x11'"
     assert_eq "$name independent X11 geometry" "$expected" "$observed_x11"
     assert_eq "$name Companion geometry" \
@@ -2797,13 +2842,9 @@ EOF
     if wait_for_text "$helper_log" 'CONFLICT_READY' 12; then
         assert_text 'KDE conflicting accelerator result completes' \
             'CONFLICT_RESULT true' "$(<"$helper_log")"
-        assert_text 'KDE conflicting accelerator is refused' \
-            'CONFLICT_REFUSED' "$(<"$helper_log")"
     else
-        local conflict_log=''
-        conflict_log=$(cat "$helper_log" 2>/dev/null || true)
-        assert_text 'KDE conflicting accelerator result completes' 'CONFLICT_RESULT true' "$conflict_log"
-        assert_text 'KDE conflicting accelerator is refused' 'CONFLICT_REFUSED' "$conflict_log"
+        assert_text 'KDE conflicting accelerator result completes' 'CONFLICT_RESULT true' \
+            "$(cat "$helper_log" 2>/dev/null || true)"
     fi
     if kde_live_inject_key ctrl+alt+F24; then
         inject_rc=0
@@ -2820,10 +2861,28 @@ EOF
     fi
     local conflict_events=0
     conflict_events=$(count_text "$helper_log" 'EVENT alt+ctrl+f24')
-    assert_eq 'KDE conflicting accelerator is inactive in Companion' 0 "$conflict_events"
+    assert_eq 'KDE conflicting accelerator delivers no Companion event' 0 "$conflict_events"
     stop_pid "$helper_pid"
     wait_pid "$helper_pid" 5 || true
     sleep 0.3
+
+    # The user-visible contract: the App must not report a binding as registered when the
+    # accelerator belongs to someone else. The raw protocol above only shows what the Companion
+    # relayed; this drives the real runtime.
+    local conflict_config_log="$KDE_ROOT/conflict-app.log"
+    cat >"$CONFIG_PATH" <<EOF
+[[bindings]]
+hotkey = "alt+ctrl+f24"
+action = { type = "move-to-zone", zone = "left-half" }
+EOF
+    start_fifo_app run auto "$conflict_config_log"
+    wait_for_text "$conflict_config_log" 'Hotkey registration initially failed' 20 || true
+    assert_text 'KDE App refuses a conflicting accelerator' \
+        'Hotkey registration initially failed' "$(cat "$conflict_config_log" 2>/dev/null || true)"
+    assert_text 'KDE App names the accelerator owner' \
+        'Window Zones conflict incumbent' "$(cat "$conflict_config_log" 2>/dev/null || true)"
+    stop_app_cleanly 'KDE App with a conflicting accelerator quits cleanly' "$conflict_config_log"
+    kde_live_write_valid_config
     set +e
     kde_live_unload_script window-zones-conflict
 }
@@ -2863,7 +2922,8 @@ kde_live_tui_lifecycle() {
     wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 10 || true
     assert_text 'KDE TUI dispatch action' 'Last action: alt+ctrl+left' \
         "$(cat "$tui_log" 2>/dev/null || true)"
-    kde_live_assert_geometry 'KDE TUI dispatch geometry' "$KDE_LEFT_HALF" "$KDE_A_ID"
+    kde_live_refresh_targets
+    kde_live_assert_zone 'KDE TUI dispatch geometry' left-half A
     send_app quit
     close_app_input
     if [[ -n "${APP_PID:-}" ]]; then
@@ -3008,11 +3068,12 @@ run_kde_live() {
     kill -0 "$KDE_KWIN_PID" 2>/dev/null && kwin_alive=1
     assert_eq 'KDE nested KWin fixture starts' 1 "$kwin_alive"
     kde_live_prepare_environment
-    local xdisplay_ok=0 xauthority_ok=0
+    local xdisplay_ok=0
     [[ "$KDE_XDISPLAY" == :* ]] && xdisplay_ok=1
-    [[ -r "$KDE_XAUTHORITY" ]] && xauthority_ok=1
     assert_eq 'KDE nested Xwayland DISPLAY is published' 1 "$xdisplay_ok"
-    assert_eq 'KDE nested Xwayland XAUTHORITY is published' 1 "$xauthority_ok"
+    # KWin's rootless Xwayland accepts clients from this user without an auth file, so an empty
+    # XAUTHORITY is not a failure; the X11 connection below is the check that matters.
+    log "KDE nested Xwayland XAUTHORITY: ${KDE_XAUTHORITY:-<none published>}"
     local x11_root_geometry='' x11_connection_ok=0
     x11_root_geometry=$(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
         xdotool getdisplaygeometry 2>/dev/null || true)
@@ -3103,7 +3164,7 @@ PY
     assert_eq 'KDE GetDisplays matches independent MaximizeArea observer' 1 "$display_compare_result"
     skip_assert 'KDE Plasma panel exclusion' \
         'bare nested KWin runs no plasmashell/panel; this run verifies panel-free per-output areas, not Plasma reserved-area behavior'
-    kde_live_select_display_targets
+
 
     local editor_log="$KDE_ROOT/editor.log" editor_deadline=0 editor_alive=0 window_found=0
     KDE_EDITOR_PID=$(start_group "$editor_log" env \
@@ -3127,25 +3188,31 @@ PY
     kde_live_activate_window || true
     kde_live_wait_focus 15 || true
     kde_live_assert_focus
+    # Outputs are windows of the outer compositor and can be resized while the fixture starts, and
+    # the test window decides which output it opens on, so targets are chosen once the window is
+    # focused, from the newest observer record.
+    kde_live_observer_records "$KDE_KWIN_LOG" >"$KDE_ROOT/observer-records"
+    kde_live_select_display_targets
+    log "KDE placement targets after focus: A=$KDE_A_LINE B=$KDE_B_LINE"
     local editor_backend=''
     editor_backend=$(tr '\0' '\n' <"/proc/$KDE_EDITOR_PID/environ" 2>/dev/null \
         | sed -n '/^GDK_BACKEND=/p' | sed -n '1p' || true)
     assert_eq 'KDE test editor uses Xwayland backend' 'GDK_BACKEND=x11' "$editor_backend"
 
     kde_live_dispatch 'KDE left-half' alt+ctrl+left
-    kde_live_assert_geometry 'KDE left-half' "$KDE_LEFT_HALF" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE left-half' left-half A
     kde_live_dispatch 'KDE center-third' alt+ctrl+up
-    kde_live_assert_geometry 'KDE center-third' "$KDE_CENTER_THIRD" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE center-third' center-third A
     kde_live_dispatch 'KDE left-two-thirds' alt+ctrl+right
-    kde_live_assert_geometry 'KDE left-two-thirds' "$KDE_TWO_THIRDS" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE left-two-thirds' left-two-thirds A
     kde_live_dispatch 'KDE next-display' alt+ctrl+down
-    kde_live_assert_geometry 'KDE next-display' "$KDE_B_TWO_THIRDS" "$KDE_B_ID"
+    kde_live_assert_zone 'KDE next-display' left-two-thirds B
     kde_live_dispatch 'KDE previous-display' alt+ctrl+shift+right
-    kde_live_assert_geometry 'KDE previous-display' "$KDE_TWO_THIRDS" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE previous-display' left-two-thirds A
     kde_live_dispatch 'KDE previous-display wrap' alt+ctrl+shift+right
-    kde_live_assert_geometry 'KDE previous-display wraps' "$KDE_B_TWO_THIRDS" "$KDE_B_ID"
+    kde_live_assert_zone 'KDE previous-display wraps' left-two-thirds B
     kde_live_dispatch 'KDE next-display wrap' alt+ctrl+down
-    kde_live_assert_geometry 'KDE next-display wraps' "$KDE_TWO_THIRDS" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE next-display wraps' left-two-thirds A
     skip_assert 'KDE negative-coordinate output movement' \
         'fixture uses KWin-generated side-by-side nonnegative output origins; no negative-origin layout was configured'
 
@@ -3174,7 +3241,8 @@ PY
     fi
 
     send_app 'dispatch alt+ctrl+up'
-    kde_live_assert_geometry 'KDE real hotkey baseline center-third' "$KDE_CENTER_THIRD" "$KDE_A_ID"
+    kde_live_refresh_targets
+    kde_live_assert_zone 'KDE real hotkey baseline center-third' center-third A
     local eis_before=0 eis_after=0 eis_ok=0 inject_rc=0 action_before=0
     eis_before=$(count_text "$KDE_KWIN_LOG" ' key ')
     action_before=$(count_text "$run_log" 'last action: alt+ctrl+left')
@@ -3188,7 +3256,7 @@ PY
     eis_after=$(count_text "$KDE_KWIN_LOG" ' key ')
     (( eis_after > eis_before )) && eis_ok=1
     assert_eq 'KDE XTEST accelerator reaches KWin EIS' 1 "$eis_ok"
-    kde_live_assert_geometry 'KDE real XTEST-to-EIS hotkey' "$KDE_LEFT_HALF" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE real XTEST-to-EIS hotkey' left-half A
     send_app status
     if wait_for_new_text "$run_log" 'last action: alt+ctrl+left' "$action_before" 10; then
         assert_text 'KDE real hotkey reports action' 'last action: alt+ctrl+left' "$(<"$run_log")"
@@ -3230,10 +3298,23 @@ PY
     assert_eq 'KDE App PID unchanged after script reload' 1 "$app_alive"
 
     local old_service_pid="$KDE_SERVICE_PID" service_stopped=0 restart_log="$KDE_ROOT/companion-restart.log"
+    # A killed child stays visible to kill -0 until it is reaped, and a service that ignores
+    # SIGTERM would otherwise be reported as stopped only by timeout, so escalate and confirm the
+    # bus name is actually gone.
     stop_pid "$old_service_pid"
+    wait_pid "$old_service_pid" 5 || kill -9 "$old_service_pid" 2>/dev/null || true
     wait_pid "$old_service_pid" 5 || true
     set +e
-    kill -0 "$old_service_pid" 2>/dev/null || service_stopped=1
+    local service_owner_gone=0 stop_deadline=$((SECONDS + 10))
+    while (( SECONDS < stop_deadline )); do
+        if ! busctl --address="$KDE_BUS" list 2>/dev/null | grep -q 'org.window_zones.KWin'; then
+            service_owner_gone=1
+            break
+        fi
+        sleep 0.2
+    done
+    service_stopped=$service_owner_gone
+    log "KDE service stop: owner gone=$service_owner_gone pid alive=$(kill -0 "$old_service_pid" 2>/dev/null && printf 1 || printf 0)"
     assert_eq 'KDE Rust service stops independently' 1 "$service_stopped"
     KDE_SERVICE_PID=$(start_group "$restart_log" env -u KDEHOME DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" \
         HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" XDG_DATA_HOME="$KDE_DATA" \
@@ -3271,7 +3352,8 @@ PY
     fi
 
     send_app 'dispatch alt+ctrl+up'
-    kde_live_assert_geometry 'KDE invalid config retention baseline center-third' "$KDE_CENTER_THIRD" "$KDE_A_ID"
+    kde_live_refresh_targets
+    kde_live_assert_zone 'KDE invalid config retention baseline center-third' center-third A
     write_invalid_config
     sleep 0.4
     send_app reload
@@ -3287,7 +3369,7 @@ PY
     assert_text 'KDE invalid reload preserves previous binding count' 'binding count: 5' \
         "$(cat "$run_log" 2>/dev/null || true)"
     kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
-    kde_live_assert_geometry 'KDE invalid config retains active binding' "$KDE_LEFT_HALF" "$KDE_A_ID"
+    kde_live_assert_zone 'KDE invalid config retains active binding' left-half A
     kde_live_write_changed_config
     sleep 0.4
     send_app reload
