@@ -45,6 +45,7 @@ PIDS=()
 GROUP_PIDS=()
 FAILURES=0
 ASSERTIONS=0
+SKIPPED=0
 CURRENT_GATE=""
 LAST_SHOT=""
 GNOME_LIVE_ACTIVE=0
@@ -101,6 +102,7 @@ assert_rc_nonzero() {
 skip_assert() {
     local name=$1 reason=$2
     ASSERTIONS=$((ASSERTIONS + 1))
+    SKIPPED=$((SKIPPED + 1))
     log "SKIP $name: $reason"
 }
 
@@ -362,6 +364,7 @@ find_last_window() {
 
 x11_geometry() {
     local geometry key value x='' y='' width='' height=''
+    local extents left=0 right=0 top=0 bottom=0
     geometry=$(xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null || true)
     while IFS='=' read -r key value; do
         case "$key" in
@@ -371,9 +374,18 @@ x11_geometry() {
             HEIGHT) height=$value ;;
         esac
     done <<<"$geometry"
+    extents=$(xprop -id "$WINDOW_ID" _NET_FRAME_EXTENTS 2>/dev/null || true)
+    if [[ "$extents" =~ =[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+) ]]; then
+        left=${BASH_REMATCH[1]}
+        right=${BASH_REMATCH[2]}
+        top=${BASH_REMATCH[3]}
+        bottom=${BASH_REMATCH[4]}
+    fi
     if [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ \
         && "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
-        printf '%s,%s,%s,%s' "$x" "$y" "$width" "$height"
+        # xdotool reports client root geometry; all gate targets describe the frame.
+        printf '%s,%s,%s,%s' "$((x - left))" "$((y - top))" \
+            "$((width + left + right))" "$((height + top + bottom))"
     else
         printf 'unavailable'
     fi
@@ -645,38 +657,37 @@ gnome_live_geometry() {
 }
 
 gnome_live_zone_targets() {
-    # A live session can drive several monitors and the test window need not open on the first one,
-    # so derive every expectation from the display the Companion reports for the focused window,
-    # and derive the cross-display expectation from the display a next-display move lands on.
-    local focused present display x y w h id
+    # Derive the current display from the frame center, not the legacy wire display id.
+    local focused present display x y w h id center_x center_y
     local area='' next_area='' found=-1 total=0 index=0
     focused=$(get_gnome_focused)
     IFS='|' read -r present display x y w h <<<"$focused"
     [[ "$present" == 'true' ]] || return 0
+    center_x=$((x + w / 2))
+    center_y=$((y + h / 2))
     while IFS='|' read -r id x y w h; do
-        [[ -n "$id" ]] || continue
-        if [[ "$id" == "$display" ]]; then
+        [[ -n "$id" ]] && (( w > 0 && h > 0 )) || continue
+        if (( found < 0 && center_x >= x && center_x < x + w \
+            && center_y >= y && center_y < y + h )); then
             found=$total
             area="$x|$y|$w|$h"
+            GNOME_LIVE_DISPLAY_ID="$id"
         fi
         total=$((total + 1))
     done <<<"$GNOME_LIVE_DISPLAY_LINES"
     (( found >= 0 )) || return 0
     while IFS='|' read -r id x y w h; do
-        [[ -n "$id" ]] || continue
+        [[ -n "$id" ]] && (( w > 0 && h > 0 )) || continue
         if (( index == (found + 1) % total )); then
             next_area="$x|$y|$w|$h"
-            GNOME_LIVE_NEXT_DISPLAY_ID="$id"
         fi
         index=$((index + 1))
     done <<<"$GNOME_LIVE_DISPLAY_LINES"
-    GNOME_LIVE_DISPLAY_ID="$display"
     IFS='|' read -r GNOME_LIVE_X GNOME_LIVE_Y GNOME_LIVE_W GNOME_LIVE_H <<<"$area"
     GNOME_LIVE_LEFT_HALF="$GNOME_LIVE_X,$GNOME_LIVE_Y,$((GNOME_LIVE_W / 2)),$GNOME_LIVE_H"
     GNOME_LIVE_CENTER_THIRD="$((GNOME_LIVE_X + GNOME_LIVE_W / 3)),$GNOME_LIVE_Y,$((GNOME_LIVE_W - 2 * (GNOME_LIVE_W / 3))),$GNOME_LIVE_H"
     GNOME_LIVE_TWO_THIRDS="$GNOME_LIVE_X,$GNOME_LIVE_Y,$((GNOME_LIVE_W - GNOME_LIVE_W / 3)),$GNOME_LIVE_H"
     GNOME_LIVE_NEXT_TWO_THIRDS=''
-    GNOME_LIVE_NEXT_DISPLAY_ID="${GNOME_LIVE_NEXT_DISPLAY_ID:-}"
     GNOME_LIVE_DISPLAY_TOTAL=$total
     if (( total > 1 )) && [[ -n "$next_area" ]]; then
         local next_x next_y next_w next_h
@@ -767,23 +778,13 @@ PY
 
 gnome_live_inject_hotkey() {
     local output='' rc=0
-    if [[ -w /dev/uinput ]]; then
-        write_uinput_injector
-        if output=$(python3 "$UINPUT_INJECTOR" "$GNOME_SAFE_UINPUT_KEY" 2>&1); then
-            rc=0
-        else
-            rc=$?
-        fi
-        log "GNOME live uinput hotkey $GNOME_SAFE_HOTKEY: exit $rc${output:+ output '$output'}"
-        return "$rc"
-    fi
-    if output=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-        xdotool key --clearmodifiers "$GNOME_SAFE_XDOT_KEY" 2>&1); then
+    write_uinput_injector
+    if output=$(python3 "$UINPUT_INJECTOR" "$GNOME_SAFE_UINPUT_KEY" 2>&1); then
         rc=0
     else
         rc=$?
     fi
-    log "GNOME live XTEST hotkey $GNOME_SAFE_HOTKEY: exit $rc${output:+ output '$output'} (/dev/uinput not writable; XTEST does not reach compositor grabs)"
+    log "GNOME live uinput hotkey $GNOME_SAFE_HOTKEY: exit $rc${output:+ output '$output'}"
     return "$rc"
 }
 
@@ -854,12 +855,10 @@ gnome_live_assert_focus() {
 }
 
 gnome_live_assert_geometry() {
-    local name=$1 expected=$2 expected_display=${3:-$GNOME_LIVE_DISPLAY_ID}
+    local name=$1 expected=$2
     local deadline=$((SECONDS + 10))
     local observed_x11='' observed_companion='' focused=''
     local present='' display='' x='' y='' width='' height=''
-    local expected_x='' expected_y='' expected_width='' expected_height=''
-    IFS=',' read -r expected_x expected_y expected_width expected_height <<<"$expected"
     gnome_live_activate_window || true
     while (( SECONDS < deadline )); do
         observed_x11=$(gnome_live_geometry)
@@ -868,7 +867,6 @@ gnome_live_assert_geometry() {
         observed_companion="$focused"
         if [[ "$observed_x11" == "$expected" \
             && "$present" == 'true' \
-            && "$display" == "$expected_display" \
             && "$x,$y,$width,$height" == "$expected" ]]; then
             break
         fi
@@ -876,9 +874,7 @@ gnome_live_assert_geometry() {
     done
     log "OBSERVED $name: companion='$observed_companion' xdotool='$observed_x11'"
     assert_eq "$name xdotool geometry" "$expected" "$observed_x11"
-    assert_eq "$name companion geometry" \
-        "true|$expected_display|$expected_x|$expected_y|$expected_width|$expected_height" \
-        "$observed_companion"
+    assert_eq "$name companion geometry" "true|$expected" "$present|$x,$y,$width,$height"
     gnome_live_capture "$name"
 }
 
@@ -963,14 +959,14 @@ wait_gnome_focused() {
     local expected=$1 timeout_s=${2:-8} observed
     local deadline=$((SECONDS + timeout_s))
     while (( SECONDS < deadline )); do
-        observed=$(get_gnome_focused)
+        observed=$(get_gnome_focused | cut -d'|' -f1,3-)
         if [[ "$observed" == "$expected" ]]; then
             printf '%s' "$observed"
             return 0
         fi
         sleep 0.1
     done
-    printf '%s' "$(get_gnome_focused)"
+    printf '%s' "$(get_gnome_focused | cut -d'|' -f1,3-)"
     return 1
 }
 
@@ -1210,37 +1206,44 @@ run_tui_lifecycle() {
 }
 
 gnome_live_choose_hotkeys() {
-    local schema raw normalized candidate hotkey canonical reverse xdotool_key
+    local schema raw normalized candidate hotkey canonical reverse reserved conflict
     local -a candidates=(
-        'cmd+ctrl+left|<Super><Control>Left|Super_L+Control_L+Left'
-        'cmd+ctrl+up|<Super><Control>Up|Super_L+Control_L+Up'
-        'cmd+ctrl+right|<Super><Control>Right|Super_L+Control_L+Right'
-        'cmd+ctrl+down|<Super><Control>Down|Super_L+Control_L+Down'
-        'pause|Pause|Pause'
-        'alt+pause|<Alt>Pause|Alt_L+Pause'
-        'ctrl+pause|<Control>Pause|Control_L+Pause'
+        'ctrl+cmd+left|<super><control>left'
+        'ctrl+cmd+up|<super><control>up'
+        'ctrl+cmd+right|<super><control>right'
+        'ctrl+cmd+down|<super><control>down'
+        'pause|pause'
+        'alt+pause|<alt>pause'
+        'ctrl+pause|<control>pause'
     )
-    GNOME_RESERVED_ACCELERATORS=''
+    GNOME_RESERVED_ACCELERATORS=()
     log 'GNOME live reserved accelerator enumeration:'
     for schema in org.gnome.desktop.wm.keybindings org.gnome.shell.keybindings \
         org.gnome.mutter.keybindings org.gnome.mutter.wayland.keybindings; do
         raw=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gsettings list-recursively "$schema" 2>&1 || true)
-        normalized=$(printf '%s\n' "$raw" | sed 's/<Primary>/<Control>/g')
+        normalized=$(printf '%s\n' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/<primary>/<control>/g')
         log "  $schema:"
         while IFS= read -r candidate; do
             [[ -n "$candidate" ]] && log "    $candidate"
         done <<<"$normalized"
+        while IFS= read -r reserved; do
+            GNOME_RESERVED_ACCELERATORS+=("$reserved")
+        done < <(printf '%s\n' "$normalized" | grep -o "'[^']*'" | tr -d "'")
     done
 
     GNOME_SAFE_HOTKEYS=()
-    GNOME_SAFE_XDOT_KEYS=()
     for candidate in "${candidates[@]}"; do
-        IFS='|' read -r hotkey canonical xdotool_key <<<"$candidate"
-        reverse=${canonical/<Super><Control>/<Control><Super>}
-        if [[ "$GNOME_RESERVED_ACCELERATORS" != *"$canonical"* \
-            && "$GNOME_RESERVED_ACCELERATORS" != *"$reverse"* ]]; then
+        IFS='|' read -r hotkey canonical <<<"$candidate"
+        reverse=${canonical/<super><control>/<control><super>}
+        conflict=0
+        for reserved in "${GNOME_RESERVED_ACCELERATORS[@]:-}"; do
+            if [[ "$reserved" == "$canonical" || "$reserved" == "$reverse" ]]; then
+                conflict=1
+                break
+            fi
+        done
+        if [[ "$conflict" -eq 0 ]]; then
             GNOME_SAFE_HOTKEYS+=("$hotkey")
-            GNOME_SAFE_XDOT_KEYS+=("$xdotool_key")
         fi
     done
     log "GNOME live selected safe hotkeys: ${GNOME_SAFE_HOTKEYS[*]}"
@@ -1341,7 +1344,7 @@ EOF
     if wait_for_text "$monitor_log" "$GNOME_SAFE_LEFT_HOTKEY" 5; then
         log "GNOME live atomic pre-error signal: $GNOME_SAFE_LEFT_HOTKEY"
     else
-        log 'Harness limitation GNOME live atomic pre-error XTEST signal was not observed'
+        log 'Harness limitation GNOME live atomic pre-error uinput signal was not observed'
     fi
     if wait_for_text "$helper_log" 'INVALID_REJECTED' 8; then
         assert_text 'GNOME live atomic invalid registration is refused' \
@@ -1473,7 +1476,7 @@ gnome_live_finish() {
 }
 run_gnome_live_app_checks() {
     local run_log="$GNOME_ROOT/live-run.log"
-    local registered=0 real_geometry='' real_ok=0 real_path='none'
+    local registered=0 real_geometry=''
     local attempts=0 deadline=0 before_pid='' disable_out='' enable_out=''
     write_gnome_live_valid_config
     start_fifo_app run wayland "$run_log"
@@ -1505,29 +1508,13 @@ run_gnome_live_app_checks() {
             sleep 0.25
             real_geometry=$(gnome_live_geometry)
             if [[ "$real_geometry" == "$GNOME_LIVE_LEFT_HALF" ]]; then
-                real_ok=1
-                real_path='XTEST'
                 break
             fi
         done
     else
         log 'GNOME live real-hotkey injection not attempted because the live grab did not register'
     fi
-    if [[ "$real_ok" -eq 0 ]]; then
-        log "Harness limitation GNOME live XTEST did not move the window after $attempts attempts"
-        log "MANUAL ACTION REQUIRED: press $GNOME_SAFE_HOTKEY once in the focused Text Editor window"
-        deadline=$((SECONDS + 15))
-        while (( SECONDS < deadline )); do
-            real_geometry=$(gnome_live_geometry)
-            if [[ "$real_geometry" == "$GNOME_LIVE_LEFT_HALF" ]]; then
-                real_ok=1
-                real_path='manual'
-                break
-            fi
-            sleep 0.25
-        done
-    fi
-    log "GNOME live real-hotkey evidence path: $real_path"
+    log "GNOME live real-hotkey evidence path: uinput ($attempts attempts)"
     assert_eq 'GNOME live real hotkey moves window' "$GNOME_LIVE_LEFT_HALF" "$real_geometry"
     gnome_live_capture real-hotkey
     if [[ -n "${APP_FD:-}" ]]; then
@@ -1682,6 +1669,12 @@ run_gnome_live_tui_lifecycle() {
 
 run_gnome_live() {
     CURRENT_GATE='gnome-live'
+    if [[ ! -w /dev/uinput ]]; then
+        assert_eq 'GNOME live uinput preflight' writable '/dev/uinput is not writable'
+        log 'BLOCKED GNOME live: run sudo modprobe uinput, then sudo chmod 0666 /dev/uinput or install a udev rule granting access; uinput is required for this gate'
+        return 1
+    fi
+    assert_eq 'GNOME live uinput preflight' writable writable
     GNOME_ROOT="$TMP_DIR/gnome-live"
     GNOME_CONFIG="$GNOME_ROOT/config"
     GNOME_DATA="$GNOME_ROOT/data"
@@ -1804,7 +1797,6 @@ run_gnome_live() {
     GNOME_SAFE_CENTER_HOTKEY="${GNOME_SAFE_HOTKEYS[1]}"
     GNOME_SAFE_RIGHT_HOTKEY="${GNOME_SAFE_HOTKEYS[2]}"
     GNOME_SAFE_NEXT_HOTKEY="${GNOME_SAFE_HOTKEYS[3]}"
-    GNOME_SAFE_XDOT_KEY="${GNOME_SAFE_XDOT_KEYS[0]}"
     GNOME_SAFE_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY"
     GNOME_SAFE_UINPUT_KEY="$GNOME_SAFE_LEFT_HOTKEY"
 
@@ -1899,7 +1891,7 @@ EOF
     if [[ -n "$GNOME_LIVE_NEXT_TWO_THIRDS" ]]; then
         run_gnome_live_dispatch next-display "$GNOME_SAFE_NEXT_HOTKEY"
         gnome_live_assert_geometry 'GNOME live cross-display move' \
-            "$GNOME_LIVE_NEXT_TWO_THIRDS" "$GNOME_LIVE_NEXT_DISPLAY_ID"
+            "$GNOME_LIVE_NEXT_TWO_THIRDS"
         if (( GNOME_LIVE_DISPLAY_TOTAL == 2 )); then
             # Two displays wrap, so a second move returns the window and leaves the later checks
             # on the display they were computed for.
@@ -2486,18 +2478,28 @@ kde_live_assert_focus() {
     assert_eq 'KDE GetFocusedWindow reports test window' true "$present"
     assert_eq 'KDE focus geometry agrees with xdotool' "$observed" "$x,$y,$width,$height"
     assert_eq 'KDE focus active nested X11 window' "$WINDOW_ID" "$active"
-    local display_match=0 id=''
-    while IFS='|' read -r id _; do
-        [[ "$id" == "$display" ]] && display_match=1
+    local display_match=0 id='' output_x output_y output_width output_height
+    local center_x=$((x + width / 2)) center_y=$((y + height / 2))
+    while IFS='|' read -r id output_x output_y output_width output_height; do
+        if (( center_x >= output_x && center_x < output_x + output_width \
+            && center_y >= output_y && center_y < output_y + output_height )); then
+            display_match=1
+            break
+        fi
     done <"$KDE_ROOT/observer-records"
-    assert_eq 'KDE focused display matches observer output' 1 "$display_match"
+    assert_eq 'KDE focused frame center is on observer output' 1 "$display_match"
 }
 
 kde_live_select_display_targets() {
-    local focused='' focused_display='' id='' x='' y='' width='' height='' record='' record_id=''
+    local focused='' present='' ignored='' id='' x='' y='' width='' height='' record=''
+    local center_x=0 center_y=0
     local -a records=()
     focused=$(kde_live_get_focused)
-    focused_display=$(printf '%s\n' "$focused" | cut -d'|' -f2)
+    IFS='|' read -r present ignored x y width height <<<"$focused"
+    if [[ "$present" == true ]]; then
+        center_x=$((x + width / 2))
+        center_y=$((y + height / 2))
+    fi
     while IFS='|' read -r id x y width height; do
         [[ -n "$id" ]] || continue
         [[ "$id" =~ ^-?[0-9]+$ ]] && continue
@@ -2506,8 +2508,9 @@ kde_live_select_display_targets() {
     KDE_A_LINE=''
     KDE_B_LINE=''
     for record in "${records[@]}"; do
-        record_id=${record%%|*}
-        if [[ "$record_id" == "$focused_display" ]]; then
+        IFS='|' read -r id x y width height <<<"$record"
+        if [[ "$present" == true ]] && (( center_x >= x && center_x < x + width \
+            && center_y >= y && center_y < y + height )); then
             KDE_A_LINE="$record"
             break
         fi
@@ -2557,7 +2560,7 @@ kde_live_assert_zone() {
     local name=$1 zone=$2 target=$3
     local deadline=$((SECONDS + 12)) observed_x11='' focused='' observed_companion=''
     local present='' display='' x='' y='' width='' height=''
-    local expected='' expected_display='' line='' wanted=''
+    local expected='' ignored='' line='' wanted=''
     if [[ "$target" == B ]]; then
         wanted="$KDE_B_ID"
     else
@@ -2567,27 +2570,22 @@ kde_live_assert_zone() {
     while : ; do
         kde_live_observer_records "$KDE_KWIN_LOG" >"$KDE_ROOT/observer-records"
         line=$(sed -n "/^${wanted}|/p" "$KDE_ROOT/observer-records" | sed -n '1p')
-        IFS='|' read -r expected_display x y width height <<<"$line"
+        IFS='|' read -r ignored x y width height <<<"$line"
         expected=$(kde_live_zone_rect "$zone" "$x" "$y" "$width" "$height")
         observed_x11=$(kde_live_x11_geometry)
         focused=$(kde_live_get_focused)
         observed_companion="$focused"
         IFS='|' read -r present display x y width height <<<"$focused"
         if [[ "$observed_x11" == "$expected" && "$present" == true \
-            && "$display" == "$expected_display" \
             && "$x,$y,$width,$height" == "$expected" ]]; then
             break
         fi
         (( SECONDS < deadline )) || break
         sleep 0.2
     done
-    local expected_x='' expected_y='' expected_width='' expected_height=''
-    IFS=',' read -r expected_x expected_y expected_width expected_height <<<"$expected"
     log "OBSERVED $name: observer-expected='$expected' companion='$observed_companion' xdotool='$observed_x11'"
     assert_eq "$name independent X11 geometry" "$expected" "$observed_x11"
-    assert_eq "$name Companion geometry" \
-        "true|$expected_display|$expected_x|$expected_y|$expected_width|$expected_height" \
-        "$observed_companion"
+    assert_eq "$name Companion geometry" "true|$expected" "$present|$x,$y,$width,$height"
 }
 
 kde_live_dispatch() {
@@ -2696,7 +2694,7 @@ const validId = request([valid]);
 waitResult(validId, 'VALID');
 print('VALID_READY');
 poll(6);
-const invalidId = request([valid, 'ctrl+alt+f25']);
+const invalidId = request([valid, 'alt+ctrl+f25']);
 waitResult(invalidId, 'INVALID');
 print('INVALID_READY');
 poll(6);
@@ -2735,24 +2733,22 @@ EOF
         assert_text 'KDE atomic rejected accelerator completes' 'INVALID_RESULT true' "$atomic_log"
         assert_text 'KDE atomic rejected accelerator names f25' 'f25' "$atomic_log"
     fi
-    invalid_events_before=$(count_text "$helper_log" 'EVENT ctrl+alt+f25')
+    invalid_events_before=$(count_text "$helper_log" 'EVENT alt+ctrl+f25')
     kde_live_inject_key ctrl+alt+F25 >/dev/null 2>&1 || true
     sleep 0.5
-    invalid_events_after=$(count_text "$helper_log" 'EVENT ctrl+alt+f25')
+    invalid_events_after=$(count_text "$helper_log" 'EVENT alt+ctrl+f25')
     assert_eq 'KDE atomic rejected accelerator is inactive' "$invalid_events_before" "$invalid_events_after"
+    valid_events_before=$(count_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY")
     if kde_live_inject_key ctrl+alt+Left; then
         inject_rc=0
     else
         inject_rc=$?
     fi
     assert_rc_zero 'KDE atomic previous accelerator injection' "$inject_rc" 'xdotool XTEST'
-    if wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 8; then
-        assert_text 'KDE atomic registration preserves previous set' \
-            "EVENT $KDE_SAFE_HOTKEY" "$(<"$helper_log")"
-    else
-        assert_text 'KDE atomic registration preserves previous set' \
-            "EVENT $KDE_SAFE_HOTKEY" "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
+    local previous_active=0
+    wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 8 \
+        && previous_active=1
+    assert_eq 'KDE atomic registration preserves previous set' 1 "$previous_active"
     stop_pid "$helper_pid"
     wait_pid "$helper_pid" 5 || true
     sleep 0.3
@@ -2785,10 +2781,11 @@ EOF
     fi
 
     local helper="$KDE_ROOT/conflict-register.js" helper_log="$KDE_ROOT/conflict-register.log"
-    local helper_pid='' inject_rc=0
+    local helper_pid='' inject_rc=0 valid_events_before=0 previous_active=0
     cat >"$helper" <<'EOF'
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+const valid = GLib.getenv('KDE_VALID_HOTKEY');
 const address = GLib.getenv('DBUS_SESSION_BUS_ADDRESS');
 const connection = Gio.DBusConnection.new_for_address_sync(
     address,
@@ -2799,53 +2796,80 @@ const connection = Gio.DBusConnection.new_for_address_sync(
 const proxy = Gio.DBusProxy.new_sync(
     connection, Gio.DBusProxyFlags.NONE, null,
     'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin1', null);
-const request = proxy.call_sync(
-    'RegisterHotkeys',
-    new GLib.Variant('(s)', ['["alt+ctrl+f24"]']),
-    Gio.DBusCallFlags.NONE,
-    5000,
-    null).deep_unpack()[0];
-let result = [false, ''];
-for (let attempt = 0; attempt < 100; attempt++) {
-    result = proxy.call_sync(
-        'GetRequestResult',
-        new GLib.Variant('(s)', [String(request)]),
+function register(keys, label) {
+    const request = proxy.call_sync(
+        'RegisterHotkeys',
+        new GLib.Variant('(s)', [JSON.stringify(keys)]),
         Gio.DBusCallFlags.NONE,
         5000,
-        null).deep_unpack();
-    if (result[0])
-        break;
-    GLib.usleep(100000);
-}
-print(`CONFLICT_RESULT ${result[0]} ${result[1]}`);
-print(result[1] ? `CONFLICT_REFUSED ${result[1]}` : 'CONFLICT_ACCEPTED');
-print('CONFLICT_READY');
-const deadline = Date.now() + 6000;
-while (Date.now() < deadline) {
-    try {
-        const event = proxy.call_sync(
-            'GetNextHotkey',
-            new GLib.Variant('()', []),
+        null).deep_unpack()[0];
+    let result = [false, ''];
+    for (let attempt = 0; attempt < 100; attempt++) {
+        result = proxy.call_sync(
+            'GetRequestResult',
+            new GLib.Variant('(s)', [String(request)]),
             Gio.DBusCallFlags.NONE,
             5000,
             null).deep_unpack();
-        if (event[0])
-            print(`EVENT ${event[1]}`);
-    } catch (_) {
+        if (result[0])
+            break;
+        GLib.usleep(100000);
     }
-    GLib.usleep(100000);
+    print(`${label}_RESULT ${JSON.stringify(result)}`);
+    print(`${label}_READY`);
 }
+
+function poll(seconds) {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+        try {
+            const event = proxy.call_sync(
+                'GetNextHotkey',
+                new GLib.Variant('()', []),
+                Gio.DBusCallFlags.NONE,
+                5000,
+                null).deep_unpack();
+            if (event[0])
+                print(`EVENT ${event[1]}`);
+        } catch (_) {
+        }
+        GLib.usleep(100000);
+    }
+}
+
+register([valid], 'VALID');
+poll(6);
+register(['alt+ctrl+f24'], 'CONFLICT');
+poll(15);
 EOF
     : >"$helper_log"
     helper_pid=$(start_group "$helper_log" env \
-        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" gjs -m "$helper")
+        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" KDE_VALID_HOTKEY="$KDE_SAFE_HOTKEY" \
+        gjs -m "$helper")
+    wait_for_text "$helper_log" 'VALID_READY' 12 || true
+    assert_text 'KDE conflict replacement starts with valid set' \
+        'VALID_RESULT [true,""]' "$(cat "$helper_log" 2>/dev/null || true)"
+    valid_events_before=$(count_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY")
+    kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
+    wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 5 \
+        && previous_active=1
+    assert_eq 'KDE conflict previous set active before replacement' 1 "$previous_active"
     if wait_for_text "$helper_log" 'CONFLICT_READY' 12; then
         assert_text 'KDE conflicting accelerator result completes' \
-            'CONFLICT_RESULT true' "$(<"$helper_log")"
+            'CONFLICT_RESULT [true,' "$(<"$helper_log")"
     else
-        assert_text 'KDE conflicting accelerator result completes' 'CONFLICT_RESULT true' \
+        assert_text 'KDE conflicting accelerator result completes' 'CONFLICT_RESULT [true,' \
             "$(cat "$helper_log" 2>/dev/null || true)"
     fi
+    assert_text 'KDE conflicting replacement reports conflict error' \
+        "KWin rejected shortcut 'alt+ctrl+f24': accelerator is already held by 'Window Zones conflict incumbent'" \
+        "$(cat "$helper_log" 2>/dev/null || true)"
+    valid_events_before=$(count_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY")
+    previous_active=0
+    kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
+    wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 5 \
+        && previous_active=1
+    assert_eq 'KDE conflicting replacement preserves previous set' 1 "$previous_active"
     if kde_live_inject_key ctrl+alt+F24; then
         inject_rc=0
     else
@@ -3534,13 +3558,13 @@ EOF
         assert_text 'GNOME GetFocusedWindow reports test window' 'true|' "$focused"
 
         run_gnome_dispatch half alt+ctrl+left
-        gnome_assert_geometry 'gnome-left-half' "true|$GNOME_DISPLAY_ID|$GNOME_X|$GNOME_Y|$((GNOME_W / 2))|$GNOME_H"
+        gnome_assert_geometry 'gnome-left-half' "true|$GNOME_X|$GNOME_Y|$((GNOME_W / 2))|$GNOME_H"
         run_gnome_dispatch center-third alt+ctrl+up
-        gnome_assert_geometry 'gnome-center-third' "true|$GNOME_DISPLAY_ID|$((GNOME_X + GNOME_W / 3))|$GNOME_Y|$((GNOME_W - 2 * (GNOME_W / 3)))|$GNOME_H"
+        gnome_assert_geometry 'gnome-center-third' "true|$((GNOME_X + GNOME_W / 3))|$GNOME_Y|$((GNOME_W - 2 * (GNOME_W / 3)))|$GNOME_H"
         run_gnome_dispatch two-thirds alt+ctrl+right
-        gnome_assert_geometry 'gnome-left-two-thirds' "true|$GNOME_DISPLAY_ID|$GNOME_X|$GNOME_Y|$((GNOME_W - GNOME_W / 3))|$GNOME_H"
+        gnome_assert_geometry 'gnome-left-two-thirds' "true|$GNOME_X|$GNOME_Y|$((GNOME_W - GNOME_W / 3))|$GNOME_H"
         run_gnome_dispatch next-display alt+ctrl+down
-        gnome_assert_geometry 'gnome-next-display' "true|$GNOME_DISPLAY2_ID|$GNOME_X2|$GNOME_Y2|$GNOME_W2|$GNOME_H2"
+        gnome_assert_geometry 'gnome-next-display' "true|$GNOME_X2|$GNOME_Y2|$GNOME_W2|$GNOME_H2"
 
         run_gnome_atomic_registration
         write_valid_config
@@ -3691,21 +3715,18 @@ run_x11() {
         center_x=-1
     fi
     assert_eq 'X11 cross-display observer sees second monitor' 1 "$((center_x >= 1920 && center_x < 3520 ? 1 : 0))"
-    # Put the frame back on the first display as a recognized built-in zone so
-    # previous-display exercises index-0 wrapping to the last display.
-    DISPLAY="$X11_DISPLAY" xdotool windowmove "$WINDOW_ID" 0 0 >/dev/null 2>&1 || true
-    DISPLAY="$X11_DISPLAY" xdotool windowsize "$WINDOW_ID" 1280 1080 >/dev/null 2>&1 || true
-    DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
-    wait_x11_geometry '0,0,1280,1080' 5 >/dev/null || true
-    run_x11_dispatch previous-display alt+ctrl+shift+right '1920,0,1067,1080'
-    x11_assert_geometry 'x11-previous-display' '1920,0,1067,1080'
-    # Move back to the left display before the hotkey baseline.
-    DISPLAY="$X11_DISPLAY" xdotool windowmove "$WINDOW_ID" 640 0 >/dev/null 2>&1 || true
-    DISPLAY="$X11_DISPLAY" xdotool windowsize "$WINDOW_ID" 640 1080 >/dev/null 2>&1 || true
-    DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
-    if ! wait_x11_geometry '640,0,640,1080' 5 >/dev/null; then
-        log "Harness setup: could not reset hotkey baseline geometry (observed '$(x11_geometry)')"
-    fi
+    log "X11 frame extents: $(xprop -id "$WINDOW_ID" _NET_FRAME_EXTENTS 2>&1 || true)"
+    # Seed a nonzero frame origin on monitor 2; client-relative coordinates must not select monitor 1.
+    DISPLAY="$X11_DISPLAY" xdotool windowmove --sync "$WINDOW_ID" 1930 10 >/dev/null 2>&1 || true
+    x11_assert_geometry 'x11-second-monitor-dispatch-precondition' '1930,10,1067,1080'
+    run_x11_dispatch second-monitor-half alt+ctrl+left '1920,0,800,1080'
+    x11_assert_geometry 'x11-second-monitor-left-half' '1920,0,800,1080'
+    run_x11_dispatch previous-from-second-display alt+ctrl+shift+right '0,0,960,1080'
+    x11_assert_geometry 'x11-previous-display-from-second-monitor' '0,0,960,1080'
+    run_x11_dispatch previous-display-wrap alt+ctrl+shift+right '1920,0,800,1080'
+    x11_assert_geometry 'x11-previous-display-wraps-to-second-monitor' '1920,0,800,1080'
+    run_x11_dispatch next-display-wrap alt+ctrl+down '0,0,960,1080'
+    x11_assert_geometry 'x11-next-display-wraps-from-second-monitor' '0,0,960,1080'
 
     run_x11_dispatch center-before-hotkey alt+ctrl+up '640,0,640,1080'
     x11_assert_geometry 'x11-center-before-hotkey' '640,0,640,1080'
@@ -3809,7 +3830,7 @@ main() {
         fi
         run_x11 || true
     fi
-    log "Smoke assertions: $ASSERTIONS; failures: $FAILURES"
+    log "Smoke assertions ($COMMAND): $ASSERTIONS; passed: $((ASSERTIONS - FAILURES - SKIPPED)); failed: $FAILURES; skipped: $SKIPPED"
     log "Assertion log: $ASSERT_LOG"
     if [[ "$KEEP_LOGS" -eq 0 ]]; then
         log 'Logs removed (rerun with --keep-logs to retain temporary evidence)'

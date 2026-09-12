@@ -37,34 +37,44 @@ pub trait HotkeySystem {
 pub struct RdevHotkeySystem {
     registered_hotkeys: Arc<Mutex<HashSet<String>>>,
     events: mpsc::Receiver<HotkeyEvent>,
-    _events_tx: mpsc::Sender<HotkeyEvent>,
+    listener_error: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 impl RdevHotkeySystem {
     pub fn new() -> Self {
         let registered_hotkeys = Arc::new(Mutex::new(HashSet::new()));
+        let listener_error = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::channel();
 
-        Self::spawn_listener(Arc::clone(&registered_hotkeys), event_tx.clone());
+        Self::spawn_listener(
+            Arc::clone(&registered_hotkeys),
+            event_tx,
+            Arc::clone(&listener_error),
+        );
 
         Self {
             registered_hotkeys,
             events: event_rx,
-            _events_tx: event_tx,
+            listener_error,
         }
     }
 
     fn spawn_listener(
         registered_hotkeys: Arc<Mutex<HashSet<String>>>,
         event_tx: mpsc::Sender<HotkeyEvent>,
+        listener_error: Arc<Mutex<Option<String>>>,
     ) {
         thread::spawn(move || {
             let mut pressed_modifiers: u8 = 0;
+            let mut pressed_keys = HashSet::new();
             let callback = move |event: Event| match event.event_type {
                 EventType::KeyPress(key) => {
                     if let Some(mask) = modifier_mask(&key) {
                         pressed_modifiers |= mask;
+                        return;
+                    }
+                    if !pressed_keys.insert(key) {
                         return;
                     }
 
@@ -86,17 +96,28 @@ impl RdevHotkeySystem {
                     if let Some(mask) = modifier_mask(&key) {
                         pressed_modifiers &= !mask;
                     }
+                    pressed_keys.remove(&key);
                 }
                 _ => {}
             };
 
-            if let Err(_error) = listen(callback) {
-                // Listener failures are surfaced as disconnected event stream in
-                // next_hotkey, since listener startup can fail on unsupported
-                // desktop configurations (for example, Wayland). The next hotkey
-                // dispatch call will report an explicit error in that case.
+            // Preserve the native failure, rather than treating a dead listener as idle.
+            if let Err(error) = listen(callback)
+                && let Ok(mut state) = listener_error.lock()
+            {
+                *state = Some(format!("{error:?}"));
             }
         });
+    }
+
+    fn listener_status(&self) -> Result<(), HotkeySystemError> {
+        let error = self.listener_error.lock().map_err(|_| {
+            HotkeySystemError::Platform("failed to read hotkey listener state".to_string())
+        })?;
+        match error.as_ref() {
+            Some(error) => Err(HotkeySystemError::Platform(error.clone())),
+            None => Ok(()),
+        }
     }
 }
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -109,6 +130,7 @@ impl Default for RdevHotkeySystem {
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 impl HotkeySystem for RdevHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        self.listener_status()?;
         let mut next = HashSet::new();
 
         for raw_hotkey in hotkeys {
@@ -120,10 +142,11 @@ impl HotkeySystem for RdevHotkeySystem {
         })?;
         *bindings = next;
 
-        Ok(())
+        self.listener_status()
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        self.listener_status()?;
         match self.events.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -225,25 +248,7 @@ fn canonical_token(raw: &str) -> Result<String, HotkeySystemError> {
         ));
     }
 
-    let canonical = match token.as_str() {
-        "alt" | "option" => "alt",
-        "control" | "ctrl" => "ctrl",
-        "shift" => "shift",
-        "cmd" | "command" | "meta" | "super" | "win" | "windows" => "cmd",
-        "esc" => "escape",
-        "pgup" | "pageup" | "page_up" => "pageup",
-        "pgdn" | "pagedown" | "page_dn" | "page_down" => "pagedown",
-        "return" | "enter" => "return",
-        "left" | "leftarrow" | "left_arrow" => "left",
-        "right" | "rightarrow" | "right_arrow" => "right",
-        "up" | "uparrow" | "up_arrow" => "up",
-        "down" | "downarrow" | "down_arrow" => "down",
-        "spacebar" => "space",
-        value => value,
-    }
-    .to_string();
-
-    Ok(canonical)
+    Ok(token)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -298,22 +303,19 @@ fn key_token_to_code(token: &str) -> Option<Key> {
         }
 
         if let Some(stripped) = token.strip_prefix('f') {
-            let Ok(number) = stripped.parse::<u8>() else {
-                return None;
-            };
-            return match number {
-                1 => Some(Key::F1),
-                2 => Some(Key::F2),
-                3 => Some(Key::F3),
-                4 => Some(Key::F4),
-                5 => Some(Key::F5),
-                6 => Some(Key::F6),
-                7 => Some(Key::F7),
-                8 => Some(Key::F8),
-                9 => Some(Key::F9),
-                10 => Some(Key::F10),
-                11 => Some(Key::F11),
-                12 => Some(Key::F12),
+            return match stripped {
+                "1" => Some(Key::F1),
+                "2" => Some(Key::F2),
+                "3" => Some(Key::F3),
+                "4" => Some(Key::F4),
+                "5" => Some(Key::F5),
+                "6" => Some(Key::F6),
+                "7" => Some(Key::F7),
+                "8" => Some(Key::F8),
+                "9" => Some(Key::F9),
+                "10" => Some(Key::F10),
+                "11" => Some(Key::F11),
+                "12" => Some(Key::F12),
                 _ => None,
             };
         }
@@ -341,12 +343,12 @@ fn key_token_to_code(token: &str) -> Option<Key> {
         "slash" => Key::Slash,
         "quote" => Key::Quote,
         "semicolon" => Key::SemiColon,
-        "leftbracket" | "left_bracket" => Key::LeftBracket,
-        "rightbracket" | "right_bracket" => Key::RightBracket,
+        "leftbracket" => Key::LeftBracket,
+        "rightbracket" => Key::RightBracket,
         "backslash" => Key::BackSlash,
         "backquote" => Key::BackQuote,
         "return" => Key::Return,
-        "print" | "printscreen" => Key::PrintScreen,
+        "printscreen" => Key::PrintScreen,
         "scrolllock" => Key::ScrollLock,
         "pause" => Key::Pause,
         "capslock" => Key::CapsLock,
@@ -446,8 +448,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_known_hotkeys() {
-        assert_eq!(normalized_hotkey("Ctrl+Alt+Left").unwrap(), "alt+ctrl+left");
+    fn accepts_canonical_hotkey_tokens() {
+        assert_eq!(normalized_hotkey("ctrl+alt+left").unwrap(), "alt+ctrl+left");
         assert_eq!(
             normalized_hotkey(" shift + Return ").unwrap(),
             "shift+return"
@@ -459,5 +461,41 @@ mod tests {
     #[test]
     fn rejects_unsupported_keys() {
         assert!(normalized_hotkey("ctrl+unknown").is_err());
+    }
+
+    #[test]
+    fn rejects_alias_tokens() {
+        for hotkey in [
+            "ctrl+esc",
+            "ctrl+enter",
+            "ctrl+page_up",
+            "option+a",
+            "super+a",
+            "ctrl+left_bracket",
+            "ctrl+print",
+            "ctrl+f01",
+        ] {
+            assert!(normalized_hotkey(hotkey).is_err(), "{hotkey}");
+        }
+    }
+
+    #[test]
+    fn listener_failures_reject_registration_and_event_reads() {
+        let (event_tx, events) = mpsc::channel();
+        let mut system = RdevHotkeySystem {
+            registered_hotkeys: Arc::new(Mutex::new(HashSet::new())),
+            events,
+            listener_error: Arc::new(Mutex::new(Some("EventTapError".to_string()))),
+        };
+        let expected = Err(HotkeySystemError::Platform("EventTapError".to_string()));
+        assert_eq!(system.register_hotkeys(&["ctrl+a".to_string()]), expected);
+        assert_eq!(
+            system.next_hotkey(),
+            Err(HotkeySystemError::Platform("EventTapError".to_string()))
+        );
+
+        system.listener_error = Arc::new(Mutex::new(None));
+        drop(event_tx);
+        assert!(system.next_hotkey().is_err());
     }
 }

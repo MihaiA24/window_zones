@@ -1,6 +1,8 @@
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::fmt::Write as _;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use std::thread;
 
@@ -247,25 +249,31 @@ fn resolve_runtime_backend(preference: BackendPreference) -> Result<RuntimeBacke
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_backend(preference: BackendPreference) -> Result<RuntimeBackend, String> {
-    resolve_linux_backend_in_session(preference, is_wayland_session())
+    let session_type = env::var_os("XDG_SESSION_TYPE");
+    let identity = session_identity(
+        session_type.as_deref(),
+        env::var_os("WAYLAND_DISPLAY").is_some(),
+        env::var_os("DISPLAY").is_some(),
+    );
+    resolve_linux_backend_in_session(preference, identity)
 }
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_backend_in_session(
     preference: BackendPreference,
-    is_wayland: bool,
+    identity: SessionIdentity,
 ) -> Result<RuntimeBackend, String> {
     match preference {
         BackendPreference::DryRun => Ok(RuntimeBackend::DryRun),
         BackendPreference::X11 => {
-            if is_wayland {
+            if matches!(identity, SessionIdentity::Wayland) {
                 Err("X11 backend is unavailable inside a Wayland session; use the native Wayland compositor integration".to_string())
             } else {
                 Ok(RuntimeBackend::X11)
             }
         }
         BackendPreference::Wayland => {
-            if !is_wayland {
+            if matches!(identity, SessionIdentity::X11) {
                 return Err(
                     "Wayland backend requires XDG_SESSION_TYPE=wayland or WAYLAND_DISPLAY"
                         .to_string(),
@@ -273,13 +281,13 @@ fn resolve_linux_backend_in_session(
             }
             resolve_wayland_runtime_backend()
         }
-        BackendPreference::Auto => {
-            if is_wayland {
-                resolve_wayland_runtime_backend()
-            } else {
-                Ok(RuntimeBackend::X11)
-            }
-        }
+        BackendPreference::Auto => match identity {
+            SessionIdentity::Wayland => resolve_wayland_runtime_backend(),
+            SessionIdentity::X11 => Ok(RuntimeBackend::X11),
+            SessionIdentity::Unresolved(reason) => Err(format!(
+                "cannot resolve desktop session from XDG_SESSION_TYPE, WAYLAND_DISPLAY, and DISPLAY: {reason}; use --backend x11|wayland"
+            )),
+        },
     }
 }
 
@@ -454,10 +462,7 @@ struct DryRunWindowSystem {
 impl DryRunWindowSystem {
     fn new() -> Self {
         Self {
-            focused_window: FocusedWindow::new(
-                "display-0",
-                window_zones::Rect::new(40, 40, 640, 480),
-            ),
+            focused_window: FocusedWindow::new(window_zones::Rect::new(40, 40, 640, 480)),
             displays: vec![
                 DisplayGeometry::new("display-0", window_zones::Rect::new(0, 0, 1920, 1080)),
                 DisplayGeometry::new("display-1", window_zones::Rect::new(1920, 0, 1280, 1024)),
@@ -528,12 +533,10 @@ fn parse_tui_input(line: &str) -> RuntimeInstruction {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 #[derive(Debug, Default)]
-struct CliHotkeySystem;
+struct NoopHotkeySystem;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-impl HotkeySystem for CliHotkeySystem {
+impl HotkeySystem for NoopHotkeySystem {
     fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         Ok(())
     }
@@ -543,9 +546,28 @@ impl HotkeySystem for CliHotkeySystem {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct UnavailableHotkeySystem(String);
+
+#[cfg(target_os = "linux")]
+impl HotkeySystem for UnavailableHotkeySystem {
+    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        if hotkeys.is_empty() {
+            Ok(())
+        } else {
+            Err(HotkeySystemError::Platform(self.0.clone()))
+        }
+    }
+
+    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        Ok(None)
+    }
+}
+
 enum RuntimeHotkeySystem {
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    Cli(CliHotkeySystem),
+    Noop(NoopHotkeySystem),
+    #[cfg(target_os = "linux")]
+    Unavailable(UnavailableHotkeySystem),
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     Global(RdevHotkeySystem),
     #[cfg(target_os = "linux")]
@@ -556,23 +578,24 @@ enum RuntimeHotkeySystem {
 
 impl RuntimeHotkeySystem {
     fn new(backend: RuntimeBackend) -> Self {
-        #[cfg(target_os = "linux")]
         match backend {
+            RuntimeBackend::DryRun => Self::Noop(NoopHotkeySystem),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Wayland => Self::Unavailable(UnavailableHotkeySystem(
+                "global hotkeys are unavailable on sway/hyprland; bind `window_zones dispatch <hotkey>` in the compositor config".to_string(),
+            )),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::X11 => Self::Global(RdevHotkeySystem::new()),
+            #[cfg(target_os = "linux")]
             RuntimeBackend::Gnome => Self::Gnome(GnomeHotkeySystem::new()),
+            #[cfg(target_os = "linux")]
             RuntimeBackend::Kde => Self::Kde(KwinHotkeySystem::new()),
-            _ => Self::Global(RdevHotkeySystem::new()),
-        }
-
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        {
-            let _ = backend;
-            Self::Global(RdevHotkeySystem::new())
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-        {
-            let _ = backend;
-            Self::Cli(CliHotkeySystem::default())
+            #[cfg(target_os = "windows")]
+            RuntimeBackend::Windows => Self::Global(RdevHotkeySystem::new()),
+            #[cfg(target_os = "macos")]
+            RuntimeBackend::MacOS => Self::Global(RdevHotkeySystem::new()),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            RuntimeBackend::Unsupported => Self::Noop(NoopHotkeySystem),
         }
     }
 }
@@ -580,8 +603,9 @@ impl RuntimeHotkeySystem {
 impl HotkeySystem for RuntimeHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         match self {
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            Self::Cli(system) => system.register_hotkeys(hotkeys),
+            Self::Noop(system) => system.register_hotkeys(hotkeys),
+            #[cfg(target_os = "linux")]
+            Self::Unavailable(system) => system.register_hotkeys(hotkeys),
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             Self::Global(system) => system.register_hotkeys(hotkeys),
             #[cfg(target_os = "linux")]
@@ -593,8 +617,9 @@ impl HotkeySystem for RuntimeHotkeySystem {
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
         match self {
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            Self::Cli(system) => system.next_hotkey(),
+            Self::Noop(system) => system.next_hotkey(),
+            #[cfg(target_os = "linux")]
+            Self::Unavailable(system) => system.next_hotkey(),
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             Self::Global(system) => system.next_hotkey(),
             #[cfg(target_os = "linux")]
@@ -673,11 +698,44 @@ fn build_app(config_path: Option<&PathBuf>) -> App {
 }
 
 #[cfg(target_os = "linux")]
-fn is_wayland_session() -> bool {
-    env::var_os("XDG_SESSION_TYPE")
-        .and_then(|value| value.to_str().map(str::to_ascii_lowercase))
-        .is_some_and(|value| value == "wayland")
-        || env::var_os("WAYLAND_DISPLAY").is_some()
+#[derive(Debug, PartialEq, Eq)]
+enum SessionIdentity {
+    X11,
+    Wayland,
+    Unresolved(String),
+}
+
+#[cfg(target_os = "linux")]
+fn session_identity(
+    session_type: Option<&std::ffi::OsStr>,
+    wayland_display: bool,
+    display: bool,
+) -> SessionIdentity {
+    match session_type {
+        Some(value) if value == "wayland" => SessionIdentity::Wayland,
+        Some(value) if value == "x11" => {
+            if wayland_display {
+                SessionIdentity::Unresolved(
+                    "conflicting XDG_SESSION_TYPE=x11 and WAYLAND_DISPLAY".to_string(),
+                )
+            } else {
+                SessionIdentity::X11
+            }
+        }
+        Some(value) => {
+            SessionIdentity::Unresolved(format!("unrecognized XDG_SESSION_TYPE={value:?}"))
+        }
+        None => match (wayland_display, display) {
+            (true, false) => SessionIdentity::Wayland,
+            (false, true) => SessionIdentity::X11,
+            (true, true) => SessionIdentity::Unresolved(
+                "conflicting WAYLAND_DISPLAY and DISPLAY without XDG_SESSION_TYPE".to_string(),
+            ),
+            (false, false) => SessionIdentity::Unresolved(
+                "XDG_SESSION_TYPE, WAYLAND_DISPLAY, and DISPLAY are unset".to_string(),
+            ),
+        },
+    }
 }
 
 fn runtime_status_lines(app: &App) -> Vec<String> {
@@ -728,12 +786,21 @@ fn print_dispatch_state(state: &DispatchState, window_system: &RuntimeWindowSyst
     }
 }
 
-fn execute_dispatch(mut app: App, mut window_system: RuntimeWindowSystem, hotkey: String) {
+fn execute_dispatch(
+    mut app: App,
+    mut window_system: RuntimeWindowSystem,
+    hotkey: String,
+) -> ExitCode {
     println!("Using runtime window backend: {}", window_system.name());
     print_status(&app);
 
     let state = app.dispatch_hotkey(&hotkey, &mut window_system);
     print_dispatch_state(state, &window_system);
+    if matches!(state, DispatchState::Error(_)) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn execute_status(app: App, backend: RuntimeBackend) {
@@ -806,6 +873,14 @@ struct TuiCapabilityStatus {
 }
 
 fn tui_capability_status(_backend: RuntimeBackend) -> TuiCapabilityStatus {
+    #[cfg(target_os = "linux")]
+    if matches!(_backend, RuntimeBackend::Wayland) {
+        return TuiCapabilityStatus {
+            window: "focused-window, displays, move-resize".to_string(),
+            hotkey: "<none>".to_string(),
+            diagnostic: None,
+        };
+    }
     #[cfg(target_os = "linux")]
     let companion_capabilities = match _backend {
         RuntimeBackend::Gnome => Some(
@@ -884,6 +959,10 @@ fn tui_hotkey_mode(backend: RuntimeBackend) -> &'static str {
     if matches!(backend, RuntimeBackend::Kde) {
         return "kwin-companion";
     }
+    #[cfg(target_os = "linux")]
+    if matches!(backend, RuntimeBackend::Wayland) {
+        return "compositor-bound dispatch";
+    }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     if matches!(backend, RuntimeBackend::Unsupported) {
@@ -911,44 +990,43 @@ fn tui_last_error(app: &App, capabilities: &TuiCapabilityStatus) -> String {
         .to_string()
 }
 
-fn render_tui(
+fn tui_frame(
     app: &App,
     backend: RuntimeBackend,
     window_system: &RuntimeWindowSystem,
     capabilities: &TuiCapabilityStatus,
-) {
-    print!("\x1b[2J\x1b[H");
-    println!("Window Zones TUI");
-    println!("================");
-    println!("Window backend: {}", window_system.name());
-    println!("Window capabilities: {}", capabilities.window);
-    println!("Hotkey mode: {}", tui_hotkey_mode(backend));
-    println!("Hotkey capabilities: {}", capabilities.hotkey);
-    println!("Hotkey state: {:?}", app.hotkey_state());
-    println!(
-        "Config: {} ({:?})",
+) -> String {
+    let mut frame = format!(
+        "\x1b[2J\x1b[HWindow Zones TUI\n================\n\
+         Window backend: {}\nWindow capabilities: {}\nHotkey mode: {}\n\
+         Hotkey capabilities: {}\nHotkey state: {:?}\nConfig: {} ({:?})\nBindings:\n",
+        window_system.name(),
+        capabilities.window,
+        tui_hotkey_mode(backend),
+        capabilities.hotkey,
+        app.hotkey_state(),
         app.config_path()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unresolved>".to_string()),
-        app.config_state()
+        app.config_state(),
     );
-    println!("Bindings:");
     if app.config().bindings.is_empty() {
-        println!("  <none>");
+        frame.push_str("  <none>\n");
     } else {
         for binding in &app.config().bindings {
-            println!("  {} -> {:?}", binding.hotkey, binding.action);
+            writeln!(frame, "  {} -> {:?}", binding.hotkey, binding.action)
+                .expect("write TUI frame");
         }
     }
-    println!(
-        "Last action: {}",
-        app.last_dispatch_hotkey().unwrap_or("<none>")
-    );
-    println!("Last error: {}", tui_last_error(app, capabilities));
-    println!();
-    println!("Commands: reload | restart | status/refresh | dispatch HOTKEY | quit");
-    print!("window-zones tui> ");
-    io::stdout().flush().expect("stdout flush");
+    write!(
+        frame,
+        "Last action: {}\nLast error: {}\n\n\
+         Commands: reload | restart | status/refresh | dispatch HOTKEY | quit\nwindow-zones tui> ",
+        app.last_dispatch_hotkey().unwrap_or("<none>"),
+        tui_last_error(app, capabilities),
+    )
+    .expect("write TUI frame");
+    frame
 }
 
 fn execute_runtime_loop(
@@ -958,6 +1036,7 @@ fn execute_runtime_loop(
     surface: RuntimeSurface,
 ) {
     let config_path = app.config_path().map(PathBuf::from);
+    let stdin_is_terminal = io::stdin().is_terminal();
     let instruction_rx = runtime_instruction_receiver();
 
     let mut hotkey_system = RuntimeHotkeySystem::new(backend);
@@ -973,45 +1052,44 @@ fn execute_runtime_loop(
         "Hotkey registration initially",
     );
 
-    let mut tui_capabilities = if matches!(surface, RuntimeSurface::Tui) {
-        Some(tui_capability_status(backend))
-    } else {
-        None
-    };
+    let mut tui_snapshot = String::new();
 
     if matches!(surface, RuntimeSurface::Cli) {
         println!("Window backend: {}", window_system.name());
         println!("Interactive session started. type `help` for commands.");
-    } else if let Some(capabilities) = tui_capabilities.as_ref() {
-        render_tui(&app, backend, &window_system, capabilities);
+        print!("window-zones> ");
+        io::stdout().flush().expect("stdout flush");
+    } else {
+        tui_snapshot = tui_frame(
+            &app,
+            backend,
+            &window_system,
+            &tui_capability_status(backend),
+        );
+        print!("{tui_snapshot}");
+        io::stdout().flush().expect("stdout flush");
     }
 
     let mut hotkey_listener_available = true;
 
     loop {
-        if matches!(surface, RuntimeSurface::Cli) {
-            print!("window-zones> ");
-            io::stdout().flush().expect("stdout flush");
-        }
-
         let mut redraw_tui = false;
-        let mut refresh_tui_capabilities = false;
+        let mut prompt_cli = false;
 
         match instruction_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) => {
+                redraw_tui = matches!(surface, RuntimeSurface::Tui);
+                prompt_cli = matches!(surface, RuntimeSurface::Cli);
                 let instruction = match surface {
                     RuntimeSurface::Cli => parse_runtime_input(&line),
                     RuntimeSurface::Tui => parse_tui_input(&line),
                 };
 
                 match instruction {
-                    RuntimeInstruction::Empty => continue,
+                    RuntimeInstruction::Empty => {}
                     RuntimeInstruction::Status => {
                         if matches!(surface, RuntimeSurface::Cli) {
                             print_status(&app);
-                        } else {
-                            refresh_tui_capabilities = true;
-                            redraw_tui = true;
                         }
                     }
                     RuntimeInstruction::Reload => {
@@ -1026,63 +1104,50 @@ fn execute_runtime_loop(
                                 }
                                 state => println!("Config state: {:?}", state),
                             }
-                        } else {
-                            refresh_tui_capabilities = true;
-                            redraw_tui = true;
                         }
                     }
                     RuntimeInstruction::Restart => {
                         app = build_app(config_path.as_ref());
+                        hotkey_system = RuntimeHotkeySystem::new(backend);
+                        hotkey_listener_available = true;
                         cached_hotkeys.clear();
                         hotkeys_are_valid = false;
                         last_registration_error = None;
                         if matches!(surface, RuntimeSurface::Cli) {
                             println!("Runtime restarted.");
-                        } else {
-                            refresh_tui_capabilities = true;
-                            redraw_tui = true;
                         }
                     }
                     RuntimeInstruction::Quit => break,
                     RuntimeInstruction::Help => {
                         if matches!(surface, RuntimeSurface::Cli) {
                             print_help();
-                        } else {
-                            redraw_tui = true;
                         }
                     }
                     RuntimeInstruction::Unknown(message) => {
                         if matches!(surface, RuntimeSurface::Cli) {
                             println!("Unknown command: {message}");
                             println!("type `help` for usage.");
-                        } else {
-                            redraw_tui = true;
                         }
                     }
                     RuntimeInstruction::Dispatch(hotkey) => {
                         let state = app.dispatch_hotkey(&hotkey, &mut window_system);
                         if matches!(surface, RuntimeSurface::Cli) {
                             print_dispatch_state(state, &window_system);
-                        } else {
-                            refresh_tui_capabilities = true;
-                            redraw_tui = true;
                         }
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                println!("Input stream closed. Session closed.");
-                return;
+                if stdin_is_terminal {
+                    println!("Input stream closed. Session closed.");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(250));
             }
         }
 
-        if refresh_tui_capabilities && let Some(capabilities) = tui_capabilities.as_mut() {
-            *capabilities = tui_capability_status(backend);
-        }
-
         let _ = app.poll_config_changes();
-        let was_hotkeys_valid = hotkeys_are_valid;
         rebind_if_configured_hotkeys_changed(
             &mut app,
             &mut hotkey_system,
@@ -1091,27 +1156,14 @@ fn execute_runtime_loop(
             &mut last_registration_error,
             "Hotkey registration now",
         );
-        if matches!(surface, RuntimeSurface::Tui) && was_hotkeys_valid != hotkeys_are_valid {
-            redraw_tui = true;
-        }
 
         if hotkeys_are_valid {
-            let previous_hotkey = app.last_dispatch_hotkey().map(str::to_owned);
-            let previous_dispatch_state = app.dispatch_state().clone();
             match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
                 Ok(state) => {
                     if let DispatchState::Error(error) = state
                         && matches!(surface, RuntimeSurface::Cli)
                     {
                         println!("Dispatch failed: {error}");
-                    }
-                    let dispatch_state_changed = app.dispatch_state() != &previous_dispatch_state;
-                    let hotkey_changed =
-                        previous_hotkey != app.last_dispatch_hotkey().map(str::to_owned);
-                    if matches!(surface, RuntimeSurface::Tui)
-                        && (dispatch_state_changed || hotkey_changed)
-                    {
-                        redraw_tui = true;
                     }
                     hotkey_listener_available = true;
                 }
@@ -1130,8 +1182,24 @@ fn execute_runtime_loop(
             }
         }
 
-        if redraw_tui && let Some(capabilities) = tui_capabilities.as_ref() {
-            render_tui(&app, backend, &window_system, capabilities);
+        if matches!(surface, RuntimeSurface::Tui) {
+            let next_snapshot = tui_frame(
+                &app,
+                backend,
+                &window_system,
+                &tui_capability_status(backend),
+            );
+            if next_snapshot != tui_snapshot {
+                redraw_tui = true;
+            }
+            if redraw_tui {
+                print!("{next_snapshot}");
+                io::stdout().flush().expect("stdout flush");
+                tui_snapshot = next_snapshot;
+            }
+        } else if prompt_cli {
+            print!("window-zones> ");
+            io::stdout().flush().expect("stdout flush");
         }
     }
 
@@ -1195,6 +1263,8 @@ fn execute_run_with_tray(
             }
             Ok(RuntimeTrayCommand::Restart) => {
                 app = build_app(config_path.as_ref());
+                hotkey_system = RuntimeHotkeySystem::new(backend);
+                hotkey_listener_available = true;
                 cached_hotkeys.clear();
                 hotkeys_are_valid = false;
                 last_registration_error = None;
@@ -1319,7 +1389,7 @@ fn print_help() {
     println!("  q/quit/exit      leave interactive session");
 }
 
-fn main() {
+fn main() -> ExitCode {
     match parse_args() {
         ParseStatus::Help => {
             print_help();
@@ -1348,7 +1418,9 @@ fn main() {
 
             match config.command {
                 Command::Status => execute_status(app, backend),
-                Command::Dispatch { hotkey } => execute_dispatch(app, window_system, hotkey),
+                Command::Dispatch { hotkey } => {
+                    return execute_dispatch(app, window_system, hotkey);
+                }
                 Command::Tui => execute_tui(app, backend, window_system),
                 Command::Run => {
                     execute_run(app, backend, window_system, config.show_tray);
@@ -1356,6 +1428,7 @@ fn main() {
             }
         }
     }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -1616,19 +1689,6 @@ action = { type = "move-to-zone", zone = "left-half" }
         fs::remove_file(config_path).unwrap();
     }
 
-    #[test]
-    fn tui_reports_dry_run_and_global_hotkey_modes() {
-        assert_eq!(tui_hotkey_mode(RuntimeBackend::DryRun), "dry-run");
-
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(tui_hotkey_mode(RuntimeBackend::X11), "global");
-            assert_eq!(tui_hotkey_mode(RuntimeBackend::Wayland), "global");
-            assert_eq!(tui_hotkey_mode(RuntimeBackend::Gnome), "gnome-companion");
-            assert_eq!(tui_hotkey_mode(RuntimeBackend::Kde), "kwin-companion");
-        }
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn runtime_window_backend_names_identify_native_linux_paths() {
@@ -1654,18 +1714,95 @@ action = { type = "move-to-zone", zone = "left-half" }
     #[test]
     fn linux_backend_routing_never_crosses_session_protocols() {
         assert_eq!(
-            resolve_linux_backend_in_session(BackendPreference::Auto, false),
+            resolve_linux_backend_in_session(BackendPreference::Auto, SessionIdentity::X11),
             Ok(RuntimeBackend::X11)
         );
         assert_eq!(
-            resolve_linux_backend_in_session(BackendPreference::X11, false),
+            resolve_linux_backend_in_session(BackendPreference::X11, SessionIdentity::X11),
             Ok(RuntimeBackend::X11)
         );
-        assert!(resolve_linux_backend_in_session(BackendPreference::X11, true).is_err());
-        assert!(resolve_linux_backend_in_session(BackendPreference::Wayland, false).is_err());
+        assert!(
+            resolve_linux_backend_in_session(BackendPreference::X11, SessionIdentity::Wayland)
+                .is_err()
+        );
+        assert!(
+            resolve_linux_backend_in_session(BackendPreference::Wayland, SessionIdentity::X11)
+                .is_err()
+        );
         assert_eq!(
-            resolve_linux_backend_in_session(BackendPreference::DryRun, true),
+            resolve_linux_backend_in_session(BackendPreference::DryRun, SessionIdentity::Wayland),
             Ok(RuntimeBackend::DryRun)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_identity_uses_unambiguous_protocol_signals() {
+        for (session_type, wayland, display, expected) in [
+            (None, true, false, SessionIdentity::Wayland),
+            (None, false, true, SessionIdentity::X11),
+            (Some("wayland"), false, true, SessionIdentity::Wayland),
+            (Some("wayland"), true, true, SessionIdentity::Wayland),
+            (Some("x11"), false, false, SessionIdentity::X11),
+        ] {
+            assert_eq!(
+                session_identity(session_type.map(std::ffi::OsStr::new), wayland, display),
+                expected,
+                "{session_type:?}, WAYLAND_DISPLAY={wayland}, DISPLAY={display}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unresolved_sessions_require_explicit_backend_selection() {
+        for (session_type, wayland, display) in [
+            (None, false, false),
+            (Some("x11"), true, false),
+            (Some("x11"), true, true),
+            (None, true, true),
+            (Some("tty"), false, true),
+            (Some(""), true, false),
+        ] {
+            let identity =
+                session_identity(session_type.map(std::ffi::OsStr::new), wayland, display);
+            assert!(matches!(identity, SessionIdentity::Unresolved(_)));
+            let error =
+                resolve_linux_backend_in_session(BackendPreference::Auto, identity).unwrap_err();
+            for hint in [
+                "XDG_SESSION_TYPE",
+                "WAYLAND_DISPLAY",
+                "DISPLAY",
+                "--backend x11|wayland",
+            ] {
+                assert!(error.contains(hint), "{error}");
+            }
+            assert_eq!(
+                resolve_linux_backend_in_session(
+                    BackendPreference::X11,
+                    session_identity(session_type.map(std::ffi::OsStr::new), wayland, display),
+                ),
+                Ok(RuntimeBackend::X11)
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_registration_does_not_need_a_native_listener() {
+        let mut hotkeys = RuntimeHotkeySystem::new(RuntimeBackend::DryRun);
+        assert_eq!(hotkeys.register_hotkeys(&["ctrl+a".to_string()]), Ok(()));
+        assert_eq!(hotkeys.next_hotkey(), Ok(None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sway_hyprland_registration_requires_compositor_bindings() {
+        let mut hotkeys = RuntimeHotkeySystem::new(RuntimeBackend::Wayland);
+        assert_eq!(hotkeys.register_hotkeys(&[]), Ok(()));
+        assert!(matches!(
+            hotkeys.register_hotkeys(&["ctrl+a".to_string()]),
+            Err(HotkeySystemError::Platform(_))
+        ));
+        assert_eq!(hotkeys.next_hotkey(), Ok(None));
     }
 }

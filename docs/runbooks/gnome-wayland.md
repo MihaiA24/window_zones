@@ -106,10 +106,10 @@ Before the seated run, prepare the session:
 gsettings set org.gnome.shell disable-user-extensions false
 gsettings get org.gnome.shell enabled-extensions      # save this list
 gsettings set org.gnome.shell enabled-extensions "['window-zones@mihai-a24']"
-sudo chmod 0666 /dev/uinput                           # real accelerator capture
+sudo modprobe uinput && sudo chmod 0666 /dev/uinput   # real accelerator capture
 ```
 
-The master switch has to be off: with `disable-user-extensions true` the Companion stays `INACTIVE` and `EnableExtension` still returns `true`, which looks exactly like a broken extension. Narrowing `enabled-extensions` keeps tiling extensions from moving the test window. `/dev/uinput` is required because Xwayland XTEST events never reach a compositor accelerator grab on GNOME 50. Restore the saved list and `sudo chmod 0600 /dev/uinput` afterwards.
+The master switch has to be off: with `disable-user-extensions true` the Companion stays `INACTIVE` and `EnableExtension` still returns `true`, which looks exactly like a broken extension. Narrowing `enabled-extensions` keeps tiling extensions from moving the test window. `/dev/uinput` is mandatory: Xwayland XTEST events never reach a compositor accelerator grab on GNOME 50, so `gnome-live` fails with the `modprobe`/`chmod`/udev remediation instead of falling back to `xdotool`. Restore the saved list and `sudo chmod 0600 /dev/uinput` afterwards.
 
 Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
 

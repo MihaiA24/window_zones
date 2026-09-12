@@ -3,20 +3,17 @@ use thiserror::Error;
 use crate::geometry::{DisplayGeometry, Rect};
 
 /// Focused window state as observed by a platform adapter.
+///
+/// The executor correlates the window to a display using its frame center.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedWindow {
-    /// Display that currently contains the focused window, using an adapter-provided id.
-    pub display_id: String,
-    /// Current window geometry in global desktop coordinates.
+    /// Current window frame geometry in global desktop coordinates.
     pub geometry: Rect,
 }
 
 impl FocusedWindow {
-    pub fn new(display_id: impl Into<String>, geometry: Rect) -> Self {
-        Self {
-            display_id: display_id.into(),
-            geometry,
-        }
+    pub const fn new(geometry: Rect) -> Self {
+        Self { geometry }
     }
 }
 

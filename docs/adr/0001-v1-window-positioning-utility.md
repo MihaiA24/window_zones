@@ -8,7 +8,7 @@ Accepted
 
 ## Current status note
 
-Subsequent slices implemented the runtime entrypoint, config discovery/reload, real X11/Windows/macOS adapters, constrained Sway/Hyprland support, tray controls, and global hotkey integration. The historical exclusions below describe the original first-slice boundary; the current merge-ready V1 gates and remaining native Wayland/TUI work are recorded in ADR 0003 and issues #33, #35, and #34.
+Subsequent slices implemented the runtime entrypoint, config discovery/reload, real X11/Windows/macOS adapters, Sway/Hyprland adapters, tray controls, and global hotkey integration. The historical exclusions below describe the original first-slice boundary; native Wayland integrations are recorded in ADR 0003, Release gates in ADR 0007, and the executor-owned window/display correlation plus compositor-bound dispatch for Sway/Hyprland in ADR 0008. Statements below about a `display_id` on the focused window, opaque hotkey strings, and exact case-sensitive dispatch matching are superseded: adapters report geometry only, `config::normalize_hotkey` canonicalizes every hotkey string, and dispatch matches canonical strings.
 
 ## Context
 

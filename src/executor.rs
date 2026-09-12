@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::actions::Action;
 use crate::display_movement::move_window_to_display;
-use crate::geometry::DisplayGeometry;
+use crate::geometry::{DisplayGeometry, Rect};
 use crate::window_system::{WindowMove, WindowSystem, WindowSystemError};
 use crate::zones::{ZoneDefinition, rect_for_zone};
 
@@ -18,8 +18,8 @@ pub enum ExecuteActionError {
     NoFocusedWindow,
     #[error("no displays available")]
     NoDisplays,
-    #[error("focused window display is missing: {display_id}")]
-    FocusedWindowDisplayMissing { display_id: String },
+    #[error("focused window center ({center_x}, {center_y}) is not on any display")]
+    FocusedWindowOffDisplay { center_x: i32, center_y: i32 },
     #[error("unknown zone: {zone}")]
     UnknownZone { zone: String },
 }
@@ -42,12 +42,7 @@ pub fn execute_action<W: WindowSystem>(
         return Err(ExecuteActionError::NoDisplays);
     }
 
-    let current_display_index = displays
-        .iter()
-        .position(|display| display.id == focused.display_id)
-        .ok_or_else(|| ExecuteActionError::FocusedWindowDisplayMissing {
-            display_id: focused.display_id.clone(),
-        })?;
+    let current_display_index = display_index_for_window(&displays, focused.geometry)?;
 
     let target = match action {
         Action::MoveToZone { zone } => rect_for_zone(
@@ -78,6 +73,25 @@ pub fn execute_action<W: WindowSystem>(
 
     window_system.move_focused_window(WindowMove::new(target))?;
     Ok(())
+}
+
+fn display_index_for_window(
+    displays: &[DisplayGeometry],
+    geometry: Rect,
+) -> Result<usize, ExecuteActionError> {
+    let center_x = geometry.x + (geometry.width / 2) as i32;
+    let center_y = geometry.y + (geometry.height / 2) as i32;
+
+    displays
+        .iter()
+        .position(|display| {
+            let area = display.usable_area;
+            area.x <= center_x
+                && center_x < area.right()
+                && area.y <= center_y
+                && center_y < area.bottom()
+        })
+        .ok_or(ExecuteActionError::FocusedWindowOffDisplay { center_x, center_y })
 }
 
 fn next_display(displays: &[DisplayGeometry], current_index: usize) -> &DisplayGeometry {
@@ -131,9 +145,9 @@ mod tests {
         }
     }
 
-    fn fake_with_focus(display_id: &str, geometry: Rect) -> FakeWindowSystem {
+    fn fake_with_focus(geometry: Rect) -> FakeWindowSystem {
         FakeWindowSystem {
-            focused_window: Ok(Some(FocusedWindow::new(display_id, geometry))),
+            focused_window: Ok(Some(FocusedWindow::new(geometry))),
             displays: Ok(vec![
                 DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
                 DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
@@ -149,7 +163,7 @@ mod tests {
 
     #[test]
     fn moves_focused_window_to_zone_on_current_display() {
-        let mut fake = fake_with_focus("left", Rect::new(100, 100, 800, 600));
+        let mut fake = fake_with_focus(Rect::new(100, 100, 800, 600));
 
         let (zone, zones) = move_to_left_half_action();
         execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap();
@@ -161,8 +175,21 @@ mod tests {
     }
 
     #[test]
+    fn uses_second_display_when_overlapping_window_center_is_on_shared_edge() {
+        let mut fake = fake_with_focus(Rect::new(1520, 100, 800, 600));
+
+        let (zone, zones) = move_to_left_half_action();
+        execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap();
+
+        assert_eq!(
+            fake.moves,
+            vec![WindowMove::new(Rect::new(1920, 0, 1280, 1440))]
+        );
+    }
+
+    #[test]
     fn moves_to_custom_zone_from_map() {
-        let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut fake = fake_with_focus(Rect::new(200, 200, 800, 600));
 
         let mut zones = BTreeMap::new();
         zones.insert(
@@ -192,7 +219,7 @@ mod tests {
 
     #[test]
     fn moves_to_next_display_preserving_recognized_zone() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
 
         execute_action(
             &crate::Action::MoveToNextDisplay,
@@ -209,7 +236,7 @@ mod tests {
 
     #[test]
     fn wraps_next_display_from_last_to_first() {
-        let mut fake = fake_with_focus("right", Rect::new(1920, 0, 1280, 1440));
+        let mut fake = fake_with_focus(Rect::new(1920, 0, 1280, 1440));
 
         execute_action(
             &crate::Action::MoveToNextDisplay,
@@ -226,7 +253,7 @@ mod tests {
 
     #[test]
     fn wraps_previous_display_from_first_to_last() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
 
         execute_action(
             &crate::Action::MoveToPreviousDisplay,
@@ -243,7 +270,7 @@ mod tests {
 
     #[test]
     fn returns_no_focused_window_without_moving() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
         fake.focused_window = Ok(None);
 
         let (zone, zones) = move_to_left_half_action();
@@ -256,7 +283,7 @@ mod tests {
 
     #[test]
     fn returns_no_displays_without_moving() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
         fake.displays = Ok(Vec::new());
 
         let (zone, zones) = move_to_left_half_action();
@@ -268,7 +295,7 @@ mod tests {
     }
     #[test]
     fn returns_no_displays_when_only_zero_sized_displays_without_moving() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
         fake.displays = Ok(vec![
             DisplayGeometry::new("zero-width", Rect::new(0, 0, 0, 1080)),
             DisplayGeometry::new("zero-height", Rect::new(10, 10, 640, 0)),
@@ -283,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn returns_missing_focused_display_without_moving() {
-        let mut fake = fake_with_focus("missing", Rect::new(0, 0, 960, 1080));
+    fn returns_off_display_window_center_without_moving() {
+        let mut fake = fake_with_focus(Rect::new(-5000, -5000, 960, 1080));
 
         let (zone, zones) = move_to_left_half_action();
         let err =
@@ -292,8 +319,9 @@ mod tests {
 
         assert_eq!(
             err,
-            ExecuteActionError::FocusedWindowDisplayMissing {
-                display_id: "missing".to_string()
+            ExecuteActionError::FocusedWindowOffDisplay {
+                center_x: -4520,
+                center_y: -4460,
             }
         );
         assert!(fake.moves.is_empty());
@@ -301,7 +329,7 @@ mod tests {
 
     #[test]
     fn returns_unknown_zone_without_moving() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
 
         let err = execute_action(
             &crate::Action::MoveToZone {
@@ -322,7 +350,7 @@ mod tests {
 
     #[test]
     fn wraps_platform_errors() {
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
         fake.move_error = Some(WindowSystemError::Platform("denied".to_string()));
 
         let (zone, zones) = move_to_left_half_action();

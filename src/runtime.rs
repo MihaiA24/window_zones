@@ -1,15 +1,15 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use crate::config::{
     AppConfig, BindingValidationError, ConfigError, normalize_hotkey, parse_config,
-    validate_and_normalize_app_config,
 };
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
@@ -19,10 +19,7 @@ const CONFIG_FILE: &str = "config.toml";
 const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ConfigFileSignature {
-    modified: SystemTime,
-    len: u64,
-}
+struct ConfigFileSignature(u64);
 
 #[derive(Debug, Error)]
 pub enum ConfigPathError {
@@ -167,7 +164,9 @@ impl App {
 
         if let Some(deadline) = self.reload_deadline {
             if now >= deadline {
-                self.reload_config();
+                if matches!(self.reload_config(), ConfigState::Error(_)) {
+                    self.last_config_signature = None;
+                }
                 self.reload_deadline = None;
             }
         } else if self.last_config_signature.is_none() {
@@ -272,30 +271,29 @@ fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoa
         }
     };
 
-    let config = parse_config(&input).map_err(|source| ConfigLoadError::Parse {
-        path: path.to_owned(),
-        source,
-    })?;
-    let config = validate_and_normalize_app_config(config).map_err(|source| {
-        ConfigLoadError::Validation {
+    let config = parse_config(&input).map_err(|error| match error {
+        ConfigError::Validation(source) => ConfigLoadError::Validation {
             path: path.to_owned(),
             source,
-        }
+        },
+        source @ ConfigError::Toml(_) => ConfigLoadError::Parse {
+            path: path.to_owned(),
+            source,
+        },
     })?;
     Ok(Some(config))
 }
 
 fn config_file_signature(path: &Path) -> Result<Option<ConfigFileSignature>, io::Error> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
 
-    Ok(Some(ConfigFileSignature {
-        modified: metadata.modified()?,
-        len: metadata.len(),
-    }))
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(Some(ConfigFileSignature(hasher.finish())))
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {
@@ -548,7 +546,7 @@ action = { type = "move-to-zone", zone = "side" }
         .unwrap();
 
         let mut app = App::start_at(&path);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         assert_eq!(
             app.config().zones,
@@ -797,7 +795,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         .unwrap();
 
         let mut app = App::start_at(&path);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
         assert_eq!(state, &DispatchState::Succeeded);
@@ -862,7 +860,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         .unwrap();
 
         let mut app = App::start_at(&path);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
         fs::write(&path, "bindings = [").unwrap();
 
         let state = app.reload_config();
@@ -908,7 +906,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         .unwrap();
 
         let mut app = App::start_at(&path);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
         assert_eq!(state, &DispatchState::Succeeded);
@@ -959,6 +957,32 @@ action = { type = "move-to-next-display" }
 
         let state = app.dispatch_hotkey("Shift+Alt+Right", &mut window_system);
         assert_eq!(state, &DispatchState::Succeeded);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn poll_config_changes_detects_same_length_edits_with_preserved_mtime() {
+        let directory = test_directory("polling_preserved_metadata");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        let config =
+            "[[bindings]]\nhotkey = \"ctrl+a\"\naction = { type = \"move-to-next-display\" }\n";
+        fs::write(&path, config).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut app = App::start_at(&path);
+
+        fs::write(&path, config.replace("ctrl+a", "ctrl+b")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        app.poll_config_changes();
+        assert_eq!(app.config().bindings[0].hotkey, "ctrl+a");
+        thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
+        assert!(matches!(app.poll_config_changes(), ConfigState::Loaded));
+        assert_eq!(app.config().bindings[0].hotkey, "ctrl+b");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1037,7 +1061,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         .unwrap();
 
         let mut app = App::start_at(&path);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
@@ -1119,7 +1143,7 @@ action = { type = "move-to-zone", zone = "left-half" }
             state => panic!("expected parse error, got {state:?}"),
         }
 
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
         let dispatch_state = app
             .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
             .unwrap();
@@ -1206,9 +1230,9 @@ action = { type = "move-to-zone", zone = "left-half" }
     }
 
     impl FakeWindowSystem {
-        fn with_focus(display_id: &str, geometry: Rect) -> Self {
+        fn with_focus(geometry: Rect) -> Self {
             Self {
-                focused_window: Ok(Some(FocusedWindow::new(display_id, geometry))),
+                focused_window: Ok(Some(FocusedWindow::new(geometry))),
                 displays: Ok(vec![
                     DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
                     DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
@@ -1326,7 +1350,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
             hotkey: "Ctrl+Alt+Left".to_string(),
         })]);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let state = app
             .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
@@ -1358,7 +1382,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
             hotkey: "Alt+Shift+Right".to_string(),
         })]);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let state = app
             .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
@@ -1392,7 +1416,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
             hotkey: "Ctrl+Alt+Left".to_string(),
         })]);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let state = app
             .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
@@ -1425,7 +1449,7 @@ action = { type = "move-to-zone", zone = "left-half" }
         let mut hotkey_system = FakeHotkeySystem::new(vec![Ok(HotkeyEvent::Pressed {
             hotkey: "Alt+Shift+Right".to_string(),
         })]);
-        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let state = app
             .dispatch_next_hotkey(&mut hotkey_system, &mut window_system)
