@@ -40,6 +40,7 @@ Together these evidence Companion protocol and capability behavior, X11 EWMH and
 - The V1 release claim is end-to-end verification of the GNOME Wayland and Linux X11 blocking Release gates, X11 entirely in a Synthetic session and GNOME across a Synthetic session plus the seated live session, including the TUI lifecycle checks recorded in the matrix.
 - V1 does not claim that KDE Plasma Wayland or Windows are verified; both ship as implemented, deferred, and non-blocking until their specified triggers pass.
 - Synthetic sessions provide repeatable compositor and geometry evidence without claiming hardware coverage or full-desktop layout behavior.
+- A nested `kwin_wayland` gate (`./scripts/smoke.sh kde-live`) exercises a real KWin against the real Companion, but a nested compositor runs `Session::Type::Noop` and does not own the login seat, so its result is Synthetic session evidence and leaves the KDE Release gate `deferred - unverified`.
 - `docs/runbooks/testing.md` is the record of record for Release gate status, Verified configuration, dates, and reproduction commands.
 
 ## Rejected alternatives

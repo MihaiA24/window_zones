@@ -29,7 +29,26 @@ const MOVE_RESIZE_CAPABILITY: &str = "move-resize";
 const HOTKEYS_CAPABILITY: &str = "hotkeys";
 const REQUEST_MOVE: &str = "move";
 const REQUEST_REGISTER_HOTKEYS: &str = "register-hotkeys";
+// KWin hosts KGlobalAccel in-process and registers script actions under the "kwin" component.
+const KGLOBALACCEL_SERVICE: &str = "org.kde.kglobalaccel";
+const KGLOBALACCEL_PATH: &str = "/kglobalaccel";
+const KGLOBALACCEL_INTERFACE: &str = "org.kde.KGlobalAccel";
+const KGLOBALACCEL_COMPONENT: &str = "kwin";
+const ACCELERATOR_SETTLE_SAMPLES: u32 = 6;
+const ACCELERATOR_SETTLE_INTERVAL: Duration = Duration::from_millis(120);
 
+/// KGlobalAccel `getGlobalShortcutsByKey` entry: action id and friendly name, component id and
+/// friendly name, context id and friendly name, then active and default key sequences.
+type ShortcutOwner = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<i32>,
+    Vec<i32>,
+);
 type DisplayPayload = (String, i32, i32, u32, u32);
 type NextRequestPayload = (u32, String, i32, i32, u32, u32, String);
 
@@ -297,7 +316,8 @@ impl KwinHotkeySystem {
             let (request_id,): (u32,) = proxy
                 .method_call(KWIN_INTERFACE, "RegisterHotkeys", (payload,))
                 .map_err(classify_dbus_error)?;
-            wait_for_request(connection, request_id)
+            wait_for_request(connection, request_id)?;
+            verify_accelerators_assigned(connection, hotkeys)
         })();
 
         if let Err(error) = &result
@@ -405,6 +425,98 @@ fn wait_for_request(connection: &Connection, request_id: u32) -> Result<(), Kwin
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// KWin's scripting `registerShortcut` reports success for any callable handler: it hands the
+/// sequence to KGlobalAccel and discards the result, so an accelerator another action already owns
+/// is accepted and then never fires. Ask KGlobalAccel which keys our actions actually hold.
+fn verify_accelerators_assigned(
+    connection: &Connection,
+    hotkeys: &[String],
+) -> Result<(), KwinIntegrationError> {
+    if hotkeys.is_empty() {
+        return Ok(());
+    }
+
+    let accel = connection.with_proxy(KGLOBALACCEL_SERVICE, KGLOBALACCEL_PATH, CALL_TIMEOUT);
+    // Without a reachable KGlobalAccel nothing can be verified and the Companion's own result
+    // stands; with one, an action it does not know about is an accelerator that was not assigned.
+    if accel
+        .method_call::<(Vec<Vec<String>>,), _, _, _>(
+            KGLOBALACCEL_INTERFACE,
+            "allMainComponents",
+            (),
+        )
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    for hotkey in hotkeys {
+        let action = format!("Window Zones Hotkey {hotkey}");
+        let action_id = vec![
+            KGLOBALACCEL_COMPONENT.to_string(),
+            action.clone(),
+            String::new(),
+            String::new(),
+        ];
+        // KGlobalAccel answers with the requested keys while registration is still in flight, and
+        // it happily lists several actions for one key: the first entry is the one KWin dispatches
+        // to. Sample until it settles; any other action on our key means our binding is dead.
+        let mut competitor = None;
+        for attempt in 0..ACCELERATOR_SETTLE_SAMPLES {
+            if attempt > 0 {
+                thread::sleep(ACCELERATOR_SETTLE_INTERVAL);
+            }
+            let keys = accel
+                .method_call::<(Vec<(Vec<i32>,)>,), _, _, _>(
+                    KGLOBALACCEL_INTERFACE,
+                    "shortcutKeys",
+                    (action_id.clone(),),
+                )
+                .map(|(keys,)| keys)
+                .unwrap_or_default();
+            let key = keys
+                .iter()
+                .flat_map(|(sequence,)| sequence.iter())
+                .copied()
+                .find(|key| *key != 0);
+            let Some(key) = key else {
+                competitor = Some(String::new());
+                break;
+            };
+            let owners = accel
+                .method_call::<(Vec<ShortcutOwner>,), _, _, _>(
+                    KGLOBALACCEL_INTERFACE,
+                    "getGlobalShortcutsByKey",
+                    (key,),
+                )
+                .map(|(owners,)| owners)
+                .unwrap_or_default();
+            competitor = owners
+                .into_iter()
+                .map(|owner| owner.0)
+                .find(|owner| owner != &action);
+            if competitor.is_some() {
+                break;
+            }
+        }
+        if let Some(competitor) = competitor {
+            return Err(KwinIntegrationError::Operation {
+                message: if competitor.is_empty() {
+                    format!(
+                        "KWin accepted '{hotkey}' but KGlobalAccel assigned it no keys; another shortcut already owns that accelerator"
+                    )
+                } else {
+                    format!(
+                        "KWin accepted '{hotkey}' but the accelerator is also held by '{competitor}', which receives it instead; choose a different binding"
+                    )
+                },
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {

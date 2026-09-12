@@ -34,3 +34,13 @@ jobs:
         run: cargo test --locked
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # Manual macOS smoke verification is out of scope; this job only proves the cfg(target_os = "macos") code compiles and unit-tests.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: cargo test --locked
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings

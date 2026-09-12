@@ -125,13 +125,15 @@ function displayData() {
         throw new Error('KWin reported no active outputs');
     if (typeof workspace.clientArea !== 'function'
         || typeof KWin === 'undefined'
-        || typeof KWin.WorkArea === 'undefined')
+        || typeof KWin.MaximizeArea === 'undefined')
         throw new Error('KWin work-area API is unavailable');
 
     const displays = [];
     screens.forEach((output, index) => {
+        // KWin.WorkArea ignores the output and returns the desktop-wide union, which reports the
+        // same rectangle for every display. MaximizeArea is the per-output area minus struts.
         const workArea = workspace.clientArea(
-            KWin.WorkArea,
+            KWin.MaximizeArea,
             output,
             workspace.currentDesktop);
         const [x, y, width, height] = rectPayload(workArea);
@@ -370,7 +372,7 @@ function apiAvailable() {
         && typeof workspace.screens.forEach === 'function'
         && typeof workspace.clientArea === 'function'
         && typeof KWin !== 'undefined'
-        && typeof KWin.WorkArea !== 'undefined'
+        && typeof KWin.MaximizeArea !== 'undefined'
         && typeof registerShortcut === 'function'
         && typeof callDBus === 'function';
 }
