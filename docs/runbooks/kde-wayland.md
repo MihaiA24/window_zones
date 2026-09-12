@@ -123,7 +123,12 @@ to let KWin clean up stale global-accelerator entries.
 
 ## Nested KWin gate
 
-`./scripts/smoke.sh kde-live` runs this checklist mechanically against a real KWin nested inside whatever compositor is already running. It needs the `kwin` package (`kwin_wayland`, `kpackagetool6`, `kwriteconfig6`) and touches nothing in the current session: private session bus, private `HOME` and XDG directories, its own script package and `kwinrc`, two virtual outputs, and its own Xwayland.
+`./scripts/smoke.sh kde-live` runs this checklist mechanically against a real KWin, started on its own `--virtual` framebuffer backend with two outputs and its own Xwayland. It needs the `kwin` package (`kwin_wayland`, `kpackagetool6`, `kwriteconfig6`) and touches nothing in the current session: private session bus, private `HOME` and XDG directories, its own script package and `kwinrc`.
 
-It is not a substitute for this checklist on a seated Plasma session. A nested `kwin_wayland` runs `Session::Type::Noop`, so the outer compositor owns the login seat; the gate's accelerator capture goes through nested Xwayland XTEST into KWin's EIS input path, which evidences compositor dispatch rather than physical-seat input. Three limitations are recorded as named skips rather than silently passed: seated accelerator capture, Plasma panel exclusion (the nested fixture runs no `plasmashell`), and negative-coordinate output movement (KWin places the two virtual outputs side by side at non-negative origins).
+It is not a substitute for this checklist on a seated Plasma session. KWin's nested and virtual backends use a `Session::Type::Noop` session and never own the login seat; the gate's accelerator capture goes through Xwayland XTEST into KWin's EIS input path, which evidences compositor dispatch rather than physical-seat input. Three limitations are recorded as named skips rather than silently passed: seated accelerator capture, Plasma panel exclusion (the fixture runs no `plasmashell`), and negative-coordinate output movement (KWin places the virtual outputs side by side at non-negative origins).
+
+Its first run found two defects, both fixed:
+
+- `workspace.clientArea(KWin.WorkArea, output, desktop)` ignores the output and returns the desktop-wide union, so every display reported the same rectangle and zones were computed against all monitors joined. The per-output area is `KWin.MaximizeArea`.
+- KWin's scripting `registerShortcut` returns success for any callable handler: it hands the sequence to KGlobalAccel and discards the result, so an accelerator another action already owns is accepted and then never fires. The runtime now asks KGlobalAccel which action holds the key and reports registration as failed when it is not ours.
 
