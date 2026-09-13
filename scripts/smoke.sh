@@ -3473,7 +3473,9 @@ EOF
     chmod +x "$launcher"
     BUS_FILE="$GNOME_ROOT/bus-address"
     local shell_pid
-    shell_pid=$(start_group "$shell_log" env \
+    # With SSH_CONNECTION set (any value) gnome-shell --headless 50 never serves
+    # org.gnome.Shell.Extensions; bisected on CachyOS, so the gate runs over SSH.
+    shell_pid=$(start_group "$shell_log" env -u SSH_CONNECTION \
         BUS_FILE="$BUS_FILE" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DCONF_PROFILE="$GNOME_DCONF_PROFILE" \
@@ -3502,10 +3504,14 @@ EOF
         fi
         sleep 0.2
     done
-    local extension_result
-    extension_result=$(gnome_shell_call /org/gnome/Shell/Extensions \
-        org.gnome.Shell.Extensions.EnableExtension "'window-zones@mihai-a24'" 2>&1 || true)
-    log "GNOME extension enable: $extension_result"
+    if [[ "$service_list" != *'org.window_zones.Gnome'* ]]; then
+        log "GNOME extension enable: $(gnome_shell_call /org/gnome/Shell \
+            org.gnome.Shell.Extensions.EnableExtension "'window-zones@mihai-a24'" 2>&1 || true)"
+        log "GNOME extension info: $(gnome_shell_call /org/gnome/Shell \
+            org.gnome.Shell.Extensions.GetExtensionInfo "'window-zones@mihai-a24'" 2>&1 || true)"
+        log "GNOME extension errors: $(gnome_shell_call /org/gnome/Shell \
+            org.gnome.Shell.Extensions.GetExtensionErrors "'window-zones@mihai-a24'" 2>&1 || true)"
+    fi
     assert_text 'GNOME companion owns D-Bus name' 'org.window_zones.Gnome' "$service_list"
 
     local capabilities displays_raw display_lines first_display second_display
@@ -3823,10 +3829,8 @@ main() {
         fi
     fi
     if [[ "$COMMAND" == x11 || "$COMMAND" == all ]]; then
-        if [[ ! -x "$BIN_PATH" ]]; then
-            if ! cargo build --locked --bin window_zones; then
-                assert_rc_zero 'X11 cargo build' 1 'cargo build --locked --bin window_zones failed'
-            fi
+        if ! cargo build --locked --bin window_zones; then
+            assert_rc_zero 'X11 cargo build' 1 'cargo build --locked --bin window_zones failed'
         fi
         run_x11 || true
     fi

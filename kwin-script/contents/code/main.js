@@ -259,7 +259,9 @@ function emitHotkey(hotkey) {
     invoke('HotkeyPressed', [hotkey], () => {});
 }
 function registerHotkeys(hotkeys, callback) {
-    const next = hotkeys.map(hotkey => ({hotkey, ...shortcutForHotkey(hotkey)}));
+    // QJSEngine has no object spread.
+    const next = hotkeys.map(hotkey => Object.assign({hotkey}, shortcutForHotkey(hotkey)));
+    // JS-owned QTimer: no deleteLater (not exposed to scripts; the TypeError killed the callback).
     const timer = new QTimer();
     let finished = false;
     const finish = error => {
@@ -267,7 +269,6 @@ function registerHotkeys(hotkeys, callback) {
             return;
         finished = true;
         timer.stop();
-        timer.deleteLater();
         callback(error);
     };
     // KWin does not invoke callDBus callbacks on errors. Fail before the App's one-second
@@ -289,7 +290,9 @@ function registerHotkeys(hotkeys, callback) {
                     'action', entry.key, winner => {
                         if (finished)
                             return;
-                        if (!Array.isArray(winner) || (winner.length !== 0 && winner.length !== 4)) {
+                        // QJSEngine hands D-Bus string lists over as sequences, not Arrays.
+                        if (!winner || typeof winner.length !== 'number'
+                            || (winner.length !== 0 && winner.length !== 4)) {
                             finish(new Error('KGlobalAccel returned an invalid shortcut owner'));
                         } else if (winner.length !== 0
                             && (winner[0] !== 'kwin'
