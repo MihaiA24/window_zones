@@ -27,11 +27,12 @@ The platform-neutral core and runtime paths currently include:
 - global hotkey registration on supported non-Wayland paths, GNOME, and KDE companion paths;
 - CLI, stdlib ANSI TUI, and optional Linux/Windows tray runtime controls.
 
-## Remaining V1 verification
+## V1 verification
 
-- Run the GNOME Wayland and Linux X11 blocking Release gates, including TUI lifecycle Smoke runs, in Synthetic sessions.
-- KDE Plasma Wayland and Windows are implemented but deferred and non-blocking until a real KWin 6.x Smoke run and the manual run in `docs/runbooks/windows-smoke.md`, respectively.
-- macOS remains source-compatible and non-blocking; Sway and Hyprland remain constrained backends.
+- Blocking Release gates: GNOME Wayland (`./scripts/smoke.sh gnome` in a Synthetic session plus `./scripts/smoke.sh gnome-live` on the seated session) and Linux X11 (`./scripts/smoke.sh x11`), each including the TUI lifecycle Smoke run.
+- KDE Plasma Wayland (`./scripts/smoke.sh kde-live` on a nested KWin) and Windows (`docs/runbooks/windows-smoke.md`) are implemented but deferred and non-blocking until a seated KWin 6.x Smoke run and the manual Windows run pass.
+- macOS, Sway, and Hyprland are ungated integrations: they build and ship without a Smoke run on record. Sway and Hyprland have no global hotkey capability and use compositor-bound dispatch (`window_zones dispatch <hotkey>` from the compositor keybinding config).
+- `docs/runbooks/testing.md` is the record of record for gate status.
 
 ## Configuration discovery
 

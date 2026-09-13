@@ -46,24 +46,7 @@ impl MacOSWindowSystem {
     fn focused_window_payload() -> Result<FocusedWindowPayload, WindowSystemError> {
         let output = Self::run_osascript(
             r#"
-            ObjC.import("Cocoa");
             var se = Application("System Events");
-
-            function visible_display_for_point(x, y) {
-                var screens = $.NSScreen.screens;
-                for (var i = 0; i < screens.count; i++) {
-                    var screen = screens.objectAtIndex(i);
-                    var bounds = screen.frame;
-                    var x0 = bounds.origin.x;
-                    var y0 = bounds.origin.y;
-                    var x1 = x0 + bounds.size.width;
-                    var y1 = y0 + bounds.size.height;
-                    if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
-                        return "display-" + i;
-                    }
-                }
-                return "display-0";
-            }
 
             function focused_payload() {
                 var procs = se.processes.whose({ frontmost: true });
@@ -79,8 +62,6 @@ impl MacOSWindowSystem {
                 var window = windows[0];
                 var position = window.position();
                 var size = window.size();
-                var cx = position[0] + size[0] / 2;
-                var cy = position[1] + size[1] / 2;
 
                 return {
                     focused: true,
@@ -88,7 +69,6 @@ impl MacOSWindowSystem {
                     y: position[1],
                     width: size[0],
                     height: size[1],
-                    display_id: visible_display_for_point(cx, cy),
                 };
             }
 
@@ -104,13 +84,14 @@ impl MacOSWindowSystem {
             ObjC.import("Cocoa");
             var out = [];
             var screens = $.NSScreen.screens;
+            var mainScreenFrameHeight = screens.objectAtIndex(0).frame.size.height;
             for (var i = 0; i < screens.count; i++) {
                 var screen = screens.objectAtIndex(i);
                 var bounds = screen.visibleFrame;
                 out.push({
                     id: "display-" + i,
                     x: bounds.origin.x,
-                    y: bounds.origin.y,
+                    y: mainScreenFrameHeight - (bounds.origin.y + bounds.size.height),
                     width: bounds.size.width,
                     height: bounds.size.height,
                 });
@@ -163,21 +144,12 @@ impl WindowSystem for MacOSWindowSystem {
             return Ok(None);
         }
 
-        if payload.display_id.is_empty() {
-            return Err(WindowSystemError::Platform(
-                "focused window payload is missing display identifier".to_string(),
-            ));
-        }
-
-        Ok(Some(FocusedWindow::new(
-            payload.display_id,
-            Rect::new(
-                as_i32("x", payload.x)?,
-                as_i32("y", payload.y)?,
-                as_u32("width", payload.width)?,
-                as_u32("height", payload.height)?,
-            ),
-        )))
+        Ok(Some(FocusedWindow::new(Rect::new(
+            as_i32("x", payload.x)?,
+            as_i32("y", payload.y)?,
+            as_u32("width", payload.width)?,
+            as_u32("height", payload.height)?,
+        ))))
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
@@ -200,8 +172,6 @@ struct FocusedWindowPayload {
     width: f64,
     #[serde(default)]
     height: f64,
-    #[serde(default)]
-    display_id: String,
 }
 
 #[derive(Debug, Deserialize)]

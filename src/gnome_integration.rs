@@ -117,8 +117,8 @@ impl WindowSystem for GnomeWindowSystem {
             self.call_with_capability(FOCUSED_WINDOW_CAPABILITY, "GetFocusedWindow", ());
 
         result
-            .map(|(present, display_id, x, y, width, height)| {
-                present.then(|| FocusedWindow::new(display_id, Rect::new(x, y, width, height)))
+            .map(|(present, _display_id, x, y, width, height)| {
+                present.then(|| FocusedWindow::new(Rect::new(x, y, width, height)))
             })
             .map_err(|error| WindowSystemError::Platform(error.to_string()))
     }
@@ -211,8 +211,11 @@ impl GnomeHotkeySystem {
         connection
             .add_match(
                 owner_rule,
-                move |(name, _old_owner, new_owner): (String, String, String), _, _| {
-                    if name == GNOME_SERVICE_NAME && new_owner.is_empty() {
+                move |(name, old_owner, new_owner): (String, String, String), _, _| {
+                    if name == GNOME_SERVICE_NAME
+                        && (new_owner.is_empty()
+                            || (!old_owner.is_empty() && old_owner != new_owner))
+                    {
                         service_lost.store(true, Ordering::Relaxed);
                     }
                     true
@@ -657,10 +660,7 @@ mod tests {
 
         assert_eq!(
             window_system.focused_window().unwrap(),
-            Some(FocusedWindow::new(
-                "monitor-1",
-                Rect::new(-300, -20, 801, 602)
-            ))
+            Some(FocusedWindow::new(Rect::new(-300, -20, 801, 602)))
         );
         assert_eq!(
             window_system.displays().unwrap(),

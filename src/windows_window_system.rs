@@ -8,8 +8,7 @@ use std::convert::TryFrom;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MONITORINFOEXW, MonitorFromWindow,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -53,46 +52,6 @@ impl WindowsWindowSystem {
 
         Ok(displays)
     }
-
-    fn display_id_for_monitor(handle: HMONITOR) -> Result<String, WindowSystemError> {
-        let mut info = MONITORINFOEXW {
-            monitorInfo: MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        unsafe {
-            GetMonitorInfoW(handle, &mut info.monitorInfo)
-                .ok()
-                .map_err(|error| WindowSystemError::Platform(error.to_string()))?;
-        }
-
-        let len = info
-            .szDevice
-            .iter()
-            .position(|character| *character == 0)
-            .unwrap_or(info.szDevice.len());
-        if len == 0 {
-            return Err(WindowSystemError::Platform(
-                "monitor device name missing".to_string(),
-            ));
-        }
-
-        Ok(String::from_utf16_lossy(&info.szDevice[..len]))
-    }
-
-    fn display_for_window(handle: HWND) -> Result<String, WindowSystemError> {
-        let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
-        if monitor.is_invalid() {
-            return Err(WindowSystemError::Platform(
-                "failed to identify monitor for focused window".to_string(),
-            ));
-        }
-
-        Self::display_id_for_monitor(monitor)
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -116,9 +75,8 @@ impl WindowSystem for WindowsWindowSystem {
             .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
 
         let geometry = Rect::new(rect.left, rect.top, width, height);
-        let display_id = Self::display_for_window(hwnd)?;
 
-        Ok(Some(FocusedWindow::new(display_id, geometry)))
+        Ok(Some(FocusedWindow::new(geometry)))
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {

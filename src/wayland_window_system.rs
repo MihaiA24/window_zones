@@ -7,7 +7,6 @@
 use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, WindowSystemError};
 
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]
@@ -111,8 +110,6 @@ struct SwayTreeNode {
     #[serde(default)]
     id: Option<i64>,
     #[serde(default)]
-    output: Option<String>,
-    #[serde(default)]
     app_id: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
@@ -135,36 +132,39 @@ struct SwayRect {
 #[derive(Debug, Deserialize)]
 struct SwayOutput {
     name: String,
-    #[serde(default)]
+    active: bool,
+    rect: SwayRect,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwayWorkspace {
+    output: String,
+    visible: bool,
     rect: SwayRect,
 }
 
 #[derive(Debug, Deserialize)]
 struct HyprWindow {
     address: String,
-    #[serde(default)]
-    x: i32,
-    #[serde(default)]
-    y: i32,
-    #[serde(default)]
-    width: u32,
-    #[serde(default)]
-    height: u32,
-    #[serde(default)]
-    monitor: Option<String>,
+    at: [i32; 2],
+    size: [u32; 2],
+    #[serde(rename = "monitor")]
+    _monitor: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct HyprMonitor {
     name: String,
-    #[serde(default)]
+    #[serde(rename = "id")]
+    _id: i64,
     x: i32,
-    #[serde(default)]
     y: i32,
-    #[serde(default)]
     width: u32,
-    #[serde(default)]
     height: u32,
+    scale: f64,
+    transform: u32,
+    reserved: [u32; 4],
+    disabled: bool,
 }
 
 pub fn resolve_wayland_backend() -> Result<WaylandBackend, WindowSystemError> {
@@ -274,7 +274,6 @@ fn desktop_signal_matches(
 
 fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
     let tree: SwayTree = run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
-    let displays = displays_sway()?;
 
     let Some(focused) = find_focused_sway_node(&tree.nodes)
         .or_else(|| find_focused_sway_node(&tree.floating_nodes))
@@ -286,19 +285,14 @@ fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
         return Ok(None);
     }
 
-    let usable_display_ids: HashSet<_> =
-        displays.iter().map(|display| display.id.as_str()).collect();
-    let display_id = match focused.output.as_deref() {
-        Some(id) if usable_display_ids.contains(id) => id.to_string(),
-        Some(id) => format!("wayland-output-unmatched:{id}"),
-        None => "wayland-output-unknown".to_string(),
-    };
-    Ok(Some(FocusedWindow::new(display_id, focused.rect.to_rect())))
+    Ok(Some(FocusedWindow::new(focused.rect.to_rect())))
 }
 
 fn displays_sway() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
     let outputs: Vec<SwayOutput> =
         run_wayland_json_command("swaymsg", &["-t", "get_outputs"], "sway get_outputs")?;
+    let workspaces: Vec<SwayWorkspace> =
+        run_wayland_json_command("swaymsg", &["-t", "get_workspaces"], "sway get_workspaces")?;
 
     if outputs.is_empty() {
         return Err(WindowSystemError::Platform(
@@ -306,20 +300,22 @@ fn displays_sway() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         ));
     }
 
-    Ok(outputs
+    Ok(sway_displays(outputs, &workspaces))
+}
+
+fn sway_displays(outputs: Vec<SwayOutput>, workspaces: &[SwayWorkspace]) -> Vec<DisplayGeometry> {
+    outputs
         .into_iter()
+        .filter(|output| output.active)
         .map(|output| {
-            DisplayGeometry::new(
-                output.name,
-                Rect::new(
-                    output.rect.x,
-                    output.rect.y,
-                    output.rect.width,
-                    output.rect.height,
-                ),
-            )
+            let usable_area = workspaces
+                .iter()
+                .find(|workspace| workspace.visible && workspace.output == output.name)
+                .map_or(&output.rect, |workspace| &workspace.rect)
+                .to_rect();
+            DisplayGeometry::new(output.name, usable_area)
         })
-        .collect())
+        .collect()
 }
 
 fn move_focused_window_sway(window_move: WindowMove) -> Result<(), WindowSystemError> {
@@ -345,30 +341,34 @@ fn move_focused_window_sway(window_move: WindowMove) -> Result<(), WindowSystemE
 }
 
 fn focused_window_hypr() -> Result<Option<FocusedWindow>, WindowSystemError> {
-    let Some(window) = run_wayland_json_command::<Option<HyprWindow>>(
-        "hyprctl",
-        &["activewindow", "-j"],
-        "hyprctl activewindow",
-    )?
-    else {
+    let Some(window) = hypr_activewindow()? else {
         return Ok(None);
     };
 
-    let geometry = Rect::new(window.x, window.y, window.width, window.height);
+    let geometry = window.geometry();
     if geometry.width == 0 || geometry.height == 0 {
         return Ok(None);
     }
 
-    let displays = displays_hypr()?;
-    let usable_display_ids: HashSet<_> =
-        displays.iter().map(|display| display.id.as_str()).collect();
-    let display_id = match window.monitor {
-        Some(id) if usable_display_ids.contains(id.as_str()) => id,
-        Some(id) => format!("wayland-unmatched:{id}"),
-        None => "wayland-output-unknown".to_string(),
-    };
+    Ok(Some(FocusedWindow::new(geometry)))
+}
 
-    Ok(Some(FocusedWindow::new(display_id, geometry)))
+fn hypr_activewindow() -> Result<Option<HyprWindow>, WindowSystemError> {
+    let output = run_command_capture("hyprctl", &["activewindow", "-j"], "hyprctl activewindow")?;
+    parse_hypr_activewindow(&output)
+}
+
+fn parse_hypr_activewindow(output: &str) -> Result<Option<HyprWindow>, WindowSystemError> {
+    if output
+        .bytes()
+        .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .eq(b"{}".iter().copied())
+    {
+        return Ok(None);
+    }
+    serde_json::from_str(output).map_err(|error| {
+        WindowSystemError::Platform(format!("hyprctl activewindow JSON parse failed: {error}"))
+    })
 }
 
 fn displays_hypr() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
@@ -381,24 +381,18 @@ fn displays_hypr() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         ));
     }
 
-    Ok(monitors
+    monitors
         .into_iter()
+        .filter(|monitor| !monitor.disabled)
         .map(|monitor| {
-            DisplayGeometry::new(
-                monitor.name,
-                Rect::new(monitor.x, monitor.y, monitor.width, monitor.height),
-            )
+            let usable_area = monitor.usable_area()?;
+            Ok(DisplayGeometry::new(monitor.name, usable_area))
         })
-        .collect())
+        .collect()
 }
 
 fn move_focused_window_hypr(window_move: WindowMove) -> Result<(), WindowSystemError> {
-    let Some(window) = run_wayland_json_command::<Option<HyprWindow>>(
-        "hyprctl",
-        &["activewindow", "-j"],
-        "hyprctl activewindow",
-    )?
-    else {
+    let Some(window) = hypr_activewindow()? else {
         return Err(WindowSystemError::Platform("no focused window".to_string()));
     };
 
@@ -540,6 +534,36 @@ fn command_exists(command: &str) -> bool {
 impl SwayRect {
     fn to_rect(&self) -> Rect {
         Rect::new(self.x, self.y, self.width, self.height)
+    }
+}
+
+impl HyprWindow {
+    fn geometry(&self) -> Rect {
+        Rect::new(self.at[0], self.at[1], self.size[0], self.size[1])
+    }
+}
+
+impl HyprMonitor {
+    fn usable_area(&self) -> Result<Rect, WindowSystemError> {
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(WindowSystemError::Platform(format!(
+                "hyprctl monitor {} has invalid scale {}",
+                self.name, self.scale
+            )));
+        }
+        let mut width = (f64::from(self.width) / self.scale).round() as u32;
+        let mut height = (f64::from(self.height) / self.scale).round() as u32;
+        if matches!(self.transform, 1 | 3 | 5 | 7) {
+            std::mem::swap(&mut width, &mut height);
+        }
+        // HyprCtl.cpp emits top-left x/y followed by bottom-right x/y.
+        let [left, top, right, bottom] = self.reserved;
+        Ok(Rect::new(
+            self.x.saturating_add_unsigned(left),
+            self.y.saturating_add_unsigned(top),
+            width.saturating_sub(left).saturating_sub(right),
+            height.saturating_sub(top).saturating_sub(bottom),
+        ))
     }
 }
 
@@ -701,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_window_parser_prefers_window_nodes_and_keeps_native_display_id() {
+    fn focused_window_parser_finds_window_geometry_below_output_and_workspace_nodes() {
         let tree_json = r#"
         {
             "nodes": [
@@ -724,7 +748,6 @@ mod tests {
                                     "type": "con",
                                     "app_id": "alacritty",
                                     "focused": true,
-                                    "output": "DP-1",
                                     "rect": {"x": 10,"y": 10,"width": 800,"height": 600},
                                     "nodes": [],
                                     "floating_nodes": []
@@ -747,57 +770,155 @@ mod tests {
             .expect("focused node");
 
         assert_eq!(focused.id, Some(10));
-        assert_eq!(focused.output, Some("DP-1".to_string()));
+        assert_eq!(focused.rect.to_rect(), Rect::new(10, 10, 800, 600));
     }
 
     #[test]
-    fn parse_display_lists_returns_wayland_ids() {
-        let output_json = r#"
+    fn sway_displays_use_visible_workspaces_and_skip_inactive_outputs() {
+        let outputs: Vec<SwayOutput> = serde_json::from_str(
+            r#"
         [
-            { "name": "DP-1", "rect": {"x":0,"y":0,"width":1920,"height":1080}, "focused": true },
-            { "name": "HDMI-A-1", "rect": {"x":1920,"y":0,"width":1280,"height":1024}, "focused": false }
+            {"name":"eDP-1","active":true,"rect":{"x":0,"y":0,"width":1920,"height":1080}},
+            {"name":"DP-1","active":true,"rect":{"x":1920,"y":0,"width":1280,"height":1024}},
+            {"name":"HDMI-A-1","active":false,"rect":{"x":0,"y":0,"width":0,"height":0}}
         ]
-        "#;
+        "#,
+        )
+        .unwrap();
+        let workspaces: Vec<SwayWorkspace> = serde_json::from_str(
+            r#"
+        [
+            {"output":"eDP-1","visible":false,"rect":{"x":0,"y":0,"width":1920,"height":1080}},
+            {"output":"eDP-1","visible":true,"rect":{"x":0,"y":23,"width":1920,"height":1057}}
+        ]
+        "#,
+        )
+        .unwrap();
 
-        let outputs: Vec<SwayOutput> = serde_json::from_str(output_json).unwrap();
-        let displays: Vec<DisplayGeometry> = outputs
-            .into_iter()
-            .map(|output| {
-                DisplayGeometry::new(
-                    output.name,
-                    Rect::new(
-                        output.rect.x,
-                        output.rect.y,
-                        output.rect.width,
-                        output.rect.height,
-                    ),
-                )
-            })
-            .collect();
-
-        let ids: HashSet<_> = displays.iter().map(|display| display.id.as_str()).collect();
-        assert!(ids.contains("DP-1"));
-        assert!(ids.contains("HDMI-A-1"));
+        assert_eq!(
+            sway_displays(outputs, &workspaces),
+            vec![
+                DisplayGeometry::new("eDP-1", Rect::new(0, 23, 1920, 1057)),
+                DisplayGeometry::new("DP-1", Rect::new(1920, 0, 1280, 1024)),
+            ]
+        );
     }
 
     #[test]
-    fn hypr_move_command_has_no_space_before_address_selector() {
-        let window = HyprWindow {
-            address: "0xfeedbeef".to_string(),
-            x: 1,
-            y: 2,
-            width: 10,
-            height: 20,
-            monitor: Some("DP-1".to_string()),
-        };
+    fn hypr_activewindow_parser_reads_real_geometry_and_rejects_missing_size() {
+        // https://github.com/hyprwm/Hyprland/discussions/14292#discussioncomment-16833698
+        let json = r#"{
+    "address": "0x55e0ed70afc0",
+    "mapped": true,
+    "hidden": false,
+    "visible": true,
+    "acceptsInput": true,
+    "at": [1320, 680],
+    "size": [600, 400],
+    "workspace": {
+        "id": 4,
+        "name": "em₄"
+    },
+    "floating": true,
+    "monitor": 0,
+    "class": "X1F",
+    "title": "vladimir@theor:~",
+    "initialClass": "X1F",
+    "initialTitle": "Alacritty",
+    "pid": 111214,
+    "xwayland": false,
+    "pinned": false,
+    "fullscreen": 0,
+    "fullscreenClient": 0,
+    "overFullscreen": true,
+    "grouped": [],
+    "tags": [],
+    "swallowing": "0x0",
+    "focusHistoryID": 0,
+    "inhibitingIdle": false,
+    "xdgTag": "",
+    "xdgDescription": "",
+    "contentType": "none",
+    "stableId": "18000017"
+}"#;
+        let window = parse_hypr_activewindow(json).unwrap().unwrap();
+        assert_eq!(window.geometry(), Rect::new(1320, 680, 600, 400));
+        let mut missing_size: serde_json::Value = serde_json::from_str(json).unwrap();
+        missing_size.as_object_mut().unwrap().remove("size");
+        assert!(parse_hypr_activewindow(&missing_size.to_string()).is_err());
+        assert!(parse_hypr_activewindow("{}").unwrap().is_none());
+        assert!(parse_hypr_activewindow(" { \n\t} ").unwrap().is_none());
+        assert!(parse_hypr_activewindow(r#"{"address": "0x1"}"#).is_err());
+    }
 
-        let move_args = format!("exact {} {},address:{}", -123, 456, window.address);
-        let resize_args = format!(
-            "exact {} {},address:{}",
-            window.width, window.height, window.address
+    #[test]
+    fn hypr_monitor_parser_reads_real_fields_and_subtracts_reserved_edges() {
+        // https://github.com/hyprwm/Hyprland/pull/12019
+        let json = r#"[{
+    "id": 0,
+    "name": "WAYLAND-1",
+    "description": "",
+    "make": "",
+    "model": "",
+    "serial": "",
+    "width": 1756,
+    "height": 1542,
+    "physicalWidth": 0,
+    "physicalHeight": 0,
+    "refreshRate": 60.00000,
+    "x": 0,
+    "y": 0,
+    "activeWorkspace": {
+        "id": 1,
+        "name": "1"
+    },
+    "specialWorkspace": {
+        "id": 0,
+        "name": ""
+    },
+    "reserved": [0, 0, 0, 0],
+    "scale": 2.00,
+    "transform": 0,
+    "focused": true,
+    "dpmsStatus": true,
+    "vrr": false,
+    "solitary": "0",
+    "solitaryBlockedBy": ["WINDOWED","CANDIDATE"],
+    "activelyTearing": false,
+    "tearingBlockedBy": ["NOT_TORN","USER","SUPPORT","CANDIDATE"],
+    "directScanoutTo": "0",
+    "directScanoutBlockedBy": ["USER","CANDIDATE"],
+    "disabled": false,
+    "currentFormat": "XRGB8888",
+    "mirrorOf": "none",
+    "availableModes": [],
+    "colorManagementPreset": "srgb",
+    "sdrBrightness": 1.00,
+    "sdrSaturation": 1.00,
+    "sdrMinLuminance": 0.20,
+    "sdrMaxLuminance": 80
+}]"#;
+        let mut monitors: Vec<HyprMonitor> = serde_json::from_str(json).unwrap();
+        let monitor = &mut monitors[0];
+        assert_eq!(monitor.usable_area().unwrap(), Rect::new(0, 0, 878, 771));
+        monitor.reserved = [5, 23, 7, 11];
+        assert_eq!(monitor.usable_area().unwrap(), Rect::new(5, 23, 866, 737));
+        let rotated: HyprMonitor = serde_json::from_str(
+            r#"{
+            "id": 1, "name": "DP-1", "x": -720, "y": 30,
+            "width": 2560, "height": 1440, "scale": 2.0, "transform": 3,
+            "reserved": [5, 23, 7, 11], "disabled": false
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rotated.usable_area().unwrap(),
+            Rect::new(-715, 53, 708, 1246)
         );
-
-        assert_eq!(move_args, "exact -123 456,address:0xfeedbeef");
-        assert_eq!(resize_args, "exact 10 20,address:0xfeedbeef");
+        monitor.scale = 0.0;
+        assert!(monitor.usable_area().is_err());
+        let mut missing_width: serde_json::Value = serde_json::from_str(json).unwrap();
+        missing_width[0].as_object_mut().unwrap().remove("width");
+        assert!(serde_json::from_value::<Vec<HyprMonitor>>(missing_width).is_err());
     }
 }

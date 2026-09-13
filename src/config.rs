@@ -7,6 +7,7 @@ use crate::actions::{Action, Binding};
 use crate::zones::{ZoneDefinition, built_in_zone_from_name};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub bindings: Vec<Binding>,
@@ -18,6 +19,8 @@ pub struct AppConfig {
 pub enum ConfigError {
     #[error("invalid TOML config: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error(transparent)]
+    Validation(#[from] BindingValidationError),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -39,7 +42,7 @@ pub enum BindingValidationError {
 }
 
 pub fn parse_config(input: &str) -> Result<AppConfig, ConfigError> {
-    Ok(toml::from_str(input)?)
+    Ok(validate_and_normalize_app_config(toml::from_str(input)?)?)
 }
 
 pub fn validate_and_normalize_app_config(
@@ -237,12 +240,49 @@ fn canonicalize_hotkey_token(raw: &str) -> Result<String, BindingValidationError
         });
     }
 
-    Ok(match token.to_ascii_lowercase().as_str() {
-        "control" => "ctrl".to_string(),
-        "option" => "alt".to_string(),
-        "cmd" | "meta" | "super" | "windows" | "win" => "cmd".to_string(),
-        token => token.to_string(),
-    })
+    let mut token = token.to_ascii_lowercase();
+    let canonical = match token.as_str() {
+        "control" => "ctrl",
+        "option" => "alt",
+        "command" | "meta" | "super" | "win" | "windows" => "cmd",
+        "esc" => "escape",
+        "enter" => "return",
+        "spacebar" => "space",
+        "pgup" | "page_up" => "pageup",
+        "pgdn" | "page_dn" | "page_down" => "pagedown",
+        "leftarrow" | "left_arrow" => "left",
+        "rightarrow" | "right_arrow" => "right",
+        "uparrow" | "up_arrow" => "up",
+        "downarrow" | "down_arrow" => "down",
+        "del" => "delete",
+        "ins" => "insert",
+        "period" => "dot",
+        "alt" | "ctrl" | "shift" | "cmd" | "escape" | "return" | "space" | "tab" | "backspace"
+        | "delete" | "insert" | "home" | "end" | "pageup" | "pagedown" | "left" | "right"
+        | "up" | "down" | "minus" | "equal" | "comma" | "dot" | "slash" | "quote" | "semicolon"
+        | "leftbracket" | "rightbracket" | "backslash" | "backquote" | "printscreen"
+        | "scrolllock" | "capslock" | "numlock" | "pause" => {
+            return Ok(token);
+        }
+        _ if matches!(
+            token.as_bytes(),
+            [b'a'..=b'z' | b'0'..=b'9']
+                | [b'f', b'1'..=b'9']
+                | [b'f', b'1', b'0'..=b'9']
+                | [b'f', b'2', b'0'..=b'4']
+        ) =>
+        {
+            return Ok(token);
+        }
+        _ => {
+            return Err(BindingValidationError::MalformedHotkey {
+                raw: raw.to_string(),
+                reason: format!("unknown key: {token}"),
+            });
+        }
+    };
+    token.replace_range(.., canonical);
+    Ok(token)
 }
 
 fn is_modifier_token(token: &str) -> bool {
@@ -265,7 +305,7 @@ mod tests {
     use crate::{Action, Binding};
 
     #[test]
-    fn parses_bindings_with_opaque_hotkeys_and_kebab_case_actions() {
+    fn parses_normalized_bindings_with_kebab_case_actions() {
         let config = parse_config(
             r#"
 [[bindings]]
@@ -280,7 +320,7 @@ action = { type = "move-to-next-display" }
         .unwrap();
 
         assert_eq!(config.bindings.len(), 2);
-        assert_eq!(config.bindings[0].hotkey, "Ctrl+Alt+Left");
+        assert_eq!(config.bindings[0].hotkey, "alt+ctrl+left");
         assert_eq!(
             config.bindings[0].action,
             Action::MoveToZone {
@@ -288,25 +328,6 @@ action = { type = "move-to-next-display" }
             }
         );
         assert_eq!(config.bindings[1].action, Action::MoveToNextDisplay);
-    }
-
-    #[test]
-    fn parses_unknown_zone_names_as_raw_values() {
-        let config = parse_config(
-            r#"
-[[bindings]]
-hotkey = "Ctrl+Alt+Left"
-action = { type = "move-to-zone", zone = "left-quarter" }
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.bindings[0].action,
-            Action::MoveToZone {
-                zone: "left-quarter".to_string()
-            }
-        );
     }
 
     #[test]
@@ -323,7 +344,6 @@ action = { type = "move-to-zone", zone = "a" }
 "#,
         )
         .unwrap();
-        let config = validate_and_normalize_app_config(config).unwrap();
 
         assert_eq!(config.zones["a"].height, 100);
         assert_eq!(
@@ -335,23 +355,25 @@ action = { type = "move-to-zone", zone = "a" }
     }
 
     #[test]
-    fn rejects_unknown_zone_names_on_validation() {
-        let config = parse_config(
+    fn rejects_unknown_zone_names_when_parsing() {
+        let err = parse_config(
             r#"
 [[bindings]]
 hotkey = "Ctrl+Alt+Left"
 action = { type = "move-to-zone", zone = "left-quarter" }
 "#,
         )
-        .unwrap();
+        .unwrap_err();
 
-        let err = validate_and_normalize_app_config(config).unwrap_err();
-        assert!(matches!(err, BindingValidationError::UnknownZone { .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Validation(BindingValidationError::UnknownZone { .. })
+        ));
     }
 
     #[test]
     fn rejects_duplicate_zone_names_with_builtin_collisions() {
-        let config = parse_config(
+        let err = parse_config(
             r#"
 [zones]
 left-half = { x = 0, y = 0, width = 50, height = 100 }
@@ -361,18 +383,17 @@ hotkey = "Ctrl+Alt+Left"
 action = { type = "move-to-zone", zone = "left-half" }
 "#,
         )
-        .unwrap();
-
-        let err = validate_and_normalize_app_config(config).unwrap_err();
+        .unwrap_err();
         assert!(matches!(
             err,
-            BindingValidationError::BuiltInZoneConflict { zone } if zone == "left-half"
+            ConfigError::Validation(BindingValidationError::BuiltInZoneConflict { zone })
+                if zone == "left-half"
         ));
     }
 
     #[test]
     fn rejects_invalid_custom_zone_geometry() {
-        let config = parse_config(
+        let err = parse_config(
             r#"
 [zones]
 a = { x = 90, y = 0, width = 20, height = 100 }
@@ -382,13 +403,26 @@ hotkey = "Ctrl+Alt+Left"
 action = { type = "move-to-zone", zone = "a" }
 "#,
         )
-        .unwrap();
-
-        let err = validate_and_normalize_app_config(config).unwrap_err();
+        .unwrap_err();
         assert!(matches!(
             err,
-            BindingValidationError::InvalidZoneDefinition { zone, .. } if zone == "a"
+            ConfigError::Validation(BindingValidationError::InvalidZoneDefinition { zone, .. })
+                if zone == "a"
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_config_fields_as_parse_errors() {
+        let err = parse_config(
+            r#"
+[[bindngs]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ConfigError::Toml(_)));
     }
 
     #[test]
@@ -401,6 +435,25 @@ action = { type = "move-to-zone", zone = "a" }
     fn normalizes_hotkey_spacing_case_and_modifier_order() {
         let normalized = normalize_hotkey(" ctrl + Alt + Left ").unwrap();
         assert_eq!(normalized, "alt+ctrl+left");
+    }
+
+    #[test]
+    fn normalizes_hotkey_aliases() {
+        assert_eq!(normalize_hotkey("Ctrl+Alt+Esc").unwrap(), "alt+ctrl+escape");
+        assert_eq!(normalize_hotkey("Shift+Enter").unwrap(), "shift+return");
+        assert_eq!(normalize_hotkey("Super+Page_Up").unwrap(), "cmd+pageup");
+    }
+
+    #[test]
+    fn accepts_f24_and_rejects_unknown_keys() {
+        assert_eq!(normalize_hotkey("ctrl+f24").unwrap(), "ctrl+f24");
+        for hotkey in ["ctrl+foo", "ctrl+f0", "ctrl+f25", "ctrl+f01"] {
+            assert!(matches!(
+                normalize_hotkey(hotkey),
+                Err(BindingValidationError::MalformedHotkey { reason, .. })
+                    if reason.starts_with("unknown key")
+            ));
+        }
     }
 
     #[test]

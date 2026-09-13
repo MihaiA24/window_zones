@@ -6,7 +6,7 @@ use crate::geometry::Rect;
 
 /// Built-in zones available in v1 config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BuiltInZone {
     LeftHalf,
     RightHalf,
@@ -31,7 +31,7 @@ pub const ALL_BUILT_IN_ZONES: [BuiltInZone; 8] = [
 
 /// User-defined zone geometry expressed in percentages of a display usable area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ZoneDefinition {
     pub x: u32,
     pub y: u32,

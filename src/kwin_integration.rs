@@ -37,18 +37,6 @@ const KGLOBALACCEL_COMPONENT: &str = "kwin";
 const ACCELERATOR_SETTLE_SAMPLES: u32 = 6;
 const ACCELERATOR_SETTLE_INTERVAL: Duration = Duration::from_millis(120);
 
-/// KGlobalAccel `getGlobalShortcutsByKey` entry: action id and friendly name, component id and
-/// friendly name, context id and friendly name, then active and default key sequences.
-type ShortcutOwner = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Vec<i32>,
-    Vec<i32>,
-);
 type DisplayPayload = (String, i32, i32, u32, u32);
 type NextRequestPayload = (u32, String, i32, i32, u32, u32, String);
 
@@ -187,8 +175,8 @@ impl WindowSystem for KwinWindowSystem {
             self.call_with_capability(FOCUSED_WINDOW_CAPABILITY, "GetFocusedWindow", ());
 
         result
-            .map(|(present, display_id, x, y, width, height)| {
-                present.then(|| FocusedWindow::new(display_id, Rect::new(x, y, width, height)))
+            .map(|(present, _display_id, x, y, width, height)| {
+                present.then(|| FocusedWindow::new(Rect::new(x, y, width, height)))
             })
             .map_err(|error| WindowSystemError::Platform(error.to_string()))
     }
@@ -317,6 +305,7 @@ impl KwinHotkeySystem {
                 .method_call(KWIN_INTERFACE, "RegisterHotkeys", (payload,))
                 .map_err(classify_dbus_error)?;
             wait_for_request(connection, request_id)?;
+            // The script preflights replacements before committing; this post-check only reads.
             verify_accelerators_assigned(connection, hotkeys)
         })();
 
@@ -460,9 +449,9 @@ fn verify_accelerators_assigned(
             String::new(),
             String::new(),
         ];
-        // KGlobalAccel answers with the requested keys while registration is still in flight, and
-        // it happily lists several actions for one key: the first entry is the one KWin dispatches
-        // to. Sample until it settles; any other action on our key means our binding is dead.
+        // KGlobalAccel answers with requested keys while registration is still in flight.
+        // Its action query selects the dispatch winner by registration serial, unlike the
+        // unordered getGlobalShortcutsByKey list. A later competitor does not steal our binding.
         let mut competitor = None;
         for attempt in 0..ACCELERATOR_SETTLE_SAMPLES {
             if attempt > 0 {
@@ -485,19 +474,14 @@ fn verify_accelerators_assigned(
                 competitor = Some(String::new());
                 break;
             };
-            let owners = accel
-                .method_call::<(Vec<ShortcutOwner>,), _, _, _>(
-                    KGLOBALACCEL_INTERFACE,
-                    "getGlobalShortcutsByKey",
-                    (key,),
-                )
-                .map(|(owners,)| owners)
+            let winner = accel
+                .method_call::<(Vec<String>,), _, _, _>(KGLOBALACCEL_INTERFACE, "action", (key,))
+                .map(|(winner,)| winner)
                 .unwrap_or_default();
-            competitor = owners
-                .into_iter()
-                .map(|owner| owner.0)
-                .find(|owner| owner != &action);
-            if competitor.is_some() {
+            if winner.first().map(String::as_str) != Some(KGLOBALACCEL_COMPONENT)
+                || winner.get(1) != Some(&action)
+            {
+                competitor = Some(winner.get(1).cloned().unwrap_or_default());
                 break;
             }
         }
@@ -818,6 +802,9 @@ impl CompanionState {
         let request = self.requests.remove(index).expect("request index exists");
         if ok && let CompanionRequest::RegisterHotkeys { hotkeys, .. } = request {
             self.registered_hotkeys = hotkeys;
+            if self.registered_hotkeys.is_empty() {
+                self.controller_sender = None;
+            }
         }
         self.results.insert(
             id,
@@ -1156,7 +1143,7 @@ mod tests {
                 moves: Vec::new(),
                 registered_hotkeys: Vec::new(),
                 pending: HashMap::new(),
-                events: VecDeque::from(["ctrl+alt+left".to_string()]),
+                events: VecDeque::from(["alt+ctrl+left".to_string()]),
                 next_request_id: 1,
             }
         }
@@ -1431,10 +1418,7 @@ mod tests {
 
         assert_eq!(
             window_system.focused_window().unwrap(),
-            Some(FocusedWindow::new(
-                "monitor-1",
-                Rect::new(-300, -20, 801, 602)
-            ))
+            Some(FocusedWindow::new(Rect::new(-300, -20, 801, 602)))
         );
         assert_eq!(
             window_system.displays().unwrap(),
@@ -1459,18 +1443,18 @@ mod tests {
 
         let mut hotkey_system = KwinHotkeySystem::with_bus_address(bus.address.clone());
         hotkey_system
-            .register_hotkeys(&["ctrl+alt+left".to_string(), "super+1".to_string()])
+            .register_hotkeys(&["alt+ctrl+left".to_string(), "cmd+1".to_string()])
             .unwrap();
         bus.update_state(|state| {
             assert_eq!(
                 state.registered_hotkeys,
-                vec!["ctrl+alt+left".to_string(), "super+1".to_string()]
+                vec!["alt+ctrl+left".to_string(), "cmd+1".to_string()]
             );
         });
         assert_eq!(
             hotkey_system.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
-                hotkey: "ctrl+alt+left".to_string()
+                hotkey: "alt+ctrl+left".to_string()
             })
         );
         assert_eq!(hotkey_system.next_hotkey().unwrap(), None);
@@ -1547,19 +1531,50 @@ mod tests {
         state
             .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
             .unwrap();
-        let first = state.enqueue_hotkeys(vec!["ctrl+alt+left".to_string()]);
+        let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
         state.complete_request(first, true, String::new()).unwrap();
         let _ = state.request_result(first);
-        assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+left"]);
+        assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
 
-        let second = state.enqueue_hotkeys(vec!["ctrl+alt+right".to_string()]);
+        let second = state.enqueue_hotkeys(vec!["alt+ctrl+right".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
         state
             .complete_request(second, false, "KWin rejected shortcut".to_string())
             .unwrap();
         assert_eq!(state.request_result(second).1, "KWin rejected shortcut");
-        assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+left"]);
+        assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
+    }
+
+    #[test]
+    fn empty_registration_releases_controller_after_completion() {
+        let mut state = CompanionState::default();
+        state
+            .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
+            .unwrap();
+        state
+            .authorize_controller("window-zones-1".to_string())
+            .unwrap();
+        let request_id = state.enqueue_hotkeys(Vec::new());
+        let _ = state.next_request("kwin-script").unwrap();
+        assert!(
+            state
+                .authorize_controller("window-zones-2".to_string())
+                .is_err()
+        );
+        state
+            .complete_request(request_id, true, String::new())
+            .unwrap();
+
+        state
+            .authorize_controller("window-zones-2".to_string())
+            .unwrap();
+        let request_id = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+        let _ = state.next_request("kwin-script").unwrap();
+        state
+            .complete_request(request_id, true, String::new())
+            .unwrap();
+        assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
     }
 
     #[test]
@@ -1572,7 +1587,7 @@ mod tests {
             .authorize_controller("window-zones-1".to_string())
             .unwrap();
 
-        let first = state.enqueue_hotkeys(vec!["ctrl+alt+left".to_string()]);
+        let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
         state.complete_request(first, true, String::new()).unwrap();
         let _ = state.request_result(first);
@@ -1584,7 +1599,7 @@ mod tests {
         let (request_id, kind, _, _, _, _, hotkeys) = state.next_request("kwin-script").unwrap();
         assert_ne!(request_id, 0);
         assert_eq!(kind, REQUEST_REGISTER_HOTKEYS);
-        assert_eq!(hotkeys, r#"["ctrl+alt+left"]"#);
+        assert_eq!(hotkeys, r#"["alt+ctrl+left"]"#);
         state
             .complete_request(request_id, true, String::new())
             .unwrap();
