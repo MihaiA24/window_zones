@@ -3,5 +3,6 @@
   "name": "Window Zones",
   "description": "Native Window Zones integration for GNOME Wayland.",
   "shell-version": ["50"],
-  "version": 1
+  "session-modes": ["user", "unlock-dialog"],
+  "version": 3
 }

@@ -299,6 +299,69 @@ fn modifier_sort_key(token: &str) -> u8 {
     }
 }
 
+/// A complete, commented starter config binding every built-in action under one
+/// modifier chord, e.g. `"Ctrl+Alt"` or `"Ctrl+Super"`. Written by `window_zones init`.
+pub fn starter_config(chord: &str) -> String {
+    let binding = |key: &str, action: &str| {
+        format!("[[bindings]]\nhotkey = \"{chord}+{key}\"\naction = {action}\n\n")
+    };
+    let zone = |key: &str, zone: &str| {
+        binding(
+            key,
+            &format!("{{ type = \"move-to-zone\", zone = \"{zone}\" }}"),
+        )
+    };
+
+    let mut config = String::from(
+        "# Window Zones config. Changes are picked up while the App runs.\n\
+         #\n\
+         # Actions: move-to-zone (zone = NAME), move-to-next-display, move-to-previous-display,\n\
+         #   move-to-display (direction = left|right|up|down), center, restore.\n\
+         # Built-in zones: left-half, right-half, top-half, bottom-half, top-left, top-right,\n\
+         #   bottom-left, bottom-right, left-third, center-third, right-third, left-two-thirds,\n\
+         #   right-two-thirds, maximize. Pressing left-half or right-half again on the same\n\
+         #   window cycles half -> two-thirds -> one third.\n\
+         # Custom zones are percentages of the display's usable area:\n\
+         #   [zones]\n\
+         #   wide-center = { x = 10, y = 0, width = 80, height = 100 }\n\
+         # Modifiers: ctrl, alt, shift, super (also cmd/meta/win). Keys: a-z, 0-9, f1-f24,\n\
+         #   left, right, up, down, return, space, tab, backspace, escape, home, end, pageup,\n\
+         #   pagedown, minus, equal, comma, dot, slash, quote, semicolon, leftbracket,\n\
+         #   rightbracket, backslash, backquote.\n\n",
+    );
+    for (key, name) in [
+        ("Left", "left-half"),
+        ("Right", "right-half"),
+        ("Up", "top-half"),
+        ("Down", "bottom-half"),
+        ("U", "top-left"),
+        ("I", "top-right"),
+        ("J", "bottom-left"),
+        ("K", "bottom-right"),
+        ("D", "left-third"),
+        ("F", "center-third"),
+        ("G", "right-third"),
+        ("E", "left-two-thirds"),
+        ("T", "right-two-thirds"),
+        ("Return", "maximize"),
+    ] {
+        config.push_str(&zone(key, name));
+    }
+    config.push_str(&binding("C", "{ type = \"center\" }"));
+    config.push_str(&binding("Backspace", "{ type = \"restore\" }"));
+    config.push_str(&binding(
+        "Shift+Right",
+        "{ type = \"move-to-next-display\" }",
+    ));
+    config.push_str(&binding(
+        "Shift+Left",
+        "{ type = \"move-to-previous-display\" }",
+    ));
+    config.truncate(config.trim_end().len());
+    config.push('\n');
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,7 +390,68 @@ action = { type = "move-to-next-display" }
                 zone: "left-half".to_string()
             }
         );
-        assert_eq!(config.bindings[1].action, Action::MoveToNextDisplay);
+        assert_eq!(config.bindings[1].action, Action::MoveToNextDisplay {});
+    }
+
+    #[test]
+    fn parses_display_direction_center_and_restore_actions() {
+        let config = parse_config(
+            r#"
+[[bindings]]
+hotkey = "Ctrl+Alt+Shift+Up"
+action = { type = "move-to-display", direction = "up" }
+
+[[bindings]]
+hotkey = "Ctrl+Alt+C"
+action = { type = "center" }
+
+[[bindings]]
+hotkey = "Ctrl+Alt+Backspace"
+action = { type = "restore" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .bindings
+                .iter()
+                .map(|binding| binding.action.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Action::MoveToDisplay {
+                    direction: crate::Direction::Up
+                },
+                Action::Center {},
+                Action::Restore {},
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_fields_that_an_action_does_not_take() {
+        for action in [
+            r#"{ type = "move-to-next-display", zone = "left-half" }"#,
+            r#"{ type = "move-to-previous-display", direction = "left" }"#,
+            r#"{ type = "center", zone = "left-half" }"#,
+            r#"{ type = "restore", zone = "left-half" }"#,
+            r#"{ type = "move-to-zone", zone = "left-half", direction = "left" }"#,
+            r#"{ type = "move-to-display", direction = "sideways" }"#,
+        ] {
+            let input = format!("[[bindings]]\nhotkey = \"Ctrl+Alt+X\"\naction = {action}\n");
+            assert!(
+                matches!(parse_config(&input), Err(ConfigError::Toml(_))),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn starter_config_is_a_valid_config_for_each_chord() {
+        for chord in ["Ctrl+Alt", "Ctrl+Super"] {
+            let config = parse_config(&starter_config(chord)).unwrap();
+            assert_eq!(config.bindings.len(), 18, "{chord}");
+        }
     }
 
     #[test]
@@ -461,11 +585,11 @@ action = { type = "move-to-zone", zone = "left-half" }
         let config = vec![
             Binding {
                 hotkey: " Ctrl + Alt + Left ".to_string(),
-                action: Action::MoveToNextDisplay,
+                action: Action::MoveToNextDisplay {},
             },
             Binding {
                 hotkey: "ctrl+alt+shift+right ".to_string(),
-                action: Action::MoveToPreviousDisplay,
+                action: Action::MoveToPreviousDisplay {},
             },
         ];
 
@@ -479,11 +603,11 @@ action = { type = "move-to-zone", zone = "left-half" }
         let err = validate_and_normalize_bindings(vec![
             Binding {
                 hotkey: " Ctrl + Alt + Left ".to_string(),
-                action: Action::MoveToNextDisplay,
+                action: Action::MoveToNextDisplay {},
             },
             Binding {
                 hotkey: "ctrl+alt+left".to_string(),
-                action: Action::MoveToPreviousDisplay,
+                action: Action::MoveToPreviousDisplay {},
             },
         ])
         .unwrap_err();
@@ -500,7 +624,7 @@ action = { type = "move-to-zone", zone = "left-half" }
     fn rejects_malformed_hotkeys_on_validation() {
         let err = validate_and_normalize_bindings(vec![Binding {
             hotkey: "  +left ".to_string(),
-            action: Action::MoveToNextDisplay,
+            action: Action::MoveToNextDisplay {},
         }])
         .unwrap_err();
 

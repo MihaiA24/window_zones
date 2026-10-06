@@ -10,12 +10,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libx11-dev libxtst-dev libxi-dev pkg-config
+        # qt6-declarative-dev-tools provides /usr/lib/qt6/bin/qmllint on Ubuntu.
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libx11-dev libxtst-dev libxi-dev pkg-config gjs qt6-declarative-dev-tools
       - name: Check scripts
         run: |
           bash -n scripts/*.sh
           node --check gnome-extension/extension.js
           node --check kwin-script/contents/code/main.js
+      - name: Test GNOME companion
+        run: gjs -m gnome-extension/tests/run.js
+      - name: Lint KWin companion
+        run: /usr/lib/qt6/bin/qmllint kwin-script/contents/code/main.js
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests

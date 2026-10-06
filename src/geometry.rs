@@ -27,11 +27,11 @@ impl Rect {
         self.y.saturating_add_unsigned(self.height)
     }
 
-    pub fn nearly_equals(self, other: Self, tolerance_px: i32) -> bool {
-        (self.x - other.x).abs() <= tolerance_px
-            && (self.y - other.y).abs() <= tolerance_px
-            && (self.right() - other.right()).abs() <= tolerance_px
-            && (self.bottom() - other.bottom()).abs() <= tolerance_px
+    pub fn nearly_equals(self, other: Self, tolerance_px: u32) -> bool {
+        self.x.abs_diff(other.x) <= tolerance_px
+            && self.y.abs_diff(other.y) <= tolerance_px
+            && self.right().abs_diff(other.right()) <= tolerance_px
+            && self.bottom().abs_diff(other.bottom()) <= tolerance_px
     }
 }
 

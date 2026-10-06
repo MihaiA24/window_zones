@@ -1,6 +1,6 @@
 use crate::geometry::Rect;
 use crate::zones::{ALL_BUILT_IN_ZONES, rect_for_built_in_zone};
-pub const KNOWN_ZONE_MATCH_TOLERANCE_PX: i32 = 2;
+pub const KNOWN_ZONE_MATCH_TOLERANCE_PX: u32 = 2;
 
 /// Moves a window from one display usable area to another.
 ///

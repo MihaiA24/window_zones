@@ -28,13 +28,51 @@ If no local binary exists, it falls back to `cargo run --release --bin window_zo
 ./scripts/run.sh run --backend dry-run
 ```
 
-Start the background listener with `window_zones run`, or install with `./scripts/install.sh --autostart` to start it automatically at desktop login (`run` keeps running after stdin closes when stdin is not a terminal).
+## First run
+
+```bash
+window_zones init                      # writes the starter config to the default path
+window_zones init --chord "Ctrl+Alt"   # pick another modifier chord
+window_zones init --force              # replace an existing config
+```
+
+`init` never overwrites an existing config without `--force`. The default chord is `Ctrl+Super` on GNOME (GNOME binds `Ctrl+Alt+arrows` to workspaces and `Super+arrows` to tiling), `Ctrl+Alt+Super` on KDE Plasma, and `Ctrl+Alt` elsewhere.
+
+## Config reference
+
+```toml
+[zones]                                  # optional custom zones, percent of the usable area
+wide-center = { x = 10, y = 0, width = 80, height = 100 }
+
+[[bindings]]
+hotkey = "Ctrl+Super+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+```
+
+Actions: `move-to-zone` (`zone = NAME`), `move-to-next-display`, `move-to-previous-display`, `move-to-display` (`direction = "left" | "right" | "up" | "down"`), `center` (keeps the size, shrinks to fit), `restore` (returns the window to its geometry before the App first moved it). Built-in zones: `left-half`, `right-half`, `top-half`, `bottom-half`, `top-left`, `top-right`, `bottom-left`, `bottom-right`, `left-third`, `center-third`, `right-third`, `left-two-thirds`, `right-two-thirds`, `maximize`. Pressing `left-half` or `right-half` again on the same window cycles half → two-thirds → third. Next/previous display follow the left-to-right layout and do nothing with one display. Unknown fields anywhere, including on actions, are rejected.
+
+Maximized and tiled windows are restored before they are placed; fullscreen windows are refused. `restore` and cycling remember windows within one `run`/`tui` session; a window you move by hand starts over.
+
+## Running in the background
+
+Start the listener with `window_zones run`, or install with `./scripts/install.sh --autostart` to run it as the `window-zones` systemd user service, which starts with every desktop login and stops at logout (`run` keeps serving hotkeys when stdin is closed). Manage it with `systemctl --user status|stop|start|restart window-zones`; `systemctl --user disable --now window-zones` turns it off. Only one `run`/`tui` session owns the hotkeys: while the service runs, a manual `run` or `tui` exits with status `75` and names the owning pid, so stop the service first. Logs: `journalctl --user -u window-zones -f`.
+
+The App prints runtime events once per change, never per retry:
+
+- `Config state: Loaded (N bindings)` / `Config state: Missing; run `window_zones init` ...`
+- `Config reload error: ...` — a broken file, or a file whose hotkeys were refused; the previous bindings stay active.
+- `Hotkeys registered: N`, `Hotkey registration now recovered: ...`
+- `Hotkey registration refused: ...` — a binding is taken by the desktop or another program; nothing is retried until the config changes.
+- `Hotkey registration failed: ...; retrying` — the companion is absent or busy; retried every second.
+- `Dispatch failed for <hotkey>: ...` — once per press.
+
+When stdout is not a terminal (the systemd service), problem events also raise a desktop notification that is updated in place and cleared by the matching recovery event. Config errors and refused hotkeys notify at once; an unavailable companion notifies only after 20 seconds without recovery, so the login race and companion restarts stay silent.
 
 `dispatch` exits `1` when the dispatch state is an error (no binding, no focused window, adapter failure); the state is still printed.
 
 ## Backend resolution
 
-`--backend auto` reads `XDG_SESSION_TYPE`, `WAYLAND_DISPLAY`, and `DISPLAY` on Linux. It resolves X11 or Wayland only when the signals agree; otherwise it fails with `cannot resolve desktop session from XDG_SESSION_TYPE, WAYLAND_DISPLAY, and DISPLAY: <reason>; use --backend x11|wayland`, where the reason is one of: conflicting `XDG_SESSION_TYPE=x11` and `WAYLAND_DISPLAY`; unrecognized `XDG_SESSION_TYPE`; `WAYLAND_DISPLAY` and `DISPLAY` both set without `XDG_SESSION_TYPE`; all three unset. An explicit `--backend x11|wayland` overrides an unresolved identity, but `--backend x11` inside a resolved Wayland session is still rejected.
+`--backend auto` reads `XDG_SESSION_TYPE`, `WAYLAND_DISPLAY`, and `DISPLAY` on Linux. It resolves X11 or Wayland only when the signals agree; otherwise it fails with `cannot resolve desktop session from XDG_SESSION_TYPE, WAYLAND_DISPLAY, and DISPLAY: <reason>; use --backend x11|wayland`, where the reason is one of: conflicting `XDG_SESSION_TYPE=x11` and `WAYLAND_DISPLAY`; unrecognized `XDG_SESSION_TYPE`; `WAYLAND_DISPLAY` and `DISPLAY` both set without `XDG_SESSION_TYPE`; all three unset. An explicit `--backend wayland` overrides an unresolved identity; `--backend x11` is refused whenever `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland` is set, because inside a Wayland session it would only reach XWayland windows.
 
 ## Hotkey vocabulary
 
@@ -42,7 +80,7 @@ Config and `dispatch` hotkeys are canonicalized once by the App: modifiers `alt`
 
 ## Sway and Hyprland
 
-Neither compositor exposes a global hotkey capability to the App, so `run` reports hotkeys as unavailable there. Bind the compositor's own keys to compositor-bound dispatch:
+Neither compositor exposes a global hotkey capability to the App, so `run` reports the hotkey set as refused there. Bind the compositor's own keys to compositor-bound dispatch (each `dispatch` is a separate process, so `restore` and half cycling do not carry over between presses):
 
 ```text
 # sway
@@ -55,7 +93,7 @@ Window and display state come from `swaymsg`/`hyprctl`; both integrations are un
 
 ## Linux X11
 
-Placement uses the window frame (client origin translated to root coordinates plus `_NET_FRAME_EXTENTS`) and removes `_NET_WM_STATE_MAXIMIZED_*` before configuring. Displays are RandR monitors; panels advertising `_NET_WM_STRUT` are not subtracted from the usable area.
+Placement uses the window frame (client origin translated to root coordinates plus `_NET_FRAME_EXTENTS`) and restores maximized windows before configuring. Displays are RandR monitors minus the `_NET_WM_STRUT_PARTIAL`/`_NET_WM_STRUT` space panels reserve on each monitor. Hotkeys are exclusive `XGrabKey` grabs: a bound combination never reaches the focused application, and a combination another program already grabbed refuses the whole set.
 
 ## KDE Plasma Wayland
 
@@ -76,9 +114,10 @@ hotkey cleanup, and the full native-window smoke checklist.
 Install and enable the Shell companion before starting the native Wayland backend:
 
 ```bash
-./scripts/install.sh --prefix "$HOME/.local"
-$HOME/.local/bin/window_zones --backend auto status
-$HOME/.local/bin/window_zones --backend auto run
+./scripts/install.sh --prefix "$HOME/.local" --gnome-extension --init-config
+# log out and back in once, then:
+$HOME/.local/bin/window_zones status
+$HOME/.local/bin/window_zones run
 ```
 
 Use `docs/runbooks/gnome-wayland.md` for extension installation, reload/restart checks, companion disconnect recovery, and the full two-display smoke checklist.

@@ -15,26 +15,26 @@ pub mod gnome_integration;
 pub mod hotkey_system;
 #[cfg(target_os = "linux")]
 pub mod kwin_integration;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod macos_window_system;
 pub mod runtime;
 #[cfg(target_os = "linux")]
 pub mod wayland_window_system;
 pub mod window_system;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 pub mod windows_window_system;
 #[cfg(target_os = "linux")]
 pub mod x11_window_system;
 pub mod zones;
 
-pub use actions::{Action, Binding};
+pub use actions::{Action, Binding, Direction};
 pub use config::{
-    AppConfig, BindingValidationError, ConfigError, parse_config,
+    AppConfig, BindingValidationError, ConfigError, parse_config, starter_config,
     validate_and_normalize_app_config, validate_and_normalize_bindings,
 };
 pub use dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 pub use display_movement::move_window_to_display;
-pub use executor::{ExecuteActionError, execute_action};
+pub use executor::{ExecuteActionError, WindowHistory, execute_action};
 pub use geometry::{DisplayGeometry, Rect};
 #[cfg(target_os = "linux")]
 pub use gnome_integration::{
@@ -52,16 +52,18 @@ pub use kwin_integration::{
 #[cfg(target_os = "macos")]
 pub use macos_window_system::MacOSWindowSystem;
 pub use runtime::{
-    App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, HotkeyRegistrationState,
-    default_config_path,
+    App, ConfigLoadError, ConfigPathError, ConfigState, DispatchState, HOTKEY_RETRY_INTERVAL,
+    HotkeyRegistrationState, RuntimeEvent, default_config_path,
 };
 #[cfg(target_os = "linux")]
-pub use wayland_window_system::{WaylandBackend, WaylandWindowSystem, resolve_wayland_backend};
-pub use window_system::{FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
+pub use wayland_window_system::{
+    ScriptedCompositor, WaylandBackend, WaylandWindowSystem, resolve_wayland_backend,
+};
+pub use window_system::{FocusedWindow, WindowId, WindowMove, WindowSystem, WindowSystemError};
 #[cfg(target_os = "windows")]
 pub use windows_window_system::WindowsWindowSystem;
 #[cfg(target_os = "linux")]
-pub use x11_window_system::X11WindowSystem;
+pub use x11_window_system::{X11HotkeySystem, X11WindowSystem};
 pub use zones::{
     BuiltInZone, ZoneDefinition, built_in_zone_from_name, is_built_in_zone_name,
     rect_for_built_in_zone, rect_for_zone,

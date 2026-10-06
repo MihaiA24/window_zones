@@ -6,23 +6,26 @@ use std::time::{Duration, Instant};
 
 use dbus::arg::{AppendAll, ReadAll};
 use dbus::blocking::{Connection, LocalConnection};
+use dbus::channel::Sender;
 use dbus::message::MatchRule;
 use dbus_tree::{Factory, MethodErr};
 use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
-    DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowMove,
-    WindowSystem, WindowSystemError,
+    DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowId,
+    WindowMove, WindowSystem, WindowSystemError,
 };
 
 pub const KWIN_SERVICE_NAME: &str = "org.window_zones.KWin";
 pub const KWIN_OBJECT_PATH: &str = "/org/window_zones/KWin";
-pub const KWIN_INTERFACE: &str = "org.window_zones.KWin1";
-pub const KWIN_PROTOCOL_MAJOR: u32 = 1;
+pub const KWIN_INTERFACE: &str = "org.window_zones.KWin2";
+pub const KWIN_PROTOCOL_MAJOR: u32 = 2;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 const COMPANION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+const NEXT_REQUEST_WAIT: Duration = Duration::from_secs(1);
+const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const FOCUSED_WINDOW_CAPABILITY: &str = "focused-window";
 const DISPLAYS_CAPABILITY: &str = "displays";
 const MOVE_RESIZE_CAPABILITY: &str = "move-resize";
@@ -38,7 +41,7 @@ const ACCELERATOR_SETTLE_SAMPLES: u32 = 6;
 const ACCELERATOR_SETTLE_INTERVAL: Duration = Duration::from_millis(120);
 
 type DisplayPayload = (String, i32, i32, u32, u32);
-type NextRequestPayload = (u32, String, i32, i32, u32, u32, String);
+type NextRequestPayload = (u32, String, String, i32, i32, u32, u32, String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum KwinIntegrationError {
@@ -64,6 +67,8 @@ pub enum KwinIntegrationError {
         "KWin companion rejected the request: {message}; restore an eligible focused window or correct the request"
     )]
     Invalid { message: String },
+    #[error("KWin window no longer exists: {window}")]
+    WindowGone { window: WindowId },
     #[error("KWin companion operation failed: {message}; retry the operation")]
     Operation { message: String },
 }
@@ -71,6 +76,24 @@ pub enum KwinIntegrationError {
 impl KwinIntegrationError {
     fn should_reconnect(&self) -> bool {
         matches!(self, Self::Unavailable { .. } | Self::Incompatible { .. })
+    }
+
+    fn into_window_error(self) -> WindowSystemError {
+        match self {
+            Self::WindowGone { window } => WindowSystemError::WindowGone(window),
+            _ => WindowSystemError::Platform(self.to_string()),
+        }
+    }
+
+    /// A refused set leaves the companion's previous set registered; every other
+    /// failure means nothing is known to be registered.
+    fn into_hotkey_error(self) -> HotkeySystemError {
+        match self {
+            Self::Unsupported { .. } | Self::Invalid { .. } => {
+                HotkeySystemError::Rejected(self.to_string())
+            }
+            _ => HotkeySystemError::Unavailable(self.to_string()),
+        }
     }
 }
 
@@ -175,10 +198,12 @@ impl WindowSystem for KwinWindowSystem {
             self.call_with_capability(FOCUSED_WINDOW_CAPABILITY, "GetFocusedWindow", ());
 
         result
-            .map(|(present, _display_id, x, y, width, height)| {
-                present.then(|| FocusedWindow::new(Rect::new(x, y, width, height)))
+            .map(|(present, window_id, x, y, width, height)| {
+                present.then(|| {
+                    FocusedWindow::new(WindowId::new(window_id), Rect::new(x, y, width, height))
+                })
             })
-            .map_err(|error| WindowSystemError::Platform(error.to_string()))
+            .map_err(KwinIntegrationError::into_window_error)
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
@@ -197,15 +222,21 @@ impl WindowSystem for KwinWindowSystem {
             .map_err(|error| WindowSystemError::Platform(error.to_string()))
     }
 
-    fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
         let target = window_move.target;
         let result: Result<(), KwinIntegrationError> = self.request_and_wait(
             MOVE_RESIZE_CAPABILITY,
-            "MoveFocusedWindow",
-            (target.x, target.y, target.width, target.height),
+            "MoveWindow",
+            (
+                window_move.window.as_str(),
+                target.x,
+                target.y,
+                target.width,
+                target.height,
+            ),
         );
 
-        result.map_err(|error| WindowSystemError::Platform(error.to_string()))
+        result.map_err(KwinIntegrationError::into_window_error)
     }
 }
 
@@ -328,21 +359,18 @@ impl Default for KwinHotkeySystem {
 impl HotkeySystem for KwinHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         self.call_register_hotkeys(hotkeys)
-            .map_err(|error| HotkeySystemError::Platform(error.to_string()))
+            .map_err(KwinIntegrationError::into_hotkey_error)
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
         let result = (|| {
             let connection = self
                 .ensure_connection()
-                .map_err(|error| HotkeySystemError::Platform(error.to_string()))?;
+                .map_err(KwinIntegrationError::into_hotkey_error)?;
             let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
             let (present, hotkey): (bool, String) = proxy
                 .method_call(KWIN_INTERFACE, "GetNextHotkey", ())
-                .map_err(|error| {
-                    let classified = classify_dbus_error(error);
-                    HotkeySystemError::Platform(classified.to_string())
-                })?;
+                .map_err(|error| classify_dbus_error(error).into_hotkey_error())?;
             Ok(present.then_some(HotkeyEvent::Pressed { hotkey }))
         })();
 
@@ -351,6 +379,14 @@ impl HotkeySystem for KwinHotkeySystem {
         }
 
         result
+    }
+}
+
+impl Drop for KwinHotkeySystem {
+    fn drop(&mut self) {
+        if self.connection.is_some() {
+            let _ = self.call_register_hotkeys(&[]);
+        }
     }
 }
 
@@ -392,7 +428,7 @@ fn wait_for_request(connection: &Connection, request_id: u32) -> Result<(), Kwin
     let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
 
     loop {
-        let (complete, message): (bool, String) = proxy
+        let (complete, error_name, message): (bool, String, String) = proxy
             .method_call(
                 KWIN_INTERFACE,
                 "GetRequestResult",
@@ -400,10 +436,17 @@ fn wait_for_request(connection: &Connection, request_id: u32) -> Result<(), Kwin
             )
             .map_err(classify_dbus_error)?;
         if complete {
-            return if message.is_empty() {
+            return if error_name.is_empty() && message.is_empty() {
                 Ok(())
             } else {
-                Err(KwinIntegrationError::Operation { message })
+                Err(classify_dbus_error(dbus::Error::new_custom(
+                    if error_name.is_empty() {
+                        "org.window_zones.KWin.Error.Operation"
+                    } else {
+                        &error_name
+                    },
+                    &message,
+                )))
             };
         }
 
@@ -529,6 +572,9 @@ fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {
             KwinIntegrationError::Invalid { message }
         }
         "org.window_zones.KWin.Error.Unavailable" => KwinIntegrationError::Unavailable { message },
+        "org.window_zones.KWin.Error.WindowGone" => KwinIntegrationError::WindowGone {
+            window: WindowId::new(message),
+        },
         "org.window_zones.KWin.Error.Unsupported" => KwinIntegrationError::Unsupported {
             capability: "requested operation".to_string(),
             message,
@@ -542,6 +588,7 @@ fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {
 enum CompanionRequest {
     Move {
         id: u32,
+        window: String,
         x: i32,
         y: i32,
         width: u32,
@@ -564,7 +611,15 @@ impl CompanionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestResult {
     complete: bool,
+    error_name: String,
     message: String,
+}
+
+#[derive(Debug)]
+struct PendingNextRequest {
+    call: dbus::Message,
+    sender: String,
+    deadline: Instant,
 }
 
 #[derive(Debug)]
@@ -579,6 +634,7 @@ struct CompanionState {
     claimed_requests: HashSet<u32>,
     results: HashMap<u32, RequestResult>,
     next_request_id: u32,
+    pending_next_request: Option<PendingNextRequest>,
     registered_hotkeys: Vec<String>,
     events: VecDeque<String>,
 }
@@ -596,6 +652,7 @@ impl Default for CompanionState {
             claimed_requests: HashSet::new(),
             results: HashMap::new(),
             next_request_id: 1,
+            pending_next_request: None,
             registered_hotkeys: Vec::new(),
             events: VecDeque::new(),
         }
@@ -707,6 +764,9 @@ impl CompanionState {
             self.results.clear();
             self.registered_hotkeys.clear();
             self.events.clear();
+            if self.script_ready {
+                self.enqueue_hotkeys(Vec::new());
+            }
         }
     }
 
@@ -719,10 +779,11 @@ impl CompanionState {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         id
     }
-    fn enqueue_move(&mut self, x: i32, y: i32, width: u32, height: u32) -> u32 {
+    fn enqueue_move(&mut self, window: String, x: i32, y: i32, width: u32, height: u32) -> u32 {
         let id = self.next_request_id();
         self.requests.push_back(CompanionRequest::Move {
             id,
+            window,
             x,
             y,
             width,
@@ -748,13 +809,23 @@ impl CompanionState {
             .find(|request| !self.claimed_requests.contains(&request.id()))
             .cloned()
         else {
-            return Ok((0, String::new(), 0, 0, 0, 0, "[]".to_string()));
+            return Ok((
+                0,
+                String::new(),
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+                "[]".to_string(),
+            ));
         };
         self.claimed_requests.insert(request.id());
 
         Ok(match request {
             CompanionRequest::Move {
                 id,
+                window,
                 x,
                 y,
                 width,
@@ -762,6 +833,7 @@ impl CompanionState {
             } => (
                 id,
                 REQUEST_MOVE.to_string(),
+                window,
                 x,
                 y,
                 width,
@@ -771,6 +843,7 @@ impl CompanionState {
             CompanionRequest::RegisterHotkeys { id, hotkeys } => (
                 id,
                 REQUEST_REGISTER_HOTKEYS.to_string(),
+                String::new(),
                 0,
                 0,
                 0,
@@ -785,7 +858,62 @@ impl CompanionState {
         })
     }
 
-    fn complete_request(&mut self, id: u32, ok: bool, message: String) -> Result<(), MethodErr> {
+    fn poll_next_request(&mut self, call: &dbus::Message) -> Result<Vec<dbus::Message>, MethodErr> {
+        let sender = sender_name(call)?;
+        self.ensure_script(&sender)?;
+        if self.pending_next_request.is_some() {
+            return Err(method_error(
+                "org.window_zones.KWin.Error.Busy",
+                "KWin script already has an outstanding NextRequest",
+            ));
+        }
+        let request = self.next_request(&sender)?;
+        if request.0 != 0 {
+            let mut reply = call.method_return();
+            reply.append_all(request);
+            return Ok(vec![reply]);
+        }
+        // dbus_message_copy deliberately resets the serial; a deferred reply must retain it.
+        let mut deferred_call = call
+            .duplicate()
+            .map_err(|error| MethodErr::failed(&error))?;
+        deferred_call.set_serial(call.get_serial().ok_or_else(|| {
+            method_error(
+                "org.window_zones.KWin.Error.Invalid",
+                "NextRequest has no D-Bus serial",
+            )
+        })?);
+        self.pending_next_request = Some(PendingNextRequest {
+            call: deferred_call,
+            sender,
+            deadline: Instant::now() + NEXT_REQUEST_WAIT,
+        });
+        Ok(Vec::new())
+    }
+
+    fn take_next_request_reply(&mut self, now: Instant) -> Option<dbus::Message> {
+        let pending = self.pending_next_request.take()?;
+        match self.next_request(&pending.sender) {
+            Ok(request) if request.0 != 0 || now >= pending.deadline => {
+                let mut reply = pending.call.method_return();
+                reply.append_all(request);
+                Some(reply)
+            }
+            Ok(_) => {
+                self.pending_next_request = Some(pending);
+                None
+            }
+            Err(error) => Some(error.to_message(&pending.call)),
+        }
+    }
+
+    fn complete_request(
+        &mut self,
+        id: u32,
+        ok: bool,
+        error_name: String,
+        message: String,
+    ) -> Result<(), MethodErr> {
         let Some(index) = self.requests.iter().position(|request| request.id() == id) else {
             return Err(method_error(
                 "org.window_zones.KWin.Error.Invalid",
@@ -810,20 +938,25 @@ impl CompanionState {
             id,
             RequestResult {
                 complete: true,
+                error_name: if ok { String::new() } else { error_name },
                 message: if ok { String::new() } else { message },
             },
         );
         Ok(())
     }
 
-    fn request_result(&mut self, id: u32) -> (bool, String) {
+    fn request_result(&mut self, id: u32) -> (bool, String, String) {
         if let Some(result) = self.results.remove(&id) {
-            return (result.complete, result.message);
+            return (result.complete, result.error_name, result.message);
         }
         if self.requests.iter().any(|request| request.id() == id) {
-            return (false, String::new());
+            return (false, String::new(), String::new());
         }
-        (true, "unknown KWin request id".to_string())
+        (
+            true,
+            "org.window_zones.KWin.Error.Invalid".to_string(),
+            "unknown KWin request id".to_string(),
+        )
     }
 }
 
@@ -832,12 +965,24 @@ fn method_error(name: &'static str, message: &'static str) -> MethodErr {
 }
 
 fn parse_hotkeys(raw: &str) -> Result<Vec<String>, MethodErr> {
-    serde_json::from_str(raw).map_err(|_| {
+    let hotkeys: Vec<String> = serde_json::from_str(raw).map_err(|_| {
         method_error(
             "org.window_zones.KWin.Error.Invalid",
             "hotkey request payload is not valid JSON",
         )
-    })
+    })?;
+    for hotkey in &hotkeys {
+        if crate::config::normalize_hotkey(hotkey).as_ref() != Ok(hotkey) {
+            return Err((
+                "org.window_zones.KWin.Error.Unsupported",
+                format!(
+                    "unsupported non-canonical KWin hotkey '{hotkey}'; use a canonical binding"
+                ),
+            )
+                .into());
+        }
+    }
+    Ok(hotkeys)
 }
 
 fn parse_displays(raw: &str) -> Result<Vec<DisplayPayload>, MethodErr> {
@@ -961,8 +1106,9 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             let reply = method.msg.method_return().append1(state.displays.clone());
                             Ok(vec![reply])
                         }))
-                        .add_m(factory.method("MoveFocusedWindow", (), move |method| {
-                            let (x, y, width, height): (i32, i32, u32, u32) = method.msg.read4()?;
+                        .add_m(factory.method("MoveWindow", (), move |method| {
+                            let (window, x, y, width, height): (String, i32, i32, u32, u32) =
+                                method.msg.read_all()?;
                             if width == 0 || height == 0 {
                                 return Err(method_error(
                                     "org.window_zones.KWin.Error.Invalid",
@@ -971,7 +1117,7 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             }
                             let mut state = move_state.lock();
                             state.ensure_ready()?;
-                            let request_id = state.enqueue_move(x, y, width, height);
+                            let request_id = state.enqueue_move(window, x, y, width, height);
                             Ok(vec![method.msg.method_return().append1(request_id)])
                         }))
                         .add_m(factory.method("RegisterHotkeys", (), move |method| {
@@ -985,15 +1131,11 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             Ok(vec![method.msg.method_return().append1(request_id)])
                         }))
                         .add_m(factory.method("NextRequest", (), move |method| {
-                            let sender = sender_name(method.msg)?;
-                            let request = next_request_state.lock().next_request(&sender)?;
-                            let mut reply = method.msg.method_return();
-                            reply.append_all(request);
-                            Ok(vec![reply])
+                            next_request_state.lock().poll_next_request(method.msg)
                         }))
                         .add_m(factory.method("CompleteRequest", (), move |method| {
-                            let (id_raw, ok, message): (String, bool, String) =
-                                method.msg.read3()?;
+                            let (id_raw, ok, error_name, message): (String, bool, String, String) =
+                                method.msg.read4()?;
                             let id = parse_u32_argument(
                                 &id_raw,
                                 "KWin request id must be an unsigned integer",
@@ -1001,7 +1143,7 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             let sender = sender_name(method.msg)?;
                             let mut state = complete_request_state.lock();
                             state.ensure_script(&sender)?;
-                            state.complete_request(id, ok, message)?;
+                            state.complete_request(id, ok, error_name, message)?;
                             Ok(vec![method.msg.method_return()])
                         }))
                         .add_m(factory.method("GetRequestResult", (), move |method| {
@@ -1079,8 +1221,13 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
 
     println!("KWin companion service started for the Window Zones KWin script.");
     loop {
+        if let Some(reply) = state.lock().take_next_request_reply(Instant::now()) {
+            connection
+                .send(reply)
+                .map_err(|_| "send deferred KWin NextRequest reply".to_string())?;
+        }
         connection
-            .process(Duration::from_millis(100))
+            .process(SERVICE_POLL_INTERVAL)
             .map_err(|error| format!("process KWin companion D-Bus requests: {error}"))?;
     }
 }
@@ -1100,6 +1247,7 @@ mod tests {
     #[derive(Debug)]
     enum FakeRequest {
         Move {
+            window: String,
             x: i32,
             y: i32,
             width: u32,
@@ -1116,13 +1264,15 @@ mod tests {
     struct FakeServiceState {
         capabilities: Vec<String>,
         capabilities_error: Option<(&'static str, String)>,
+        request_error: Option<(&'static str, String)>,
         focused: Option<(String, i32, i32, u32, u32)>,
         displays: Vec<DisplayPayload>,
-        moves: Vec<(i32, i32, u32, u32)>,
+        moves: Vec<(String, i32, i32, u32, u32)>,
         registered_hotkeys: Vec<String>,
         pending: HashMap<u32, FakeRequest>,
         events: VecDeque<String>,
         next_request_id: u32,
+        script_state: CompanionState,
     }
 
     impl FakeServiceState {
@@ -1135,7 +1285,8 @@ mod tests {
                     HOTKEYS_CAPABILITY.to_string(),
                 ],
                 capabilities_error: None,
-                focused: Some(("monitor-1".to_string(), -300, -20, 801, 602)),
+                request_error: None,
+                focused: Some(("window-1".to_string(), -300, -20, 801, 602)),
                 displays: vec![
                     ("monitor-0".to_string(), -1920, 0, 1920, 1080),
                     ("monitor-1".to_string(), 0, -50, 1280, 1024),
@@ -1145,6 +1296,7 @@ mod tests {
                 pending: HashMap::new(),
                 events: VecDeque::from(["alt+ctrl+left".to_string()]),
                 next_request_id: 1,
+                script_state: CompanionState::default(),
             }
         }
     }
@@ -1221,6 +1373,8 @@ mod tests {
                 let register_state = Arc::clone(&state);
                 let request_result_state = Arc::clone(&state);
                 let hotkey_state = Arc::clone(&state);
+                let companion_state = Arc::clone(&state);
+                let next_request_state = Arc::clone(&state);
 
                 let tree = factory
                     .tree(())
@@ -1231,6 +1385,22 @@ mod tests {
                             .add(
                                 factory
                                     .interface(KWIN_INTERFACE, ())
+                                    .add_m(factory.method("RegisterCompanion", (), move |method| {
+                                        let (protocol, reset): (String, bool) =
+                                            method.msg.read2()?;
+                                        companion_state.lock().script_state.mark_ready(
+                                            protocol.parse().unwrap(),
+                                            sender_name(method.msg)?,
+                                            reset,
+                                        )?;
+                                        Ok(vec![method.msg.method_return()])
+                                    }))
+                                    .add_m(factory.method("NextRequest", (), move |method| {
+                                        next_request_state
+                                            .lock()
+                                            .script_state
+                                            .poll_next_request(method.msg)
+                                    }))
                                     .add_m(factory.method("GetCapabilities", (), move |method| {
                                         let state = capabilities_state.lock();
                                         if let Some((name, message)) =
@@ -1277,15 +1447,21 @@ mod tests {
                                                 .append1(state.displays.clone()),
                                         ])
                                     }))
-                                    .add_m(factory.method("MoveFocusedWindow", (), move |method| {
-                                        let (x, y, width, height): (i32, i32, u32, u32) =
-                                            method.msg.read4()?;
+                                    .add_m(factory.method("MoveWindow", (), move |method| {
+                                        let (window, x, y, width, height): (
+                                            String,
+                                            i32,
+                                            i32,
+                                            u32,
+                                            u32,
+                                        ) = method.msg.read_all()?;
                                         let mut state = move_state.lock();
                                         let request_id = state.next_request_id;
                                         state.next_request_id += 1;
                                         state.pending.insert(
                                             request_id,
                                             FakeRequest::Move {
+                                                window,
                                                 x,
                                                 y,
                                                 width,
@@ -1322,6 +1498,7 @@ mod tests {
                                             let mut reply = method.msg.method_return();
                                             reply.append_all((
                                                 true,
+                                                "org.window_zones.KWin.Error.Invalid".to_string(),
                                                 "unknown KWin request id".to_string(),
                                             ));
                                             return Ok(vec![reply]);
@@ -1336,7 +1513,7 @@ mod tests {
                                         };
                                         if !seen {
                                             let mut reply = method.msg.method_return();
-                                            reply.append_all((false, String::new()));
+                                            reply.append_all((false, String::new(), String::new()));
                                             return Ok(vec![reply]);
                                         }
 
@@ -1344,20 +1521,30 @@ mod tests {
                                             .pending
                                             .remove(&request_id)
                                             .expect("pending KWin request exists");
-                                        match request {
-                                            FakeRequest::Move {
-                                                x,
-                                                y,
-                                                width,
-                                                height,
-                                                ..
-                                            } => state.moves.push((x, y, width, height)),
-                                            FakeRequest::RegisterHotkeys { hotkeys, .. } => {
-                                                state.registered_hotkeys = hotkeys
+                                        if state.request_error.is_none() {
+                                            match request {
+                                                FakeRequest::Move {
+                                                    window,
+                                                    x,
+                                                    y,
+                                                    width,
+                                                    height,
+                                                    ..
+                                                } => {
+                                                    state.moves.push((window, x, y, width, height))
+                                                }
+                                                FakeRequest::RegisterHotkeys {
+                                                    hotkeys, ..
+                                                } => state.registered_hotkeys = hotkeys,
                                             }
                                         }
                                         let mut reply = method.msg.method_return();
-                                        reply.append_all((true, String::new()));
+                                        let (error_name, message) = state
+                                            .request_error
+                                            .clone()
+                                            .map(|(name, message)| (name.to_string(), message))
+                                            .unwrap_or_default();
+                                        reply.append_all((true, error_name, message));
                                         Ok(vec![reply])
                                     }))
                                     .add_m(factory.method("GetNextHotkey", (), move |method| {
@@ -1378,6 +1565,15 @@ mod tests {
                     .expect("report fake companion readiness");
 
                 while !stop.load(Ordering::Relaxed) {
+                    if let Some(reply) = state
+                        .lock()
+                        .script_state
+                        .take_next_request_reply(Instant::now())
+                    {
+                        connection
+                            .send(reply)
+                            .expect("send deferred fake request reply");
+                    }
                     if connection.process(Duration::from_millis(25)).is_err() {
                         break;
                     }
@@ -1418,7 +1614,10 @@ mod tests {
 
         assert_eq!(
             window_system.focused_window().unwrap(),
-            Some(FocusedWindow::new(Rect::new(-300, -20, 801, 602)))
+            Some(FocusedWindow::new(
+                WindowId::new("window-1"),
+                Rect::new(-300, -20, 801, 602)
+            ))
         );
         assert_eq!(
             window_system.displays().unwrap(),
@@ -1429,15 +1628,24 @@ mod tests {
         );
 
         window_system
-            .move_focused_window(WindowMove::new(Rect::new(-123, 456, 777, 888)))
+            .move_window(&WindowMove::new(
+                WindowId::new("window-1"),
+                Rect::new(-123, 456, 777, 888),
+            ))
             .unwrap();
         window_system
-            .move_focused_window(WindowMove::new(Rect::new(12, -34, 500, 400)))
+            .move_window(&WindowMove::new(
+                WindowId::new("window-1"),
+                Rect::new(12, -34, 500, 400),
+            ))
             .unwrap();
         bus.update_state(|state| {
             assert_eq!(
                 state.moves,
-                vec![(-123, 456, 777, 888), (12, -34, 500, 400)]
+                vec![
+                    ("window-1".to_string(), -123, 456, 777, 888),
+                    ("window-1".to_string(), 12, -34, 500, 400),
+                ]
             );
         });
 
@@ -1458,6 +1666,215 @@ mod tests {
             })
         );
         assert_eq!(hotkey_system.next_hotkey().unwrap(), None);
+    }
+
+    #[test]
+    fn move_keeps_observed_identity_after_focus_switches() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = KwinWindowSystem::with_bus_address(bus.address.clone());
+        let focused = system.focused_window().unwrap().unwrap();
+        bus.update_state(|state| {
+            state.focused = Some(("window-2".to_string(), 0, 0, 640, 480));
+        });
+        let target = Rect::new(-20, 30, 900, 600);
+        system
+            .move_window(&WindowMove::new(focused.id, target))
+            .unwrap();
+        bus.update_state(|state| {
+            assert_eq!(
+                state.moves,
+                vec![("window-1".to_string(), -20, 30, 900, 600)]
+            );
+        });
+    }
+
+    #[test]
+    fn closed_window_maps_to_window_gone() {
+        let mut state = FakeServiceState::complete();
+        state.request_error = Some((
+            "org.window_zones.KWin.Error.WindowGone",
+            "window-1".to_string(),
+        ));
+        let bus = FakeBus::new(state);
+        let mut system = KwinWindowSystem::with_bus_address(bus.address.clone());
+        let movement = WindowMove::new(WindowId::new("window-1"), Rect::new(0, 0, 900, 600));
+        assert_eq!(
+            system.move_window(&movement),
+            Err(WindowSystemError::WindowGone(WindowId::new("window-1")))
+        );
+        bus.update_state(|state| assert!(state.moves.is_empty()));
+    }
+
+    #[test]
+    fn hotkey_conflict_is_rejected_and_previous_set_survives() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = KwinHotkeySystem::with_bus_address(bus.address.clone());
+        system
+            .register_hotkeys(&["alt+ctrl+left".to_string()])
+            .unwrap();
+        bus.update_state(|state| {
+            state.request_error = Some((
+                "org.window_zones.KWin.Error.Unsupported",
+                "accelerator is already held; choose a different binding".to_string(),
+            ));
+        });
+        assert!(matches!(
+            system.register_hotkeys(&["alt+ctrl+right".to_string()]),
+            Err(HotkeySystemError::Rejected(_))
+        ));
+        bus.update_state(|state| {
+            assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
+            state.request_error = None;
+        });
+        drop(system);
+        bus.update_state(|state| assert!(state.registered_hotkeys.is_empty()));
+    }
+
+    #[test]
+    fn idle_next_request_waits_but_queued_move_wakes_it() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let script = Connection::new_address(&bus.address).unwrap();
+        let proxy = script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, Duration::from_secs(3));
+        proxy
+            .method_call::<(), _, _, _>(
+                KWIN_INTERFACE,
+                "RegisterCompanion",
+                (KWIN_PROTOCOL_MAJOR.to_string(), true),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let started = Instant::now();
+            let reply: NextRequestPayload = proxy
+                .method_call(KWIN_INTERFACE, "NextRequest", ())
+                .unwrap();
+            assert_eq!(reply.0, 0);
+            assert!(
+                started.elapsed() >= NEXT_REQUEST_WAIT,
+                "idle replies must not busy-poll"
+            );
+            assert!(started.elapsed() < NEXT_REQUEST_WAIT + Duration::from_secs(1));
+        }
+        let state = Arc::clone(&bus.state);
+        let producer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut state = state.lock();
+                if state.script_state.pending_next_request.is_some() {
+                    return state.script_state.enqueue_move(
+                        "window-1".to_string(),
+                        -1,
+                        2,
+                        800,
+                        600,
+                    );
+                }
+                drop(state);
+                assert!(
+                    Instant::now() < deadline,
+                    "script long poll was never deferred"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let started = Instant::now();
+        let reply: NextRequestPayload = proxy
+            .method_call(KWIN_INTERFACE, "NextRequest", ())
+            .unwrap();
+        assert_eq!(reply.0, producer.join().unwrap());
+        assert_eq!(reply.1, REQUEST_MOVE);
+        assert_eq!(reply.2, "window-1");
+        assert!(
+            started.elapsed() < NEXT_REQUEST_WAIT,
+            "queued moves must wake the long poll"
+        );
+    }
+
+    #[test]
+    fn script_moves_identity_restores_state_and_connects_geometry_once() {
+        let output = Command::new("node")
+            .args(["-e", r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+function signal() {
+    const handlers = new Set();
+    return {
+        connect: callback => handlers.add(callback),
+        disconnect: callback => handlers.delete(callback),
+        emit: value => Array.from(handlers).forEach(callback => callback(value)),
+        count: () => handlers.size,
+    };
+}
+function window(id) {
+    const calls = [];
+    let geometry = {x: 0, y: 0, width: 640, height: 480};
+    return {
+        internalId: id, managed: true, normalWindow: true, moveable: true, resizeable: true,
+        frameGeometryChanged: signal(), calls,
+        setMaximize: (vertical, horizontal) => calls.push([vertical, horizontal]),
+        get frameGeometry() { return geometry; },
+        set frameGeometry(value) { calls.push('frame'); geometry = value; },
+    };
+}
+const first = window('window-1');
+const second = window('window-2');
+const updates = [];
+const workspace = {
+    activeWindow: first, screens: [], stackingOrder: [first, second],
+    windowActivated: signal(), windowRemoved: signal(),
+};
+const context = vm.createContext({
+    workspace, console,
+    QTimer: function() { this.timeout = signal(); this.start = () => {}; this.stop = () => {}; },
+    callDBus: (...args) => { if (args[3] === 'UpdateFocusedWindow') updates.push(JSON.parse(args[4])); },
+});
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+for (let i = 0; i < 100; i++) {
+    workspace.activeWindow = i % 2 ? first : second;
+    workspace.windowActivated.emit(workspace.activeWindow);
+}
+assert.equal(first.frameGeometryChanged.count(), 1);
+assert.equal(second.frameGeometryChanged.count(), 1);
+updates.length = 0;
+first.frameGeometryChanged.emit();
+assert.equal(updates.length, 1);
+assert.equal(updates[0][1], 'window-1');
+workspace.activeWindow = second;
+first.tile = {unmanage: value => {
+    assert.equal(value, first);
+    first.calls.push('untile');
+    first.tile = null;
+}};
+vm.runInContext("moveWindow('window-1', -10, 20, 800, 600)", context);
+assert.equal(JSON.stringify(first.frameGeometry), '{"x":-10,"y":20,"width":800,"height":600}');
+assert.deepEqual(first.calls, ['untile', [false, false], 'frame']);
+assert.equal(second.calls.length, 0);
+first.calls.length = 0;
+first.tile = {};
+vm.runInContext("moveWindow('window-1', 10, 20, 800, 600)", context);
+assert.equal(first.tile, null);
+assert.deepEqual(first.calls, [[true, true], [false, false], 'frame']);
+first.fullScreen = true;
+first.calls.length = 0;
+assert.throws(() => vm.runInContext("moveWindow('window-1', 0, 0, 800, 600)", context), /leave fullscreen first/);
+assert.equal(first.calls.length, 0);
+assert.throws(() => vm.runInContext("moveWindow('missing', 0, 0, 800, 600)", context),
+    error => error.dbusError === 'org.window_zones.KWin.Error.WindowGone' && error.message === 'missing');
+workspace.windowRemoved.emit(first);
+assert.equal(first.frameGeometryChanged.count(), 0);
+for (const hotkey of ['ctrl+alt+a', 'ALT+a', 'alt+ctrl+f25', 'alt++a', 'alt+enter']) {
+    assert.throws(() => vm.runInContext(`shortcutForHotkey(${JSON.stringify(hotkey)})`, context),
+        error => error.dbusError === 'org.window_zones.KWin.Error.Unsupported');
+}
+"#])
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/kwin-script/contents/code/main.js"))
+            .output()
+            .expect("node must be installed for KWin script contract tests");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1504,13 +1921,14 @@ mod tests {
         state
             .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
             .unwrap();
-        let request_id = state.enqueue_move(-123, 456, 777, 888);
+        let request_id = state.enqueue_move("window-1".to_string(), -123, 456, 777, 888);
 
         assert_eq!(
             state.next_request("kwin-script").unwrap(),
             (
                 request_id,
                 REQUEST_MOVE.to_string(),
+                "window-1".to_string(),
                 -123,
                 456,
                 777,
@@ -1518,11 +1936,17 @@ mod tests {
                 "[]".to_string()
             )
         );
-        assert_eq!(state.request_result(request_id), (false, String::new()));
+        assert_eq!(
+            state.request_result(request_id),
+            (false, String::new(), String::new())
+        );
         state
-            .complete_request(request_id, true, String::new())
+            .complete_request(request_id, true, String::new(), String::new())
             .unwrap();
-        assert_eq!(state.request_result(request_id), (true, String::new()));
+        assert_eq!(
+            state.request_result(request_id),
+            (true, String::new(), String::new())
+        );
     }
 
     #[test]
@@ -1533,16 +1957,23 @@ mod tests {
             .unwrap();
         let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
-        state.complete_request(first, true, String::new()).unwrap();
+        state
+            .complete_request(first, true, String::new(), String::new())
+            .unwrap();
         let _ = state.request_result(first);
         assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
 
         let second = state.enqueue_hotkeys(vec!["alt+ctrl+right".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
         state
-            .complete_request(second, false, "KWin rejected shortcut".to_string())
+            .complete_request(
+                second,
+                false,
+                "org.window_zones.KWin.Error.Unsupported".to_string(),
+                "KWin rejected shortcut".to_string(),
+            )
             .unwrap();
-        assert_eq!(state.request_result(second).1, "KWin rejected shortcut");
+        assert_eq!(state.request_result(second).2, "KWin rejected shortcut");
         assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
     }
 
@@ -1563,7 +1994,7 @@ mod tests {
                 .is_err()
         );
         state
-            .complete_request(request_id, true, String::new())
+            .complete_request(request_id, true, String::new(), String::new())
             .unwrap();
 
         state
@@ -1572,7 +2003,7 @@ mod tests {
         let request_id = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
         state
-            .complete_request(request_id, true, String::new())
+            .complete_request(request_id, true, String::new(), String::new())
             .unwrap();
         assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
     }
@@ -1589,19 +2020,21 @@ mod tests {
 
         let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
         let _ = state.next_request("kwin-script").unwrap();
-        state.complete_request(first, true, String::new()).unwrap();
+        state
+            .complete_request(first, true, String::new(), String::new())
+            .unwrap();
         let _ = state.request_result(first);
 
         state
             .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
             .unwrap();
         assert_eq!(state.controller_sender.as_deref(), Some("window-zones-1"));
-        let (request_id, kind, _, _, _, _, hotkeys) = state.next_request("kwin-script").unwrap();
+        let (request_id, kind, _, _, _, _, _, hotkeys) = state.next_request("kwin-script").unwrap();
         assert_ne!(request_id, 0);
         assert_eq!(kind, REQUEST_REGISTER_HOTKEYS);
         assert_eq!(hotkeys, r#"["alt+ctrl+left"]"#);
         state
-            .complete_request(request_id, true, String::new())
+            .complete_request(request_id, true, String::new(), String::new())
             .unwrap();
         let _ = state.request_result(request_id);
 
@@ -1610,7 +2043,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.next_request("kwin-script").unwrap(),
-            (0, String::new(), 0, 0, 0, 0, "[]".to_string())
+            (
+                0,
+                String::new(),
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+                "[]".to_string()
+            )
         );
     }
     #[test]

@@ -26,7 +26,12 @@
 - **Display identity**: An opaque per-session label a Display carries in status and diagnostics; it never decides which Display a Window is on and is not persistent across companion restarts or monitor changes. _Avoid_: connector identity, monitor index.
 
 
-- **Window state**: A compositor condition that can constrain a move, such as maximized, fullscreen, tiled, or non-resizable; a rejected move does not change that state.
+- **Window state**: A compositor condition that can constrain a move, such as maximized, fullscreen, tiled, or non-resizable. A move restores a maximized or tiled Window first and then places it; fullscreen and non-resizable Windows are rejected and keep their state.
+
+- **Window identity**: An opaque, adapter-scoped id of a Window, captured with the Focused window and carried to the move, so a focus change between discovery and move cannot redirect the move to another Window; a Window that closed in between fails as gone. _Avoid_: focused-window move.
+
+- **Window history**: The App's per-Window memory of its own moves within one run: the geometry before the first App move (the restore point for `restore`) and the step of a repeated half action (half → two-thirds → third). A Window the user moves by hand starts over. _Avoid_: session restore.
+
 - **Session identity**: The resolved desktop-session protocol and compositor represented by normalized session signals; unknown or conflicting signals mean the identity is unresolved. _Avoid_: environment heuristic.
 
 - **Integration diagnostic**: An action-oriented report of companion state and required user remediation, distinguishing absence, incompatibility, denial, unavailability, and operation failure.
@@ -43,7 +48,11 @@
 
 - **Usable area**: The global rectangle available for zones after compositor-reserved panels, docks, and similar regions are excluded; it is not the full monitor bounds.
 
-- **Window/display correlation**: The App's executor resolves the Focused window's Display as the Display whose Usable area contains the Window frame's center; adapters report geometry only, and an unmatched center is an explicit error, never a guess. _Avoid_: adapter display id.
+- **Window/display correlation**: The App's executor resolves the Focused window's Display as the Display whose Usable area contains the Window frame's center, else the Display the frame overlaps most, else the nearest Display; adapters report geometry only. _Avoid_: adapter display id.
+
+- **Runtime event**: A user-facing report of a runtime state transition (config loaded/failed/refused, hotkeys registered/recovered/refused/unavailable); emitted once per transition, never per retry, and shown on the terminal, the TUI, or as a desktop notification when no terminal is attached.
+
+- **Starter config**: The complete, commented config `window_zones init` writes, binding every built-in action under one modifier chord chosen to avoid the desktop's own bindings.
 
 - **Window frame**: The full global rectangle used for placement, including compositor-managed decoration space where available; it is distinct from client content geometry.
 

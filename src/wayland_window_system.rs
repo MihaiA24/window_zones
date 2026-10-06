@@ -1,14 +1,17 @@
 //! Linux Wayland adapter for `WindowSystem`.
 //!
-//! This adapter selects a compositor-specific implementation when Wayland support is
-//! available (currently GNOME, KDE Plasma, sway, or Hyprland) and returns explicit
-//! diagnostics when it is not.
+//! Sway and Hyprland use compositor-bound dispatch and identify windows before
+//! moving them. Session routing also recognizes GNOME and KDE, whose separate
+//! companion integrations own their window operations.
 
-use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, WindowSystemError};
+use crate::{
+    DisplayGeometry, FocusedWindow, Rect, WindowId, WindowMove, WindowSystem, WindowSystemError,
+};
 
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -21,16 +24,21 @@ pub enum WaylandBackend {
     Hyprland,
 }
 
+/// Compositors controlled through their command-line IPC clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptedCompositor {
+    Sway,
+    Hyprland,
+}
+
 #[derive(Debug)]
-pub struct WaylandWindowSystem;
+pub struct WaylandWindowSystem {
+    compositor: ScriptedCompositor,
+}
 
 impl WaylandWindowSystem {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn backend() -> Result<WaylandBackend, WindowSystemError> {
-        resolve_wayland_backend()
+    pub fn new(compositor: ScriptedCompositor) -> Self {
+        Self { compositor }
     }
 
     fn session_error_for(is_wayland: bool) -> WindowSystemError {
@@ -46,51 +54,27 @@ impl WaylandWindowSystem {
     }
 }
 
-impl Default for WaylandWindowSystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WindowSystem for WaylandWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-        match WaylandWindowSystem::backend()? {
-            WaylandBackend::Gnome => Err(gnome_backend_error()),
-            WaylandBackend::Kde => Err(kde_backend_error()),
-            WaylandBackend::Sway => focused_window_sway(),
-            WaylandBackend::Hyprland => focused_window_hypr(),
+        match self.compositor {
+            ScriptedCompositor::Sway => focused_window_sway(),
+            ScriptedCompositor::Hyprland => focused_window_hypr(),
         }
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-        match WaylandWindowSystem::backend()? {
-            WaylandBackend::Gnome => Err(gnome_backend_error()),
-            WaylandBackend::Kde => Err(kde_backend_error()),
-            WaylandBackend::Sway => displays_sway(),
-            WaylandBackend::Hyprland => displays_hypr(),
+        match self.compositor {
+            ScriptedCompositor::Sway => displays_sway(),
+            ScriptedCompositor::Hyprland => displays_hypr(),
         }
     }
 
-    fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
-        match WaylandWindowSystem::backend()? {
-            WaylandBackend::Gnome => Err(gnome_backend_error()),
-            WaylandBackend::Kde => Err(kde_backend_error()),
-            WaylandBackend::Sway => move_focused_window_sway(window_move),
-            WaylandBackend::Hyprland => move_focused_window_hypr(window_move),
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
+        match self.compositor {
+            ScriptedCompositor::Sway => move_window_sway(window_move),
+            ScriptedCompositor::Hyprland => move_window_hypr(window_move),
         }
     }
-}
-
-fn gnome_backend_error() -> WindowSystemError {
-    WindowSystemError::Platform(
-        "GNOME Wayland requires the org.window_zones.Gnome companion integration".to_string(),
-    )
-}
-
-fn kde_backend_error() -> WindowSystemError {
-    WindowSystemError::Platform(
-        "KDE Plasma Wayland requires the org.window_zones.KWin companion integration".to_string(),
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +97,10 @@ struct SwayTreeNode {
     app_id: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
+    #[serde(default)]
+    floating: Option<String>,
+    #[serde(default)]
+    fullscreen_mode: u32,
     #[serde(default)]
     rect: SwayRect,
     #[serde(default)]
@@ -150,6 +138,10 @@ struct HyprWindow {
     size: [u32; 2],
     #[serde(rename = "monitor")]
     _monitor: i64,
+    floating: bool,
+    fullscreen: u32,
+    #[serde(rename = "fullscreenClient")]
+    fullscreen_client: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,17 +267,16 @@ fn desktop_signal_matches(
 fn focused_window_sway() -> Result<Option<FocusedWindow>, WindowSystemError> {
     let tree: SwayTree = run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
 
-    let Some(focused) = find_focused_sway_node(&tree.nodes)
-        .or_else(|| find_focused_sway_node(&tree.floating_nodes))
-    else {
-        return Ok(None);
-    };
+    Ok(sway_focused_window(&tree))
+}
 
-    if focused.rect.width == 0 || focused.rect.height == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(FocusedWindow::new(focused.rect.to_rect())))
+fn sway_focused_window(tree: &SwayTree) -> Option<FocusedWindow> {
+    let focused = find_focused_sway_node(&tree.nodes)
+        .or_else(|| find_focused_sway_node(&tree.floating_nodes))?;
+    Some(FocusedWindow::new(
+        WindowId::new(focused.id?.to_string()),
+        focused.rect.to_rect(),
+    ))
 }
 
 fn displays_sway() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
@@ -318,39 +309,62 @@ fn sway_displays(outputs: Vec<SwayOutput>, workspaces: &[SwayWorkspace]) -> Vec<
         .collect()
 }
 
-fn move_focused_window_sway(window_move: WindowMove) -> Result<(), WindowSystemError> {
-    let tree =
-        run_wayland_json_command::<SwayTree>("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
-    let focused = find_focused_sway_node(&tree.nodes)
-        .or_else(|| find_focused_sway_node(&tree.floating_nodes))
-        .and_then(|window| window.id);
+fn move_window_sway(window_move: &WindowMove) -> Result<(), WindowSystemError> {
+    let tree: SwayTree = run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
+    let command = sway_move_command(&tree, window_move)?;
+    run_sway_command(&command, &window_move.window)
+}
 
-    let Some(window_id) = focused else {
-        return Err(WindowSystemError::Platform("no focused window".to_string()));
-    };
+fn sway_move_command(
+    tree: &SwayTree,
+    window_move: &WindowMove,
+) -> Result<String, WindowSystemError> {
+    let id = window_move
+        .window
+        .as_str()
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+    let (_, floating, fullscreen) = find_sway_window(&tree.nodes, id, false, false)
+        .or_else(|| find_sway_window(&tree.floating_nodes, id, true, false))
+        .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+    if fullscreen {
+        return Err(WindowSystemError::Platform(
+            "Sway window is fullscreen; leave fullscreen first".to_string(),
+        ));
+    }
 
-    run_sway_command(&format!(
-        "[con_id={window_id}] move position {} {}",
-        window_move.target.x, window_move.target.y
-    ))?;
-
-    run_sway_command(&format!(
-        "[con_id={window_id}] resize set width {} px height {} px",
-        window_move.target.width, window_move.target.height
-    ))
+    let mut command = String::new();
+    if !floating {
+        write!(command, "[con_id={id}] floating enable; ").unwrap();
+    }
+    // move.c adds the workspace offset unless "absolute" is present.
+    // resize.c recenters floating frames, so position must be applied last.
+    // https://github.com/swaywm/sway/blob/master/sway/commands/{move,resize}.c
+    write!(
+        command,
+        "[con_id={id}] resize set width {} px height {} px; \
+         [con_id={id}] move absolute position {} {}",
+        window_move.target.width,
+        window_move.target.height,
+        window_move.target.x,
+        window_move.target.y
+    )
+    .unwrap();
+    Ok(command)
 }
 
 fn focused_window_hypr() -> Result<Option<FocusedWindow>, WindowSystemError> {
-    let Some(window) = hypr_activewindow()? else {
-        return Ok(None);
-    };
+    Ok(hypr_activewindow()?.and_then(hypr_focused_window))
+}
 
+fn hypr_focused_window(window: HyprWindow) -> Option<FocusedWindow> {
     let geometry = window.geometry();
     if geometry.width == 0 || geometry.height == 0 {
-        return Ok(None);
+        return None;
     }
-
-    Ok(Some(FocusedWindow::new(geometry)))
+    Some(FocusedWindow::new(WindowId::new(window.address), geometry))
 }
 
 fn hypr_activewindow() -> Result<Option<HyprWindow>, WindowSystemError> {
@@ -391,39 +405,68 @@ fn displays_hypr() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         .collect()
 }
 
-fn move_focused_window_hypr(window_move: WindowMove) -> Result<(), WindowSystemError> {
-    let Some(window) = hypr_activewindow()? else {
-        return Err(WindowSystemError::Platform("no focused window".to_string()));
-    };
+fn move_window_hypr(window_move: &WindowMove) -> Result<(), WindowSystemError> {
+    let windows: Vec<HyprWindow> =
+        run_wayland_json_command("hyprctl", &["-j", "clients"], "hyprctl clients")?;
+    let command = hypr_move_command(&windows, window_move)?;
+    let reply = run_command_capture("hyprctl", &["--batch", &command], "hyprctl move/resize")?;
+    validate_hypr_batch_reply(&reply, command.split(';').count(), &window_move.window)
+}
 
-    run_hyprctl_window_dispatch(
-        &[
-            "dispatch",
-            "movewindowpixel",
-            &format!(
-                "exact {} {},address:{}",
-                window_move.target.x, window_move.target.y, window.address
-            ),
-        ],
-        "hyprctl movewindowpixel",
-    )?;
+fn hypr_move_command(
+    windows: &[HyprWindow],
+    window_move: &WindowMove,
+) -> Result<String, WindowSystemError> {
+    let address = window_move.window.as_str();
+    let window = windows
+        .iter()
+        .find(|window| window.address == address)
+        .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+    if !address
+        .strip_prefix("0x")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(WindowSystemError::Platform(
+            "hyprctl reported an invalid window address".to_string(),
+        ));
+    }
+    // Hyprland's fullscreen mode is a bitmask: 1 = maximized, 2 = fullscreen.
+    if (window.fullscreen | window.fullscreen_client) & 2 != 0 {
+        return Err(WindowSystemError::Platform(
+            "Hyprland window is fullscreen; leave fullscreen first".to_string(),
+        ));
+    }
 
-    run_hyprctl_window_dispatch(
-        &[
-            "dispatch",
-            "resizewindowpixel",
-            &format!(
-                "exact {} {},address:{}",
-                window_move.target.width, window_move.target.height, window.address
-            ),
-        ],
-        "hyprctl resizewindowpixel",
+    let mut command = String::new();
+    // setfloating is a no-op for an already-floating maximized window. A
+    // targeted settiled/setfloating restores it without changing focus.
+    // IHyprLayout::changeWindowFloatingMode clears the internal maximized state.
+    if window.floating && window.fullscreen != 0 {
+        write!(command, "dispatch settiled address:{address}; ").unwrap();
+    }
+    if !window.floating || window.fullscreen != 0 {
+        write!(command, "dispatch setfloating address:{address}; ").unwrap();
+    }
+    // KeybindManager::{resizeWindow,moveWindow} resolve the explicit address
+    // and Compositor::parseWindowVectorArgsRelative treats "exact" as global.
+    // https://github.com/hyprwm/Hyprland/blob/v0.52.0/src/managers/KeybindManager.cpp
+    write!(
+        command,
+        "dispatch resizewindowpixel exact {} {},address:{address}; \
+         dispatch movewindowpixel exact {} {},address:{address}",
+        window_move.target.width,
+        window_move.target.height,
+        window_move.target.x,
+        window_move.target.y
     )
+    .unwrap();
+    Ok(command)
 }
 
 fn find_focused_sway_node(nodes: &[SwayTreeNode]) -> Option<&SwayTreeNode> {
     nodes.iter().find_map(|node| {
-        if is_sway_window_node(node) {
+        if node.focused && is_sway_window_node(node) && node.rect.width > 0 && node.rect.height > 0
+        {
             return Some(node);
         }
 
@@ -432,30 +475,139 @@ fn find_focused_sway_node(nodes: &[SwayTreeNode]) -> Option<&SwayTreeNode> {
 }
 
 fn is_sway_window_node(node: &SwayTreeNode) -> bool {
-    if !node.focused {
-        return false;
-    }
-
-    if node.rect.width == 0 || node.rect.height == 0 {
-        return false;
-    }
-
-    if matches!(
+    matches!(
         node.node_type.as_deref(),
-        Some("output") | Some("workspace")
-    ) {
-        return false;
+        Some("con") | Some("floating_con")
+    ) && node.id.is_some()
+        && (node.pid.is_some() || node.app_id.is_some())
+}
+
+fn find_sway_window(
+    nodes: &[SwayTreeNode],
+    id: i64,
+    floating: bool,
+    fullscreen: bool,
+) -> Option<(&SwayTreeNode, bool, bool)> {
+    nodes.iter().find_map(|node| {
+        let floating = floating
+            || node.node_type.as_deref() == Some("floating_con")
+            || matches!(node.floating.as_deref(), Some("auto_on") | Some("user_on"));
+        // Workspaces always report fullscreen_mode=1; only containers
+        // represent a real fullscreen state (including fullscreen parents).
+        let fullscreen = fullscreen
+            || (matches!(
+                node.node_type.as_deref(),
+                Some("con") | Some("floating_con")
+            ) && node.fullscreen_mode != 0);
+        if node.id == Some(id) && is_sway_window_node(node) {
+            return Some((node, floating, fullscreen));
+        }
+        find_sway_window(&node.nodes, id, floating, fullscreen)
+            .or_else(|| find_sway_window(&node.floating_nodes, id, true, fullscreen))
+    })
+}
+
+fn run_sway_command(command: &str, window: &WindowId) -> Result<(), WindowSystemError> {
+    // -r keeps the IPC JSON even when swaymsg exits 2 for a rejected command.
+    let output = Command::new("swaymsg")
+        .args(["-r", command])
+        .output()
+        .map_err(|error| {
+            WindowSystemError::Platform(format!("failed to execute swaymsg: {error}"))
+        })?;
+    if !output.stdout.is_empty() {
+        let reply = std::str::from_utf8(&output.stdout).map_err(|error| {
+            WindowSystemError::Platform(format!("swaymsg returned non-utf8 output: {error}"))
+        })?;
+        validate_sway_reply(reply, command.split(';').count(), window)?;
+    } else if output.status.success() {
+        return Err(WindowSystemError::Platform(
+            "swaymsg returned no command reply".to_string(),
+        ));
     }
-
-    node.pid.is_some() || node.app_id.is_some() || node.id.is_some()
+    if !output.status.success() {
+        return Err(WindowSystemError::Platform(format!(
+            "swaymsg move/resize failed with exit status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
-fn run_sway_command(command: &str) -> Result<(), WindowSystemError> {
-    run_command("swaymsg", &["-q", command], "swaymsg")
+#[derive(Deserialize)]
+struct SwayCommandReply {
+    success: bool,
+    error: Option<String>,
 }
 
-fn run_hyprctl_window_dispatch(command: &[&str], context: &str) -> Result<(), WindowSystemError> {
-    run_command("hyprctl", command, context)
+fn validate_sway_reply(
+    reply: &str,
+    expected: usize,
+    window: &WindowId,
+) -> Result<(), WindowSystemError> {
+    let replies: Vec<SwayCommandReply> = serde_json::from_str(reply).map_err(|error| {
+        WindowSystemError::Platform(format!("swaymsg command reply JSON parse failed: {error}"))
+    })?;
+    for reply in &replies {
+        if !reply.success {
+            let error = reply.error.as_deref().unwrap_or("unknown command error");
+            if error == "No matching node." {
+                return Err(WindowSystemError::WindowGone(window.clone()));
+            }
+            return Err(WindowSystemError::Platform(format!(
+                "swaymsg move/resize failed: {error}"
+            )));
+        }
+    }
+    if replies.len() != expected {
+        return Err(WindowSystemError::Platform(format!(
+            "swaymsg returned {} command replies; expected {expected}",
+            replies.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_hypr_batch_reply(
+    reply: &str,
+    expected: usize,
+    window: &WindowId,
+) -> Result<(), WindowSystemError> {
+    // v0.52 HyprCtl::dispatchBatch separates replies with three newlines;
+    // hyprctl's exit status does not describe individual dispatch success.
+    let mut count = 0;
+    for reply in reply.trim().split("\n\n\n") {
+        let reply = reply.trim();
+        count += 1;
+        match reply {
+            "ok" => {}
+            "Window not found" | "moveWindow: no window" | "resizeWindow: no window" => {
+                return Err(WindowSystemError::WindowGone(window.clone()));
+            }
+            "Window is fullscreen" => {
+                return Err(WindowSystemError::Platform(
+                    "Hyprland window is fullscreen; leave fullscreen first".to_string(),
+                ));
+            }
+            _ => {
+                return Err(WindowSystemError::Platform(format!(
+                    "hyprctl move/resize failed: {}",
+                    if reply.is_empty() {
+                        "empty dispatch reply"
+                    } else {
+                        reply
+                    }
+                )));
+            }
+        }
+    }
+    if count != expected {
+        return Err(WindowSystemError::Platform(format!(
+            "hyprctl returned {count} dispatch replies; expected {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn run_wayland_json_command<T>(
@@ -471,20 +623,6 @@ where
     serde_json::from_str(&output).map_err(|error| {
         WindowSystemError::Platform(format!("{context} JSON parse failed: {error}"))
     })
-}
-
-fn run_command(command: &str, args: &[&str], context: &str) -> Result<(), WindowSystemError> {
-    let status = Command::new(command).args(args).status().map_err(|error| {
-        WindowSystemError::Platform(format!("failed to execute {command}: {error}"))
-    })?;
-
-    if !status.success() {
-        return Err(WindowSystemError::Platform(format!(
-            "{context} failed: exit status {status}"
-        )));
-    }
-
-    Ok(())
 }
 
 fn run_command_capture(
@@ -573,57 +711,17 @@ mod tests {
 
     use std::ffi::OsString;
 
-    fn set_env(key: &str, value: Option<&str>) {
-        unsafe {
-            if let Some(value) = value {
-                env::set_var(key, value);
-            } else {
-                env::remove_var(key);
-            }
-        }
-    }
-
-    fn restore_env(vars: &[(String, Option<OsString>)]) {
-        for (key, value) in vars {
-            unsafe {
-                match value {
-                    Some(value) => env::set_var(key, value),
-                    None => env::remove_var(key),
-                }
-            }
-        }
-    }
-
     #[test]
     fn non_wayland_session_returns_session_error() {
-        let backups = [
-            (
-                "XDG_SESSION_TYPE".to_string(),
-                env::var_os("XDG_SESSION_TYPE"),
-            ),
-            (
-                "WAYLAND_DISPLAY".to_string(),
-                env::var_os("WAYLAND_DISPLAY"),
-            ),
-            ("SWAYSOCK".to_string(), env::var_os("SWAYSOCK")),
-            (
-                "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
-                env::var_os("HYPRLAND_INSTANCE_SIGNATURE"),
-            ),
-            ("PATH".to_string(), env::var_os("PATH")),
-        ];
-
-        set_env("XDG_SESSION_TYPE", Some("x11"));
-        set_env("WAYLAND_DISPLAY", None);
-
-        let error = WaylandWindowSystem::new().displays().unwrap_err();
+        let error = resolve_wayland_backend_with_env(|name| {
+            (name == "XDG_SESSION_TYPE").then(|| OsString::from("x11"))
+        })
+        .unwrap_err();
         assert!(matches!(
             error,
             WindowSystemError::Platform(message)
                 if message.contains("can only be used when XDG_SESSION_TYPE=wayland")
         ));
-
-        restore_env(&backups);
     }
 
     #[test]
@@ -724,53 +822,59 @@ mod tests {
         ));
     }
 
+    // Captured swaymsg -t get_tree (Sway 1.9), with unrelated output metadata
+    // and unused fields removed; node identity, frame, and state are unchanged.
+    // https://gist.github.com/o-alquimista/821755fd1133c90bf8b73b045234cd81#file-swaymsg-t-get_tree-json
+    const SWAY_TREE_JSON: &str = r#"{
+        "id":1, "type":"root", "nodes":[{
+            "id":3, "type":"output", "name":"HDMI-A-1",
+            "rect":{"x":0,"y":0,"width":2560,"height":1080},
+            "nodes":[{
+                "id":4, "type":"workspace", "name":"1", "fullscreen_mode":1,
+                "rect":{"x":0,"y":23,"width":2560,"height":1057},
+                "nodes":[{
+                    "id":8, "type":"con", "name":"Steam", "focused":false,
+                    "rect":{"x":0,"y":48,"width":2560,"height":1032},
+                    "window":23068699, "pid":8512, "app_id":null,
+                    "fullscreen_mode":0, "nodes":[], "floating_nodes":[]
+                }],
+                "floating_nodes":[{
+                    "id":9, "type":"floating_con", "name":"Counter-Strike 2",
+                    "focused":false, "border":"csd",
+                    "rect":{"x":0,"y":0,"width":2560,"height":1080},
+                    "window":44040218, "pid":9659, "app_id":null,
+                    "fullscreen_mode":0, "nodes":[], "floating_nodes":[]
+                }]
+            },{
+                "id":10, "type":"workspace", "name":"2", "fullscreen_mode":1,
+                "rect":{"x":0,"y":23,"width":2560,"height":1057},
+                "nodes":[{
+                    "id":11, "type":"con", "name":"foot", "focused":true,
+                    "rect":{"x":0,"y":48,"width":2560,"height":1032},
+                    "window_rect":{"x":2,"y":0,"width":2556,"height":1030},
+                    "geometry":{"x":0,"y":0,"width":696,"height":494},
+                    "window":null, "pid":10625, "app_id":"foot",
+                    "fullscreen_mode":0, "nodes":[], "floating_nodes":[]
+                }],
+                "floating_nodes":[]
+            }],
+            "floating_nodes":[]
+        }], "floating_nodes":[]
+    }"#;
+
     #[test]
-    fn focused_window_parser_finds_window_geometry_below_output_and_workspace_nodes() {
-        let tree_json = r#"
-        {
-            "nodes": [
-                {
-                    "id": 1,
-                    "name": "",
-                    "type": "output",
-                    "rect": {"x":0,"y":0,"width":1920,"height":1080},
-                    "nodes": [
-                        {
-                            "id": 2,
-                            "name": "workspace",
-                            "type": "workspace",
-                            "focused": false,
-                            "rect": {"x":0,"y":0,"width":1920,"height":1080},
-                            "nodes": [
-                                {
-                                    "id": 10,
-                                    "name": "Alacritty",
-                                    "type": "con",
-                                    "app_id": "alacritty",
-                                    "focused": true,
-                                    "rect": {"x": 10,"y": 10,"width": 800,"height": 600},
-                                    "nodes": [],
-                                    "floating_nodes": []
-                                }
-                            ],
-                            "floating_nodes": []
-                        }
-                    ],
-                    "floating_nodes": []
-                }
-            ],
-            "floating_nodes": []
-        }
-        "#;
-
-        let tree: SwayTree = serde_json::from_str(tree_json).unwrap();
-
-        let focused = find_focused_sway_node(&tree.nodes)
-            .or_else(|| find_focused_sway_node(&tree.floating_nodes))
-            .expect("focused node");
-
-        assert_eq!(focused.id, Some(10));
-        assert_eq!(focused.rect.to_rect(), Rect::new(10, 10, 800, 600));
+    fn focused_window_parser_finds_frame_and_identity_below_workspace_nodes() {
+        let tree: SwayTree = serde_json::from_str(SWAY_TREE_JSON).unwrap();
+        assert_eq!(
+            sway_focused_window(&tree),
+            Some(FocusedWindow::new(
+                WindowId::new("11"),
+                Rect::new(0, 48, 2560, 1032)
+            ))
+        );
+        let (_, floating, fullscreen) = find_sway_window(&tree.nodes, 9, false, false).unwrap();
+        assert!(floating);
+        assert!(!fullscreen);
     }
 
     #[test]
@@ -804,10 +908,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hypr_activewindow_parser_reads_real_geometry_and_rejects_missing_size() {
+    fn hypr_window_json() -> &'static str {
+        // Captured hyprctl -j activewindow, also the object shape used by clients.
         // https://github.com/hyprwm/Hyprland/discussions/14292#discussioncomment-16833698
-        let json = r#"{
+        r#"{
     "address": "0x55e0ed70afc0",
     "mapped": true,
     "hidden": false,
@@ -840,9 +944,24 @@ mod tests {
     "xdgDescription": "",
     "contentType": "none",
     "stableId": "18000017"
-}"#;
+}"#
+    }
+
+    #[test]
+    fn hypr_activewindow_parser_reads_real_geometry_and_rejects_missing_size() {
+        let json = hypr_window_json();
         let window = parse_hypr_activewindow(json).unwrap().unwrap();
         assert_eq!(window.geometry(), Rect::new(1320, 680, 600, 400));
+        assert!(window.floating);
+        assert_eq!(window.fullscreen, 0);
+        assert_eq!(window.fullscreen_client, 0);
+        assert_eq!(
+            hypr_focused_window(window),
+            Some(FocusedWindow::new(
+                WindowId::new("0x55e0ed70afc0"),
+                Rect::new(1320, 680, 600, 400)
+            ))
+        );
         let mut missing_size: serde_json::Value = serde_json::from_str(json).unwrap();
         missing_size.as_object_mut().unwrap().remove("size");
         assert!(parse_hypr_activewindow(&missing_size.to_string()).is_err());
@@ -920,5 +1039,215 @@ mod tests {
         let mut missing_width: serde_json::Value = serde_json::from_str(json).unwrap();
         missing_width[0].as_object_mut().unwrap().remove("width");
         assert!(serde_json::from_value::<Vec<HyprMonitor>>(missing_width).is_err());
+    }
+
+    #[test]
+    fn sway_commands_restore_resize_then_move_identified_window_across_outputs() {
+        let mut tree: SwayTree = serde_json::from_str(SWAY_TREE_JSON).unwrap();
+        // Focus changed since discovery; it must not redirect the action.
+        tree.nodes[0].nodes[0].nodes[0].focused = true;
+        tree.nodes[0].nodes[1].nodes[0].focused = false;
+        let window_move = WindowMove::new(WindowId::new("11"), Rect::new(-1920, -200, 960, 1080));
+        assert_eq!(
+            sway_move_command(&tree, &window_move).unwrap(),
+            "[con_id=11] floating enable; \
+             [con_id=11] resize set width 960 px height 1080 px; \
+             [con_id=11] move absolute position -1920 -200"
+        );
+        let floating_move = WindowMove::new(WindowId::new("9"), Rect::new(1920, 23, 800, 600));
+        assert_eq!(
+            sway_move_command(&tree, &floating_move).unwrap(),
+            "[con_id=9] resize set width 800 px height 600 px; \
+             [con_id=9] move absolute position 1920 23"
+        );
+        // Modern Sway also emits the floating reason for a con node.
+        tree.nodes[0].nodes[1].nodes[0].floating = Some("user_on".to_string());
+        assert_eq!(
+            sway_move_command(&tree, &window_move).unwrap(),
+            "[con_id=11] resize set width 960 px height 1080 px; \
+             [con_id=11] move absolute position -1920 -200"
+        );
+    }
+
+    #[test]
+    fn sway_commands_reject_closed_non_window_and_fullscreen_targets() {
+        let mut tree: SwayTree = serde_json::from_str(SWAY_TREE_JSON).unwrap();
+        for id in ["999", "10", "focused", "11] move left"] {
+            let window_move = WindowMove::new(WindowId::new(id), Rect::new(0, 0, 800, 600));
+            assert_eq!(
+                sway_move_command(&tree, &window_move),
+                Err(WindowSystemError::WindowGone(window_move.window))
+            );
+        }
+        for mode in [1, 2] {
+            tree.nodes[0].nodes[1].nodes[0].fullscreen_mode = mode;
+            let window_move = WindowMove::new(WindowId::new("11"), Rect::new(0, 0, 800, 600));
+            assert!(matches!(
+                sway_move_command(&tree, &window_move),
+                Err(WindowSystemError::Platform(message)) if message.contains("leave fullscreen first")
+            ));
+        }
+        tree.nodes[0].nodes[1].nodes[0].fullscreen_mode = 0;
+        let parent = &mut tree.nodes[0].nodes[1].nodes[0];
+        let child: SwayTreeNode = serde_json::from_str(
+            r#"{"id":12,"type":"con","pid":123,"rect":{"x":0,"y":0,"width":800,"height":600}}"#,
+        )
+        .unwrap();
+        parent.fullscreen_mode = 1;
+        parent.nodes.push(child);
+        let child_move = WindowMove::new(WindowId::new("12"), Rect::new(0, 0, 800, 600));
+        assert!(matches!(
+            sway_move_command(&tree, &child_move),
+            Err(WindowSystemError::Platform(message)) if message.contains("leave fullscreen first")
+        ));
+    }
+
+    #[test]
+    fn sway_focused_parser_skips_non_windows_and_empty_frames() {
+        let mut tree: SwayTree = serde_json::from_str(SWAY_TREE_JSON).unwrap();
+        tree.nodes[0].focused = true;
+        tree.nodes[0].nodes[1].focused = true;
+        tree.nodes[0].nodes[1].nodes[0].focused = false;
+        assert_eq!(sway_focused_window(&tree), None);
+        let node = &mut tree.nodes[0].nodes[1].nodes[0];
+        node.focused = true;
+        node.pid = None;
+        node.app_id = None;
+        assert_eq!(sway_focused_window(&tree), None);
+        let node = &mut tree.nodes[0].nodes[1].nodes[0];
+        node.pid = Some(10625);
+        node.rect.width = 0;
+        assert_eq!(sway_focused_window(&tree), None);
+    }
+
+    #[test]
+    fn sway_replies_check_every_success_and_surface_compositor_errors() {
+        let window = WindowId::new("11");
+        assert_eq!(
+            validate_sway_reply(r#"[{"success":true},{"success":true}]"#, 2, &window),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_sway_reply(
+                r#"[{"success":true},{"success":false,"error":"Cannot resize a hidden scratchpad container"}]"#,
+                2,
+                &window
+            ),
+            Err(WindowSystemError::Platform(message)) if message.contains("hidden scratchpad")
+        ));
+        assert_eq!(
+            validate_sway_reply(
+                r#"[{"success":false,"error":"No matching node."}]"#,
+                2,
+                &window
+            ),
+            Err(WindowSystemError::WindowGone(window.clone()))
+        );
+        for reply in ["[]", "[{}]", r#"[{"success":true}]"#, "not JSON"] {
+            assert!(validate_sway_reply(reply, 2, &window).is_err());
+        }
+    }
+
+    #[test]
+    fn hypr_commands_target_client_address_restore_then_resize_and_move() {
+        let mut clients: Vec<HyprWindow> =
+            serde_json::from_str(&format!("[{}]", hypr_window_json())).unwrap();
+        let target = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(-2560, -100, 1280, 720),
+        );
+        assert_eq!(
+            hypr_move_command(&clients, &target).unwrap(),
+            "dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
+             dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
+        );
+        clients[0].floating = false;
+        assert_eq!(
+            hypr_move_command(&clients, &target).unwrap(),
+            "dispatch setfloating address:0x55e0ed70afc0; \
+             dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
+             dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
+        );
+        clients[0].fullscreen = 1;
+        clients[0].floating = true;
+        assert_eq!(
+            hypr_move_command(&clients, &target).unwrap(),
+            "dispatch settiled address:0x55e0ed70afc0; \
+             dispatch setfloating address:0x55e0ed70afc0; \
+             dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
+             dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
+        );
+        clients[0].fullscreen = 0;
+        // The active/focused client need not be first or even in this snapshot.
+        let mut other = parse_hypr_activewindow(hypr_window_json())
+            .unwrap()
+            .unwrap();
+        other.address = "0x1234".to_string();
+        clients.insert(0, other);
+        assert_eq!(
+            hypr_move_command(&clients, &target).unwrap(),
+            "dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
+             dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
+        );
+    }
+
+    #[test]
+    fn hypr_commands_reject_missing_addresses_fullscreen_and_invalid_addresses() {
+        let mut clients = vec![
+            parse_hypr_activewindow(hypr_window_json())
+                .unwrap()
+                .unwrap(),
+        ];
+        let target = WindowMove::new(WindowId::new("0x55e0ed70afc0"), Rect::new(0, 0, 800, 600));
+        assert_eq!(
+            hypr_move_command(&[], &target),
+            Err(WindowSystemError::WindowGone(target.window.clone()))
+        );
+        for (internal, client) in [(2, 0), (0, 2), (3, 0)] {
+            clients[0].fullscreen = internal;
+            clients[0].fullscreen_client = client;
+            assert!(matches!(
+                hypr_move_command(&clients, &target),
+                Err(WindowSystemError::Platform(message)) if message.contains("leave fullscreen first")
+            ));
+        }
+        for address in ["0x", "0x123; dispatch killactive", "active"] {
+            clients[0].address = address.to_string();
+            let target = WindowMove::new(WindowId::new(address), target.target);
+            assert!(matches!(
+                hypr_move_command(&clients, &target),
+                Err(WindowSystemError::Platform(message)) if message.contains("invalid window address")
+            ));
+        }
+    }
+
+    #[test]
+    fn hypr_batch_replies_require_one_ok_per_dispatch_not_just_exit_success() {
+        let window = WindowId::new("0x55e0ed70afc0");
+        assert_eq!(
+            validate_hypr_batch_reply("ok\n\n\nok\n\n\nok\n", 3, &window),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_hypr_batch_reply("ok\n\n\nInvalid size provided\n", 2, &window),
+            Err(WindowSystemError::Platform(message)) if message.contains("Invalid size provided")
+        ));
+        for reply in [
+            "Window not found",
+            "moveWindow: no window",
+            "resizeWindow: no window",
+        ] {
+            assert_eq!(
+                validate_hypr_batch_reply(&format!("ok\n\n\n{reply}\n"), 2, &window),
+                Err(WindowSystemError::WindowGone(window.clone()))
+            );
+        }
+        assert!(matches!(
+            validate_hypr_batch_reply("Window is fullscreen\n", 1, &window),
+            Err(WindowSystemError::Platform(message)) if message.contains("leave fullscreen first")
+        ));
+        for reply in ["", "ok", "ok\nok", "ok\n\n\nok\n\n\nunexpected", "OK"] {
+            assert!(validate_hypr_batch_reply(reply, 2, &window).is_err());
+        }
     }
 }
