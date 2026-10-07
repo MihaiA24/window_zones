@@ -14,7 +14,9 @@ What this verifies:
 - `cargo clippy --locked --all-targets --all-features` (only if clippy is installed)
 - `bash -n scripts/*.sh` (shell syntax, including the 3800-line Smoke harness)
 - `node --check gnome-extension/extension.js`
+- `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
 - `node --check kwin-script/contents/code/main.js`
+- `qmllint kwin-script/contents/code/main.js` (QJSEngine syntax, which `node` does not enforce; only if `qmllint` is installed)
 
 The repository test script covers formatting, unit/integration tests, doc tests,
 and clippy when installed. The GNOME and KDE adapter contract tests use fake
@@ -41,6 +43,10 @@ Run the GNOME Wayland or Linux X11 Smoke run with:
 ```
 The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit in each corresponding Synthetic or seated session.
 
+The X11 adapter now owns exclusive `XGrabKey` accelerators (including CapsLock/NumLock variants); `xdotool` XTEST injection reaches these grabs without delivering the accelerator to the focused application. It no longer requires XRecord. The historical X11 gate results below predate this cutover and must be re-recorded with `./scripts/smoke.sh x11` before release.
+
+Pure X11 checks run with `cargo test --lib x11`. The ignored `x11_real_server_grabs_are_exclusive_atomic_and_released` test requires `WZ_X11_TEST_DISPLAY` and, when authentication is enabled, `XAUTHORITY` for an isolated X server, never the user's desktop. Use Xvfb or a separate rootful `Xwayland -geometry 800x600 -shm` on an isolated headless compositor, without `-enable-ei-portal`; GNOME's rootless XWayland did not deliver XTEST keys to X11 clients in the headless configuration tested here. Run it with `cargo test --lib x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored`.
+
 `gnome-live` has two prerequisites on the seated session:
 
 - The Companion must be active: `window-zones@mihai-a24` in `org.gnome.shell enabled-extensions` **and** `org.gnome.shell disable-user-extensions` set to `false`. The master switch suppresses the extension even when it is listed, which reads exactly like an extension that refuses to load.
@@ -48,7 +54,7 @@ The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit i
 
 `kde-live` needs the `kwin` package (`kwin_wayland`, `kpackagetool6`, `kwriteconfig6`) and nothing from the user's session: it builds its own private bus, XDG tree, KWin configuration, and compositor. It runs KWin on its `--virtual` framebuffer backend with two 1200x900 outputs; a nested windowed backend was tried first and rejected because the outer compositor resizes those output windows mid-run. It is Synthetic session evidence whatever it reports: KWin runs a `Session::Type::Noop` session and never owns the login seat, so it cannot close the KDE Release gate — only a Smoke run on a seated KWin session does that.
 
-The seated halves of the GNOME Wayland and TUI lifecycle (GNOME) rows below (`gnome-live`) were recorded before ADR 0008 (executor-owned correlation, mandatory `/dev/uinput`); re-run `gnome-live` on the seated host and re-record them before release. `gnome`, `x11`, and `kde-live` run over SSH and are current.
+ADR 0009 changed every integration's move path (identified-window moves, restore-before-move, `org.window_zones.Gnome2`, KWin protocol 2, X11 `XGrabKey` hotkeys), so the rows below predate it and must be re-recorded before release. On 2026-10-06 the Synthetic `gnome` gate was re-run against the ADR 0009 tree on CachyOS, kernel 7.2.9-1-cachyos, GNOME Shell 50.5, Text Editor 50.1: 23 assertions, 17 passed, 0 failed, 6 skipped (the seat-dependent focus, placement, accelerator, and recovery checks). The seated `gnome-live`, `x11` (needs Xvfb and Openbox), and `kde-live` (needs `kwin_wayland`) gates have not been re-run since ADR 0009.
 
 | Gate | Status | Environment | Verified configuration | Date | How to reproduce |
 |---|---|---|---|---|---|

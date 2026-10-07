@@ -1,34 +1,45 @@
 use std::env;
 use std::fmt::Write as _;
+use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-use std::thread;
-
 use std::sync::mpsc;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::sync::mpsc::SyncSender;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use tray_item::{IconSource, TrayItem};
 
 #[cfg(target_os = "macos")]
 use window_zones::MacOSWindowSystem;
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use window_zones::RdevHotkeySystem;
 #[cfg(target_os = "windows")]
 use window_zones::WindowsWindowSystem;
 use window_zones::{
     App, ConfigState, DispatchState, DisplayGeometry, FocusedWindow, HotkeyEvent,
-    HotkeyRegistrationState, HotkeySystem, HotkeySystemError, WindowMove, WindowSystem,
+    HotkeyRegistrationState, HotkeySystem, HotkeySystemError, Rect, RuntimeEvent, WindowId,
+    WindowMove, WindowSystem, WindowSystemError, default_config_path, parse_config, starter_config,
 };
 #[cfg(target_os = "linux")]
 use window_zones::{
-    GnomeHotkeySystem, GnomeWindowSystem, KwinHotkeySystem, KwinWindowSystem, WaylandBackend,
-    WaylandWindowSystem, X11WindowSystem,
+    GnomeHotkeySystem, GnomeWindowSystem, KwinHotkeySystem, KwinWindowSystem, ScriptedCompositor,
+    WaylandBackend, WaylandWindowSystem, X11HotkeySystem, X11WindowSystem,
 };
+
+/// How often queued hotkey presses are read; bounds keypress-to-move latency.
+const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often the config file and hotkey registration are reconciled.
+const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(250);
+/// How often the TUI re-reads companion capabilities.
+const CAPABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bound on presses handled in one poll, so input stays responsive.
+const MAX_HOTKEYS_PER_POLL: usize = 32;
+/// Exit status when another instance already owns the hotkeys (EX_TEMPFAIL);
+/// the systemd unit does not restart on it.
+const EXIT_ALREADY_RUNNING: u8 = 75;
+
 #[derive(Debug, Clone, Copy)]
 enum BackendPreference {
     Auto,
@@ -49,6 +60,7 @@ enum Command {
     Dispatch { hotkey: String },
     Tui,
     Run,
+    Init,
 }
 
 #[derive(Debug)]
@@ -57,6 +69,8 @@ struct CliArgs {
     config_path: Option<PathBuf>,
     backend: BackendPreference,
     show_tray: bool,
+    chord: Option<String>,
+    force: bool,
 }
 
 #[derive(Debug)]
@@ -76,90 +90,69 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         return ParseStatus::Help;
     }
 
-    let mut command = Command::Run;
+    let mut command = None;
     let mut config_path = None;
     let mut backend = BackendPreference::Auto;
     let mut show_tray = false;
+    let mut chord = None;
+    let mut force = false;
 
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
 
         match arg.as_str() {
-            "--config" => {
-                let Some(next) = args.get(index + 1) else {
-                    return ParseStatus::Err("--config requires a path argument".to_string());
+            "--config" | "--backend" | "--chord" => {
+                let Some(value) = args.get(index + 1) else {
+                    return ParseStatus::Err(format!("{arg} requires a value"));
                 };
-
-                config_path = Some(PathBuf::from(next));
-                index += 1;
-            }
-            "--backend" => {
-                let Some(next) = args.get(index + 1) else {
-                    return ParseStatus::Err("--backend requires a value".to_string());
-                };
-
-                match parse_backend_preference(next) {
-                    Ok(value) => backend = value,
-                    Err(message) => return ParseStatus::Err(message),
+                match arg.as_str() {
+                    "--config" => config_path = Some(PathBuf::from(value)),
+                    "--backend" => match parse_backend_preference(value) {
+                        Ok(value) => backend = value,
+                        Err(message) => return ParseStatus::Err(message),
+                    },
+                    _ => chord = Some(value.clone()),
                 }
-
                 index += 1;
             }
             "--dry-run" => backend = BackendPreference::DryRun,
             "--tray" => show_tray = true,
-            "status" => {
-                if !matches!(command, Command::Run) {
+            "--force" => force = true,
+            "status" | "dispatch" | "tui" | "run" | "init" => {
+                if command.is_some() {
                     return ParseStatus::Err("only one command is allowed".to_string());
                 }
-
-                command = Command::Status;
-            }
-            "dispatch" => {
-                if !matches!(command, Command::Run) {
-                    return ParseStatus::Err("only one command is allowed".to_string());
-                }
-
-                command = Command::Dispatch {
-                    hotkey: String::new(),
-                };
-            }
-            "tui" => {
-                if !matches!(command, Command::Run) {
-                    return ParseStatus::Err("only one command is allowed".to_string());
-                }
-
-                command = Command::Tui;
-            }
-            "run" => {
-                if !matches!(command, Command::Run) {
-                    return ParseStatus::Err("only one command is allowed".to_string());
-                }
-
-                command = Command::Run;
+                command = Some(match arg.as_str() {
+                    "status" => Command::Status,
+                    "dispatch" => Command::Dispatch {
+                        hotkey: String::new(),
+                    },
+                    "tui" => Command::Tui,
+                    "init" => Command::Init,
+                    _ => Command::Run,
+                });
             }
             arg if arg.starts_with('-') => {
                 return ParseStatus::Err(format!("unknown flag `{arg}`"));
             }
             _ => match &mut command {
-                Command::Dispatch { hotkey } if hotkey.is_empty() => {
+                Some(Command::Dispatch { hotkey }) if hotkey.is_empty() => {
                     *hotkey = arg.to_string();
                 }
-                Command::Dispatch { hotkey: _ } => {
+                Some(Command::Dispatch { .. }) => {
                     return ParseStatus::Err(format!(
-                        "dispatch command got an extra argument `{}`",
-                        arg
+                        "dispatch command got an extra argument `{arg}`"
                     ));
                 }
-                _ => {
-                    return ParseStatus::Err(format!("unexpected argument `{arg}`"));
-                }
+                _ => return ParseStatus::Err(format!("unexpected argument `{arg}`")),
             },
         }
 
         index += 1;
     }
 
+    let command = command.unwrap_or(Command::Run);
     if let Command::Dispatch { hotkey } = &command
         && hotkey.is_empty()
     {
@@ -168,9 +161,11 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
                 .to_string(),
         );
     }
-
     if show_tray && !matches!(command, Command::Run) {
         return ParseStatus::Err("--tray is only valid with the `run` command".to_string());
+    }
+    if (chord.is_some() || force) && !matches!(command, Command::Init) {
+        return ParseStatus::Err("--chord and --force are only valid with `init`".to_string());
     }
 
     ParseStatus::Ok(CliArgs {
@@ -178,6 +173,8 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         config_path,
         backend,
         show_tray,
+        chord,
+        force,
     })
 }
 
@@ -203,7 +200,7 @@ enum RuntimeBackend {
     #[cfg(target_os = "linux")]
     X11,
     #[cfg(target_os = "linux")]
-    Wayland,
+    Wayland(ScriptedCompositor),
     #[cfg(target_os = "linux")]
     Gnome,
     #[cfg(target_os = "linux")]
@@ -250,24 +247,30 @@ fn resolve_runtime_backend(preference: BackendPreference) -> Result<RuntimeBacke
 #[cfg(target_os = "linux")]
 fn resolve_linux_backend(preference: BackendPreference) -> Result<RuntimeBackend, String> {
     let session_type = env::var_os("XDG_SESSION_TYPE");
+    let wayland_display = env::var_os("WAYLAND_DISPLAY").is_some();
     let identity = session_identity(
         session_type.as_deref(),
-        env::var_os("WAYLAND_DISPLAY").is_some(),
+        wayland_display,
         env::var_os("DISPLAY").is_some(),
     );
-    resolve_linux_backend_in_session(preference, identity)
+    let wayland_indicated = wayland_display || session_type.as_deref() == Some("wayland".as_ref());
+    resolve_linux_backend_in_session(preference, identity, wayland_indicated)
 }
 
+/// `wayland_indicated`: any Wayland signal is present, even one the session
+/// identity could not reconcile. X11 is never used then: inside a Wayland
+/// session it would only reach XWayland windows.
 #[cfg(target_os = "linux")]
 fn resolve_linux_backend_in_session(
     preference: BackendPreference,
     identity: SessionIdentity,
+    wayland_indicated: bool,
 ) -> Result<RuntimeBackend, String> {
     match preference {
         BackendPreference::DryRun => Ok(RuntimeBackend::DryRun),
         BackendPreference::X11 => {
-            if matches!(identity, SessionIdentity::Wayland) {
-                Err("X11 backend is unavailable inside a Wayland session; use the native Wayland compositor integration".to_string())
+            if wayland_indicated {
+                Err("X11 backend is unavailable while WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland is set; use the native Wayland compositor integration".to_string())
             } else {
                 Ok(RuntimeBackend::X11)
             }
@@ -296,404 +299,8 @@ fn resolve_wayland_runtime_backend() -> Result<RuntimeBackend, String> {
     match window_zones::resolve_wayland_backend().map_err(|error| error.to_string())? {
         WaylandBackend::Gnome => Ok(RuntimeBackend::Gnome),
         WaylandBackend::Kde => Ok(RuntimeBackend::Kde),
-        WaylandBackend::Sway | WaylandBackend::Hyprland => Ok(RuntimeBackend::Wayland),
-    }
-}
-
-#[derive(Debug)]
-enum RuntimeWindowSystem {
-    DryRun(DryRunWindowSystem),
-    #[cfg(target_os = "linux")]
-    X11(X11WindowSystem),
-    #[cfg(target_os = "linux")]
-    Wayland(WaylandWindowSystem),
-    #[cfg(target_os = "linux")]
-    Gnome(GnomeWindowSystem),
-    #[cfg(target_os = "linux")]
-    Kde(KwinWindowSystem),
-    #[cfg(target_os = "windows")]
-    Windows(WindowsWindowSystem),
-    #[cfg(target_os = "macos")]
-    MacOS(MacOSWindowSystem),
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    Unsupported,
-}
-
-impl RuntimeWindowSystem {
-    fn with_backend(backend: RuntimeBackend) -> Self {
-        match backend {
-            RuntimeBackend::DryRun => RuntimeWindowSystem::DryRun(DryRunWindowSystem::new()),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::X11 => RuntimeWindowSystem::X11(X11WindowSystem::new()),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::Wayland => RuntimeWindowSystem::Wayland(WaylandWindowSystem::new()),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::Gnome => RuntimeWindowSystem::Gnome(GnomeWindowSystem::new()),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::Kde => RuntimeWindowSystem::Kde(KwinWindowSystem::new()),
-            #[cfg(target_os = "windows")]
-            RuntimeBackend::Windows => RuntimeWindowSystem::Windows(WindowsWindowSystem::new()),
-            #[cfg(target_os = "macos")]
-            RuntimeBackend::MacOS => RuntimeWindowSystem::MacOS(MacOSWindowSystem::new()),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeBackend::Unsupported => RuntimeWindowSystem::Unsupported,
-        }
-    }
-
-    fn last_move(&self) -> Option<WindowMove> {
-        match self {
-            RuntimeWindowSystem::DryRun(system) => system.last_move,
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::X11(_) => None,
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Wayland(_) => None,
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Gnome(_) => None,
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Kde(_) => None,
-            #[cfg(target_os = "windows")]
-            RuntimeWindowSystem::Windows(_) => None,
-            #[cfg(target_os = "macos")]
-            RuntimeWindowSystem::MacOS(_) => None,
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeWindowSystem::Unsupported => None,
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            RuntimeWindowSystem::DryRun(_) => "dry-run",
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::X11(_) => "x11",
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Wayland(_) => "wayland",
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Gnome(_) => "gnome-wayland",
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Kde(_) => "kde-wayland",
-            #[cfg(target_os = "windows")]
-            RuntimeWindowSystem::Windows(_) => "windows",
-            #[cfg(target_os = "macos")]
-            RuntimeWindowSystem::MacOS(_) => "macos",
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeWindowSystem::Unsupported => "unsupported",
-        }
-    }
-}
-
-impl WindowSystem for RuntimeWindowSystem {
-    fn focused_window(&self) -> Result<Option<FocusedWindow>, window_zones::WindowSystemError> {
-        match self {
-            RuntimeWindowSystem::DryRun(system) => system.focused_window(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::X11(system) => system.focused_window(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Wayland(system) => system.focused_window(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Gnome(system) => system.focused_window(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Kde(system) => system.focused_window(),
-            #[cfg(target_os = "windows")]
-            RuntimeWindowSystem::Windows(system) => system.focused_window(),
-            #[cfg(target_os = "macos")]
-            RuntimeWindowSystem::MacOS(system) => system.focused_window(),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeWindowSystem::Unsupported => Err(window_zones::WindowSystemError::Platform(
-                "window-system adapter is unsupported on this platform".to_string(),
-            )),
-        }
-    }
-
-    fn displays(&self) -> Result<Vec<DisplayGeometry>, window_zones::WindowSystemError> {
-        match self {
-            RuntimeWindowSystem::DryRun(system) => system.displays(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::X11(system) => system.displays(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Wayland(system) => system.displays(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Gnome(system) => system.displays(),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Kde(system) => system.displays(),
-            #[cfg(target_os = "windows")]
-            RuntimeWindowSystem::Windows(system) => system.displays(),
-            #[cfg(target_os = "macos")]
-            RuntimeWindowSystem::MacOS(system) => system.displays(),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeWindowSystem::Unsupported => Err(window_zones::WindowSystemError::Platform(
-                "window-system adapter is unsupported on this platform".to_string(),
-            )),
-        }
-    }
-
-    fn move_focused_window(
-        &mut self,
-        window_move: WindowMove,
-    ) -> Result<(), window_zones::WindowSystemError> {
-        match self {
-            RuntimeWindowSystem::DryRun(system) => system.move_focused_window(window_move),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::X11(system) => system.move_focused_window(window_move),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Wayland(system) => system.move_focused_window(window_move),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Gnome(system) => system.move_focused_window(window_move),
-            #[cfg(target_os = "linux")]
-            RuntimeWindowSystem::Kde(system) => system.move_focused_window(window_move),
-            #[cfg(target_os = "windows")]
-            RuntimeWindowSystem::Windows(system) => system.move_focused_window(window_move),
-            #[cfg(target_os = "macos")]
-            RuntimeWindowSystem::MacOS(system) => system.move_focused_window(window_move),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeWindowSystem::Unsupported => Err(window_zones::WindowSystemError::Platform(
-                "window-system adapter is unsupported on this platform".to_string(),
-            )),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DryRunWindowSystem {
-    focused_window: FocusedWindow,
-    displays: Vec<DisplayGeometry>,
-    last_move: Option<WindowMove>,
-}
-
-impl DryRunWindowSystem {
-    fn new() -> Self {
-        Self {
-            focused_window: FocusedWindow::new(window_zones::Rect::new(40, 40, 640, 480)),
-            displays: vec![
-                DisplayGeometry::new("display-0", window_zones::Rect::new(0, 0, 1920, 1080)),
-                DisplayGeometry::new("display-1", window_zones::Rect::new(1920, 0, 1280, 1024)),
-            ],
-            last_move: None,
-        }
-    }
-}
-
-impl WindowSystem for DryRunWindowSystem {
-    fn focused_window(&self) -> Result<Option<FocusedWindow>, window_zones::WindowSystemError> {
-        Ok(Some(self.focused_window.clone()))
-    }
-
-    fn displays(&self) -> Result<Vec<DisplayGeometry>, window_zones::WindowSystemError> {
-        Ok(self.displays.clone())
-    }
-
-    fn move_focused_window(
-        &mut self,
-        window_move: WindowMove,
-    ) -> Result<(), window_zones::WindowSystemError> {
-        self.last_move = Some(window_move);
-        Ok(())
-    }
-}
-
-enum RuntimeInstruction {
-    Empty,
-    Status,
-    Reload,
-    Restart,
-    Quit,
-    Help,
-    Dispatch(String),
-    Unknown(String),
-}
-
-fn parse_runtime_input(line: &str) -> RuntimeInstruction {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return RuntimeInstruction::Empty;
-    }
-
-    let mut parts = trimmed.splitn(2, ' ');
-    let command = parts.next().unwrap_or("");
-    let rest = parts.next().map(str::trim).filter(|rest| !rest.is_empty());
-
-    match command.to_ascii_lowercase().as_str() {
-        "status" => RuntimeInstruction::Status,
-        "reload" => RuntimeInstruction::Reload,
-        "restart" => RuntimeInstruction::Restart,
-        "quit" | "exit" | "q" => RuntimeInstruction::Quit,
-        "help" | "?" => RuntimeInstruction::Help,
-        "dispatch" => rest.filter(|value| !value.is_empty()).map_or(
-            RuntimeInstruction::Unknown("missing hotkey argument".to_string()),
-            |hotkey| RuntimeInstruction::Dispatch(hotkey.to_string()),
-        ),
-        _ => RuntimeInstruction::Dispatch(trimmed.to_string()),
-    }
-}
-
-fn parse_tui_input(line: &str) -> RuntimeInstruction {
-    if line.trim().eq_ignore_ascii_case("refresh") {
-        RuntimeInstruction::Status
-    } else {
-        parse_runtime_input(line)
-    }
-}
-
-#[derive(Debug, Default)]
-struct NoopHotkeySystem;
-
-impl HotkeySystem for NoopHotkeySystem {
-    fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        Ok(())
-    }
-
-    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        Ok(None)
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct UnavailableHotkeySystem(String);
-
-#[cfg(target_os = "linux")]
-impl HotkeySystem for UnavailableHotkeySystem {
-    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        if hotkeys.is_empty() {
-            Ok(())
-        } else {
-            Err(HotkeySystemError::Platform(self.0.clone()))
-        }
-    }
-
-    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        Ok(None)
-    }
-}
-
-enum RuntimeHotkeySystem {
-    Noop(NoopHotkeySystem),
-    #[cfg(target_os = "linux")]
-    Unavailable(UnavailableHotkeySystem),
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    Global(RdevHotkeySystem),
-    #[cfg(target_os = "linux")]
-    Gnome(GnomeHotkeySystem),
-    #[cfg(target_os = "linux")]
-    Kde(KwinHotkeySystem),
-}
-
-impl RuntimeHotkeySystem {
-    fn new(backend: RuntimeBackend) -> Self {
-        match backend {
-            RuntimeBackend::DryRun => Self::Noop(NoopHotkeySystem),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::Wayland => Self::Unavailable(UnavailableHotkeySystem(
-                "global hotkeys are unavailable on sway/hyprland; bind `window_zones dispatch <hotkey>` in the compositor config".to_string(),
-            )),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::X11 => Self::Global(RdevHotkeySystem::new()),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::Gnome => Self::Gnome(GnomeHotkeySystem::new()),
-            #[cfg(target_os = "linux")]
-            RuntimeBackend::Kde => Self::Kde(KwinHotkeySystem::new()),
-            #[cfg(target_os = "windows")]
-            RuntimeBackend::Windows => Self::Global(RdevHotkeySystem::new()),
-            #[cfg(target_os = "macos")]
-            RuntimeBackend::MacOS => Self::Global(RdevHotkeySystem::new()),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeBackend::Unsupported => Self::Noop(NoopHotkeySystem),
-        }
-    }
-}
-
-impl HotkeySystem for RuntimeHotkeySystem {
-    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        match self {
-            Self::Noop(system) => system.register_hotkeys(hotkeys),
-            #[cfg(target_os = "linux")]
-            Self::Unavailable(system) => system.register_hotkeys(hotkeys),
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            Self::Global(system) => system.register_hotkeys(hotkeys),
-            #[cfg(target_os = "linux")]
-            Self::Gnome(system) => system.register_hotkeys(hotkeys),
-            #[cfg(target_os = "linux")]
-            Self::Kde(system) => system.register_hotkeys(hotkeys),
-        }
-    }
-
-    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        match self {
-            Self::Noop(system) => system.next_hotkey(),
-            #[cfg(target_os = "linux")]
-            Self::Unavailable(system) => system.next_hotkey(),
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            Self::Global(system) => system.next_hotkey(),
-            #[cfg(target_os = "linux")]
-            Self::Gnome(system) => system.next_hotkey(),
-            #[cfg(target_os = "linux")]
-            Self::Kde(system) => system.next_hotkey(),
-        }
-    }
-}
-
-fn configured_hotkeys_for_runtime(app: &App) -> Vec<String> {
-    app.config()
-        .bindings
-        .iter()
-        .map(|binding| binding.hotkey.clone())
-        .collect()
-}
-
-fn rebind_if_configured_hotkeys_changed<H: HotkeySystem>(
-    app: &mut App,
-    hotkey_system: &mut H,
-    cached_hotkeys: &mut Vec<String>,
-    registration_is_valid: &mut bool,
-    last_registration_error: &mut Option<String>,
-    event_label: &str,
-) {
-    let target_hotkeys = configured_hotkeys_for_runtime(app);
-
-    if *registration_is_valid && *cached_hotkeys == target_hotkeys {
-        return;
-    }
-
-    match app.register_hotkeys(hotkey_system) {
-        Ok(()) => {
-            *cached_hotkeys = target_hotkeys;
-            *registration_is_valid = true;
-            if last_registration_error.take().is_some() {
-                println!("{event_label} recovered.");
-            }
-        }
-        Err(error) => {
-            let message = error.to_string();
-            if last_registration_error.as_deref() != Some(message.as_str()) {
-                println!("{event_label} failed: {message}");
-                *last_registration_error = Some(message);
-            }
-            *registration_is_valid = false;
-        }
-    }
-}
-
-fn runtime_instruction_receiver() -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel::<String>();
-
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut stdin = stdin.lock();
-        let mut line = String::new();
-
-        while stdin.read_line(&mut line).expect("read stdin") > 0 {
-            if tx.send(line.clone()).is_err() {
-                break;
-            }
-            line.clear();
-        }
-    });
-
-    rx
-}
-
-fn build_app(config_path: Option<&PathBuf>) -> App {
-    match config_path {
-        Some(path) => App::start_at(path),
-        None => App::start(),
+        WaylandBackend::Sway => Ok(RuntimeBackend::Wayland(ScriptedCompositor::Sway)),
+        WaylandBackend::Hyprland => Ok(RuntimeBackend::Wayland(ScriptedCompositor::Hyprland)),
     }
 }
 
@@ -738,131 +345,592 @@ fn session_identity(
     }
 }
 
-fn runtime_status_lines(app: &App) -> Vec<String> {
-    let mut status = vec![
-        "Runtime status:".to_string(),
-        format!(
-            "  config path: {}",
-            app.config_path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unresolved>".to_string())
-        ),
-        format!("  binding count: {}", app.config().bindings.len()),
-        format!("  config state: {:?}", app.config_state()),
-        format!("  hotkey state: {:?}", app.hotkey_state()),
-        format!(
-            "  last action: {}",
-            app.last_dispatch_hotkey().unwrap_or("<none>")
-        ),
-        format!("  dispatch state: {:?}", app.dispatch_state()),
-    ];
-
-    if let ConfigState::Error(error) = app.config_state() {
-        status.push(format!("  config error: {error}"));
-    }
-    if let DispatchState::Error(error) = app.dispatch_state() {
-        status.push(format!("  dispatch error: {error}"));
-    }
-
-    status
-}
-
-fn print_status(app: &App) {
-    for line in runtime_status_lines(app) {
-        println!("{line}");
-    }
-}
-
-fn print_dispatch_state(state: &DispatchState, window_system: &RuntimeWindowSystem) {
-    println!("Dispatch state: {:?}", state);
-    if let Some(window_move) = window_system.last_move() {
-        println!(
-            "  last move: x={} y={} w={} h={}",
-            window_move.target.x,
-            window_move.target.y,
-            window_move.target.width,
-            window_move.target.height
-        );
-    }
-}
-
-fn execute_dispatch(
-    mut app: App,
-    mut window_system: RuntimeWindowSystem,
-    hotkey: String,
-) -> ExitCode {
-    println!("Using runtime window backend: {}", window_system.name());
-    print_status(&app);
-
-    let state = app.dispatch_hotkey(&hotkey, &mut window_system);
-    print_dispatch_state(state, &window_system);
-    if matches!(state, DispatchState::Error(_)) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-fn execute_status(app: App, backend: RuntimeBackend) {
-    let window_system = RuntimeWindowSystem::with_backend(backend);
-    println!("Using runtime window backend: {}", window_system.name());
+#[derive(Debug)]
+enum RuntimeWindowSystem {
+    DryRun(DryRunWindowSystem),
     #[cfg(target_os = "linux")]
-    if matches!(backend, RuntimeBackend::Gnome | RuntimeBackend::Kde) {
-        let label = if matches!(backend, RuntimeBackend::Gnome) {
-            "GNOME"
-        } else {
-            "KDE"
-        };
-        let capabilities = match backend {
-            RuntimeBackend::Gnome => GnomeWindowSystem::new()
-                .capabilities()
-                .map_err(|error| error.to_string()),
-            RuntimeBackend::Kde => KwinWindowSystem::new()
-                .capabilities()
-                .map_err(|error| error.to_string()),
-            _ => unreachable!("companion label only applies to companion backends"),
-        };
-        match capabilities {
-            Ok(capabilities) => println!("{label} companion capabilities: {capabilities:?}"),
-            Err(error) => println!("{label} companion status: {error}"),
+    X11(X11WindowSystem),
+    #[cfg(target_os = "linux")]
+    Wayland(WaylandWindowSystem),
+    #[cfg(target_os = "linux")]
+    Gnome(GnomeWindowSystem),
+    #[cfg(target_os = "linux")]
+    Kde(KwinWindowSystem),
+    #[cfg(target_os = "windows")]
+    Windows(WindowsWindowSystem),
+    #[cfg(target_os = "macos")]
+    MacOS(MacOSWindowSystem),
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    Unsupported,
+}
+
+/// Runs `$body` with `$system` bound to whichever adapter is active.
+macro_rules! with_window_system {
+    ($runtime_system:expr, $system:ident => $body:expr) => {
+        match $runtime_system {
+            RuntimeWindowSystem::DryRun($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::X11($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Wayland($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Gnome($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Kde($system) => $body,
+            #[cfg(target_os = "windows")]
+            RuntimeWindowSystem::Windows($system) => $body,
+            #[cfg(target_os = "macos")]
+            RuntimeWindowSystem::MacOS($system) => $body,
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            RuntimeWindowSystem::Unsupported => Err(WindowSystemError::Platform(
+                "window-system adapter is unsupported on this platform".to_string(),
+            )),
+        }
+    };
+}
+
+impl RuntimeWindowSystem {
+    fn with_backend(backend: RuntimeBackend) -> Self {
+        match backend {
+            RuntimeBackend::DryRun => Self::DryRun(DryRunWindowSystem::new()),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::X11 => Self::X11(X11WindowSystem::new()),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Wayland(compositor) => {
+                Self::Wayland(WaylandWindowSystem::new(compositor))
+            }
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Gnome => Self::Gnome(GnomeWindowSystem::new()),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Kde => Self::Kde(KwinWindowSystem::new()),
+            #[cfg(target_os = "windows")]
+            RuntimeBackend::Windows => Self::Windows(WindowsWindowSystem::new()),
+            #[cfg(target_os = "macos")]
+            RuntimeBackend::MacOS => Self::MacOS(MacOSWindowSystem::new()),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            RuntimeBackend::Unsupported => Self::Unsupported,
         }
     }
-    print_status(&app);
+
+    fn last_move(&self) -> Option<&WindowMove> {
+        match self {
+            Self::DryRun(system) => system.last_move.as_ref(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::DryRun(_) => "dry-run",
+            #[cfg(target_os = "linux")]
+            Self::X11(_) => "x11",
+            #[cfg(target_os = "linux")]
+            Self::Wayland(_) => "wayland",
+            #[cfg(target_os = "linux")]
+            Self::Gnome(_) => "gnome-wayland",
+            #[cfg(target_os = "linux")]
+            Self::Kde(_) => "kde-wayland",
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => "windows",
+            #[cfg(target_os = "macos")]
+            Self::MacOS(_) => "macos",
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// The companion label and its capability report, for companion backends.
+    fn companion_capabilities(&self) -> Option<(&'static str, Result<Vec<String>, String>)> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Gnome(system) => Some((
+                "GNOME",
+                system.capabilities().map_err(|error| error.to_string()),
+            )),
+            #[cfg(target_os = "linux")]
+            Self::Kde(system) => Some((
+                "KDE",
+                system.capabilities().map_err(|error| error.to_string()),
+            )),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
 }
 
-fn execute_run(
+impl WindowSystem for RuntimeWindowSystem {
+    fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
+        with_window_system!(self, system => system.focused_window())
+    }
+
+    fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        with_window_system!(self, system => system.displays())
+    }
+
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
+        with_window_system!(self, system => system.move_window(window_move))
+    }
+}
+
+/// Simulated desktop for `--backend dry-run`: one window on two displays that
+/// moves when asked, so actions and their sequences can be checked safely.
+#[derive(Debug)]
+struct DryRunWindowSystem {
+    focused_window: FocusedWindow,
+    displays: Vec<DisplayGeometry>,
+    last_move: Option<WindowMove>,
+}
+
+impl DryRunWindowSystem {
+    fn new() -> Self {
+        Self {
+            focused_window: FocusedWindow::new(
+                WindowId::new("dry-run-window"),
+                Rect::new(40, 40, 640, 480),
+            ),
+            displays: vec![
+                DisplayGeometry::new("display-0", Rect::new(0, 0, 1920, 1080)),
+                DisplayGeometry::new("display-1", Rect::new(1920, 0, 1280, 1024)),
+            ],
+            last_move: None,
+        }
+    }
+}
+
+impl WindowSystem for DryRunWindowSystem {
+    fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
+        Ok(Some(self.focused_window.clone()))
+    }
+
+    fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        Ok(self.displays.clone())
+    }
+
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
+        if window_move.window != self.focused_window.id {
+            return Err(WindowSystemError::WindowGone(window_move.window.clone()));
+        }
+        self.focused_window.geometry = window_move.target;
+        self.last_move = Some(window_move.clone());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoopHotkeySystem;
+
+impl HotkeySystem for NoopHotkeySystem {
+    fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        Ok(())
+    }
+
+    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        Ok(None)
+    }
+}
+
+/// Hotkeys on compositors whose own config binds keys to `window_zones dispatch`.
+#[cfg(target_os = "linux")]
+struct CompositorBoundHotkeySystem;
+
+#[cfg(target_os = "linux")]
+impl HotkeySystem for CompositorBoundHotkeySystem {
+    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        if hotkeys.is_empty() {
+            Ok(())
+        } else {
+            Err(HotkeySystemError::Rejected(
+                "global hotkeys are unavailable on sway/hyprland; bind `window_zones dispatch <hotkey>` in the compositor config".to_string(),
+            ))
+        }
+    }
+
+    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        Ok(None)
+    }
+}
+
+enum RuntimeHotkeySystem {
+    Noop(NoopHotkeySystem),
+    #[cfg(target_os = "linux")]
+    CompositorBound(CompositorBoundHotkeySystem),
+    #[cfg(target_os = "linux")]
+    X11(X11HotkeySystem),
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    Global(RdevHotkeySystem),
+    #[cfg(target_os = "linux")]
+    Gnome(GnomeHotkeySystem),
+    #[cfg(target_os = "linux")]
+    Kde(KwinHotkeySystem),
+}
+
+/// Runs `$body` with `$system` bound to whichever hotkey system is active.
+macro_rules! with_hotkey_system {
+    ($runtime_system:expr, $system:ident => $body:expr) => {
+        match $runtime_system {
+            RuntimeHotkeySystem::Noop($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeHotkeySystem::CompositorBound($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeHotkeySystem::X11($system) => $body,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            RuntimeHotkeySystem::Global($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeHotkeySystem::Gnome($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeHotkeySystem::Kde($system) => $body,
+        }
+    };
+}
+
+impl RuntimeHotkeySystem {
+    fn new(backend: RuntimeBackend) -> Self {
+        match backend {
+            RuntimeBackend::DryRun => Self::Noop(NoopHotkeySystem),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Wayland(_) => Self::CompositorBound(CompositorBoundHotkeySystem),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::X11 => Self::X11(X11HotkeySystem::new()),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Gnome => Self::Gnome(GnomeHotkeySystem::new()),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Kde => Self::Kde(KwinHotkeySystem::new()),
+            #[cfg(target_os = "windows")]
+            RuntimeBackend::Windows => Self::Global(RdevHotkeySystem::new()),
+            #[cfg(target_os = "macos")]
+            RuntimeBackend::MacOS => Self::Global(RdevHotkeySystem::new()),
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            RuntimeBackend::Unsupported => Self::Noop(NoopHotkeySystem),
+        }
+    }
+}
+
+impl HotkeySystem for RuntimeHotkeySystem {
+    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        with_hotkey_system!(self, system => system.register_hotkeys(hotkeys))
+    }
+
+    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+        with_hotkey_system!(self, system => system.next_hotkey())
+    }
+}
+
+fn build_app(config_path: Option<&PathBuf>) -> App {
+    match config_path {
+        Some(path) => App::start_at(path),
+        None => App::start(),
+    }
+}
+
+/// A hotkey press and what dispatching it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchReport {
+    hotkey: String,
+    state: DispatchState,
+}
+
+/// The running App with its adapters: one engine shared by the CLI, TUI, and
+/// tray surfaces.
+struct Runtime {
     app: App,
     backend: RuntimeBackend,
+    config_path: Option<PathBuf>,
     window_system: RuntimeWindowSystem,
-    show_tray: bool,
-) {
-    if show_tray {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        {
-            return execute_run_with_tray(app, backend, window_system);
-        }
+    hotkey_system: RuntimeHotkeySystem,
+    next_tick: Instant,
+}
 
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        {
-            eprintln!("Tray mode is not supported on this platform yet.");
+impl Runtime {
+    fn new(config_path: Option<PathBuf>, backend: RuntimeBackend) -> Self {
+        Self {
+            app: build_app(config_path.as_ref()),
+            backend,
+            config_path,
+            window_system: RuntimeWindowSystem::with_backend(backend),
+            hotkey_system: RuntimeHotkeySystem::new(backend),
+            next_tick: Instant::now(),
         }
     }
 
-    execute_run_cli(app, backend, window_system);
+    /// Reconciles config and registration when due, then dispatches every
+    /// queued hotkey press.
+    fn poll(&mut self, now: Instant) -> (Vec<RuntimeEvent>, Vec<DispatchReport>) {
+        let mut events = Vec::new();
+        if now >= self.next_tick {
+            events = self.app.tick(&mut self.hotkey_system, now);
+            self.next_tick = now + RUNTIME_TICK_INTERVAL;
+        }
+
+        let mut dispatches = Vec::new();
+        if !self.app.hotkeys_registered() {
+            return (events, dispatches);
+        }
+        for _ in 0..MAX_HOTKEYS_PER_POLL {
+            match self
+                .app
+                .dispatch_next_hotkey(&mut self.hotkey_system, &mut self.window_system)
+            {
+                Ok(Some(state)) => {
+                    let state = state.clone();
+                    dispatches.push(DispatchReport {
+                        hotkey: self
+                            .app
+                            .last_dispatch_hotkey()
+                            .unwrap_or_default()
+                            .to_string(),
+                        state,
+                    });
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    events.extend(self.app.hotkeys_lost(error, now));
+                    self.next_tick = now;
+                    break;
+                }
+            }
+        }
+        (events, dispatches)
+    }
+
+    fn reload(&mut self, now: Instant) -> Vec<RuntimeEvent> {
+        self.app.reload(&mut self.hotkey_system, now)
+    }
+
+    /// Rebuilds the App and adapters from scratch, releasing the old grabs first.
+    fn restart(&mut self, now: Instant) -> Vec<RuntimeEvent> {
+        self.hotkey_system = RuntimeHotkeySystem::Noop(NoopHotkeySystem);
+        self.app = build_app(self.config_path.as_ref());
+        self.window_system = RuntimeWindowSystem::with_backend(self.backend);
+        self.hotkey_system = RuntimeHotkeySystem::new(self.backend);
+        self.next_tick = now + RUNTIME_TICK_INTERVAL;
+        let mut events = vec![self.app.startup_event()];
+        events.extend(self.app.tick(&mut self.hotkey_system, now));
+        events
+    }
+
+    fn dispatch(&mut self, hotkey: &str) -> DispatchState {
+        self.app
+            .dispatch_hotkey(hotkey, &mut self.window_system)
+            .clone()
+    }
 }
 
-fn execute_run_cli(app: App, backend: RuntimeBackend, window_system: RuntimeWindowSystem) {
-    execute_runtime_loop(app, backend, window_system, RuntimeSurface::Cli);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeInstruction {
+    Empty,
+    Status,
+    Reload,
+    Restart,
+    Quit,
+    Help,
+    Dispatch(String),
+    Unknown(String),
 }
 
-fn execute_tui(app: App, backend: RuntimeBackend, window_system: RuntimeWindowSystem) {
-    execute_runtime_loop(app, backend, window_system, RuntimeSurface::Tui);
+fn parse_runtime_input(line: &str) -> RuntimeInstruction {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return RuntimeInstruction::Empty;
+    }
+
+    let mut parts = trimmed.splitn(2, ' ');
+    let command = parts.next().unwrap_or("");
+    let rest = parts.next().map(str::trim).filter(|rest| !rest.is_empty());
+
+    match command.to_ascii_lowercase().as_str() {
+        "status" => RuntimeInstruction::Status,
+        "reload" => RuntimeInstruction::Reload,
+        "restart" => RuntimeInstruction::Restart,
+        "quit" | "exit" | "q" => RuntimeInstruction::Quit,
+        "help" | "?" => RuntimeInstruction::Help,
+        "dispatch" => rest.map_or(
+            RuntimeInstruction::Unknown("missing hotkey argument".to_string()),
+            |hotkey| RuntimeInstruction::Dispatch(hotkey.to_string()),
+        ),
+        _ => RuntimeInstruction::Dispatch(trimmed.to_string()),
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeSurface {
-    Cli,
-    Tui,
+fn parse_tui_input(line: &str) -> RuntimeInstruction {
+    if line.trim().eq_ignore_ascii_case("refresh") {
+        RuntimeInstruction::Status
+    } else {
+        parse_runtime_input(line)
+    }
+}
+
+/// Reads stdin lines on a thread; the channel disconnects at end of input.
+fn spawn_stdin_reader(parse: fn(&str) -> RuntimeInstruction) -> mpsc::Receiver<RuntimeInstruction> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(parse(&line)).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// What a runtime surface is told to show.
+enum Report {
+    Event(RuntimeEvent),
+    HotkeyDispatch(DispatchReport),
+    ManualDispatch(DispatchState),
+    Status,
+    Help,
+    Unknown(String),
+    ReloadRequested,
+    Restarted,
+    InputClosed,
+}
+
+trait Surface {
+    fn start(&mut self, runtime: &Runtime);
+    fn report(&mut self, runtime: &Runtime, report: Report);
+    /// Called once per loop iteration after all reports; `input` is whether an
+    /// instruction was handled in this iteration.
+    fn refresh(&mut self, runtime: &Runtime, now: Instant, input: bool);
+    fn finish(&mut self);
+}
+
+/// Drives a surface until Quit. With `quit_on_input_end`, the end of the
+/// instruction stream ends the session (interactive terminals); otherwise the
+/// runtime keeps serving hotkeys (services with stdin closed).
+fn run_runtime(
+    runtime: &mut Runtime,
+    surface: &mut impl Surface,
+    instructions: mpsc::Receiver<RuntimeInstruction>,
+    quit_on_input_end: bool,
+) {
+    surface.start(runtime);
+    surface.report(runtime, Report::Event(runtime.app.startup_event()));
+
+    let mut input_open = true;
+    loop {
+        let instruction = if input_open {
+            match instructions.recv_timeout(HOTKEY_POLL_INTERVAL) {
+                Ok(instruction) => Some(instruction),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    input_open = false;
+                    if quit_on_input_end {
+                        surface.report(runtime, Report::InputClosed);
+                        break;
+                    }
+                    None
+                }
+            }
+        } else {
+            thread::sleep(HOTKEY_POLL_INTERVAL);
+            None
+        };
+
+        let now = Instant::now();
+        let handled_input = instruction.is_some();
+        if let Some(instruction) = instruction {
+            match instruction {
+                RuntimeInstruction::Quit => break,
+                RuntimeInstruction::Empty => {}
+                RuntimeInstruction::Status => surface.report(runtime, Report::Status),
+                RuntimeInstruction::Help => surface.report(runtime, Report::Help),
+                RuntimeInstruction::Unknown(message) => {
+                    surface.report(runtime, Report::Unknown(message));
+                }
+                RuntimeInstruction::Reload => {
+                    surface.report(runtime, Report::ReloadRequested);
+                    for event in runtime.reload(now) {
+                        surface.report(runtime, Report::Event(event));
+                    }
+                }
+                RuntimeInstruction::Restart => {
+                    let events = runtime.restart(now);
+                    surface.report(runtime, Report::Restarted);
+                    for event in events {
+                        surface.report(runtime, Report::Event(event));
+                    }
+                }
+                RuntimeInstruction::Dispatch(hotkey) => {
+                    let state = runtime.dispatch(&hotkey);
+                    surface.report(runtime, Report::ManualDispatch(state));
+                }
+            }
+        }
+
+        let (events, dispatches) = runtime.poll(now);
+        for event in events {
+            surface.report(runtime, Report::Event(event));
+        }
+        for dispatch in dispatches {
+            surface.report(runtime, Report::HotkeyDispatch(dispatch));
+        }
+        surface.refresh(runtime, now, handled_input);
+    }
+
+    surface.finish();
+}
+
+/// Line-oriented session for terminals and background services.
+struct CliSurface {
+    prompt: bool,
+    notifier: Option<Notifier>,
+}
+
+impl Surface for CliSurface {
+    fn start(&mut self, runtime: &Runtime) {
+        println!("Window backend: {}", runtime.window_system.name());
+        println!("Interactive session started. type `help` for commands.");
+        if self.prompt {
+            print_prompt();
+        }
+    }
+
+    fn report(&mut self, runtime: &Runtime, report: Report) {
+        match report {
+            Report::Event(event) => {
+                println!("{event}");
+                if let Some(notifier) = &mut self.notifier {
+                    notifier.event(&event, Instant::now());
+                }
+            }
+            Report::HotkeyDispatch(DispatchReport {
+                hotkey,
+                state: DispatchState::Error(error),
+            }) => println!("Dispatch failed for {hotkey}: {error}"),
+            Report::HotkeyDispatch(_) => {}
+            Report::ManualDispatch(state) => print_dispatch_state(&state, &runtime.window_system),
+            Report::Status => print_status(&runtime.app),
+            Report::Help => print_help(),
+            Report::Unknown(message) => {
+                println!("Unknown command: {message}");
+                println!("type `help` for usage.");
+            }
+            Report::ReloadRequested => println!("Reload requested."),
+            Report::Restarted => println!("Runtime restarted."),
+            Report::InputClosed => println!("Input stream closed."),
+        }
+        let _ = io::stdout().flush();
+    }
+
+    fn refresh(&mut self, _runtime: &Runtime, now: Instant, input: bool) {
+        if let Some(notifier) = &mut self.notifier {
+            notifier.tick(now);
+        }
+        if input && self.prompt {
+            print_prompt();
+        }
+    }
+
+    fn finish(&mut self) {
+        println!("Session closed.");
+    }
+}
+
+fn print_prompt() {
+    print!("window-zones> ");
+    let _ = io::stdout().flush();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -872,34 +940,24 @@ struct TuiCapabilityStatus {
     diagnostic: Option<String>,
 }
 
-fn tui_capability_status(_backend: RuntimeBackend) -> TuiCapabilityStatus {
+fn tui_capability_status(
+    backend: RuntimeBackend,
+    window_system: &RuntimeWindowSystem,
+) -> TuiCapabilityStatus {
     #[cfg(target_os = "linux")]
-    if matches!(_backend, RuntimeBackend::Wayland) {
+    if matches!(backend, RuntimeBackend::Wayland(_)) {
         return TuiCapabilityStatus {
             window: "focused-window, displays, move-resize".to_string(),
             hotkey: "<none>".to_string(),
             diagnostic: None,
         };
     }
-    #[cfg(target_os = "linux")]
-    let companion_capabilities = match _backend {
-        RuntimeBackend::Gnome => Some(
-            GnomeWindowSystem::new()
-                .capabilities()
-                .map_err(|error| error.to_string()),
-        ),
-        RuntimeBackend::Kde => Some(
-            KwinWindowSystem::new()
-                .capabilities()
-                .map_err(|error| error.to_string()),
-        ),
-        _ => None,
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let companion_capabilities: Option<Result<Vec<String>, String>> = None;
-
-    tui_capability_status_from(companion_capabilities)
+    let _ = backend;
+    tui_capability_status_from(
+        window_system
+            .companion_capabilities()
+            .map(|(_, capabilities)| capabilities),
+    )
 }
 
 fn tui_capability_status_from(
@@ -947,29 +1005,19 @@ fn tui_capability_status_from(
 }
 
 fn tui_hotkey_mode(backend: RuntimeBackend) -> &'static str {
-    if matches!(backend, RuntimeBackend::DryRun) {
-        return "dry-run";
+    match backend {
+        RuntimeBackend::DryRun => "dry-run",
+        #[cfg(target_os = "linux")]
+        RuntimeBackend::Gnome => "gnome-companion",
+        #[cfg(target_os = "linux")]
+        RuntimeBackend::Kde => "kwin-companion",
+        #[cfg(target_os = "linux")]
+        RuntimeBackend::Wayland(_) => "compositor-bound dispatch",
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        RuntimeBackend::Unsupported => "cli",
+        #[allow(unreachable_patterns)]
+        _ => "global",
     }
-
-    #[cfg(target_os = "linux")]
-    if matches!(backend, RuntimeBackend::Gnome) {
-        return "gnome-companion";
-    }
-    #[cfg(target_os = "linux")]
-    if matches!(backend, RuntimeBackend::Kde) {
-        return "kwin-companion";
-    }
-    #[cfg(target_os = "linux")]
-    if matches!(backend, RuntimeBackend::Wayland) {
-        return "compositor-bound dispatch";
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    if matches!(backend, RuntimeBackend::Unsupported) {
-        return "cli";
-    }
-
-    "global"
 }
 
 fn tui_last_error(app: &App, capabilities: &TuiCapabilityStatus) -> String {
@@ -991,18 +1039,18 @@ fn tui_last_error(app: &App, capabilities: &TuiCapabilityStatus) -> String {
 }
 
 fn tui_frame(
-    app: &App,
-    backend: RuntimeBackend,
-    window_system: &RuntimeWindowSystem,
+    runtime: &Runtime,
     capabilities: &TuiCapabilityStatus,
+    last_event: Option<&str>,
 ) -> String {
+    let app = &runtime.app;
     let mut frame = format!(
         "\x1b[2J\x1b[HWindow Zones TUI\n================\n\
          Window backend: {}\nWindow capabilities: {}\nHotkey mode: {}\n\
          Hotkey capabilities: {}\nHotkey state: {:?}\nConfig: {} ({:?})\nBindings:\n",
-        window_system.name(),
+        runtime.window_system.name(),
         capabilities.window,
-        tui_hotkey_mode(backend),
+        tui_hotkey_mode(runtime.backend),
         capabilities.hotkey,
         app.hotkey_state(),
         app.config_path()
@@ -1020,544 +1068,767 @@ fn tui_frame(
     }
     write!(
         frame,
-        "Last action: {}\nLast error: {}\n\n\
+        "Last action: {}\nLast error: {}\nLast event: {}\n\n\
          Commands: reload | restart | status/refresh | dispatch HOTKEY | quit\nwindow-zones tui> ",
         app.last_dispatch_hotkey().unwrap_or("<none>"),
         tui_last_error(app, capabilities),
+        last_event.unwrap_or("none"),
     )
     .expect("write TUI frame");
     frame
 }
 
-fn execute_runtime_loop(
-    mut app: App,
-    backend: RuntimeBackend,
-    mut window_system: RuntimeWindowSystem,
-    surface: RuntimeSurface,
-) {
-    let config_path = app.config_path().map(PathBuf::from);
-    let stdin_is_terminal = io::stdin().is_terminal();
-    let instruction_rx = runtime_instruction_receiver();
+/// Full-screen ANSI dashboard redrawn whenever its content changes.
+struct TuiSurface {
+    snapshot: String,
+    capabilities: TuiCapabilityStatus,
+    capabilities_due: Instant,
+    last_event: Option<String>,
+}
 
-    let mut hotkey_system = RuntimeHotkeySystem::new(backend);
-    let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
-    let mut hotkeys_are_valid = false;
-    let mut last_registration_error = None;
-    rebind_if_configured_hotkeys_changed(
-        &mut app,
-        &mut hotkey_system,
-        &mut cached_hotkeys,
-        &mut hotkeys_are_valid,
-        &mut last_registration_error,
-        "Hotkey registration initially",
-    );
-
-    let mut tui_snapshot = String::new();
-
-    if matches!(surface, RuntimeSurface::Cli) {
-        println!("Window backend: {}", window_system.name());
-        println!("Interactive session started. type `help` for commands.");
-        print!("window-zones> ");
-        io::stdout().flush().expect("stdout flush");
-    } else {
-        tui_snapshot = tui_frame(
-            &app,
-            backend,
-            &window_system,
-            &tui_capability_status(backend),
-        );
-        print!("{tui_snapshot}");
-        io::stdout().flush().expect("stdout flush");
-    }
-
-    let mut hotkey_listener_available = true;
-
-    loop {
-        let mut redraw_tui = false;
-        let mut prompt_cli = false;
-
-        match instruction_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(line) => {
-                redraw_tui = matches!(surface, RuntimeSurface::Tui);
-                prompt_cli = matches!(surface, RuntimeSurface::Cli);
-                let instruction = match surface {
-                    RuntimeSurface::Cli => parse_runtime_input(&line),
-                    RuntimeSurface::Tui => parse_tui_input(&line),
-                };
-
-                match instruction {
-                    RuntimeInstruction::Empty => {}
-                    RuntimeInstruction::Status => {
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            print_status(&app);
-                        }
-                    }
-                    RuntimeInstruction::Reload => {
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            println!("Reload requested.");
-                        }
-                        let state = app.poll_config_changes();
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            match state {
-                                ConfigState::Error(error) => {
-                                    println!("Config reload error: {error}");
-                                }
-                                state => println!("Config state: {:?}", state),
-                            }
-                        }
-                    }
-                    RuntimeInstruction::Restart => {
-                        app = build_app(config_path.as_ref());
-                        hotkey_system = RuntimeHotkeySystem::new(backend);
-                        hotkey_listener_available = true;
-                        cached_hotkeys.clear();
-                        hotkeys_are_valid = false;
-                        last_registration_error = None;
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            println!("Runtime restarted.");
-                        }
-                    }
-                    RuntimeInstruction::Quit => break,
-                    RuntimeInstruction::Help => {
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            print_help();
-                        }
-                    }
-                    RuntimeInstruction::Unknown(message) => {
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            println!("Unknown command: {message}");
-                            println!("type `help` for usage.");
-                        }
-                    }
-                    RuntimeInstruction::Dispatch(hotkey) => {
-                        let state = app.dispatch_hotkey(&hotkey, &mut window_system);
-                        if matches!(surface, RuntimeSurface::Cli) {
-                            print_dispatch_state(state, &window_system);
-                        }
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if stdin_is_terminal {
-                    println!("Input stream closed. Session closed.");
-                    return;
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
-        }
-
-        let _ = app.poll_config_changes();
-        rebind_if_configured_hotkeys_changed(
-            &mut app,
-            &mut hotkey_system,
-            &mut cached_hotkeys,
-            &mut hotkeys_are_valid,
-            &mut last_registration_error,
-            "Hotkey registration now",
-        );
-
-        if hotkeys_are_valid {
-            match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-                Ok(state) => {
-                    if let DispatchState::Error(error) = state
-                        && matches!(surface, RuntimeSurface::Cli)
-                    {
-                        println!("Dispatch failed: {error}");
-                    }
-                    hotkey_listener_available = true;
-                }
-                Err(error) if hotkey_listener_available => {
-                    if matches!(surface, RuntimeSurface::Cli) {
-                        println!("Dispatch failed: {error}");
-                    }
-                    hotkeys_are_valid = false;
-                    hotkey_listener_available = false;
-                    redraw_tui = true;
-                }
-                Err(_) => {
-                    hotkeys_are_valid = false;
-                    redraw_tui = true;
-                }
-            }
-        }
-
-        if matches!(surface, RuntimeSurface::Tui) {
-            let next_snapshot = tui_frame(
-                &app,
-                backend,
-                &window_system,
-                &tui_capability_status(backend),
-            );
-            if next_snapshot != tui_snapshot {
-                redraw_tui = true;
-            }
-            if redraw_tui {
-                print!("{next_snapshot}");
-                io::stdout().flush().expect("stdout flush");
-                tui_snapshot = next_snapshot;
-            }
-        } else if prompt_cli {
-            print!("window-zones> ");
-            io::stdout().flush().expect("stdout flush");
+impl TuiSurface {
+    fn new() -> Self {
+        Self {
+            snapshot: String::new(),
+            capabilities: tui_capability_status_from(None),
+            capabilities_due: Instant::now(),
+            last_event: None,
         }
     }
 
-    println!("Session closed.");
+    fn draw(&mut self, runtime: &Runtime, force: bool) {
+        let frame = tui_frame(runtime, &self.capabilities, self.last_event.as_deref());
+        if force || frame != self.snapshot {
+            print!("{frame}");
+            let _ = io::stdout().flush();
+            self.snapshot = frame;
+        }
+    }
+}
+
+impl Surface for TuiSurface {
+    fn start(&mut self, runtime: &Runtime) {
+        self.capabilities = tui_capability_status(runtime.backend, &runtime.window_system);
+        self.capabilities_due = Instant::now() + CAPABILITY_REFRESH_INTERVAL;
+        self.draw(runtime, true);
+    }
+
+    fn report(&mut self, _runtime: &Runtime, report: Report) {
+        match report {
+            Report::Event(event) => self.last_event = Some(event.to_string()),
+            Report::Unknown(message) => {
+                self.last_event = Some(format!("unknown command: {message}"));
+            }
+            Report::Restarted => self.capabilities_due = Instant::now(),
+            _ => {}
+        }
+    }
+
+    fn refresh(&mut self, runtime: &Runtime, now: Instant, input: bool) {
+        if now >= self.capabilities_due {
+            self.capabilities = tui_capability_status(runtime.backend, &runtime.window_system);
+            self.capabilities_due = now + CAPABILITY_REFRESH_INTERVAL;
+        }
+        self.draw(runtime, input);
+    }
+
+    fn finish(&mut self) {
+        println!("\nSession closed.");
+    }
+}
+
+/// Fixed tray status lines, updated in place.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn tray_status_lines(runtime: &Runtime) -> [String; 4] {
+    let app = &runtime.app;
+    let config = match app.config_state() {
+        ConfigState::Loaded => format!("Config: {} bindings", app.config().bindings.len()),
+        ConfigState::Missing => "Config: missing (run `window_zones init`)".to_string(),
+        ConfigState::Error(error) => format!("Config error: {error}"),
+    };
+    let hotkeys = match app.hotkey_state() {
+        HotkeyRegistrationState::Registered => "Hotkeys: registered".to_string(),
+        HotkeyRegistrationState::Unregistered => "Hotkeys: not registered".to_string(),
+        HotkeyRegistrationState::Error(error) => format!("Hotkeys: {error}"),
+    };
+    let last = match (app.last_dispatch_hotkey(), app.dispatch_state()) {
+        (Some(hotkey), DispatchState::Error(error)) => format!("Last: {hotkey} failed: {error}"),
+        (Some(hotkey), _) => format!("Last: {hotkey}"),
+        (None, _) => "Last: <none>".to_string(),
+    };
+    [
+        format!("Backend: {}", runtime.window_system.name()),
+        config,
+        hotkeys,
+        last,
+    ]
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-#[derive(Debug)]
-enum RuntimeTrayCommand {
-    Reload,
-    Restart,
-    Status,
-    Quit,
+struct TraySurface {
+    tray: TrayItem,
+    label_ids: Vec<u32>,
+    labels: Vec<String>,
+    cli: CliSurface,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn execute_run_with_tray(
-    mut app: App,
-    backend: RuntimeBackend,
-    mut window_system: RuntimeWindowSystem,
-) {
-    let config_path = app.config_path().map(PathBuf::from);
-    let mut hotkey_system = RuntimeHotkeySystem::new(backend);
-    let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
-    let mut hotkeys_are_valid = false;
-    let mut last_registration_error = None;
-    let mut hotkey_listener_available = true;
+impl TraySurface {
+    fn new(runtime: &Runtime, tx: &mpsc::Sender<RuntimeInstruction>) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        let icon = IconSource::Resource("preferences-system-windows");
+        #[cfg(target_os = "windows")]
+        let icon = IconSource::Resource("");
+        let mut tray = TrayItem::new("Window Zones", icon).map_err(|error| error.to_string())?;
 
-    rebind_if_configured_hotkeys_changed(
-        &mut app,
-        &mut hotkey_system,
-        &mut cached_hotkeys,
-        &mut hotkeys_are_valid,
-        &mut last_registration_error,
-        "Hotkey registration initially",
-    );
+        let labels = tray_status_lines(runtime).to_vec();
+        let mut label_ids = Vec::with_capacity(labels.len());
+        for line in &labels {
+            #[cfg(target_os = "linux")]
+            let id = tray.inner_mut().add_menu_item_with_id(line, || {});
+            #[cfg(target_os = "windows")]
+            let id = tray.inner_mut().add_label_with_id(line);
+            label_ids.push(id.map_err(|error| error.to_string())?);
+        }
 
-    let (tray_tx, tray_rx) = mpsc::sync_channel::<RuntimeTrayCommand>(16);
-    let mut tray = match build_tray_menu(&app, &tray_tx) {
-        Ok(tray) => tray,
-        Err(error) => {
-            eprintln!("Failed to start tray surface: {error}");
+        for (label, instruction) in [
+            ("Show status", RuntimeInstruction::Status),
+            ("Reload", RuntimeInstruction::Reload),
+            ("Restart", RuntimeInstruction::Restart),
+            ("Quit", RuntimeInstruction::Quit),
+        ] {
+            let tx = tx.clone();
+            tray.add_menu_item(label, move || {
+                let _ = tx.send(instruction.clone());
+            })
+            .map_err(|error| error.to_string())?;
+        }
+
+        Ok(Self {
+            tray,
+            label_ids,
+            labels,
+            cli: CliSurface {
+                prompt: false,
+                notifier: Notifier::new(),
+            },
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Surface for TraySurface {
+    fn start(&mut self, runtime: &Runtime) {
+        println!("Window backend: {}", runtime.window_system.name());
+        println!("Tray menu started. Use tray controls to reload/restart/quit.");
+    }
+
+    fn report(&mut self, runtime: &Runtime, report: Report) {
+        self.cli.report(runtime, report);
+    }
+
+    fn refresh(&mut self, runtime: &Runtime, now: Instant, _input: bool) {
+        self.cli.refresh(runtime, now, false);
+        for (index, line) in tray_status_lines(runtime).into_iter().enumerate() {
+            if self.labels[index] == line {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            let updated = self
+                .tray
+                .inner_mut()
+                .set_menu_item_label(&line, self.label_ids[index]);
+            #[cfg(target_os = "windows")]
+            let updated = self
+                .tray
+                .inner_mut()
+                .set_label(&line, self.label_ids[index]);
+            match updated {
+                Ok(()) => self.labels[index] = line,
+                Err(error) => eprintln!("Failed to refresh tray status: {error}"),
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        self.cli.finish();
+    }
+}
+
+/// How long hotkeys may stay unavailable before a notification is shown. Short
+/// outages fix themselves: at login the App can start before GNOME Shell has
+/// loaded the companion, and a Shell or companion restart reconnects within seconds.
+#[cfg(target_os = "linux")]
+const HOTKEY_OUTAGE_GRACE: Duration = Duration::from_secs(20);
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProblemKind {
+    Config,
+    Hotkeys,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum Notification {
+    Problem(String),
+    Resolved(String),
+}
+
+/// Decides which runtime events become desktop notifications. Config problems
+/// and refused hotkeys are shown at once; unavailable hotkeys only once the
+/// outage outlasts `HOTKEY_OUTAGE_GRACE`. A resolution is shown only for the
+/// problem currently on screen.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct NotificationPolicy {
+    pending_outage: Option<(Instant, String)>,
+    shown: Option<ProblemKind>,
+}
+
+#[cfg(target_os = "linux")]
+impl NotificationPolicy {
+    fn event(&mut self, event: &RuntimeEvent, now: Instant) -> Option<Notification> {
+        let resolved = match event {
+            RuntimeEvent::HotkeysUnavailable { .. } => {
+                self.pending_outage = Some((now, event.to_string()));
+                return None;
+            }
+            RuntimeEvent::ConfigFailed { .. } | RuntimeEvent::ConfigRejected { .. } => {
+                return Some(self.problem(ProblemKind::Config, event));
+            }
+            RuntimeEvent::HotkeysRejected { .. } => {
+                self.pending_outage = None;
+                return Some(self.problem(ProblemKind::Hotkeys, event));
+            }
+            RuntimeEvent::ConfigLoaded { .. } => ProblemKind::Config,
+            RuntimeEvent::HotkeysRegistered { .. } | RuntimeEvent::HotkeysRecovered { .. } => {
+                self.pending_outage = None;
+                ProblemKind::Hotkeys
+            }
+            RuntimeEvent::ConfigMissing { .. } => return None,
+        };
+        if self.shown == Some(resolved) {
+            self.shown = None;
+            return Some(Notification::Resolved(event.to_string()));
+        }
+        None
+    }
+
+    /// Shows an outage that has lasted past the grace period.
+    fn tick(&mut self, now: Instant) -> Option<Notification> {
+        let (since, _) = self.pending_outage.as_ref()?;
+        if now.duration_since(*since) < HOTKEY_OUTAGE_GRACE {
+            return None;
+        }
+        let (_, message) = self.pending_outage.take()?;
+        self.shown = Some(ProblemKind::Hotkeys);
+        Some(Notification::Problem(message))
+    }
+
+    fn problem(&mut self, kind: ProblemKind, event: &RuntimeEvent) -> Notification {
+        self.shown = Some(kind);
+        Notification::Problem(event.to_string())
+    }
+}
+
+/// Desktop notifications for problems while no terminal is attached, so a
+/// background App does not fail silently. One notification is updated in place.
+#[cfg(target_os = "linux")]
+struct Notifier {
+    policy: NotificationPolicy,
+    connection: Option<dbus::blocking::Connection>,
+    notification_id: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl Notifier {
+    fn new() -> Option<Self> {
+        Some(Self {
+            policy: NotificationPolicy::default(),
+            connection: None,
+            notification_id: 0,
+        })
+    }
+
+    fn event(&mut self, event: &RuntimeEvent, now: Instant) {
+        if let Some(notification) = self.policy.event(event, now) {
+            self.show(notification);
+        }
+    }
+
+    fn tick(&mut self, now: Instant) {
+        if let Some(notification) = self.policy.tick(now) {
+            self.show(notification);
+        }
+    }
+
+    fn show(&mut self, notification: Notification) {
+        let (summary, body) = match &notification {
+            Notification::Problem(body) => ("Window Zones needs attention", body),
+            Notification::Resolved(body) => ("Window Zones", body),
+        };
+        if self.connection.is_none() {
+            self.connection = dbus::blocking::Connection::new_session().ok();
+        }
+        let Some(connection) = &self.connection else {
             return;
+        };
+        let proxy = connection.with_proxy(
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            Duration::from_millis(500),
+        );
+        let hints = dbus::arg::PropMap::new();
+        let result: Result<(u32,), dbus::Error> = proxy.method_call(
+            "org.freedesktop.Notifications",
+            "Notify",
+            (
+                "Window Zones",
+                self.notification_id,
+                "preferences-system-windows",
+                summary,
+                body.as_str(),
+                Vec::<String>::new(),
+                hints,
+                -1_i32,
+            ),
+        );
+        match result {
+            Ok((id,)) => self.notification_id = id,
+            Err(error) => {
+                eprintln!("Desktop notification failed: {error}");
+                self.connection = None;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct Notifier;
+
+#[cfg(not(target_os = "linux"))]
+impl Notifier {
+    fn new() -> Option<Self> {
+        None
+    }
+
+    fn event(&mut self, _event: &RuntimeEvent, _now: Instant) {}
+
+    fn tick(&mut self, _now: Instant) {}
+}
+
+/// Held for the lifetime of a `run`/`tui` session: only one App instance owns
+/// the hotkeys at a time.
+#[derive(Debug)]
+struct InstanceLock {
+    _file: File,
+}
+
+fn instance_lock_path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(runtime_dir).join("window_zones.lock");
+    }
+    let user = env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_default();
+    env::temp_dir().join(format!("window_zones-{user}.lock"))
+}
+
+fn acquire_instance_lock(path: &Path) -> Result<InstanceLock, String> {
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("cannot open instance lock {}: {error}", path.display()))?;
+    // The pid sits beside the lock: a Windows lock also blocks reading the locked file.
+    let pid_path = path.with_extension("pid");
+    match file.try_lock() {
+        Ok(()) => {
+            // The pid is informational, for the message another instance prints.
+            let _ = fs::write(&pid_path, std::process::id().to_string());
+            Ok(InstanceLock { _file: file })
+        }
+        Err(fs::TryLockError::WouldBlock) => {
+            let owner = fs::read_to_string(&pid_path).unwrap_or_default();
+            let owner = owner.trim();
+            Err(format!(
+                "another window_zones session{} already owns the hotkeys; stop it first (for the systemd service: `systemctl --user stop window-zones`) or use `window_zones dispatch <hotkey>`",
+                if owner.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (pid {owner})")
+                }
+            ))
+        }
+        Err(fs::TryLockError::Error(error)) => {
+            Err(format!("cannot lock {}: {error}", path.display()))
+        }
+    }
+}
+
+fn runtime_status_lines(app: &App) -> Vec<String> {
+    let mut status = vec![
+        "Runtime status:".to_string(),
+        format!(
+            "  config path: {}",
+            app.config_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string())
+        ),
+        format!("  binding count: {}", app.config().bindings.len()),
+        format!("  config state: {:?}", app.config_state()),
+        format!("  hotkey state: {:?}", app.hotkey_state()),
+        format!(
+            "  last action: {}",
+            app.last_dispatch_hotkey().unwrap_or("<none>")
+        ),
+        format!("  dispatch state: {:?}", app.dispatch_state()),
+    ];
+
+    if let ConfigState::Error(error) = app.config_state() {
+        status.push(format!("  config error: {error}"));
+    }
+    if let DispatchState::Error(error) = app.dispatch_state() {
+        status.push(format!("  dispatch error: {error}"));
+    }
+
+    status
+}
+
+fn print_status(app: &App) {
+    for line in runtime_status_lines(app) {
+        println!("{line}");
+    }
+}
+
+fn print_dispatch_state(state: &DispatchState, window_system: &RuntimeWindowSystem) {
+    println!("Dispatch state: {state:?}");
+    match state {
+        DispatchState::Error(error) => println!("  error: {error}"),
+        DispatchState::Succeeded => {
+            if let Some(window_move) = window_system.last_move() {
+                println!(
+                    "  last move: x={} y={} w={} h={}",
+                    window_move.target.x,
+                    window_move.target.y,
+                    window_move.target.width,
+                    window_move.target.height
+                );
+            }
+        }
+        DispatchState::Idle => {}
+    }
+}
+
+fn execute_dispatch(
+    mut app: App,
+    mut window_system: RuntimeWindowSystem,
+    hotkey: &str,
+) -> ExitCode {
+    println!("Using runtime window backend: {}", window_system.name());
+    print_status(&app);
+
+    let state = app.dispatch_hotkey(hotkey, &mut window_system).clone();
+    print_dispatch_state(&state, &window_system);
+    if matches!(state, DispatchState::Error(_)) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn execute_status(app: &App, window_system: &RuntimeWindowSystem) {
+    println!("Using runtime window backend: {}", window_system.name());
+    match window_system.companion_capabilities() {
+        Some((label, Ok(capabilities))) => {
+            println!("{label} companion capabilities: {capabilities:?}");
+        }
+        Some((label, Err(error))) => println!("{label} companion status: {error}"),
+        None => {}
+    }
+    print_status(app);
+}
+
+fn execute_session(
+    config_path: Option<PathBuf>,
+    backend: RuntimeBackend,
+    command: &Command,
+    show_tray: bool,
+) -> ExitCode {
+    let _lock = if matches!(backend, RuntimeBackend::DryRun) {
+        None
+    } else {
+        match acquire_instance_lock(&instance_lock_path()) {
+            Ok(lock) => Some(lock),
+            Err(message) => {
+                eprintln!("Error: {message}");
+                return ExitCode::from(EXIT_ALREADY_RUNNING);
+            }
         }
     };
-    let mut status_snapshot = runtime_status_lines(&app);
 
-    println!("Window backend: {}", window_system.name());
-    println!("Tray menu started. Use tray controls to reload/restart/quit.");
+    let mut runtime = Runtime::new(config_path, backend);
+    let interactive = io::stdin().is_terminal();
 
-    loop {
-        match tray_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(RuntimeTrayCommand::Reload) => {
-                println!("Reload requested.");
-                match app.poll_config_changes() {
-                    ConfigState::Error(error) => {
-                        println!("Config reload error: {error}");
-                    }
-                    state => println!("Config state: {:?}", state),
-                }
-            }
-            Ok(RuntimeTrayCommand::Restart) => {
-                app = build_app(config_path.as_ref());
-                hotkey_system = RuntimeHotkeySystem::new(backend);
-                hotkey_listener_available = true;
-                cached_hotkeys.clear();
-                hotkeys_are_valid = false;
-                last_registration_error = None;
-                println!("Runtime restarted.");
-            }
-            Ok(RuntimeTrayCommand::Status) => print_status(&app),
-            Ok(RuntimeTrayCommand::Quit) => {
-                println!("Session closed.");
-                return;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                println!("Tray channel closed. Session closed.");
-                return;
-            }
-        }
+    if matches!(command, Command::Tui) {
+        let instructions = spawn_stdin_reader(parse_tui_input);
+        run_runtime(&mut runtime, &mut TuiSurface::new(), instructions, true);
+        return ExitCode::SUCCESS;
+    }
 
-        let _ = app.poll_config_changes();
-        rebind_if_configured_hotkeys_changed(
-            &mut app,
-            &mut hotkey_system,
-            &mut cached_hotkeys,
-            &mut hotkeys_are_valid,
-            &mut last_registration_error,
-            "Hotkey registration now",
-        );
-
-        if hotkeys_are_valid {
-            match app.dispatch_next_hotkey(&mut hotkey_system, &mut window_system) {
-                Ok(state) => {
-                    if let DispatchState::Error(error) = state {
-                        println!("Dispatch failed: {error}");
-                    } else if let DispatchState::Succeeded = state {
-                        print_dispatch_state(state, &window_system);
-                    }
-                    hotkey_listener_available = true;
-                }
-                Err(error) if hotkey_listener_available => {
-                    println!("Dispatch failed: {error}");
-                    hotkeys_are_valid = false;
-                    hotkey_listener_available = false;
-                }
-                Err(_) => {
-                    hotkeys_are_valid = false;
-                }
-            }
-        }
-
-        let next_snapshot = runtime_status_lines(&app);
-        if status_snapshot != next_snapshot {
-            tray = match build_tray_menu(&app, &tray_tx) {
-                Ok(new_tray) => {
-                    status_snapshot = next_snapshot;
-                    new_tray
-                }
+    if show_tray {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            let (tx, instructions) = mpsc::channel();
+            let mut surface = match TraySurface::new(&runtime, &tx) {
+                Ok(surface) => surface,
                 Err(error) => {
-                    eprintln!("Failed to refresh tray status: {error}");
-                    tray
+                    eprintln!("Failed to start tray surface: {error}");
+                    return ExitCode::FAILURE;
                 }
             };
+            run_runtime(&mut runtime, &mut surface, instructions, false);
+            return ExitCode::SUCCESS;
         }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        eprintln!("Tray mode is not supported on this platform yet; continuing without it.");
+    }
+
+    let mut surface = CliSurface {
+        prompt: interactive,
+        // Without a terminal nobody reads stdout live: surface problems on the desktop.
+        notifier: if io::stdout().is_terminal() {
+            None
+        } else {
+            Notifier::new()
+        },
+    };
+    let instructions = spawn_stdin_reader(parse_runtime_input);
+    run_runtime(&mut runtime, &mut surface, instructions, interactive);
+    ExitCode::SUCCESS
+}
+
+/// Default modifier chord for the starter config, chosen to avoid the desktop's
+/// own bindings: GNOME uses Ctrl+Alt+arrows for workspaces and Super+arrows
+/// for tiling; Plasma uses Ctrl+Meta+arrows for desktops.
+fn default_chord(current_desktop: Option<&str>) -> &'static str {
+    let desktop_is = |name: &str| {
+        current_desktop.is_some_and(|desktops| {
+            desktops
+                .split(':')
+                .any(|desktop| desktop.eq_ignore_ascii_case(name))
+        })
+    };
+    if desktop_is("GNOME") {
+        "Ctrl+Super"
+    } else if desktop_is("KDE") {
+        "Ctrl+Alt+Super"
+    } else {
+        "Ctrl+Alt"
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<TrayItem, String> {
-    let mut tray = TrayItem::new("Window Zones", IconSource::Resource(""))
-        .map_err(|error| error.to_string())?;
+#[derive(Debug, PartialEq, Eq)]
+enum InitOutcome {
+    Written,
+    AlreadyExists,
+}
 
-    for line in runtime_status_lines(app) {
-        tray.add_label(&line).map_err(|error| error.to_string())?;
+fn write_starter_config(path: &Path, chord: &str, force: bool) -> Result<InitOutcome, String> {
+    if path.exists() && !force {
+        return Ok(InitOutcome::AlreadyExists);
     }
+    let contents = starter_config(chord);
+    parse_config(&contents)
+        .map_err(|error| format!("--chord `{chord}` does not form valid hotkeys: {error}"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, contents)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    Ok(InitOutcome::Written)
+}
 
-    let status_tx = tx.clone();
-    tray.add_menu_item("Show status", move || {
-        let _ = status_tx.send(RuntimeTrayCommand::Status);
-    })
-    .map_err(|error| error.to_string())?;
+fn execute_init(config_path: Option<PathBuf>, chord: Option<&str>, force: bool) -> ExitCode {
+    let path = match config_path.map_or_else(default_config_path, Ok) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let current_desktop = env::var("XDG_CURRENT_DESKTOP").ok();
+    let chord = chord.unwrap_or_else(|| default_chord(current_desktop.as_deref()));
 
-    let reload_tx = tx.clone();
-    tray.add_menu_item("Reload", move || {
-        let _ = reload_tx.send(RuntimeTrayCommand::Reload);
-    })
-    .map_err(|error| error.to_string())?;
-
-    let restart_tx = tx.clone();
-    tray.add_menu_item("Restart", move || {
-        let _ = restart_tx.send(RuntimeTrayCommand::Restart);
-    })
-    .map_err(|error| error.to_string())?;
-
-    let quit_tx = tx.clone();
-    tray.add_menu_item("Quit", move || {
-        let _ = quit_tx.send(RuntimeTrayCommand::Quit);
-    })
-    .map_err(|error| error.to_string())?;
-
-    Ok(tray)
+    match write_starter_config(&path, chord, force) {
+        Ok(InitOutcome::Written) => {
+            println!("Wrote starter config to {}", path.display());
+            println!(
+                "Hotkeys use {chord}+<key>: arrows for halves (repeat to cycle widths), U/I/J/K corners, D/F/G thirds, E/T two-thirds, Return maximize, C center, Backspace restore, Shift+Left/Right other display."
+            );
+            println!("Edit it any time; a running window_zones applies changes automatically.");
+            ExitCode::SUCCESS
+        }
+        Ok(InitOutcome::AlreadyExists) => {
+            println!(
+                "Config already exists at {}; pass --force to replace it",
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_help() {
-    println!("window_zones: execute configured window movement actions");
+    println!("window_zones: move and resize the focused window into zones with hotkeys");
     println!("Usage:");
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] status"
+        "  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] status"
     );
-    println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] dispatch <HOTKEY>"
-    );
-    println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] run"
-    );
-    println!(
-        "  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] tui"
-    );
+    println!("  window_zones [--config <path>] [--backend <...>] dispatch <HOTKEY>");
+    println!("  window_zones [--tray] [--config <path>] [--backend <...>] run");
+    println!("  window_zones [--config <path>] [--backend <...>] tui");
+    println!("  window_zones [--config <path>] init [--chord <MODIFIERS>] [--force]");
     println!("Commands:");
+    println!("  init             write a starter config (default chord depends on the desktop)");
     println!("  status           print runtime state and exit");
-    println!("  dispatch         dispatch a single hotkey and exit");
-    println!("  run              start an interactive session (reload/restart/quit)");
-    println!("  run --tray       start optional tray/menu surface (reload/restart/quit)");
-    println!("  tui              start the ANSI runtime dashboard");
-    println!("  q/quit/exit      leave interactive session");
+    println!(
+        "  dispatch         run the action bound to HOTKEY once and exit (non-zero on failure)"
+    );
+    println!("  run              serve hotkeys until quit; keeps running without a terminal");
+    println!("  run --tray       serve hotkeys with a tray status menu");
+    println!("  tui              serve hotkeys with the ANSI dashboard");
+    println!("Session commands: status, reload, restart, dispatch HOTKEY, help, q/quit/exit");
 }
 
 fn main() -> ExitCode {
-    match parse_args() {
+    let args = match parse_args() {
         ParseStatus::Help => {
             print_help();
+            return ExitCode::SUCCESS;
         }
         ParseStatus::Err(message) => {
             eprintln!("Error: {message}");
             print_help();
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
-        ParseStatus::Ok(config) => {
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            if !matches!(config.backend, BackendPreference::DryRun) {
-                eprintln!("Unsupported host OS for live window-system actions. Use --dry-run.");
-                std::process::exit(1);
-            }
+        ParseStatus::Ok(args) => args,
+    };
 
-            let backend = match resolve_runtime_backend(config.backend) {
-                Ok(backend) => backend,
-                Err(error) => {
-                    eprintln!("Backend selection failed: {error}");
-                    std::process::exit(1);
-                }
-            };
-            let app = build_app(config.config_path.as_ref());
-            let window_system = RuntimeWindowSystem::with_backend(backend);
-
-            match config.command {
-                Command::Status => execute_status(app, backend),
-                Command::Dispatch { hotkey } => {
-                    return execute_dispatch(app, window_system, hotkey);
-                }
-                Command::Tui => execute_tui(app, backend, window_system),
-                Command::Run => {
-                    execute_run(app, backend, window_system, config.show_tray);
-                }
-            }
-        }
+    if matches!(args.command, Command::Init) {
+        return execute_init(args.config_path, args.chord.as_deref(), args.force);
     }
-    ExitCode::SUCCESS
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    if !matches!(args.backend, BackendPreference::DryRun) {
+        eprintln!("Unsupported host OS for live window-system actions. Use --dry-run.");
+        return ExitCode::FAILURE;
+    }
+
+    let backend = match resolve_runtime_backend(args.backend) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("Backend selection failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match &args.command {
+        Command::Status => {
+            let app = build_app(args.config_path.as_ref());
+            execute_status(&app, &RuntimeWindowSystem::with_backend(backend));
+            ExitCode::SUCCESS
+        }
+        Command::Dispatch { hotkey } => execute_dispatch(
+            build_app(args.config_path.as_ref()),
+            RuntimeWindowSystem::with_backend(backend),
+            hotkey,
+        ),
+        Command::Run | Command::Tui => {
+            execute_session(args.config_path, backend, &args.command, args.show_tray)
+        }
+        Command::Init => unreachable!("handled before backend selection"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, fs, path::PathBuf};
-
-    #[test]
-    fn parses_run_with_tray() {
-        let ParseStatus::Ok(args) = parse(&["run", "--tray"]) else {
-            panic!("expected parsed args");
-        };
-        assert!(matches!(args.command, Command::Run));
-        assert!(args.show_tray);
-    }
-
-    #[test]
-    fn parse_rejects_tray_with_non_run_command() {
-        assert!(matches!(parse(&["status", "--tray"]), ParseStatus::Err(_)));
-        assert!(matches!(
-            parse(&["dispatch", "Ctrl+Alt+Left", "--tray"]),
-            ParseStatus::Err(_)
-        ));
-    }
 
     fn parse(raw: &[&str]) -> ParseStatus {
         let args: Vec<String> = raw.iter().map(|value| (*value).to_string()).collect();
         parse_args_from_inputs(&args)
     }
 
-    #[test]
-    fn parses_tui_command() {
-        let ParseStatus::Ok(args) = parse(&["tui"]) else {
-            panic!("expected parsed args");
-        };
-        assert!(matches!(args.command, Command::Tui));
+    fn temp_path(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("window_zones_main_{}_{name}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+        path
     }
 
     #[test]
-    fn parse_rejects_tui_with_tray() {
-        assert!(matches!(parse(&["tui", "--tray"]), ParseStatus::Err(_)));
+    fn parses_commands_and_rejects_misplaced_flags() {
+        assert!(matches!(
+            parse(&["run", "--tray"]),
+            ParseStatus::Ok(CliArgs {
+                command: Command::Run,
+                show_tray: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&[]),
+            ParseStatus::Ok(CliArgs {
+                command: Command::Run,
+                ..
+            })
+        ));
+        assert!(matches!(
+            &parse(&["dispatch", "Ctrl+Alt+Left"]),
+            ParseStatus::Ok(CliArgs { command: Command::Dispatch { hotkey }, .. })
+                if hotkey == "Ctrl+Alt+Left"
+        ));
+        assert!(matches!(
+            &parse(&["init", "--chord", "Ctrl+Super", "--force"]),
+            ParseStatus::Ok(CliArgs { command: Command::Init, chord: Some(chord), force: true, .. })
+                if chord == "Ctrl+Super"
+        ));
+        for invalid in [
+            &["status", "--tray"][..],
+            &["tui", "--tray"],
+            &["dispatch"],
+            &["dispatch", "a", "b"],
+            &["run", "--force"],
+            &["status", "--chord", "Ctrl+Alt"],
+            &["init", "--chord"],
+            &["status", "run"],
+            &["--mystery"],
+        ] {
+            assert!(matches!(parse(invalid), ParseStatus::Err(_)), "{invalid:?}");
+        }
     }
 
     #[test]
     fn tui_refresh_is_status_without_changing_run_input() {
-        assert!(matches!(
-            parse_tui_input("refresh"),
-            RuntimeInstruction::Status
-        ));
-        assert!(matches!(
+        assert_eq!(parse_tui_input("refresh"), RuntimeInstruction::Status);
+        assert_eq!(
             parse_runtime_input("refresh"),
-            RuntimeInstruction::Dispatch(hotkey) if hotkey == "refresh"
-        ));
-    }
-
-    #[test]
-    fn parses_status_command() {
-        let ParseStatus::Ok(args) = parse(&["status"]) else {
-            panic!("expected parsed args");
-        };
-        assert!(matches!(args.command, Command::Status));
-    }
-
-    #[test]
-    fn parses_dispatch_command_with_hotkey() {
-        let ParseStatus::Ok(args) = parse(&["dispatch", "Ctrl+Alt+Left"]) else {
-            panic!("expected parsed args");
-        };
-        assert!(matches!(
-            args.command,
-            Command::Dispatch { hotkey } if hotkey == "Ctrl+Alt+Left"
-        ));
-    }
-
-    #[test]
-    fn parse_rejects_dispatch_without_hotkey() {
-        assert!(matches!(parse(&["dispatch"]), ParseStatus::Err(_)));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn parse_accepts_macos_backend() {
-        let ParseStatus::Ok(args) = parse(&["status", "--backend", "macos"]) else {
-            panic!("expected parsed args");
-        };
-        assert!(matches!(args.backend, BackendPreference::MacOS));
-    }
-    #[test]
-    fn parse_rejects_unknown_flags() {
-        assert!(matches!(parse(&["--mystery"]), ParseStatus::Err(_)));
-    }
-    #[derive(Debug)]
-    struct FakeHotkeySystem {
-        registration_calls: usize,
-        registered_hotkeys: Vec<String>,
-        outcomes: VecDeque<Result<(), HotkeySystemError>>,
-    }
-
-    impl FakeHotkeySystem {
-        fn new(outcomes: Vec<Result<(), HotkeySystemError>>) -> Self {
-            Self {
-                registration_calls: 0,
-                registered_hotkeys: Vec::new(),
-                outcomes: outcomes.into(),
-            }
-        }
-    }
-
-    impl HotkeySystem for FakeHotkeySystem {
-        fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-            self.registration_calls += 1;
-            self.registered_hotkeys = hotkeys.to_vec();
-            self.outcomes.pop_front().unwrap_or(Ok(()))
-        }
-
-        fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-            Ok(None)
-        }
-    }
-
-    fn write_test_config(name: &str, contents: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "window_zones_main_{}_{}.toml",
-            std::process::id(),
-            name
-        ));
-        let _ = fs::remove_file(&path);
-        fs::write(&path, contents).unwrap();
-        path
+            RuntimeInstruction::Dispatch("refresh".to_string())
+        );
+        assert_eq!(
+            parse_runtime_input("dispatch"),
+            RuntimeInstruction::Unknown("missing hotkey argument".to_string())
+        );
     }
 
     #[test]
@@ -1575,7 +1846,6 @@ mod tests {
         let degraded = tui_capability_status_from(Some(Ok(vec!["focused-window".to_string()])));
         assert_eq!(degraded.window, "focused-window");
         assert_eq!(degraded.hotkey, "<none>");
-        assert_eq!(degraded.diagnostic, None);
 
         let unavailable =
             tui_capability_status_from(Some(Err("GNOME companion unavailable".to_string())));
@@ -1585,108 +1855,128 @@ mod tests {
             unavailable.diagnostic.as_deref(),
             Some("GNOME companion unavailable")
         );
-
-        let dry_run = tui_capability_status(RuntimeBackend::DryRun);
-        assert_eq!(dry_run.window, "focused-window, displays, move-resize");
-        assert_eq!(dry_run.hotkey, "hotkeys");
-        assert_eq!(dry_run.diagnostic, None);
     }
 
     #[test]
     fn tui_error_precedence_prefers_runtime_errors_over_companion_diagnostics() {
+        struct RefusingHotkeys;
+        impl HotkeySystem for RefusingHotkeys {
+            fn register_hotkeys(&mut self, _: &[String]) -> Result<(), HotkeySystemError> {
+                Err(HotkeySystemError::Rejected("taken".to_string()))
+            }
+            fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+                Ok(None)
+            }
+        }
         let capability_status = TuiCapabilityStatus {
             window: "unavailable".to_string(),
             hotkey: "unavailable".to_string(),
             diagnostic: Some("companion unavailable".to_string()),
         };
 
-        let missing_path = std::env::temp_dir().join(format!(
-            "window_zones_main_missing_{}.toml",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&missing_path);
-        let missing_app = App::start_at(missing_path);
+        let missing_app = App::start_at(temp_path("missing.toml"));
+        let config_path = temp_path("error_precedence.toml");
+        fs::write(&config_path, "bindings = [").unwrap();
+        let mut app = App::start_at(&config_path);
+        let config_error = tui_last_error(&app, &capability_status);
+        app.tick(&mut RefusingHotkeys, Instant::now());
+        let hotkey_error = tui_last_error(&app, &capability_status);
+        app.dispatch_hotkey("Ctrl+Alt+Left", &mut DryRunWindowSystem::new());
+        let dispatch_error = tui_last_error(&app, &capability_status);
+        fs::remove_file(config_path).unwrap();
+
         assert_eq!(
             tui_last_error(&missing_app, &capability_status),
             "companion unavailable"
         );
-
-        let config_path = write_test_config("error_precedence", "bindings = [");
-        let mut app = App::start_at(&config_path);
-        assert!(tui_last_error(&app, &capability_status).starts_with("config: "));
-
-        let mut hotkeys = FakeHotkeySystem::new(vec![Err(HotkeySystemError::Platform(
-            "permission denied".to_string(),
-        ))]);
-        assert!(app.register_hotkeys(&mut hotkeys).is_err());
-        assert!(tui_last_error(&app, &capability_status).starts_with("hotkey registration: "));
-
-        let mut window_system = DryRunWindowSystem::new();
-        app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
-        assert!(tui_last_error(&app, &capability_status).starts_with("dispatch: "));
-
-        fs::remove_file(config_path).unwrap();
+        assert!(config_error.starts_with("config: "), "{config_error}");
+        assert!(
+            hotkey_error.starts_with("hotkey registration: "),
+            "{hotkey_error}"
+        );
+        assert!(dispatch_error.starts_with("dispatch: "), "{dispatch_error}");
     }
 
     #[test]
-    fn rebind_retries_failed_registration_and_skips_unchanged_valid_sets() {
-        let config_path = write_test_config(
-            "rebind",
-            r#"[[bindings]]
-hotkey = "Ctrl+Alt+Left"
-action = { type = "move-to-zone", zone = "left-half" }
-"#,
-        );
-        let mut app = App::start_at(&config_path);
-        let mut hotkeys = FakeHotkeySystem::new(vec![
-            Err(HotkeySystemError::Platform("unavailable".to_string())),
-            Ok(()),
-        ]);
-        let mut cached_hotkeys = Vec::new();
-        let mut registration_is_valid = false;
-        let mut last_registration_error = None;
+    fn dry_run_runtime_cycles_and_restores_the_simulated_window() {
+        let config_path = temp_path("dry_run_cycle.toml");
+        fs::write(&config_path, starter_config("Ctrl+Alt")).unwrap();
+        let mut runtime = Runtime::new(Some(config_path.clone()), RuntimeBackend::DryRun);
 
-        rebind_if_configured_hotkeys_changed(
-            &mut app,
-            &mut hotkeys,
-            &mut cached_hotkeys,
-            &mut registration_is_valid,
-            &mut last_registration_error,
-            "test registration",
-        );
-        assert_eq!(hotkeys.registration_calls, 1);
-        assert!(!registration_is_valid);
-        assert!(cached_hotkeys.is_empty());
-        assert_eq!(
-            last_registration_error.as_deref(),
-            Some("platform hotkey error: unavailable")
-        );
-
-        rebind_if_configured_hotkeys_changed(
-            &mut app,
-            &mut hotkeys,
-            &mut cached_hotkeys,
-            &mut registration_is_valid,
-            &mut last_registration_error,
-            "test registration",
-        );
-        assert_eq!(hotkeys.registration_calls, 2);
-        assert!(registration_is_valid);
-        assert_eq!(cached_hotkeys, vec!["alt+ctrl+left".to_string()]);
-        assert!(last_registration_error.is_none());
-        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
-
-        rebind_if_configured_hotkeys_changed(
-            &mut app,
-            &mut hotkeys,
-            &mut cached_hotkeys,
-            &mut registration_is_valid,
-            &mut last_registration_error,
-            "test registration",
-        );
-        assert_eq!(hotkeys.registration_calls, 2);
-
+        let mut targets = Vec::new();
+        for hotkey in [
+            "ctrl+alt+left",
+            "ctrl+alt+left",
+            "ctrl+alt+left",
+            "ctrl+alt+backspace",
+        ] {
+            assert_eq!(
+                runtime.dispatch(hotkey),
+                DispatchState::Succeeded,
+                "{hotkey}"
+            );
+            targets.push(runtime.window_system.last_move().unwrap().target);
+        }
         fs::remove_file(config_path).unwrap();
+
+        assert_eq!(
+            targets,
+            vec![
+                Rect::new(0, 0, 960, 1080),
+                Rect::new(0, 0, 1280, 1080),
+                Rect::new(0, 0, 640, 1080),
+                Rect::new(40, 40, 640, 480),
+            ]
+        );
+    }
+
+    #[test]
+    fn second_instance_lock_is_refused_until_the_first_is_released() {
+        let path = temp_path("instance.lock");
+
+        let first = acquire_instance_lock(&path).unwrap();
+        let second = acquire_instance_lock(&path).unwrap_err();
+        drop(first);
+        let third = acquire_instance_lock(&path);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(path.with_extension("pid")).unwrap();
+
+        assert!(
+            second.contains(&format!("pid {}", std::process::id())),
+            "{second}"
+        );
+        assert!(third.is_ok());
+    }
+
+    #[test]
+    fn init_writes_a_valid_config_once_and_rejects_bad_chords() {
+        let directory = temp_path("init");
+        let path = directory.join("nested").join("config.toml");
+
+        let written = write_starter_config(&path, "Ctrl+Super", false);
+        fs::write(&path, "# user edits\n").unwrap();
+        let kept = write_starter_config(&path, "Ctrl+Super", false);
+        let kept_contents = fs::read_to_string(&path).unwrap();
+        let bad_chord = write_starter_config(&path, "Ctrl+Hyper", true);
+        let forced = write_starter_config(&path, "Ctrl+Alt", true);
+        let forced_config = parse_config(&fs::read_to_string(&path).unwrap()).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+
+        assert_eq!(written, Ok(InitOutcome::Written));
+        assert_eq!(kept, Ok(InitOutcome::AlreadyExists));
+        assert_eq!(kept_contents, "# user edits\n");
+        assert!(bad_chord.unwrap_err().contains("Ctrl+Hyper"));
+        assert_eq!(forced, Ok(InitOutcome::Written));
+        assert_eq!(forced_config.bindings[0].hotkey, "alt+ctrl+left");
+    }
+
+    #[test]
+    fn default_chord_avoids_desktop_bindings() {
+        assert_eq!(default_chord(Some("GNOME")), "Ctrl+Super");
+        assert_eq!(default_chord(Some("ubuntu:GNOME")), "Ctrl+Super");
+        assert_eq!(default_chord(Some("KDE")), "Ctrl+Alt+Super");
+        assert_eq!(default_chord(Some("XFCE")), "Ctrl+Alt");
+        assert_eq!(default_chord(None), "Ctrl+Alt");
     }
 
     #[cfg(target_os = "linux")]
@@ -1697,7 +1987,8 @@ action = { type = "move-to-zone", zone = "left-half" }
             "x11"
         );
         assert_eq!(
-            RuntimeWindowSystem::with_backend(RuntimeBackend::Wayland).name(),
+            RuntimeWindowSystem::with_backend(RuntimeBackend::Wayland(ScriptedCompositor::Sway))
+                .name(),
             "wayland"
         );
         assert_eq!(
@@ -1714,23 +2005,35 @@ action = { type = "move-to-zone", zone = "left-half" }
     #[test]
     fn linux_backend_routing_never_crosses_session_protocols() {
         assert_eq!(
-            resolve_linux_backend_in_session(BackendPreference::Auto, SessionIdentity::X11),
+            resolve_linux_backend_in_session(BackendPreference::Auto, SessionIdentity::X11, false),
             Ok(RuntimeBackend::X11)
         );
         assert_eq!(
-            resolve_linux_backend_in_session(BackendPreference::X11, SessionIdentity::X11),
+            resolve_linux_backend_in_session(BackendPreference::X11, SessionIdentity::X11, false),
             Ok(RuntimeBackend::X11)
         );
         assert!(
-            resolve_linux_backend_in_session(BackendPreference::X11, SessionIdentity::Wayland)
-                .is_err()
+            resolve_linux_backend_in_session(
+                BackendPreference::X11,
+                SessionIdentity::Wayland,
+                true
+            )
+            .is_err()
         );
         assert!(
-            resolve_linux_backend_in_session(BackendPreference::Wayland, SessionIdentity::X11)
-                .is_err()
+            resolve_linux_backend_in_session(
+                BackendPreference::Wayland,
+                SessionIdentity::X11,
+                false
+            )
+            .is_err()
         );
         assert_eq!(
-            resolve_linux_backend_in_session(BackendPreference::DryRun, SessionIdentity::Wayland),
+            resolve_linux_backend_in_session(
+                BackendPreference::DryRun,
+                SessionIdentity::Wayland,
+                true
+            ),
             Ok(RuntimeBackend::DryRun)
         );
     }
@@ -1755,7 +2058,7 @@ action = { type = "move-to-zone", zone = "left-half" }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unresolved_sessions_require_explicit_backend_selection() {
+    fn unresolved_sessions_require_explicit_backend_and_x11_needs_no_wayland_signal() {
         for (session_type, wayland, display) in [
             (None, false, false),
             (Some("x11"), true, false),
@@ -1765,10 +2068,11 @@ action = { type = "move-to-zone", zone = "left-half" }
             (Some(""), true, false),
         ] {
             let identity =
-                session_identity(session_type.map(std::ffi::OsStr::new), wayland, display);
-            assert!(matches!(identity, SessionIdentity::Unresolved(_)));
+                || session_identity(session_type.map(std::ffi::OsStr::new), wayland, display);
+            assert!(matches!(identity(), SessionIdentity::Unresolved(_)));
             let error =
-                resolve_linux_backend_in_session(BackendPreference::Auto, identity).unwrap_err();
+                resolve_linux_backend_in_session(BackendPreference::Auto, identity(), wayland)
+                    .unwrap_err();
             for hint in [
                 "XDG_SESSION_TYPE",
                 "WAYLAND_DISPLAY",
@@ -1777,32 +2081,101 @@ action = { type = "move-to-zone", zone = "left-half" }
             ] {
                 assert!(error.contains(hint), "{error}");
             }
+            let explicit_x11 =
+                resolve_linux_backend_in_session(BackendPreference::X11, identity(), wayland);
             assert_eq!(
-                resolve_linux_backend_in_session(
-                    BackendPreference::X11,
-                    session_identity(session_type.map(std::ffi::OsStr::new), wayland, display),
-                ),
-                Ok(RuntimeBackend::X11)
+                explicit_x11.is_ok(),
+                !wayland,
+                "{session_type:?} {wayland} {display}"
             );
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn dry_run_registration_does_not_need_a_native_listener() {
-        let mut hotkeys = RuntimeHotkeySystem::new(RuntimeBackend::DryRun);
-        assert_eq!(hotkeys.register_hotkeys(&["ctrl+a".to_string()]), Ok(()));
-        assert_eq!(hotkeys.next_hotkey(), Ok(None));
+    fn short_hotkey_outages_never_notify_and_long_ones_notify_once() {
+        let unavailable = RuntimeEvent::HotkeysUnavailable {
+            message: "companion absent".to_string(),
+        };
+        let recovered = RuntimeEvent::HotkeysRecovered { count: 18 };
+        let start = Instant::now();
+
+        // Login race: the companion appears a few seconds after the App.
+        let mut login = NotificationPolicy::default();
+        let login_notifications = [
+            login.event(&RuntimeEvent::ConfigLoaded { bindings: 18 }, start),
+            login.event(&unavailable, start),
+            login.tick(start + Duration::from_secs(3)),
+            login.event(&recovered, start + Duration::from_secs(4)),
+            login.tick(start + HOTKEY_OUTAGE_GRACE * 2),
+        ];
+
+        // The companion stays away: one notification, then its resolution.
+        let mut outage = NotificationPolicy::default();
+        outage.event(&unavailable, start);
+        let before_grace = outage.tick(start + HOTKEY_OUTAGE_GRACE - Duration::from_secs(1));
+        let after_grace = outage.tick(start + HOTKEY_OUTAGE_GRACE);
+        let again = outage.tick(start + HOTKEY_OUTAGE_GRACE * 3);
+        let resolution = outage.event(&recovered, start + HOTKEY_OUTAGE_GRACE * 4);
+
+        assert_eq!(login_notifications, [None, None, None, None, None]);
+        assert_eq!(before_grace, None);
+        assert_eq!(
+            after_grace,
+            Some(Notification::Problem(unavailable.to_string()))
+        );
+        assert_eq!(again, None);
+        assert_eq!(
+            resolution,
+            Some(Notification::Resolved(recovered.to_string()))
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn sway_hyprland_registration_requires_compositor_bindings() {
-        let mut hotkeys = RuntimeHotkeySystem::new(RuntimeBackend::Wayland);
+    fn config_problems_notify_at_once_and_only_their_own_fix_resolves_them() {
+        let start = Instant::now();
+        let failed = RuntimeEvent::ConfigFailed {
+            message: "bad toml".to_string(),
+        };
+        let refused = RuntimeEvent::HotkeysRejected {
+            message: "ctrl+super+c is taken".to_string(),
+        };
+        let loaded = RuntimeEvent::ConfigLoaded { bindings: 18 };
+        let mut policy = NotificationPolicy::default();
+
+        let config_problem = policy.event(&failed, start);
+        let config_fixed = policy.event(&loaded, start);
+        let hotkey_problem = policy.event(&refused, start);
+        // A config reload alone does not claim the refused hotkeys are fixed.
+        let unrelated_reload = policy.event(&loaded, start);
+        let hotkeys_fixed = policy.event(&RuntimeEvent::HotkeysRegistered { count: 18 }, start);
+
+        assert_eq!(
+            config_problem,
+            Some(Notification::Problem(failed.to_string()))
+        );
+        assert_eq!(
+            config_fixed,
+            Some(Notification::Resolved(loaded.to_string()))
+        );
+        assert_eq!(
+            hotkey_problem,
+            Some(Notification::Problem(refused.to_string()))
+        );
+        assert_eq!(unrelated_reload, None);
+        assert!(matches!(hotkeys_fixed, Some(Notification::Resolved(_))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sway_hyprland_refuse_global_hotkeys_once() {
+        let mut hotkeys =
+            RuntimeHotkeySystem::new(RuntimeBackend::Wayland(ScriptedCompositor::Hyprland));
         assert_eq!(hotkeys.register_hotkeys(&[]), Ok(()));
         assert!(matches!(
             hotkeys.register_hotkeys(&["ctrl+a".to_string()]),
-            Err(HotkeySystemError::Platform(_))
+            Err(HotkeySystemError::Rejected(message)) if message.contains("window_zones dispatch")
         ));
-        assert_eq!(hotkeys.next_hotkey(), Ok(None));
     }
 }

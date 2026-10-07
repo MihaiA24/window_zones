@@ -4,12 +4,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::geometry::Rect;
 
-/// Built-in zones available in v1 config.
+/// Built-in zones available in config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BuiltInZone {
     LeftHalf,
     RightHalf,
+    TopHalf,
+    BottomHalf,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
     LeftThird,
     CenterThird,
     RightThird,
@@ -18,9 +24,15 @@ pub enum BuiltInZone {
     Maximize,
 }
 
-pub const ALL_BUILT_IN_ZONES: [BuiltInZone; 8] = [
+pub const ALL_BUILT_IN_ZONES: [BuiltInZone; 14] = [
     BuiltInZone::LeftHalf,
     BuiltInZone::RightHalf,
+    BuiltInZone::TopHalf,
+    BuiltInZone::BottomHalf,
+    BuiltInZone::TopLeft,
+    BuiltInZone::TopRight,
+    BuiltInZone::BottomLeft,
+    BuiltInZone::BottomRight,
     BuiltInZone::LeftThird,
     BuiltInZone::CenterThird,
     BuiltInZone::RightThird,
@@ -71,6 +83,12 @@ pub fn built_in_zone_from_name(name: &str) -> Option<BuiltInZone> {
     match name {
         "left-half" => Some(BuiltInZone::LeftHalf),
         "right-half" => Some(BuiltInZone::RightHalf),
+        "top-half" => Some(BuiltInZone::TopHalf),
+        "bottom-half" => Some(BuiltInZone::BottomHalf),
+        "top-left" => Some(BuiltInZone::TopLeft),
+        "top-right" => Some(BuiltInZone::TopRight),
+        "bottom-left" => Some(BuiltInZone::BottomLeft),
+        "bottom-right" => Some(BuiltInZone::BottomRight),
         "left-third" => Some(BuiltInZone::LeftThird),
         "center-third" => Some(BuiltInZone::CenterThird),
         "right-third" => Some(BuiltInZone::RightThird),
@@ -107,6 +125,12 @@ pub fn rect_for_built_in_zone(zone: BuiltInZone, usable_area: Rect) -> Rect {
     match zone {
         BuiltInZone::LeftHalf => left_fraction(usable_area, 2, 1),
         BuiltInZone::RightHalf => right_fraction(usable_area, 2, 1),
+        BuiltInZone::TopHalf => top_half(usable_area),
+        BuiltInZone::BottomHalf => bottom_half(usable_area),
+        BuiltInZone::TopLeft => top_half(left_fraction(usable_area, 2, 1)),
+        BuiltInZone::TopRight => top_half(right_fraction(usable_area, 2, 1)),
+        BuiltInZone::BottomLeft => bottom_half(left_fraction(usable_area, 2, 1)),
+        BuiltInZone::BottomRight => bottom_half(right_fraction(usable_area, 2, 1)),
         BuiltInZone::LeftThird => left_fraction(usable_area, 3, 1),
         BuiltInZone::CenterThird => center_third(usable_area),
         BuiltInZone::RightThird => right_fraction(usable_area, 3, 1),
@@ -128,6 +152,15 @@ fn left_fraction(area: Rect, denominator: u32, numerator: u32) -> Rect {
 fn right_fraction(area: Rect, denominator: u32, numerator: u32) -> Rect {
     let width = area.width.saturating_mul(numerator) / denominator;
     Rect::new(area.right() - width as i32, area.y, width, area.height)
+}
+
+fn top_half(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height / 2)
+}
+
+fn bottom_half(area: Rect) -> Rect {
+    let height = area.height / 2;
+    Rect::new(area.x, area.bottom() - height as i32, area.width, height)
 }
 
 fn center_third(area: Rect) -> Rect {
@@ -253,5 +286,21 @@ mod tests {
         assert_eq!(right, Rect::new(38, 0, 67, 50));
         assert_eq!(left.x, area.x);
         assert_eq!(right.right(), area.right());
+    }
+
+    #[test]
+    fn vertical_halves_and_quarters_preserve_outer_edges_on_odd_areas() {
+        let area = Rect::new(-1921, 31, 1921, 1049);
+        let zone = |name| rect_for_zone(name, area, &BTreeMap::new()).unwrap();
+
+        assert_eq!(zone("top-half"), Rect::new(-1921, 31, 1921, 524));
+        assert_eq!(zone("bottom-half"), Rect::new(-1921, 556, 1921, 524));
+        assert_eq!(zone("bottom-half").bottom(), area.bottom());
+        assert_eq!(zone("top-left"), Rect::new(-1921, 31, 960, 524));
+        assert_eq!(zone("top-right"), Rect::new(-960, 31, 960, 524));
+        assert_eq!(zone("bottom-left"), Rect::new(-1921, 556, 960, 524));
+        assert_eq!(zone("bottom-right"), Rect::new(-960, 556, 960, 524));
+        assert_eq!(zone("bottom-right").right(), area.right());
+        assert_eq!(zone("bottom-right").bottom(), area.bottom());
     }
 }

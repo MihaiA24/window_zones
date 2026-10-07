@@ -6,18 +6,19 @@ use std::time::Duration;
 
 use dbus::arg::{AppendAll, ReadAll};
 use dbus::blocking::Connection;
+use dbus::channel::MatchingReceiver;
 use dbus::message::MatchRule;
 use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
-    DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowMove,
-    WindowSystem, WindowSystemError,
+    DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowId,
+    WindowMove, WindowSystem, WindowSystemError,
 };
 
 pub const GNOME_SERVICE_NAME: &str = "org.window_zones.Gnome";
 pub const GNOME_OBJECT_PATH: &str = "/org/window_zones/Gnome";
-pub const GNOME_INTERFACE: &str = "org.window_zones.Gnome1";
+pub const GNOME_INTERFACE: &str = "org.window_zones.Gnome2";
 const HOTKEY_SIGNAL: &str = "HotkeyPressed";
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -31,11 +32,11 @@ type DisplayPayload = (String, i32, i32, u32, u32);
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GnomeIntegrationError {
     #[error(
-        "GNOME companion is unavailable: {message}; install and enable the GNOME Shell companion, then retry"
+        "GNOME companion is unavailable: {message}; install and enable it (`scripts/install.sh --gnome-extension`), then log out and back in so GNOME Shell loads it"
     )]
     Unavailable { message: String },
     #[error(
-        "GNOME companion is incompatible: {message}; upgrade the GNOME Shell companion for org.window_zones.Gnome1"
+        "GNOME companion is incompatible: {message}; upgrade the GNOME Shell companion for org.window_zones.Gnome2"
     )]
     Incompatible { message: String },
     #[error(
@@ -52,6 +53,8 @@ pub enum GnomeIntegrationError {
         "GNOME companion rejected the request: {message}; restore an eligible focused window or correct the request"
     )]
     Invalid { message: String },
+    #[error("GNOME companion window no longer exists: {message}; focus another window and retry")]
+    WindowGone { message: String },
     #[error("GNOME companion operation failed: {message}; retry the operation")]
     Operation { message: String },
 }
@@ -60,28 +63,85 @@ impl GnomeIntegrationError {
     fn should_reconnect(&self) -> bool {
         matches!(self, Self::Unavailable { .. } | Self::Incompatible { .. })
     }
+
+    /// A refused set leaves the companion's previous set registered; every other
+    /// failure means nothing is known to be registered.
+    fn into_hotkey_error(self) -> HotkeySystemError {
+        match self {
+            Self::Unsupported { .. } | Self::Invalid { .. } => {
+                HotkeySystemError::Rejected(self.to_string())
+            }
+            _ => HotkeySystemError::Unavailable(self.to_string()),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+struct WindowConnection {
+    connection: Connection,
+    capabilities: Option<Vec<String>>,
+}
+
+#[derive(Clone)]
 pub struct GnomeWindowSystem {
     bus_address: Option<String>,
+    cache: Arc<Mutex<Option<WindowConnection>>>,
+}
+
+impl fmt::Debug for GnomeWindowSystem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GnomeWindowSystem")
+            .field("bus_address", &self.bus_address)
+            .field("connection_established", &self.cache.lock().is_some())
+            .finish()
+    }
 }
 
 impl GnomeWindowSystem {
     pub fn new() -> Self {
-        Self { bus_address: None }
+        Self {
+            bus_address: None,
+            cache: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, GnomeIntegrationError> {
-        let connection = connect(self.bus_address.as_deref())?;
-        get_capabilities(&connection)
+        self.with_connection(|cached| Ok(cached.capabilities.as_ref().unwrap().clone()))
     }
 
     #[cfg(test)]
     fn with_bus_address(bus_address: impl Into<String>) -> Self {
         Self {
             bus_address: Some(bus_address.into()),
+            cache: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn with_connection<R>(
+        &self,
+        call: impl FnOnce(&WindowConnection) -> Result<R, GnomeIntegrationError>,
+    ) -> Result<R, GnomeIntegrationError> {
+        let mut cache = self.cache.lock();
+        let result = (|| {
+            if cache.is_none() {
+                *cache = Some(WindowConnection {
+                    connection: connect(self.bus_address.as_deref())?,
+                    capabilities: None,
+                });
+            }
+            let cached = cache.as_mut().unwrap();
+            if cached.capabilities.is_none() {
+                cached.capabilities = Some(get_capabilities(&cached.connection)?);
+            }
+            call(cached)
+        })();
+        if result
+            .as_ref()
+            .is_err_and(GnomeIntegrationError::should_reconnect)
+        {
+            *cache = None;
+        }
+        result
     }
 
     fn call_with_capability<R, A>(
@@ -94,14 +154,16 @@ impl GnomeWindowSystem {
         R: ReadAll,
         A: AppendAll,
     {
-        let connection = connect(self.bus_address.as_deref())?;
-        let capabilities = get_capabilities(&connection)?;
-        require_capability(&capabilities, capability)?;
-
-        let proxy = connection.with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
-        proxy
-            .method_call(GNOME_INTERFACE, method, args)
-            .map_err(classify_dbus_error)
+        self.with_connection(|cached| {
+            require_capability(cached.capabilities.as_ref().unwrap(), capability)?;
+            let proxy =
+                cached
+                    .connection
+                    .with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
+            proxy
+                .method_call(GNOME_INTERFACE, method, args)
+                .map_err(classify_dbus_error)
+        })
     }
 }
 
@@ -113,12 +175,17 @@ impl Default for GnomeWindowSystem {
 
 impl WindowSystem for GnomeWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-        let result: Result<(bool, String, i32, i32, u32, u32), GnomeIntegrationError> =
+        let result: Result<(bool, u64, i32, i32, u32, u32), GnomeIntegrationError> =
             self.call_with_capability(FOCUSED_WINDOW_CAPABILITY, "GetFocusedWindow", ());
 
         result
-            .map(|(present, _display_id, x, y, width, height)| {
-                present.then(|| FocusedWindow::new(Rect::new(x, y, width, height)))
+            .map(|(present, id, x, y, width, height)| {
+                present.then(|| {
+                    FocusedWindow::new(
+                        WindowId::new(id.to_string()),
+                        Rect::new(x, y, width, height),
+                    )
+                })
             })
             .map_err(|error| WindowSystemError::Platform(error.to_string()))
     }
@@ -139,21 +206,37 @@ impl WindowSystem for GnomeWindowSystem {
             .map_err(|error| WindowSystemError::Platform(error.to_string()))
     }
 
-    fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
+        let id = window_move
+            .window
+            .as_str()
+            .parse::<u64>()
+            .map_err(|error| {
+                WindowSystemError::Platform(format!(
+                    "invalid GNOME window id '{}': {error}; refocus the window and retry",
+                    window_move.window.as_str()
+                ))
+            })?;
         let target = window_move.target;
         let result: Result<(), GnomeIntegrationError> = self.call_with_capability(
             MOVE_RESIZE_CAPABILITY,
-            "MoveFocusedWindow",
-            (target.x, target.y, target.width, target.height),
+            "MoveWindow",
+            (id, target.x, target.y, target.width, target.height),
         );
 
-        result.map_err(|error| WindowSystemError::Platform(error.to_string()))
+        result.map_err(|error| match error {
+            GnomeIntegrationError::WindowGone { .. } => {
+                WindowSystemError::WindowGone(window_move.window.clone())
+            }
+            _ => WindowSystemError::Platform(error.to_string()),
+        })
     }
 }
 
 pub struct GnomeHotkeySystem {
     bus_address: Option<String>,
     connection: Option<Connection>,
+    capabilities: Option<Vec<String>>,
     events: Arc<Mutex<VecDeque<HotkeyEvent>>>,
     service_lost: Arc<AtomicBool>,
 }
@@ -175,6 +258,7 @@ impl GnomeHotkeySystem {
         Self {
             bus_address: None,
             connection: None,
+            capabilities: None,
             events: Arc::new(Mutex::new(VecDeque::new())),
             service_lost: Arc::new(AtomicBool::new(false)),
         }
@@ -185,6 +269,7 @@ impl GnomeHotkeySystem {
         Self {
             bus_address: Some(bus_address.into()),
             connection: None,
+            capabilities: None,
             events: Arc::new(Mutex::new(VecDeque::new())),
             service_lost: Arc::new(AtomicBool::new(false)),
         }
@@ -207,21 +292,29 @@ impl GnomeHotkeySystem {
             })
             .map_err(classify_dbus_error)?;
 
-        let owner_rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+        let owner_rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
+            .with_sender("org.freedesktop.DBus")
+            .with_path("/org/freedesktop/DBus");
+        // dbus 0.9 MatchRule only supports headers; arg0 must be added to
+        // the bus-side rule separately from the local callback filter.
         connection
-            .add_match(
-                owner_rule,
-                move |(name, old_owner, new_owner): (String, String, String), _, _| {
-                    if name == GNOME_SERVICE_NAME
-                        && (new_owner.is_empty()
-                            || (!old_owner.is_empty() && old_owner != new_owner))
-                    {
-                        service_lost.store(true, Ordering::Relaxed);
-                    }
-                    true
-                },
-            )
+            .add_match_no_cb(&format!(
+                "{},arg0='{GNOME_SERVICE_NAME}'",
+                owner_rule.match_str()
+            ))
             .map_err(classify_dbus_error)?;
+        connection.start_receive(
+            owner_rule,
+            Box::new(move |message, _| {
+                if let Ok((name, old_owner, new_owner)) = message.read3::<String, String, String>()
+                    && name == GNOME_SERVICE_NAME
+                    && (new_owner.is_empty() || (!old_owner.is_empty() && old_owner != new_owner))
+                {
+                    service_lost.store(true, Ordering::Relaxed);
+                }
+                true
+            }),
+        );
 
         self.service_lost.store(false, Ordering::Relaxed);
         self.connection = Some(connection);
@@ -242,9 +335,12 @@ impl GnomeHotkeySystem {
 
     fn call_register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), GnomeIntegrationError> {
         let result = (|| {
-            let connection = self.ensure_connection()?;
-            let capabilities = get_capabilities(connection)?;
-            require_capability(&capabilities, HOTKEYS_CAPABILITY)?;
+            self.ensure_connection()?;
+            if self.capabilities.is_none() {
+                self.capabilities = Some(get_capabilities(self.connection.as_ref().unwrap())?);
+            }
+            require_capability(self.capabilities.as_ref().unwrap(), HOTKEYS_CAPABILITY)?;
+            let connection = self.connection.as_ref().unwrap();
 
             let proxy = connection.with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
             proxy
@@ -265,6 +361,7 @@ impl GnomeHotkeySystem {
     }
     fn reset_connection(&mut self) {
         self.connection = None;
+        self.capabilities = None;
         self.events.lock().clear();
     }
 }
@@ -278,20 +375,25 @@ impl Default for GnomeHotkeySystem {
 impl HotkeySystem for GnomeHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         self.call_register_hotkeys(hotkeys)
-            .map_err(|error| HotkeySystemError::Platform(error.to_string()))
+            .map_err(GnomeIntegrationError::into_hotkey_error)
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
         let process_result = {
             let connection = self
                 .ensure_connection()
-                .map_err(|error| HotkeySystemError::Platform(error.to_string()))?;
-            connection.process(Duration::from_millis(0))
+                .map_err(GnomeIntegrationError::into_hotkey_error)?;
+            loop {
+                match connection.process(Duration::ZERO) {
+                    Ok(true) => continue,
+                    result => break result,
+                }
+            }
         };
 
         if let Err(error) = process_result {
             self.reset_connection();
-            return Err(HotkeySystemError::Platform(
+            return Err(HotkeySystemError::Unavailable(
                 GnomeIntegrationError::Unavailable {
                     message: format!("failed to process D-Bus events: {error}"),
                 }
@@ -301,7 +403,7 @@ impl HotkeySystem for GnomeHotkeySystem {
 
         if self.service_lost.load(Ordering::Relaxed) {
             self.reset_connection();
-            return Err(HotkeySystemError::Platform(
+            return Err(HotkeySystemError::Unavailable(
                 GnomeIntegrationError::Unavailable {
                     message: "GNOME companion service disappeared from the session bus".to_string(),
                 }
@@ -357,6 +459,7 @@ fn classify_dbus_error(error: dbus::Error) -> GnomeIntegrationError {
         "org.freedesktop.DBus.Error.ServiceUnknown"
         | "org.freedesktop.DBus.Error.NameHasNoOwner"
         | "org.freedesktop.DBus.Error.NoReply"
+        | "org.freedesktop.DBus.Error.Disconnected"
         | "org.freedesktop.DBus.Error.UnknownObject" => {
             GnomeIntegrationError::Unavailable { message }
         }
@@ -374,6 +477,7 @@ fn classify_dbus_error(error: dbus::Error) -> GnomeIntegrationError {
         "org.window_zones.Gnome.Error.InvalidWindowState" => {
             GnomeIntegrationError::Invalid { message }
         }
+        "org.window_zones.Gnome.Error.WindowGone" => GnomeIntegrationError::WindowGone { message },
         _ => GnomeIntegrationError::Operation { message },
     }
 }
@@ -397,12 +501,15 @@ mod tests {
         capabilities: Vec<String>,
         capabilities_error: Option<(&'static str, String)>,
         capabilities_delay: Option<Duration>,
-        focused: Option<(String, i32, i32, u32, u32)>,
+        capabilities_calls: usize,
+        window_senders: Vec<String>,
+        focused: Option<(u64, i32, i32, u32, u32)>,
         displays: Vec<(String, i32, i32, u32, u32)>,
-        moves: Vec<(i32, i32, u32, u32)>,
+        moves: Vec<(u64, i32, i32, u32, u32)>,
+        move_error: Option<(&'static str, String)>,
         registered_hotkeys: Vec<String>,
         register_error: Option<(&'static str, String)>,
-        signal_hotkey: Option<String>,
+        signal_hotkeys: Vec<String>,
     }
 
     impl FakeServiceState {
@@ -416,15 +523,18 @@ mod tests {
                 ],
                 capabilities_error: None,
                 capabilities_delay: None,
-                focused: Some(("monitor-1".to_string(), -300, -20, 801, 602)),
+                capabilities_calls: 0,
+                window_senders: Vec::new(),
+                focused: Some((4294967301, -300, -20, 801, 602)),
                 displays: vec![
                     ("monitor-0".to_string(), -1920, 0, 1920, 1080),
                     ("monitor-1".to_string(), 0, -50, 1280, 1024),
                 ],
                 moves: Vec::new(),
+                move_error: None,
                 registered_hotkeys: Vec::new(),
                 register_error: None,
-                signal_hotkey: Some("ctrl+alt+left".to_string()),
+                signal_hotkeys: vec!["ctrl+cmd+left".to_string()],
             }
         }
     }
@@ -518,7 +628,11 @@ mod tests {
                                         if let Some(delay) = delay {
                                             thread::sleep(delay);
                                         }
-                                        let state = capabilities_state.lock();
+                                        let mut state = capabilities_state.lock();
+                                        state.capabilities_calls += 1;
+                                        state
+                                            .window_senders
+                                            .push(method.msg.sender().unwrap().to_string());
                                         if let Some((name, message)) =
                                             state.capabilities_error.clone()
                                         {
@@ -532,57 +646,59 @@ mod tests {
                                     }))
                                     .add_m(factory.method("GetFocusedWindow", (), move |method| {
                                         let mut reply = method.msg.method_return();
-                                        let state = focused_state.lock();
+                                        let mut state = focused_state.lock();
+                                        state
+                                            .window_senders
+                                            .push(method.msg.sender().unwrap().to_string());
                                         match &state.focused {
-                                            Some((id, x, y, width, height)) => reply.append_all((
-                                                true,
-                                                id.clone(),
-                                                *x,
-                                                *y,
-                                                *width,
-                                                *height,
-                                            )),
+                                            Some((id, x, y, width, height)) => reply
+                                                .append_all((true, *id, *x, *y, *width, *height)),
                                             None => reply.append_all((
-                                                false,
-                                                String::new(),
-                                                0_i32,
-                                                0_i32,
-                                                0_u32,
-                                                0_u32,
+                                                false, 0_u64, 0_i32, 0_i32, 0_u32, 0_u32,
                                             )),
                                         }
                                         Ok(vec![reply])
                                     }))
                                     .add_m(factory.method("GetDisplays", (), move |method| {
-                                        let state = displays_state.lock();
+                                        let mut state = displays_state.lock();
+                                        state
+                                            .window_senders
+                                            .push(method.msg.sender().unwrap().to_string());
                                         let reply = method
                                             .msg
                                             .method_return()
                                             .append1(state.displays.clone());
                                         Ok(vec![reply])
                                     }))
-                                    .add_m(factory.method("MoveFocusedWindow", (), move |method| {
-                                        let (x, y, width, height): (i32, i32, u32, u32) =
-                                            method.msg.read4()?;
-                                        move_state.lock().moves.push((x, y, width, height));
+                                    .add_m(factory.method("MoveWindow", (), move |method| {
+                                        let payload: (u64, i32, i32, u32, u32) =
+                                            method.msg.read5()?;
+                                        let mut state = move_state.lock();
+                                        state
+                                            .window_senders
+                                            .push(method.msg.sender().unwrap().to_string());
+                                        if let Some((name, message)) = state.move_error.clone() {
+                                            return Err((name, message).into());
+                                        }
+                                        state.moves.push(payload);
                                         Ok(vec![method.msg.method_return()])
                                     }))
                                     .add_m(factory.method("RegisterHotkeys", (), move |method| {
                                         let hotkeys: Vec<String> = method.msg.read1()?;
-                                        let (error, signal_hotkey) = {
+                                        let (error, signal_hotkeys) = {
                                             let mut state = register_state.lock();
                                             let error = state.register_error.clone();
                                             if error.is_none() {
                                                 state.registered_hotkeys = hotkeys;
                                             }
-                                            (error, state.signal_hotkey.clone())
+                                            (error, state.signal_hotkeys.clone())
                                         };
                                         if let Some((name, message)) = error {
                                             return Err(MethodErr::from((name, message)));
                                         }
 
                                         let mut replies = vec![method.msg.method_return()];
-                                        if let Some(hotkey) = signal_hotkey {
+                                        for hotkey in signal_hotkeys {
                                             replies.push(
                                                 signal_for_method
                                                     .msg(
@@ -660,7 +776,10 @@ mod tests {
 
         assert_eq!(
             window_system.focused_window().unwrap(),
-            Some(FocusedWindow::new(Rect::new(-300, -20, 801, 602)))
+            Some(FocusedWindow::new(
+                WindowId::new("4294967301"),
+                Rect::new(-300, -20, 801, 602)
+            ))
         );
         assert_eq!(
             window_system.displays().unwrap(),
@@ -671,22 +790,25 @@ mod tests {
         );
 
         window_system
-            .move_focused_window(WindowMove::new(Rect::new(-123, 456, 777, 888)))
+            .move_window(&WindowMove::new(
+                WindowId::new("4294967301"),
+                Rect::new(-123, 456, 777, 888),
+            ))
             .unwrap();
         bus.update_state(|state| {
-            assert_eq!(state.moves, vec![(-123, 456, 777, 888)]);
+            assert_eq!(state.moves, vec![(4294967301, -123, 456, 777, 888)]);
             state.focused = None;
         });
         assert_eq!(window_system.focused_window().unwrap(), None);
 
         let mut hotkey_system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
         hotkey_system
-            .register_hotkeys(&["ctrl+alt+left".to_string(), "super+1".to_string()])
+            .register_hotkeys(&["ctrl+cmd+left".to_string(), "cmd+1".to_string()])
             .unwrap();
         bus.update_state(|state| {
             assert_eq!(
                 state.registered_hotkeys,
-                vec!["ctrl+alt+left".to_string(), "super+1".to_string()]
+                vec!["ctrl+cmd+left".to_string(), "cmd+1".to_string()]
             );
         });
         let mut event = None;
@@ -700,7 +822,7 @@ mod tests {
         assert_eq!(
             event,
             Some(HotkeyEvent::Pressed {
-                hotkey: "ctrl+alt+left".to_string()
+                hotkey: "ctrl+cmd+left".to_string()
             })
         );
     }
@@ -710,7 +832,7 @@ mod tests {
         let bus = FakeBus::new(FakeServiceState::complete());
         let mut hotkey_system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
         hotkey_system
-            .register_hotkeys(&["ctrl+alt+left".to_string()])
+            .register_hotkeys(&["ctrl+cmd+left".to_string()])
             .unwrap();
         let _ = hotkey_system.next_hotkey();
 
@@ -721,19 +843,20 @@ mod tests {
             ));
         });
         let error = hotkey_system
-            .register_hotkeys(&["ctrl+alt+right".to_string()])
+            .register_hotkeys(&["ctrl+cmd+right".to_string()])
             .unwrap_err();
+        assert!(matches!(error, HotkeySystemError::Unavailable(_)));
         assert!(error.to_string().contains("busy"));
         bus.update_state(|state| {
-            assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+left".to_string()]);
+            assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+left".to_string()]);
             state.register_error = None;
         });
 
         hotkey_system
-            .register_hotkeys(&["ctrl+alt+right".to_string()])
+            .register_hotkeys(&["ctrl+cmd+right".to_string()])
             .unwrap();
         bus.update_state(|state| {
-            assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+right".to_string()]);
+            assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+right".to_string()]);
         });
     }
 
@@ -742,7 +865,7 @@ mod tests {
         let mut bus = FakeBus::new(FakeServiceState::complete());
         let mut hotkey_system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
         hotkey_system
-            .register_hotkeys(&["ctrl+alt+left".to_string()])
+            .register_hotkeys(&["ctrl+cmd+left".to_string()])
             .unwrap();
         let _ = hotkey_system.next_hotkey();
 
@@ -764,10 +887,10 @@ mod tests {
 
         bus.start_companion();
         hotkey_system
-            .register_hotkeys(&["ctrl+alt+left".to_string()])
+            .register_hotkeys(&["ctrl+cmd+left".to_string()])
             .unwrap();
         bus.update_state(|state| {
-            assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+left".to_string()]);
+            assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+left".to_string()]);
         });
     }
 
@@ -775,7 +898,7 @@ mod tests {
     fn connection_reset_discards_queued_events() {
         let mut hotkey_system = GnomeHotkeySystem::with_bus_address("unused");
         hotkey_system.events.lock().push_back(HotkeyEvent::Pressed {
-            hotkey: "ctrl+alt+left".to_string(),
+            hotkey: "ctrl+cmd+left".to_string(),
         });
 
         hotkey_system.reset_connection();
@@ -856,7 +979,7 @@ mod tests {
         bus.update_state(|state| {
             state.capabilities_error = Some((
                 "org.freedesktop.DBus.Error.UnknownInterface",
-                "GNOME1 is not available".to_string(),
+                "GNOME2 is not available".to_string(),
             ));
         });
         assert!(matches!(
@@ -874,5 +997,139 @@ mod tests {
             window_system.capabilities(),
             Err(GnomeIntegrationError::Denied { .. })
         ));
+    }
+
+    #[test]
+    fn window_adapter_reuses_connection_and_capabilities_across_operations() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        let focused = system.focused_window().unwrap().unwrap();
+        system.displays().unwrap();
+        system
+            .move_window(&WindowMove::new(focused.id, Rect::new(1, 2, 300, 400)))
+            .unwrap();
+        system.capabilities().unwrap();
+        system.capabilities().unwrap();
+
+        bus.update_state(|state| {
+            assert_eq!(state.capabilities_calls, 1, "capability list is cached");
+            assert_eq!(
+                state.window_senders.len(),
+                4,
+                "one handshake and three operations"
+            );
+            assert!(
+                state
+                    .window_senders
+                    .iter()
+                    .all(|sender| sender == &state.window_senders[0]),
+                "all calls use the same unique bus sender"
+            );
+        });
+    }
+
+    #[test]
+    fn window_gone_maps_to_requested_identity_without_resetting_cache() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        let focused = system.focused_window().unwrap().unwrap();
+        bus.update_state(|state| {
+            state.move_error = Some((
+                "org.window_zones.Gnome.Error.WindowGone",
+                "window was closed".to_string(),
+            ));
+        });
+        assert_eq!(
+            system.move_window(&WindowMove::new(
+                focused.id.clone(),
+                Rect::new(1, 2, 300, 400)
+            )),
+            Err(WindowSystemError::WindowGone(focused.id)),
+        );
+        system.displays().unwrap();
+        bus.update_state(|state| {
+            assert_eq!(state.capabilities_calls, 1);
+            assert!(state.moves.is_empty());
+            assert!(
+                state
+                    .window_senders
+                    .iter()
+                    .all(|sender| sender == &state.window_senders[0])
+            );
+        });
+    }
+
+    #[test]
+    fn window_adapter_reconnects_after_service_loss() {
+        let mut bus = FakeBus::new(FakeServiceState::complete());
+        let system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        system.focused_window().unwrap();
+        bus.stop_companion();
+        assert!(system.displays().is_err());
+        bus.start_companion();
+        system.focused_window().unwrap();
+        bus.update_state(|state| {
+            assert_eq!(state.capabilities_calls, 2);
+            assert_ne!(
+                state.window_senders[0],
+                state.window_senders.last().unwrap().as_str()
+            );
+        });
+    }
+
+    #[test]
+    fn hotkey_adapter_caches_capabilities_and_drains_pending_bus_events() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
+        bus.update_state(|state| {
+            state.signal_hotkeys = vec!["ctrl+cmd+left".to_string(), "ctrl+cmd+right".to_string()];
+        });
+        system
+            .register_hotkeys(&["ctrl+cmd+left".to_string(), "ctrl+cmd+right".to_string()])
+            .unwrap();
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            system.next_hotkey().unwrap(),
+            Some(HotkeyEvent::Pressed {
+                hotkey: "ctrl+cmd+left".to_string(),
+            })
+        );
+        assert_eq!(
+            system.events.lock().len(),
+            1,
+            "one call drains transport before popping"
+        );
+        assert_eq!(
+            system.next_hotkey().unwrap(),
+            Some(HotkeyEvent::Pressed {
+                hotkey: "ctrl+cmd+right".to_string(),
+            })
+        );
+        assert_eq!(system.next_hotkey().unwrap(), None);
+        system.register_hotkeys(&[]).unwrap();
+        bus.update_state(|state| assert_eq!(state.capabilities_calls, 1));
+    }
+
+    #[test]
+    fn unsupported_hotkey_set_is_rejected_and_previous_set_survives() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
+        system
+            .register_hotkeys(&["ctrl+cmd+left".to_string()])
+            .unwrap();
+        bus.update_state(|state| {
+            state.register_error = Some((
+                "org.window_zones.Gnome.Error.Unsupported",
+                "non-canonical hotkey 'Ctrl+Left'".to_string(),
+            ));
+        });
+        let error = system
+            .register_hotkeys(&["Ctrl+Left".to_string()])
+            .unwrap_err();
+        assert!(matches!(error, HotkeySystemError::Rejected(_)));
+        bus.update_state(|state| {
+            assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+left".to_string()]);
+            assert_eq!(state.capabilities_calls, 1);
+        });
     }
 }

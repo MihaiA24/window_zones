@@ -8,7 +8,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SERVICE_NAME = 'org.window_zones.Gnome';
 const OBJECT_PATH = '/org/window_zones/Gnome';
-const INTERFACE_NAME = 'org.window_zones.Gnome1';
+const INTERFACE_NAME = 'org.window_zones.Gnome2';
 const CAPABILITIES = [
     'focused-window',
     'displays',
@@ -16,7 +16,7 @@ const CAPABILITIES = [
     'hotkeys',
 ];
 
-const INTERFACE_XML = `
+export const INTERFACE_XML = `
 <node>
   <interface name="${INTERFACE_NAME}">
     <method name="GetCapabilities">
@@ -24,7 +24,7 @@ const INTERFACE_XML = `
     </method>
     <method name="GetFocusedWindow">
       <arg name="present" type="b" direction="out"/>
-      <arg name="display_id" type="s" direction="out"/>
+      <arg name="window_id" type="t" direction="out"/>
       <arg name="x" type="i" direction="out"/>
       <arg name="y" type="i" direction="out"/>
       <arg name="width" type="u" direction="out"/>
@@ -33,7 +33,8 @@ const INTERFACE_XML = `
     <method name="GetDisplays">
       <arg name="displays" type="a(siiuu)" direction="out"/>
     </method>
-    <method name="MoveFocusedWindow">
+    <method name="MoveWindow">
+      <arg name="window_id" type="t" direction="in"/>
       <arg name="x" type="i" direction="in"/>
       <arg name="y" type="i" direction="in"/>
       <arg name="width" type="u" direction="in"/>
@@ -113,48 +114,28 @@ function dbusError(name, message) {
 }
 
 function canonicalAccelerator(hotkey) {
-    const tokens = hotkey
-        .split('+')
-        .map(token => token.trim().toLowerCase())
-        .filter(Boolean);
-    const modifiers = [];
-    let key = null;
+    if (/\s/.test(hotkey) || !/^(alt\+)?(ctrl\+)?(shift\+)?(cmd\+)?[^+]+$/.test(hotkey))
+        throw new Error(`non-canonical hotkey '${hotkey}'`);
 
-    for (const token of tokens) {
-        const modifier = MODIFIER_TOKENS.get(token);
-        if (modifier) {
-            if (!modifiers.includes(modifier))
-                modifiers.push(modifier);
-            continue;
-        }
-
-        if (key !== null)
-            throw new Error(`hotkey '${hotkey}' contains multiple non-modifier keys`);
-        key = token;
-    }
-
-    if (key === null)
-        throw new Error(`hotkey '${hotkey}' is missing its key`);
-
+    const tokens = hotkey.split('+');
+    const key = tokens.pop();
+    const modifiers = tokens.map(token => MODIFIER_TOKENS.get(token));
     let gdkKey = KEY_TOKENS.get(key);
     if (!gdkKey && /^f([1-9]|1[0-9]|2[0-4])$/.test(key))
         gdkKey = key.toUpperCase();
     if (!gdkKey && /^[a-z0-9]$/.test(key))
         gdkKey = key;
     if (!gdkKey)
-        throw new Error(`unsupported GNOME accelerator key '${key}' in '${hotkey}'`);
+        throw new Error(`unsupported or non-canonical GNOME accelerator key '${key}' in '${hotkey}'`);
 
     return `${modifiers.join('')}${gdkKey}`;
 }
 
-function containsPoint(rect, x, y) {
-    return x >= rect.x && x < rect.x + rect.width
-        && y >= rect.y && y < rect.y + rect.height;
-}
 
-class WindowZonesService {
+export class WindowZonesService {
     constructor() {
         this._accelerators = new Map();
+        this._hotkeysByAction = new Map();
         this._allowedKeybindings = new Map();
         this._controllerSender = null;
         this._connection = null;
@@ -222,16 +203,16 @@ class WindowZonesService {
             }
             case 'GetFocusedWindow':
                 invocation.return_value(
-                    new GLib.Variant('(bsiiuu)', this.GetFocusedWindow()));
+                    new GLib.Variant('(btiiuu)', this.GetFocusedWindow()));
                 return;
             case 'GetDisplays': {
                 const displays = this.GetDisplays();
                 invocation.return_value(new GLib.Variant('(a(siiuu))', [displays]));
                 return;
             }
-            case 'MoveFocusedWindow': {
-                const [x, y, width, height] = parameters.deep_unpack();
-                this.MoveFocusedWindow(x, y, width, height);
+            case 'MoveWindow': {
+                const [id, x, y, width, height] = parameters.deep_unpack();
+                this.MoveWindow(id, x, y, width, height);
                 invocation.return_value(new GLib.Variant('()', []));
                 return;
             }
@@ -262,16 +243,10 @@ class WindowZonesService {
     GetFocusedWindow() {
         const window = this._focusedWindow();
         if (!window)
-            return [false, '', 0, 0, 0, 0];
+            return [false, 0, 0, 0, 0, 0];
 
         const frame = window.get_frame_rect();
-        const centerX = frame.x + Math.floor(frame.width / 2);
-        const centerY = frame.y + Math.floor(frame.height / 2);
-        const displays = this._displayData();
-        const display = displays.find(item => containsPoint(item.rect, centerX, centerY));
-        const displayId = display ? display.id : `unmatched:${centerX}:${centerY}`;
-
-        return [true, displayId, frame.x, frame.y, frame.width, frame.height];
+        return [true, window.get_id(), frame.x, frame.y, frame.width, frame.height];
     }
 
     GetDisplays() {
@@ -284,39 +259,34 @@ class WindowZonesService {
         ]);
     }
 
-    MoveFocusedWindow(x, y, width, height) {
-        const window = this._focusedWindow();
+    MoveWindow(id, x, y, width, height) {
+        const window = global.display.list_all_windows()
+            .find(candidate => candidate.get_id() === id);
         if (!window)
             throw dbusError(
+                'org.window_zones.Gnome.Error.WindowGone',
+                `window ${id} no longer exists`);
+        if (!this._applicationWindow(window))
+            throw dbusError(
                 'org.window_zones.Gnome.Error.InvalidWindowState',
-                'no focused application window');
+                'window is not an eligible application window; leave overview or unlock the session first');
         if (width === 0 || height === 0)
             throw dbusError(
                 'org.window_zones.Gnome.Error.InvalidWindowState',
                 'window target must have positive dimensions');
-        const maximizeFlags =
-            typeof window.get_maximize_flags === 'function'
-                ? window.get_maximize_flags()
-                : 0;
-        const isTiled = typeof window.tile_mode === 'number' && window.tile_mode !== 0;
-        if (
-            maximizeFlags !== 0
-            || isTiled
-            || window.maximized_horizontally
-            || window.maximized_vertically
-        )
+        if (window.is_fullscreen())
             throw dbusError(
                 'org.window_zones.Gnome.Error.InvalidWindowState',
-                'focused window is maximized or tiled; restore it before moving');
-        if (typeof window.is_fullscreen === 'function' && window.is_fullscreen())
+                'window is fullscreen; leave fullscreen first');
+        if (!window.allows_resize())
             throw dbusError(
                 'org.window_zones.Gnome.Error.InvalidWindowState',
-                'focused window is fullscreen; leave fullscreen before moving');
-        if (typeof window.allows_resize === 'function' && !window.allows_resize())
-            throw dbusError(
-                'org.window_zones.Gnome.Error.InvalidWindowState',
-                'focused window does not allow resizing');
+                'window does not allow resizing');
 
+        // Shell 50's no-argument unmaximize clears both directions and edge tiling.
+        // Edge-tiled windows carry the VERTICAL maximize flag.
+        if (window.get_maximize_flags() !== 0)
+            window.unmaximize();
         window.move_resize_frame(true, x, y, width, height);
     }
 
@@ -338,13 +308,13 @@ class WindowZonesService {
                 if (next.has(hotkey))
                     throw new Error(`duplicate hotkey '${hotkey}'`);
 
+                const accelerator = canonicalAccelerator(hotkey);
                 const existingAction = this._accelerators.get(hotkey);
                 if (existingAction !== undefined) {
                     next.set(hotkey, existingAction);
                     continue;
                 }
 
-                const accelerator = canonicalAccelerator(hotkey);
                 const action = global.display.grab_accelerator(accelerator, 0);
                 if (action === 0)
                     throw new Error(`GNOME rejected hotkey '${hotkey}' (${accelerator})`);
@@ -368,6 +338,7 @@ class WindowZonesService {
                 this._ungrabAccelerator(action);
         }
         this._accelerators = next;
+        this._hotkeysByAction = new Map([...next].map(([hotkey, action]) => [action, hotkey]));
         this._controllerSender = next.size === 0 ? null : sender;
     }
 
@@ -384,27 +355,27 @@ class WindowZonesService {
         for (const action of this._accelerators.values())
             this._ungrabAccelerator(action);
         this._accelerators.clear();
+        this._hotkeysByAction.clear();
     }
 
 
     _emitHotkey(action) {
-        for (const [hotkey, registeredAction] of this._accelerators) {
-            if (registeredAction !== action)
-                continue;
-
-            if (this._connection) {
-                this._connection.emit_signal(
-                    null,
-                    OBJECT_PATH,
-                    INTERFACE_NAME,
-                    'HotkeyPressed',
-                    new GLib.Variant('(s)', [hotkey]));
-            }
-            return;
+        const hotkey = this._hotkeysByAction.get(action);
+        if (hotkey !== undefined && this._connection) {
+            this._connection.emit_signal(
+                null,
+                OBJECT_PATH,
+                INTERFACE_NAME,
+                'HotkeyPressed',
+                new GLib.Variant('(s)', [hotkey]));
         }
     }
 
     _focusedWindow() {
+        return this._applicationWindow(global.display.get_focus_window());
+    }
+
+    _applicationWindow(window) {
         if (
             Main.overview?.visible === true
             || Main.sessionMode?.isLocked === true
@@ -412,18 +383,11 @@ class WindowZonesService {
         )
             return null;
 
-        const window = global.display.get_focus_window();
-        if (!window || typeof window.get_frame_rect !== 'function')
+        if (!window)
             return null;
-
-        if (typeof window.get_window_type === 'function'
-            && NON_APPLICATION_WINDOW_TYPES.has(window.get_window_type()))
-            return null;
-        if (
-            typeof global.get_pid === 'function'
-            && typeof window.get_pid === 'function'
-            && window.get_pid() === global.get_pid()
-        )
+        if (NON_APPLICATION_WINDOW_TYPES.has(window.get_window_type())
+            || window.is_override_redirect()
+            || window.get_pid() === global.get_pid())
             return null;
 
         const frame = window.get_frame_rect();
@@ -437,8 +401,6 @@ class WindowZonesService {
         const monitors = Main.layoutManager.monitors ?? [];
         if (monitors.length === 0)
             throw new Error('GNOME reported no active displays');
-        if (typeof Main.layoutManager.getWorkAreaForMonitor !== 'function')
-            throw new Error('GNOME work-area API is unavailable');
 
         const activeDisplayIds = new Map();
         const displays = monitors.map((_monitor, index) => {

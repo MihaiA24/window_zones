@@ -347,7 +347,7 @@ parse_gnome_focused() {
     python - "$raw" <<'PY'
 import re, sys
 s = sys.argv[1]
-m = re.search(r"\((true|false),\s*'([^']*)',\s*(-?\d+),\s*(-?\d+),\s*(?:uint32\s+)?(\d+),\s*(?:uint32\s+)?(\d+)\)", s)
+m = re.search(r"\((true|false),\s*(?:uint64\s+)?(\d+),\s*(-?\d+),\s*(-?\d+),\s*(?:uint32\s+)?(\d+),\s*(?:uint32\s+)?(\d+)\)", s)
 if m:
     print('|'.join(m.groups()))
 PY
@@ -425,8 +425,7 @@ x11_inject_hotkey() {
 }
 
 x11_hotkey_diagnostics() {
-    local run_log=$1 app_tail='' app_display='' registered='' registration_log="$TMP_DIR/x11-hotkey-registration.log"
-    local registration_rc=0 line
+    local run_log=$1 app_tail='' app_display='' line
     log 'X11 real-hotkey diagnostics:'
     app_display=$(tr '\0' '\n' <"/proc/$APP_PID/environ" 2>/dev/null | sed -n '/^DISPLAY=/p' | sed -n '1p' || true)
     log "  App environment: ${app_display:-DISPLAY unavailable}"
@@ -435,25 +434,15 @@ x11_hotkey_diagnostics() {
     while IFS= read -r line; do
         log "    $line"
     done <<<"$app_tail"
-    if [[ "$app_tail" == *'global hotkey listener is unavailable'* ]]; then
-        log '  next_hotkey error: global hotkey listener is unavailable'
+    if [[ "$app_tail" == *'Hotkey registration refused:'* ]]; then
+        log '  XGrabKey registration was refused; check for another program owning a configured accelerator'
+    elif [[ "$app_tail" == *'Hotkey registration failed:'* ]]; then
+        log '  XGrabKey listener is unavailable; check the App DISPLAY and X server access'
     else
-        log '  next_hotkey error: none observed in App output'
+        log '  No XGrabKey registration error observed in App output'
     fi
-
-    printf 'status\nquit\n' | timeout 5 env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 \
-        XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" \
-        "$BIN_PATH" --backend x11 --config "$CONFIG_PATH" tui >"$registration_log" 2>&1 || registration_rc=$?
-    registered=$(sed -n '/^Bindings:/,/^Last action:/p' "$registration_log" 2>/dev/null \
-        | sed '/^Last action:/d' || true)
-    log '  App parsed registered hotkey set:'
-    if [[ -n "$registered" ]]; then
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && log "    $line"
-        done <<<"$registered"
-    else
-        log "    unavailable (diagnostic TUI exit $registration_rc)"
-    fi
+    # A second App would contend for the instance lock and exclusive grabs, so
+    # inspect the owning App's status/log rather than launching a diagnostic TUI.
 }
 
 wait_x11_geometry() {
@@ -565,7 +554,7 @@ find_gnome_xwayland() {
 gnome_call() {
     DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus call --session \
         --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome \
-        --method "org.window_zones.Gnome1.$1" "${@:2}"
+        --method "org.window_zones.Gnome2.$1" "${@:2}"
 }
 
 gnome_shell_call() {
@@ -657,11 +646,11 @@ gnome_live_geometry() {
 }
 
 gnome_live_zone_targets() {
-    # Derive the current display from the frame center, not the legacy wire display id.
-    local focused present display x y w h id center_x center_y
+    # Derive the current display from the frame center; the wire id identifies the window.
+    local focused present window_id x y w h id center_x center_y
     local area='' next_area='' found=-1 total=0 index=0
     focused=$(get_gnome_focused)
-    IFS='|' read -r present display x y w h <<<"$focused"
+    IFS='|' read -r present window_id x y w h <<<"$focused"
     [[ "$present" == 'true' ]] || return 0
     center_x=$((x + w / 2))
     center_y=$((y + h / 2))
@@ -817,7 +806,7 @@ gnome_live_capture() {
 gnome_live_focus_baseline() {
     local timeout_s=${1:-10}
     local deadline=$((SECONDS + timeout_s))
-    local focused='' observed='' active='' present='' display='' x='' y='' width='' height=''
+    local focused='' observed='' active='' present='' window_id='' x='' y='' width='' height=''
     GNOME_LIVE_FOCUS_X11=''
     GNOME_LIVE_FOCUS_COMPANION=''
     GNOME_LIVE_FOCUS_ACTIVE=''
@@ -825,7 +814,7 @@ gnome_live_focus_baseline() {
         observed=$(gnome_live_geometry)
         focused=$(get_gnome_focused)
         active=$(gnome_live_active_window)
-        IFS='|' read -r present display x y width height <<<"$focused"
+        IFS='|' read -r present window_id x y width height <<<"$focused"
         if [[ "$observed" != 'unavailable' && "$present" == 'true' \
             && "$x,$y,$width,$height" == "$observed" && "$active" == "$WINDOW_ID" ]]; then
             GNOME_LIVE_FOCUS_X11="$observed"
@@ -844,8 +833,8 @@ gnome_live_focus_baseline() {
 gnome_live_assert_focus() {
     local focused=$GNOME_LIVE_FOCUS_COMPANION observed=$GNOME_LIVE_FOCUS_X11
     local active=$GNOME_LIVE_FOCUS_ACTIVE
-    local present='' display='' x='' y='' width='' height='' focused_geometry=''
-    IFS='|' read -r present display x y width height <<<"$focused"
+    local present='' window_id='' x='' y='' width='' height='' focused_geometry=''
+    IFS='|' read -r present window_id x y width height <<<"$focused"
     focused_geometry="$x,$y,$width,$height"
     log "OBSERVED GNOME live focus: companion='$focused' xdotool='$observed' active='$active' window='$WINDOW_ID'"
     assert_eq 'GNOME live focused-window present' 'true' "$present"
@@ -858,12 +847,12 @@ gnome_live_assert_geometry() {
     local name=$1 expected=$2
     local deadline=$((SECONDS + 10))
     local observed_x11='' observed_companion='' focused=''
-    local present='' display='' x='' y='' width='' height=''
+    local present='' window_id='' x='' y='' width='' height=''
     gnome_live_activate_window || true
     while (( SECONDS < deadline )); do
         observed_x11=$(gnome_live_geometry)
         focused=$(get_gnome_focused)
-        IFS='|' read -r present display x y width height <<<"$focused"
+        IFS='|' read -r present window_id x y width height <<<"$focused"
         observed_companion="$focused"
         if [[ "$observed_x11" == "$expected" \
             && "$present" == 'true' \
@@ -1052,7 +1041,7 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.Gnome',
     '/org/window_zones/Gnome',
-    'org.window_zones.Gnome1',
+    'org.window_zones.Gnome2',
     null);
 proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [['alt+ctrl+left']]), Gio.DBusCallFlags.NONE, 5000, null);
 print('VALID_OK');
@@ -1105,7 +1094,7 @@ run_gnome_hotkey_and_disconnect() {
     else
         assert_text 'GNOME run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
     fi
-    assert_text 'GNOME hotkeys initially register' 'Hotkey registration initially' "$(cat "$run_log" 2>/dev/null || true)"
+    assert_text 'GNOME hotkeys initially register' 'Hotkeys registered:' "$(cat "$run_log" 2>/dev/null || true)"
     : >"$monitor_log"
     local monitor_pid=''
     if monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor \
@@ -1302,7 +1291,7 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.Gnome',
     '/org/window_zones/Gnome',
-    'org.window_zones.Gnome1',
+    'org.window_zones.Gnome2',
     null);
 try {
     proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [[valid]]),
@@ -1917,7 +1906,7 @@ kde_live_companion_call() {
     local method=$1
     shift
     busctl --address="$KDE_BUS" call \
-        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin1 "$method" "$@"
+        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin2 "$method" "$@"
 }
 
 kde_live_kwin_call() {
@@ -2449,12 +2438,12 @@ kde_live_x11_geometry() {
 kde_live_wait_focus() {
     local timeout_s=${1:-15}
     local deadline=$((SECONDS + timeout_s))
-    local observed='' focused='' active='' present='' display='' x='' y='' width='' height=''
+    local observed='' focused='' active='' present='' window_id='' x='' y='' width='' height=''
     while (( SECONDS < deadline )); do
         observed=$(kde_live_x11_geometry)
         focused=$(kde_live_get_focused)
         active=$(kde_live_x11_active_window)
-        IFS='|' read -r present display x y width height <<<"$focused"
+        IFS='|' read -r present window_id x y width height <<<"$focused"
         if [[ "$observed" != unavailable && "$present" == true \
             && "$active" == "$WINDOW_ID" && "$observed" == "$x,$y,$width,$height" ]]; then
             KDE_FOCUS_X11="$observed"
@@ -2472,10 +2461,11 @@ kde_live_wait_focus() {
 
 kde_live_assert_focus() {
     local focused="$KDE_FOCUS_COMPANION" observed="$KDE_FOCUS_X11" active="$KDE_FOCUS_ACTIVE"
-    local present='' display='' x='' y='' width='' height=''
-    IFS='|' read -r present display x y width height <<<"$focused"
+    local present='' window_id='' x='' y='' width='' height=''
+    IFS='|' read -r present window_id x y width height <<<"$focused"
     log "OBSERVED KDE focus: companion='$focused' xdotool='$observed' active='$active' window='${WINDOW_ID:-unavailable}'"
     assert_eq 'KDE GetFocusedWindow reports test window' true "$present"
+    assert_eq 'KDE focused window has stable identity' 1 "$([[ -n "$window_id" ]] && printf 1 || printf 0)"
     assert_eq 'KDE focus geometry agrees with xdotool' "$observed" "$x,$y,$width,$height"
     assert_eq 'KDE focus active nested X11 window' "$WINDOW_ID" "$active"
     local display_match=0 id='' output_x output_y output_width output_height
@@ -2634,7 +2624,7 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.KWin',
     '/org/window_zones/KWin',
-    'org.window_zones.KWin1',
+    'org.window_zones.KWin2',
     null);
 
 function request(keys) {
@@ -2658,7 +2648,7 @@ function requestResult(id) {
 }
 
 function waitResult(id, label) {
-    let result = [false, ''];
+    let result = [false, '', ''];
     for (let attempt = 0; attempt < 100; attempt++) {
         try {
             result = requestResult(id);
@@ -2668,7 +2658,7 @@ function waitResult(id, label) {
         }
         GLib.usleep(100000);
     }
-    print(`${label}_RESULT ${result[0]} ${result[1]}`);
+    print(`${label}_RESULT ${result[0]} ${result[1]} ${result[2]}`);
     return result;
 }
 
@@ -2694,8 +2684,13 @@ const validId = request([valid]);
 waitResult(validId, 'VALID');
 print('VALID_READY');
 poll(6);
-const invalidId = request([valid, 'alt+ctrl+f25']);
-waitResult(invalidId, 'INVALID');
+try {
+    const invalidId = request([valid, 'alt+ctrl+f25']);
+    waitResult(invalidId, 'INVALID');
+} catch (error) {
+    // Canonical-vocabulary rejection can happen before the script request is queued.
+    print(`INVALID_RESULT true ${error.message}`);
+}
 print('INVALID_READY');
 poll(6);
 EOF
@@ -2795,7 +2790,7 @@ const connection = Gio.DBusConnection.new_for_address_sync(
     null);
 const proxy = Gio.DBusProxy.new_sync(
     connection, Gio.DBusProxyFlags.NONE, null,
-    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin1', null);
+    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin2', null);
 function register(keys, label) {
     const request = proxy.call_sync(
         'RegisterHotkeys',
@@ -2803,7 +2798,7 @@ function register(keys, label) {
         Gio.DBusCallFlags.NONE,
         5000,
         null).deep_unpack()[0];
-    let result = [false, ''];
+    let result = [false, '', ''];
     for (let attempt = 0; attempt < 100; attempt++) {
         result = proxy.call_sync(
             'GetRequestResult',
@@ -2848,7 +2843,7 @@ EOF
         gjs -m "$helper")
     wait_for_text "$helper_log" 'VALID_READY' 12 || true
     assert_text 'KDE conflict replacement starts with valid set' \
-        'VALID_RESULT [true,""]' "$(cat "$helper_log" 2>/dev/null || true)"
+        'VALID_RESULT [true,"",""]' "$(cat "$helper_log" 2>/dev/null || true)"
     valid_events_before=$(count_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY")
     kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
     wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 5 \
@@ -2900,9 +2895,9 @@ hotkey = "alt+ctrl+f24"
 action = { type = "move-to-zone", zone = "left-half" }
 EOF
     start_fifo_app run auto "$conflict_config_log"
-    wait_for_text "$conflict_config_log" 'Hotkey registration initially failed' 20 || true
+    wait_for_text "$conflict_config_log" 'Hotkey registration refused' 20 || true
     assert_text 'KDE App refuses a conflicting accelerator' \
-        'Hotkey registration initially failed' "$(cat "$conflict_config_log" 2>/dev/null || true)"
+        'Hotkey registration refused' "$(cat "$conflict_config_log" 2>/dev/null || true)"
     assert_text 'KDE App names the accelerator owner' \
         'Window Zones conflict incumbent' "$(cat "$conflict_config_log" 2>/dev/null || true)"
     stop_app_cleanly 'KDE App with a conflicting accelerator quits cleanly' "$conflict_config_log"
@@ -3562,6 +3557,11 @@ EOF
     focused=$(wait_gnome_focused 'true|' 5 || true)
     if [[ "$focused" == 'true|'* ]]; then
         assert_text 'GNOME GetFocusedWindow reports test window' 'true|' "$focused"
+        local present window_id frame_x frame_y frame_w frame_h move_reply
+        IFS='|' read -r present window_id frame_x frame_y frame_w frame_h <<<"$(get_gnome_focused)"
+        move_reply=$(gnome_call MoveWindow "$window_id" "$GNOME_X" "$GNOME_Y" "$((GNOME_W / 2))" "$GNOME_H" 2>&1 || true)
+        assert_eq 'GNOME MoveWindow by id empty reply' '()' "$move_reply"
+        gnome_assert_geometry 'gnome-move-window-by-id' "true|$GNOME_X|$GNOME_Y|$((GNOME_W / 2))|$GNOME_H"
 
         run_gnome_dispatch half alt+ctrl+left
         gnome_assert_geometry 'gnome-left-half' "true|$GNOME_X|$GNOME_Y|$((GNOME_W / 2))|$GNOME_H"
@@ -3622,8 +3622,11 @@ run_x11() {
     X11_CONFIG="$X11_ROOT/config"
     X11_DATA="$X11_ROOT/data"
     X11_HOME="$X11_ROOT/home"
+    X11_RUNTIME="$X11_ROOT/runtime"
     CONFIG_PATH="$X11_ROOT/config.toml"
-    mkdir -p "$X11_CONFIG" "$X11_DATA" "$X11_HOME" "$X11_ROOT"
+    mkdir -p "$X11_CONFIG" "$X11_DATA" "$X11_HOME" "$X11_RUNTIME" "$X11_ROOT"
+    chmod 700 "$X11_RUNTIME"
+    export XDG_RUNTIME_DIR="$X11_RUNTIME"
     local display_num
     for display_num in $(seq 90 199); do
         if [[ ! -S "/tmp/.X11-unix/X$display_num" ]]; then
@@ -3633,7 +3636,7 @@ run_x11() {
     X11_DISPLAY=":$display_num"
     record_versions_x11
     local xvfb_log="$X11_ROOT/xvfb.log" xvfb_pid openbox_log="$X11_ROOT/openbox.log" openbox_pid wm_check=''
-    xvfb_pid=$(start_group "$xvfb_log" Xvfb "$X11_DISPLAY" -screen 0 3520x1080x24 -nolisten tcp -ac +extension RECORD +extension XTEST)
+    xvfb_pid=$(start_group "$xvfb_log" Xvfb "$X11_DISPLAY" -screen 0 3520x1080x24 -nolisten tcp -ac +extension XTEST)
     local deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )) && [[ ! -S "/tmp/.X11-unix/X$display_num" ]]; do sleep 0.1; done
     assert_eq 'X11 Xvfb starts' 0 "$([[ -S "/tmp/.X11-unix/X$display_num" ]] && printf 0 || printf 1)"
@@ -3644,7 +3647,6 @@ run_x11() {
     else
         extension_text='xdpyinfo unavailable'
     fi
-    assert_text 'X11 RECORD extension' 'RECORD' "$extension_text"
     assert_text 'X11 XTEST extension' 'XTEST' "$extension_text"
     openbox_pid=$(start_group "$openbox_log" env DISPLAY="$X11_DISPLAY" openbox --replace)
     deadline=$((SECONDS + 15))
@@ -3737,7 +3739,7 @@ run_x11() {
     run_x11_dispatch center-before-hotkey alt+ctrl+up '640,0,640,1080'
     x11_assert_geometry 'x11-center-before-hotkey' '640,0,640,1080'
 
-    # Real XRecord/XTEST hotkey capture through the running App.
+    # Exclusive XGrabKey accelerator capture, injected through XTEST.
     local run_log="$X11_ROOT/run.log"
     start_fifo_app run x11 "$run_log"
     if wait_for_text "$run_log" 'Interactive session started' 15; then

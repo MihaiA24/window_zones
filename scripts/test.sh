@@ -7,6 +7,9 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 bash -n "$PROJECT_ROOT"/scripts/*.sh
 node --check "$PROJECT_ROOT/gnome-extension/extension.js"
+if command -v gjs >/dev/null 2>&1; then
+  gjs -m "$PROJECT_ROOT/gnome-extension/tests/run.js"
+fi
 node --check "$PROJECT_ROOT/kwin-script/contents/code/main.js"
 # node accepts syntax QJSEngine rejects (object spread); qmllint is Qt's own parser.
 if command -v qmllint >/dev/null 2>&1; then
