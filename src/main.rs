@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -1437,23 +1437,22 @@ fn instance_lock_path() -> PathBuf {
 }
 
 fn acquire_instance_lock(path: &Path) -> Result<InstanceLock, String> {
-    let mut file = File::options()
-        .read(true)
+    let file = File::options()
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
         .map_err(|error| format!("cannot open instance lock {}: {error}", path.display()))?;
+    // The pid sits beside the lock: a Windows lock also blocks reading the locked file.
+    let pid_path = path.with_extension("pid");
     match file.try_lock() {
         Ok(()) => {
             // The pid is informational, for the message another instance prints.
-            let _ = file.set_len(0);
-            let _ = write!(file, "{}", std::process::id());
+            let _ = fs::write(&pid_path, std::process::id().to_string());
             Ok(InstanceLock { _file: file })
         }
         Err(fs::TryLockError::WouldBlock) => {
-            let mut owner = String::new();
-            let _ = file.read_to_string(&mut owner);
+            let owner = fs::read_to_string(&pid_path).unwrap_or_default();
             let owner = owner.trim();
             Err(format!(
                 "another window_zones session{} already owns the hotkeys; stop it first (for the systemd service: `systemctl --user stop window-zones`) or use `window_zones dispatch <hotkey>`",
@@ -1940,6 +1939,7 @@ mod tests {
         drop(first);
         let third = acquire_instance_lock(&path);
         fs::remove_file(&path).unwrap();
+        fs::remove_file(path.with_extension("pid")).unwrap();
 
         assert!(
             second.contains(&format!("pid {}", std::process::id())),

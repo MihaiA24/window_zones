@@ -14,7 +14,9 @@ What this verifies:
 - `cargo clippy --locked --all-targets --all-features` (only if clippy is installed)
 - `bash -n scripts/*.sh` (shell syntax, including the 3800-line Smoke harness)
 - `node --check gnome-extension/extension.js`
+- `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
 - `node --check kwin-script/contents/code/main.js`
+- `qmllint kwin-script/contents/code/main.js` (QJSEngine syntax, which `node` does not enforce; only if `qmllint` is installed)
 
 The repository test script covers formatting, unit/integration tests, doc tests,
 and clippy when installed. The GNOME and KDE adapter contract tests use fake
