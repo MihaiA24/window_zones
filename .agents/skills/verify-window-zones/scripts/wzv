@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+# wzv: verification harness for window_zones. Starts owned, disposable `--backend dry-run`
+# instances through scripts/run.sh and types session commands into them over a FIFO, the same
+# control path scripts/smoke.sh uses. Run `wzv --help`. Bash 3.2 compatible (macOS /bin/bash).
+set -euo pipefail
+
+SKILL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd -- "$SKILL_DIR/../../.." && pwd)"
+ROOT="${WZV_ROOT:-$REPO/target/verify-window-zones}"
+[[ $ROOT == /* ]] || ROOT=$PWD/$ROOT
+BIN="$REPO/target/debug/window_zones"
+RUNNER="$REPO/scripts/run.sh"
+# Programs the live backends and notifier spawn. A dry-run instance must invoke none of them;
+# shims with these names sit first on the instance's PATH and log every call.
+SENTINELS="osascript swaymsg hyprctl gdbus dbus-daemon dbus-launch dbus-send busctl notify-send xdotool kpackagetool6 qdbus"
+
+usage() {
+    cat <<'EOF'
+Usage: wzv <command> [options]
+
+Drives owned, disposable window_zones instances for verification. Every instance runs
+`scripts/run.sh --backend dry-run ...` under `env -i` with its own HOME, XDG dirs, TMPDIR and
+a dead session-bus address, so it cannot reach real windows, the desktop, or your config.
+
+Runs live in $WZV_ROOT/<run-id>/ (default <repo>/target/verify-window-zones/<run-id>/):
+  meta.env, pids   what was started (kept)
+  evidence/        app.log, transcript.log, config-NN.toml, sentinel.log, exit-code,
+                   side-effects.txt (kept by cleanup)
+  scratch/         disposable HOME, TMPDIR, XDG_RUNTIME_DIR, input FIFO (removed by cleanup)
+
+Commands:
+  start [--mode run|tui] [--run-id ID] [--no-init] [--no-build] [--timeout S]
+      cargo build --locked --bin window_zones, create the isolated run, run `window_zones init`
+      (skip with --no-init), launch `run` (default) or `tui` on a FIFO, and wait until it is ready.
+      Prints run_id= run_dir= evidence_dir= mode= pid= config_path= ready=yes.
+  doctor RUN
+      Read-only: owned app alive (pid + start time), stdin holder alive, binary unchanged since
+      start, ready line seen, dry-run backend, no live-backend program invoked, no instance lock.
+      Prints one ok/FAIL line per check and doctor=ok|fail.
+  send RUN LINE [--expect TEXT]... [--timeout S]
+      Type one session line into the app ('status', 'reload', 'restart', 'help',
+      'dispatch ctrl+alt+left'; the TUI also takes 'refresh'). Prints the output it produced.
+      Fails if any TEXT is not in that output within S seconds (default 8).
+  config RUN FILE [--expect TEXT]... [--timeout S]
+      Save FILE over the app's config file (write + rename, like an editor), snapshot it as
+      evidence/config-NN.toml, and wait for TEXT in the app output.
+  exec RUN [--expect-exit N] [--expect TEXT]... -- ARGS...
+      Run one-shot `window_zones --backend dry-run ARGS` (status, dispatch HOTKEY, init ...) in the
+      run's isolated environment. Prints its stdout, its stderr on stderr, then exit_code=N.
+      Exits with the app's status, or 0/1 for whether --expect-exit and --expect matched.
+      Refuses --backend; a --config PATH (relative = from the current dir) must be inside RUN.
+  stop RUN [--timeout S]
+      Type `quit`, wait for the app to exit, stop the stdin holder, write
+      evidence/side-effects.txt. Prints exit_code= live_backend_tool_calls= instance_locks=
+      home_files= side_effects= evidence_dir=. Fails unless the app exited 0.
+  cleanup [--dry-run] (RUN... | --all)
+      Kill processes this helper started for RUN that are still running (only when pid AND start
+      time match the record), remove RUN/scratch, keep evidence. --dry-run prints the plan
+      (would-kill / would-remove) and changes nothing. --all covers every run under $WZV_ROOT,
+      including other agents' live runs in this checkout: run --all --dry-run first.
+
+RUN is a run id (directory name under $WZV_ROOT) or a run directory path.
+Exit status: 0 success, 1 failed check/expectation/runtime error, 2 usage error.
+EOF
+}
+
+die() { printf 'wzv: error: %s\n' "$*" >&2; exit 1; }
+usage_error() { printf 'wzv: usage error: %s (see wzv --help)\n' "$*" >&2; exit 2; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+strip_ansi() { sed -e $'s/\x1b\\[[0-9;?]*[A-Za-z]//g'; }
+need_value() { [[ $2 -ge 2 ]] || usage_error "$1 needs a value"; }
+
+set_paths() {
+    EVID=$RUN_DIR/evidence
+    SCRATCH=$RUN_DIR/scratch
+    LOG=$EVID/app.log
+    TRANSCRIPT=$EVID/transcript.log
+    FIFO=$SCRATCH/input.fifo
+    APP_ENV=(env -i "PATH=$SCRATCH/bin:/usr/bin:/bin" "HOME=$SCRATCH/home" "USER=${USER:-wzv}"
+        "XDG_CONFIG_HOME=$SCRATCH/home/.config" "XDG_DATA_HOME=$SCRATCH/home/.local/share"
+        "XDG_STATE_HOME=$SCRATCH/home/.local/state" "XDG_CACHE_HOME=$SCRATCH/home/.cache"
+        "XDG_RUNTIME_DIR=$SCRATCH/runtime" "TMPDIR=$SCRATCH/tmp"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=$SCRATCH/runtime/no-session-bus"
+        "WINDOW_ZONES_BINARY=$BIN_PATH")
+}
+
+load_run() {
+    if [[ -f $1/meta.env ]]; then
+        RUN_DIR=$(cd -- "$1" && pwd)
+    elif [[ -f $ROOT/$1/meta.env ]]; then
+        RUN_DIR=$ROOT/$1
+    else
+        die "no run '$1' (looked for $1/meta.env and $ROOT/$1/meta.env)"
+    fi
+    BIN_PATH=$BIN
+    # shellcheck source=/dev/null
+    . "$RUN_DIR/meta.env"
+    set_paths
+}
+
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//'; }
+record_pid() { printf '%s %s %s\n' "$1" "$2" "$(proc_start "$2")" >>"$RUN_DIR/pids"; }
+pid_of() { sed -n "s/^$1 \\([0-9][0-9]*\\) .*/\\1/p" "$RUN_DIR/pids" 2>/dev/null | sed -n 1p; }
+
+# owned ROLE: 0 = the process we started is alive, 1 = gone, 2 = pid alive but another process.
+owned() {
+    local line pid recorded actual
+    line=$(grep "^$1 " "$RUN_DIR/pids" 2>/dev/null | sed -n 1p || true)
+    [[ -n $line ]] || return 1
+    pid=${line#"$1 "}
+    pid=${pid%% *}
+    recorded=${line#"$1 $pid "}
+    kill -0 "$pid" 2>/dev/null || return 1
+    actual=$(proc_start "$pid")
+    [[ -n $actual ]] || return 1
+    [[ $actual == "$recorded" ]] || return 2
+}
+
+wait_gone() { # ROLE TENTHS
+    local n=0 rc
+    while ((n < $2)); do
+        rc=0
+        owned "$1" || rc=$?
+        ((rc == 0)) || return 0
+        sleep 0.1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+exit_note() { [[ -f $EVID/exit-code ]] && printf ' (exit code %s)' "$(cat "$EVID/exit-code")" || true; }
+
+require_live() {
+    local rc=0
+    owned app || rc=$?
+    ((rc != 1)) || die "app for run $RUN_ID is not running$(exit_note); see $LOG"
+    ((rc != 2)) || die "recorded app pid for run $RUN_ID now belongs to another process; not touching it"
+    rc=0
+    owned holder || rc=$?
+    ((rc == 0)) || die "stdin holder for run $RUN_ID is gone; finish with: wzv stop $RUN_ID"
+}
+
+log_size() { wc -c <"$LOG" | tr -d ' '; }
+count_locks() { { find "$SCRATCH/tmp" "$SCRATCH/runtime" -name 'window_zones*.lock' 2>/dev/null || true; } | wc -l | tr -d ' '; }
+
+# await_output OFFSET TIMEOUT [TEXT...]: wait for app output past OFFSET containing every TEXT
+# (or, with no TEXT, for any output that then settles); print it and append it to the transcript.
+await_output() {
+    local offset=$1 timeout=$2 new='' missing='' t size last=-1 settled=0 rc
+    shift 2
+    local deadline=$((SECONDS + timeout))
+    while :; do
+        new=$(tail -c +"$((offset + 1))" "$LOG")
+        missing=''
+        for t in "$@"; do
+            if [[ $new != *"$t"* ]]; then
+                missing=$t
+                break
+            fi
+        done
+        if (($# > 0)); then
+            [[ -n $missing ]] || break
+        else
+            size=${#new}
+            if ((size > 0 && size == last)); then
+                settled=$((settled + 1))
+                ((settled < 3)) || break
+            else
+                settled=0
+            fi
+            last=$size
+        fi
+        rc=0
+        owned app || rc=$?
+        if ((SECONDS >= deadline || rc != 0)); then
+            printf '%s\n' "$new" | strip_ansi >>"$TRANSCRIPT"
+            if (($# > 0)); then
+                printf '[expect FAIL] %s\n' "$missing" >>"$TRANSCRIPT"
+                printf 'wzv: output seen:\n%s\n' "$(printf '%s\n' "$new" | strip_ansi)" >&2
+                ((rc == 0)) || die "app exited$(exit_note) before printing: $missing"
+                die "expected text not seen within ${timeout}s: $missing"
+            fi
+            ((rc == 0)) || die "app exited$(exit_note) without output; see $LOG"
+            die "no app output within ${timeout}s"
+        fi
+        sleep 0.1
+    done
+    printf '%s\n' "$new" | strip_ansi | tee -a "$TRANSCRIPT"
+    for t in "$@"; do printf '[expect ok] %s\n' "$t" >>"$TRANSCRIPT"; done
+}
+
+# run_oneshot ARGS...: one-shot app command in the run's environment, logged to the transcript.
+run_oneshot() {
+    ONESHOT_RC=0
+    "${APP_ENV[@]}" "$RUNNER" --backend dry-run "$@" >"$SCRATCH/oneshot.out" 2>"$SCRATCH/oneshot.err" ||
+        ONESHOT_RC=$?
+    {
+        printf '[%s] $ window_zones --backend dry-run %s\n' "$(now)" "$*"
+        cat "$SCRATCH/oneshot.out"
+        if [[ -s $SCRATCH/oneshot.err ]]; then
+            printf '[stderr]\n'
+            cat "$SCRATCH/oneshot.err"
+        fi
+        printf 'exit_code=%s\n' "$ONESHOT_RC"
+    } >>"$TRANSCRIPT"
+}
+
+cmd_start() {
+    local mode=run run_id='' init=1 build=1 timeout=20 ready tool rc n=0
+    while (($#)); do
+        case $1 in
+            --mode) need_value "$1" $#; mode=$2; shift 2 ;;
+            --run-id) need_value "$1" $#; run_id=$2; shift 2 ;;
+            --timeout) need_value "$1" $#; timeout=$2; shift 2 ;;
+            --no-init) init=0; shift ;;
+            --no-build) build=0; shift ;;
+            *) usage_error "start: unknown argument '$1'" ;;
+        esac
+    done
+    case $mode in
+        run) ready='Interactive session started' ;;
+        tui) ready='Window Zones TUI' ;;
+        *) usage_error '--mode must be run or tui' ;;
+    esac
+    [[ $timeout =~ ^[0-9]+$ ]] || usage_error '--timeout takes whole seconds'
+    [[ -n $run_id ]] || run_id="$(date +%Y%m%d-%H%M%S)-$$"
+    [[ $run_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        usage_error "--run-id may only contain letters, digits, '.', '_' and '-'"
+    RUN_DIR=$ROOT/$run_id
+    RUN_ID=$run_id
+    BIN_PATH=$BIN
+    [[ ! -e $RUN_DIR ]] || die "run $run_id already exists at $RUN_DIR; pick another --run-id"
+    set_paths
+    mkdir -p "$EVID" "$SCRATCH/home" "$SCRATCH/tmp" "$SCRATCH/runtime" "$SCRATCH/bin"
+    chmod 700 "$SCRATCH/runtime"
+    : >"$LOG"
+    : >"$TRANSCRIPT"
+    : >"$EVID/sentinel.log"
+    : >"$RUN_DIR/pids"
+
+    if ((build)) && ! (cd "$REPO" && cargo build --locked --bin window_zones) >"$EVID/build.log" 2>&1; then
+        die "cargo build --locked --bin window_zones failed; see $EVID/build.log (nothing was started)"
+    fi
+    [[ -x $BIN ]] || die "no binary at $BIN; drop --no-build (nothing was started)"
+    for tool in $SENTINELS; do
+        cat >"$SCRATCH/bin/$tool" <<EOF
+#!/bin/sh
+{ printf '%s' "$tool \$*" | tr '\n' ' '; echo; } >>"$EVID/sentinel.log"
+exit 127
+EOF
+        chmod +x "$SCRATCH/bin/$tool"
+    done
+    {
+        printf 'RUN_ID=%q\n' "$run_id"
+        printf 'MODE=%q\n' "$mode"
+        printf 'READY_TEXT=%q\n' "$ready"
+        printf 'BIN_PATH=%q\n' "$BIN"
+        printf 'BIN_CKSUM=%q\n' "$(cksum <"$BIN" | awk '{print $1 "-" $2}')"
+        printf 'GIT_HEAD=%q\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo none)"
+        printf 'GIT_CHANGES_AT_START=%q\n' "$(git -C "$REPO" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+        printf 'STARTED_AT=%q\n' "$(now)"
+    } >"$RUN_DIR/meta.env"
+
+    # The app reports where it resolves its config; inside env -i that must be under scratch/home.
+    run_oneshot status
+    CONFIG_PATH=$(sed -n 's/^  config path: //p' "$SCRATCH/oneshot.out")
+    case $CONFIG_PATH in
+        "$SCRATCH"/home/*) ;;
+        *) die "app resolved its config outside the run's HOME: '${CONFIG_PATH}' (nothing was started)" ;;
+    esac
+    printf 'CONFIG_PATH=%q\n' "$CONFIG_PATH" >>"$RUN_DIR/meta.env"
+    if ((init)); then
+        run_oneshot init
+        ((ONESHOT_RC == 0)) || die "window_zones init failed; see $TRANSCRIPT (nothing was started)"
+        cp "$CONFIG_PATH" "$EVID/config-00-init.toml"
+    fi
+
+    mkfifo "$FIFO"
+    (
+        trap '' HUP
+        "${APP_ENV[@]}" "$RUNNER" --backend dry-run "$mode" <"$FIFO" >>"$LOG" 2>&1 &
+        echo $! >"$SCRATCH/app.pid"
+        code=0
+        wait $! || code=$?
+        echo "$code" >"$EVID/exit-code"
+    ) </dev/null >/dev/null 2>&1 &
+    record_pid wrapper $!
+    # Holds the FIFO's write end open between `wzv send` calls so the app never sees EOF.
+    sleep 2147483647 >"$FIFO" </dev/null 2>/dev/null &
+    record_pid holder $!
+    while [[ ! -s $SCRATCH/app.pid ]] && ((n < 50)); do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    [[ -s $SCRATCH/app.pid ]] || { cleanup_run "$RUN_DIR" 0 >&2 || true; die "app did not start"; }
+    record_pid app "$(cat "$SCRATCH/app.pid")"
+    printf '[%s] started: scripts/run.sh --backend dry-run %s (pid %s)\n' \
+        "$(now)" "$mode" "$(pid_of app)" >>"$TRANSCRIPT"
+
+    local deadline=$((SECONDS + timeout))
+    while ! grep -qF -- "$ready" "$LOG"; do
+        rc=0
+        owned app || rc=$?
+        if ((rc != 0 || SECONDS >= deadline)); then
+            printf 'wzv: last app output:\n' >&2
+            strip_ansi <"$LOG" | tail -n 20 >&2
+            cleanup_run "$RUN_DIR" 0 >&2 || true
+            die "app did not print '$ready' within ${timeout}s; run cleaned up, evidence kept in $EVID"
+        fi
+        sleep 0.1
+    done
+    # Startup lines (config state, hotkey registration) follow the ready line; let them land so
+    # the first `send` only sees output caused by its own line.
+    local size last=-1 stable=0
+    n=0
+    while ((stable < 3 && n < 30)); do
+        size=$(log_size)
+        if ((size == last)); then stable=$((stable + 1)); else stable=0; fi
+        last=$size
+        sleep 0.1
+        n=$((n + 1))
+    done
+    printf '[%s] ready: %s\n' "$(now)" "$ready" >>"$TRANSCRIPT"
+    printf 'run_id=%s\nrun_dir=%s\nevidence_dir=%s\nmode=%s\npid=%s\nconfig_path=%s\nready=yes\n' \
+        "$run_id" "$RUN_DIR" "$EVID" "$mode" "$(pid_of app)" "$CONFIG_PATH"
+}
+
+DOCTOR_FAIL=0
+check() { # OK(0|1) NAME DETAIL
+    if (($1)); then
+        printf 'ok   %s: %s\n' "$2" "$3"
+    else
+        printf 'FAIL %s: %s\n' "$2" "$3"
+        DOCTOR_FAIL=1
+    fi
+}
+
+cmd_doctor() {
+    [[ $# -eq 1 ]] || usage_error 'doctor takes exactly one RUN'
+    load_run "$1"
+    local rc ok head calls locks
+    rc=0
+    owned app || rc=$?
+    case $rc in
+        0) check 1 app "pid $(pid_of app) is the process this run started" ;;
+        1) check 0 app "not running$(exit_note)" ;;
+        *) check 0 app "pid $(pid_of app) now belongs to another process" ;;
+    esac
+    rc=0
+    owned holder || rc=$?
+    ok=0
+    ((rc != 0)) || ok=1
+    check "$ok" input "stdin FIFO holder $( ((ok)) && echo alive || echo gone)"
+    ok=0
+    [[ $(cksum <"$BIN_PATH" 2>/dev/null | awk '{print $1 "-" $2}') == "$BIN_CKSUM" ]] && ok=1
+    check "$ok" binary "$BIN_PATH $( ((ok)) && echo 'unchanged since start' || echo 'changed since start; start a new run to test the new build')"
+    ok=0
+    grep -qF -- "$READY_TEXT" "$LOG" 2>/dev/null && ok=1
+    check "$ok" ready "'$READY_TEXT' $( ((ok)) && echo seen || echo 'not seen')"
+    ok=0
+    grep -q 'Window backend: dry-run' "$LOG" 2>/dev/null && ok=1
+    check "$ok" backend "$( ((ok)) && echo 'dry-run' || echo 'no "Window backend: dry-run" line')"
+    calls=$(grep -c . "$EVID/sentinel.log" 2>/dev/null || true)
+    ok=0
+    [[ ${calls:-0} -eq 0 ]] && ok=1
+    check "$ok" isolation "${calls:-0} live-backend program calls (evidence/sentinel.log)"
+    if [[ -d $SCRATCH ]]; then
+        locks=$(count_locks)
+        ok=0
+        [[ $locks -eq 0 ]] && ok=1
+        check "$ok" lock "$locks instance lock files in the run's TMPDIR/XDG_RUNTIME_DIR"
+    else
+        check 0 scratch "$SCRATCH removed by cleanup; nothing left to drive"
+    fi
+    head=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo none)
+    printf 'info source: started at %s with %s local changes; HEAD now %s\n' \
+        "$GIT_HEAD" "$GIT_CHANGES_AT_START" "$head"
+    if ((DOCTOR_FAIL)); then
+        echo 'doctor=fail'
+        exit 1
+    fi
+    echo 'doctor=ok'
+}
+
+# Splits "RUN POSITIONAL [--expect T]... [--timeout S]" into RUN_ARG, POS_ARG, EXPECTS, TIMEOUT.
+parse_driven() {
+    local cmd=$1 what=$2
+    shift 2
+    RUN_ARG='' POS_ARG='' TIMEOUT=8 EXPECTS=()
+    while (($#)); do
+        case $1 in
+            --expect) need_value "$1" $#; EXPECTS+=("$2"); shift 2 ;;
+            --timeout) need_value "$1" $#; TIMEOUT=$2; shift 2 ;;
+            *)
+                if [[ -z $RUN_ARG ]]; then RUN_ARG=$1
+                elif [[ -z $POS_ARG ]]; then POS_ARG=$1
+                else usage_error "$cmd: unexpected argument '$1' (quote the $what)"
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n $RUN_ARG && -n $POS_ARG ]] || usage_error "$cmd needs RUN and $what"
+    [[ $TIMEOUT =~ ^[0-9]+$ ]] || usage_error '--timeout takes whole seconds'
+}
+
+cmd_send() {
+    parse_driven send LINE "$@"
+    load_run "$RUN_ARG"
+    require_live
+    local offset
+    offset=$(log_size)
+    printf '[%s] > %s\n' "$(now)" "$POS_ARG" >>"$TRANSCRIPT"
+    # Read-write open never blocks, even if the app has just exited.
+    printf '%s\n' "$POS_ARG" 1<>"$FIFO"
+    await_output "$offset" "$TIMEOUT" ${EXPECTS[@]+"${EXPECTS[@]}"}
+}
+
+cmd_config() {
+    parse_driven config FILE "$@"
+    load_run "$RUN_ARG"
+    require_live
+    [[ -f $POS_ARG ]] || die "no such file: $POS_ARG"
+    local snapshot offset
+    snapshot=$(printf 'config-%02d.toml' "$(find "$EVID" -name 'config-*.toml' | wc -l | tr -d ' ')")
+    cp "$POS_ARG" "$EVID/$snapshot"
+    offset=$(log_size)
+    mkdir -p "$(dirname "$CONFIG_PATH")"
+    cp "$POS_ARG" "$CONFIG_PATH.wzv-save"
+    mv -f "$CONFIG_PATH.wzv-save" "$CONFIG_PATH"
+    printf '[%s] # saved %s over the config file (evidence/%s)\n' "$(now)" "$POS_ARG" "$snapshot" >>"$TRANSCRIPT"
+    await_output "$offset" "$TIMEOUT" ${EXPECTS[@]+"${EXPECTS[@]}"}
+}
+
+cmd_exec() {
+    local run='' expect_exit='' arg t missing='' prev=''
+    local -a expects=() args=()
+    while (($#)); do
+        case $1 in
+            --expect-exit) need_value "$1" $#; expect_exit=$2; shift 2 ;;
+            --expect) need_value "$1" $#; expects+=("$2"); shift 2 ;;
+            --) shift; break ;;
+            *) [[ -z $run ]] || usage_error "exec: unexpected '$1' before --"; run=$1; shift ;;
+        esac
+    done
+    [[ -n $run && $# -gt 0 ]] || usage_error 'exec needs RUN, --, and window_zones arguments'
+    [[ -z $expect_exit || $expect_exit =~ ^[0-9]+$ ]] || usage_error '--expect-exit takes a number'
+    load_run "$run"
+    for arg in "$@"; do
+        case $arg in
+            --backend | --backend=*) usage_error 'exec always uses --backend dry-run; drop --backend' ;;
+            --config=*) usage_error 'exec: write --config PATH, not --config=PATH' ;;
+        esac
+        if [[ $prev == --config ]]; then
+            # Relative paths resolve against the caller's directory, like the app would.
+            [[ $arg == /* ]] || arg=$PWD/$arg
+            case $arg in
+                */../* | */..) usage_error '--config must not contain ..' ;;
+                "$RUN_DIR"/*) ;;
+                *) usage_error "--config must point inside $RUN_DIR" ;;
+            esac
+        fi
+        args+=("$arg")
+        prev=$arg
+    done
+    [[ -d $SCRATCH ]] || die "run $RUN_ID was cleaned up; start a new run"
+    run_oneshot "${args[@]}"
+    cat "$SCRATCH/oneshot.out"
+    cat "$SCRATCH/oneshot.err" >&2
+    printf 'exit_code=%s\n' "$ONESHOT_RC"
+    for t in ${expects[@]+"${expects[@]}"}; do
+        grep -qF -- "$t" "$SCRATCH/oneshot.out" "$SCRATCH/oneshot.err" || { missing=$t; break; }
+    done
+    if [[ -n $missing ]]; then
+        printf '[expect FAIL] %s\n' "$missing" >>"$TRANSCRIPT"
+        die "expected text not in output: $missing"
+    fi
+    for t in ${expects[@]+"${expects[@]}"}; do printf '[expect ok] %s\n' "$t" >>"$TRANSCRIPT"; done
+    if [[ -n $expect_exit ]]; then
+        ((ONESHOT_RC == expect_exit)) || die "expected exit code $expect_exit, got $ONESHOT_RC"
+        return 0
+    fi
+    return "$ONESHOT_RC"
+}
+
+list_files() { # DIR -> relative file paths, or (none)
+    local out
+    out=$(cd "$1" 2>/dev/null && find . -type f | sort)
+    printf '%s\n' "${out:-(none)}"
+}
+
+cmd_stop() {
+    local run='' timeout=12 rc offset code calls locks home
+    while (($#)); do
+        case $1 in
+            --timeout) need_value "$1" $#; timeout=$2; shift 2 ;;
+            *) [[ -z $run ]] || usage_error "stop: unexpected argument '$1'"; run=$1; shift ;;
+        esac
+    done
+    [[ -n $run ]] || usage_error 'stop needs RUN'
+    [[ $timeout =~ ^[0-9]+$ ]] || usage_error '--timeout takes whole seconds'
+    load_run "$run"
+    [[ -d $SCRATCH ]] || die "run $RUN_ID was cleaned up; nothing to stop"
+    offset=$(log_size)
+    rc=0
+    owned app || rc=$?
+    ((rc != 2)) || die "recorded app pid for run $RUN_ID now belongs to another process; not touching it"
+    if ((rc == 0)); then
+        printf '[%s] > quit\n' "$(now)" >>"$TRANSCRIPT"
+        printf 'quit\n' 1<>"$FIFO"
+        wait_gone app "$((timeout * 10))" ||
+            die "app did not exit within ${timeout}s after quit; force it with: wzv cleanup $RUN_ID"
+    fi
+    local n=0
+    while [[ ! -f $EVID/exit-code ]] && ((n < 30)); do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    rc=0
+    owned holder || rc=$?
+    if ((rc == 0)); then
+        kill "$(pid_of holder)" 2>/dev/null || true
+        wait_gone holder 20 || true
+    fi
+    tail -c +"$((offset + 1))" "$LOG" | strip_ansi >>"$TRANSCRIPT"
+    code=$(cat "$EVID/exit-code" 2>/dev/null || echo unknown)
+    calls=$(grep -c . "$EVID/sentinel.log" 2>/dev/null || true)
+    locks=$(count_locks)
+    home=$(cd "$SCRATCH/home" && find . -type f | wc -l | tr -d ' ')
+    {
+        printf '# side effects of run %s, recorded %s\n' "$RUN_ID" "$(now)"
+        printf '## files in the run HOME (%s)\n' "$SCRATCH/home"
+        list_files "$SCRATCH/home"
+        printf '## files in the run TMPDIR (instance locks would appear here)\n'
+        list_files "$SCRATCH/tmp"
+        printf '## files in the run XDG_RUNTIME_DIR\n'
+        list_files "$SCRATCH/runtime"
+        printf '## live-backend programs invoked (sentinel PATH shims)\n'
+        if [[ -s $EVID/sentinel.log ]]; then cat "$EVID/sentinel.log"; else echo '(none)'; fi
+        printf '## app exit code\n%s\n' "$code"
+    } >"$EVID/side-effects.txt"
+    printf '[%s] stopped: exit code %s\n' "$(now)" "$code" >>"$TRANSCRIPT"
+    printf 'exit_code=%s\nlive_backend_tool_calls=%s\ninstance_locks=%s\nhome_files=%s\nside_effects=%s\nevidence_dir=%s\n' \
+        "$code" "${calls:-0}" "$locks" "$home" "$EVID/side-effects.txt" "$EVID"
+    [[ $code == 0 ]] || die "app exited with status $code; see $LOG"
+}
+
+cleanup_run() { # RUN DRY
+    load_run "$1"
+    local dry=$2 role pid rc failed=0
+    printf 'run=%s\n' "$RUN_ID"
+    for role in holder app wrapper; do
+        pid=$(pid_of "$role")
+        [[ -n $pid ]] || continue
+        # With the holder gone a TUI reads EOF and exits by itself (`run` keeps serving hotkeys
+        # without a terminal and gets TERM), and the wrapper then records the exit code.
+        [[ $role == holder ]] || ((dry)) || wait_gone "$role" 20 || true
+        rc=0
+        owned "$role" || rc=$?
+        case $rc in
+            1) printf 'gone %s pid=%s\n' "$role" "$pid" ;;
+            2) printf 'skip-not-owned %s pid=%s (start time differs from the record: pid reused)\n' "$role" "$pid" ;;
+            0)
+                if ((dry)); then
+                    printf 'would-kill %s pid=%s\n' "$role" "$pid"
+                    continue
+                fi
+                kill -TERM "$pid" 2>/dev/null || true
+                if ! wait_gone "$role" 30; then
+                    kill -KILL "$pid" 2>/dev/null || true
+                    if ! wait_gone "$role" 20; then
+                        printf 'FAILED to kill %s pid=%s\n' "$role" "$pid"
+                        failed=1
+                        continue
+                    fi
+                fi
+                printf 'killed %s pid=%s\n' "$role" "$pid"
+                ;;
+        esac
+    done
+    if [[ ! -d $SCRATCH ]]; then
+        printf 'already-removed %s\n' "$SCRATCH"
+    elif ((dry)); then
+        printf 'would-remove %s\n' "$SCRATCH"
+    elif rm -rf -- "$SCRATCH"; then
+        printf 'removed %s\n' "$SCRATCH"
+    else
+        printf 'FAILED to remove %s\n' "$SCRATCH"
+        failed=1
+    fi
+    printf 'kept %s\n' "$EVID"
+    return "$failed"
+}
+
+cmd_cleanup() {
+    local dry=0 all=0 status=0 dir
+    local -a runs=()
+    while (($#)); do
+        case $1 in
+            --dry-run) dry=1; shift ;;
+            --all) all=1; shift ;;
+            -*) usage_error "cleanup: unknown option '$1'" ;;
+            *) runs+=("$1"); shift ;;
+        esac
+    done
+    if ((all)); then
+        ((${#runs[@]} == 0)) || usage_error 'cleanup takes RUN... or --all, not both'
+        for dir in "$ROOT"/*/; do
+            [[ -f ${dir}meta.env ]] && runs+=("${dir%/}")
+        done
+        ((${#runs[@]})) || { echo "no runs under $ROOT"; return 0; }
+    fi
+    ((${#runs[@]})) || usage_error 'cleanup needs RUN... or --all'
+    for dir in "${runs[@]}"; do
+        cleanup_run "$dir" "$dry" || status=1
+    done
+    return "$status"
+}
+
+case ${1:-} in
+    -h | --help | help) usage ;;
+    start | doctor | send | config | exec | stop | cleanup)
+        cmd=$1
+        shift
+        for a in "$@"; do
+            [[ $a != -- ]] || break
+            [[ $a != -h && $a != --help ]] || { usage; exit 0; }
+        done
+        "cmd_$cmd" "$@"
+        ;;
+    '') usage >&2; exit 2 ;;
+    *) usage_error "unknown command '$1'" ;;
+esac
