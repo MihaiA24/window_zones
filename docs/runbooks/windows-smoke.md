@@ -106,9 +106,6 @@ public static class WindowZonesProbe
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-
     [DllImport("dwmapi.dll")]
     public static extern int DwmGetWindowAttribute(
         IntPtr hWnd, int attribute, out RECT rect, int size);
@@ -118,12 +115,6 @@ public static class WindowZonesProbe
 
     [DllImport("user32.dll")]
     public static extern bool IsZoomed(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int command);
 }
 '@
 # Keep this observer in physical pixels even if PowerShell set process awareness earlier.

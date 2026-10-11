@@ -172,63 +172,30 @@ fn validate_zone_definition(
     name: &str,
     zone: &ZoneDefinition,
 ) -> Result<(), BindingValidationError> {
-    if zone.width == 0 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "width must be greater than 0".to_string(),
-        });
-    }
+    let reason = if zone.width == 0 {
+        "width must be greater than 0"
+    } else if zone.height == 0 {
+        "height must be greater than 0"
+    } else if zone.x > 100 {
+        "x must be in 0..=100"
+    } else if zone.y > 100 {
+        "y must be in 0..=100"
+    } else if zone.width > 100 {
+        "width must be in 1..=100"
+    } else if zone.height > 100 {
+        "height must be in 1..=100"
+    } else if zone.x.saturating_add(zone.width) > 100 {
+        "x + width must be <= 100"
+    } else if zone.y.saturating_add(zone.height) > 100 {
+        "y + height must be <= 100"
+    } else {
+        return Ok(());
+    };
 
-    if zone.height == 0 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "height must be greater than 0".to_string(),
-        });
-    }
-
-    if zone.x > 100 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "x must be in 0..=100".to_string(),
-        });
-    }
-
-    if zone.y > 100 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "y must be in 0..=100".to_string(),
-        });
-    }
-
-    if zone.width > 100 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "width must be in 1..=100".to_string(),
-        });
-    }
-
-    if zone.height > 100 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "height must be in 1..=100".to_string(),
-        });
-    }
-
-    if zone.x.saturating_add(zone.width) > 100 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "x + width must be <= 100".to_string(),
-        });
-    }
-
-    if zone.y.saturating_add(zone.height) > 100 {
-        return Err(BindingValidationError::InvalidZoneDefinition {
-            zone: name.to_string(),
-            reason: "y + height must be <= 100".to_string(),
-        });
-    }
-
-    Ok(())
+    Err(BindingValidationError::InvalidZoneDefinition {
+        zone: name.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 fn canonicalize_hotkey_token(raw: &str) -> Result<String, BindingValidationError> {

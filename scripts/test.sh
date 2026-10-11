@@ -18,7 +18,6 @@ fi
 
 cargo fmt --all -- --check
 cargo test --locked
-cargo test --locked --doc
 
 if command -v cargo-clippy >/dev/null 2>&1; then
   cargo clippy --locked --all-targets --all-features -- -D warnings

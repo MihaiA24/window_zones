@@ -25,8 +25,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run tests
         run: cargo test --locked
-      - name: Run doc tests
-        run: cargo test --locked --doc
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 

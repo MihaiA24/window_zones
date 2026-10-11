@@ -58,14 +58,10 @@ impl ZoneDefinition {
         let right = percent_to_pixel(self.x + self.width, usable_area.width);
         let bottom = percent_to_pixel(self.y + self.height, usable_area.height);
 
-        let left = clamp_i32(usable_area.x + x as i32, usable_area.x, usable_area.right());
-        let top = clamp_i32(
-            usable_area.y + y as i32,
-            usable_area.y,
-            usable_area.bottom(),
-        );
-        let right = clamp_i32(usable_area.x + right as i32, left, usable_area.right());
-        let bottom = clamp_i32(usable_area.y + bottom as i32, top, usable_area.bottom());
+        let left = (usable_area.x + x as i32).clamp(usable_area.x, usable_area.right());
+        let top = (usable_area.y + y as i32).clamp(usable_area.y, usable_area.bottom());
+        let right = (usable_area.x + right as i32).clamp(left, usable_area.right());
+        let bottom = (usable_area.y + bottom as i32).clamp(top, usable_area.bottom());
 
         Rect::new(left, top, (right - left) as u32, (bottom - top) as u32)
     }
@@ -73,10 +69,6 @@ impl ZoneDefinition {
 
 fn percent_to_pixel(percent: u32, dimension: u32) -> u32 {
     dimension.saturating_mul(percent) / 100
-}
-
-fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
-    value.clamp(min, max)
 }
 
 pub fn built_in_zone_from_name(name: &str) -> Option<BuiltInZone> {

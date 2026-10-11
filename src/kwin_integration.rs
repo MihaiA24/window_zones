@@ -610,7 +610,6 @@ impl CompanionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestResult {
-    complete: bool,
     error_name: String,
     message: String,
 }
@@ -937,7 +936,6 @@ impl CompanionState {
         self.results.insert(
             id,
             RequestResult {
-                complete: true,
                 error_name: if ok { String::new() } else { error_name },
                 message: if ok { String::new() } else { message },
             },
@@ -947,7 +945,7 @@ impl CompanionState {
 
     fn request_result(&mut self, id: u32) -> (bool, String, String) {
         if let Some(result) = self.results.remove(&id) {
-            return (result.complete, result.error_name, result.message);
+            return (true, result.error_name, result.message);
         }
         if self.requests.iter().any(|request| request.id() == id) {
             return (false, String::new(), String::new());

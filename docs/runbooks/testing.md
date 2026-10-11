@@ -9,8 +9,7 @@
 What this verifies:
 
 - `cargo fmt --all -- --check` (formatting)
-- `cargo test --locked` (unit + integration tests)
-- `cargo test --locked --doc` (doc tests)
+- `cargo test --locked` (unit + integration + doc tests)
 - `cargo clippy --locked --all-targets --all-features` (only if clippy is installed)
 - `bash -n scripts/*.sh` (shell syntax, including the Smoke harness)
 - `node --check gnome-extension/extension.js`
@@ -18,10 +17,10 @@ What this verifies:
 - `node --check kwin-script/contents/code/main.js`
 - `qmllint kwin-script/contents/code/main.js` (QJSEngine syntax, which `node` does not enforce; only if `qmllint` is installed)
 
-The repository test script covers formatting, unit/integration tests, doc tests,
-and clippy when installed. The GNOME and KDE adapter contract tests use fake
-compositor services on private `dbus-daemon` instances; they do not require a
-running compositor session.
+The repository test script covers formatting, unit/integration/doc tests in one
+Cargo test invocation, and clippy when installed. The GNOME and KDE adapter
+contract tests use fake compositor services on private `dbus-daemon` instances;
+they do not require a running compositor session.
 
 The compositor scripts can be syntax-checked with:
 

@@ -41,15 +41,12 @@ PID_FILE="$TMP_DIR/pids"
 GROUP_PID_FILE="$TMP_DIR/group-pids"
 : >"$PID_FILE"
 : >"$GROUP_PID_FILE"
-PIDS=()
-GROUP_PIDS=()
 FAILURES=0
 ASSERTIONS=0
 SKIPPED=0
 CURRENT_GATE=""
 LAST_SHOT=""
 GNOME_LIVE_ACTIVE=0
-GNOME_LIVE_NEEDS_RESTORE=0
 GNOME_LIVE_RESTORE_FAILURE=0
 log() {
     printf '%s\n' "$*" | tee -a "$ASSERT_LOG"
@@ -312,7 +309,7 @@ hotkey = "Alt+Ctrl+Down"
 action = { type = "move-to-next-display" }
 EOF
 }
-write_x11_valid_config() {
+write_five_binding_config() {
     write_valid_config
     cat >>"$CONFIG_PATH" <<'EOF'
 
@@ -582,7 +579,6 @@ start_fifo_app() {
     APP_PID=$!
     printf '%s\n' "$APP_PID" >>"$PID_FILE"
     exec {APP_FD}>"$fifo"
-    APP_FIFO="$fifo"
 }
 
 send_app() {
@@ -667,26 +663,13 @@ gnome_live_wait_companion() {
     return 1
 }
 
-gnome_live_wait_companion_gone() {
-    local timeout_s=${1:-10}
-    local deadline=$((SECONDS + timeout_s))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        if [[ "$service_list" != *'org.window_zones.Gnome'* ]]; then
-            return 0
-        fi
-        sleep 0.2
-    done
-    return 1
-}
-
-gnome_live_geometry() {
-    local geometry key value x='' y='' width='' height=''
+gtk_x11_geometry() {
+    local display=$1 xauthority=$2 geometry key value x='' y='' width='' height=''
     if [[ -z "${WINDOW_ID:-}" ]]; then
         printf 'unavailable'
         return 0
     fi
-    geometry=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
+    geometry=$(DISPLAY="$display" XAUTHORITY="$xauthority" \
         xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null || true)
     while IFS='=' read -r key value; do
         case "$key" in
@@ -700,7 +683,7 @@ gnome_live_geometry() {
     # every side than the frame the compositor places. Inset it so the observer and the Companion
     # describe the same rectangle.
     local extents left=0 right=0 top=0 bottom=0
-    extents=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
+    extents=$(DISPLAY="$display" XAUTHORITY="$xauthority" \
         xprop -id "$WINDOW_ID" _GTK_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p')
     if [[ "$extents" =~ ^([0-9]+),\ ([0-9]+),\ ([0-9]+),\ ([0-9]+)$ ]]; then
         left=${BASH_REMATCH[1]}
@@ -715,6 +698,10 @@ gnome_live_geometry() {
     else
         printf 'unavailable'
     fi
+}
+
+gnome_live_geometry() {
+    gtk_x11_geometry "$GNOME_XDISPLAY" "$GNOME_XAUTHORITY"
 }
 
 gnome_live_zone_targets() {
@@ -1216,9 +1203,8 @@ run_gnome_hotkey_and_disconnect() {
     fi
     stop_app_cleanly 'GNOME run quits cleanly' "$run_log"
 }
-run_tui_lifecycle() {
-    local backend=$1 label=$2
-    local tui_log="$TMP_DIR/${CURRENT_GATE}-${label}-tui.log" before after rc=0
+tui_begin() {
+    local backend=$1 label=$2 tui_log=$3 command marker before
     start_fifo_app tui "$backend" "$tui_log"
     if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
         assert_text "$label TUI starts" 'Window Zones TUI' "$(<"$tui_log")"
@@ -1226,29 +1212,37 @@ run_tui_lifecycle() {
         assert_text "$label TUI starts" 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app reload
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text "$label TUI reload" 'Config:' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI reload" 'Config:' ''
-    fi
+    for command in reload restart status; do
+        case "$command" in
+            reload) marker='Config:' ;;
+            restart) marker='Hotkey state:' ;;
+            status) marker='Commands: reload' ;;
+        esac
+        before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
+        send_app "$command"
+        if wait_for_size_growth "$tui_log" "$before" 8; then
+            assert_text "$label TUI $command" "$marker" "$(<"$tui_log")"
+        else
+            assert_text "$label TUI $command" "$marker" ''
+        fi
+    done
+}
 
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app restart
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text "$label TUI restart" 'Hotkey state:' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI restart" 'Hotkey state:' ''
+tui_end() {
+    local label=$1 tui_log=$2 rc=0
+    send_app quit
+    close_app_input
+    if [[ -n "${APP_PID:-}" ]]; then
+        wait_pid "$APP_PID" 12 || rc=$?
+        APP_PID=''
     fi
+    assert_rc_zero "$label TUI quit" "$rc" "tui log $tui_log"
+}
 
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app status
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text "$label TUI status" 'Commands: reload' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI status" 'Commands: reload' ''
-    fi
+run_tui_lifecycle() {
+    local backend=$1 label=$2
+    local tui_log="$TMP_DIR/${CURRENT_GATE}-${label}-tui.log"
+    tui_begin "$backend" "$label" "$tui_log"
 
     send_app 'dispatch alt+ctrl+left'
     if wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8; then
@@ -1257,13 +1251,7 @@ run_tui_lifecycle() {
         assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero "$label TUI quit" "$rc" "tui log $tui_log"
+    tui_end "$label" "$tui_log"
 }
 
 gnome_live_choose_hotkeys() {
@@ -1600,7 +1588,7 @@ run_gnome_live_adr9_window_checks() {
         DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland "$GNOME_ROOT/launch-editor.sh")
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone)
     b=$(xwindow_for_pid "$b_pid" 20 || true)
     assert_text 'GNOME live second test window maps' 'mapped' "${b:+mapped}"
     if [[ -z "$b" || -z "$a_id" ]]; then
@@ -1866,39 +1854,9 @@ EOF
 }
 
 run_gnome_live_tui_lifecycle() {
-    local tui_log="$GNOME_ROOT/live-tui.log" before rc=0
+    local tui_log="$GNOME_ROOT/live-tui.log"
     write_gnome_live_valid_config
-    start_fifo_app tui wayland "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text 'GNOME live TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI starts' 'Window Zones TUI' \
-            "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
-
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app reload
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'GNOME live TUI reload' 'Config:' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI reload' 'Config:' ''
-    fi
-
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app restart
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'GNOME live TUI restart' 'Hotkey state:' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI restart' 'Hotkey state:' ''
-    fi
-
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app status
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'GNOME live TUI status' 'Commands: reload' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI status' 'Commands: reload' ''
-    fi
+    tui_begin wayland 'GNOME live' "$tui_log"
 
     gnome_live_activate_window || true
     send_app "dispatch $GNOME_SAFE_LEFT_HOTKEY"
@@ -1906,13 +1864,7 @@ run_gnome_live_tui_lifecycle() {
         "$(sorted_hotkey "$GNOME_SAFE_LEFT_HOTKEY")" \
         "$(sorted_hotkey "$(wait_for_reported_action "$tui_log" 'Last action: ' 10)")"
 
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero 'GNOME live TUI quit' "$rc" "tui log $tui_log"
+    tui_end 'GNOME live' "$tui_log"
 }
 
 run_gnome_live() {
@@ -1938,11 +1890,8 @@ run_gnome_live() {
     WAYLAND_DISPLAY='wayland-0'
     GNOME_XDISPLAY=':0'
     GNOME_XAUTHORITY=''
-    GNOME_LIVE_EXT_PRESENT=0
     GNOME_LIVE_WINDOW_ENABLED_BEFORE=0
     GNOME_LIVE_TILING_ENABLED_BEFORE=0
-    GNOME_LIVE_SNAPSHOT_READY=0
-    GNOME_LIVE_NEEDS_RESTORE=0
     GNOME_LIVE_ACTIVE=1
     GNOME_LIVE_RESTORE_FAILURE=0
     APP_PID=''
@@ -1977,16 +1926,13 @@ run_gnome_live() {
         snapshot_ok=0
     fi
     if [[ -d "$GNOME_LIVE_EXT_DIR" ]]; then
-        GNOME_LIVE_EXT_PRESENT=1
         if ! cp -a -- "$GNOME_LIVE_EXT_DIR" "$GNOME_LIVE_BACKUP_DIR"; then
             snapshot_ok=0
         fi
     else
         log "SNAPSHOT installed extension directory: absent ($GNOME_LIVE_EXT_DIR)"
     fi
-    if [[ "$snapshot_ok" -eq 1 ]]; then
-        GNOME_LIVE_SNAPSHOT_READY=1
-    else
+    if [[ "$snapshot_ok" -ne 1 ]]; then
         assert_eq 'GNOME live snapshot complete' 1 0
     fi
 
@@ -2094,19 +2040,12 @@ run_gnome_live() {
     GNOME_LIVE_DISPLAY_TOTAL="$display_count"
     write_gnome_live_valid_config
 
-    local editor_launcher="$GNOME_ROOT/launch-editor.sh"
     local editor_log="$GNOME_ROOT/editor.log" editor_pid='' editor_deadline
-    cat >"$editor_launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec gnome-text-editor --standalone
-EOF
-    chmod +x "$editor_launcher"
     editor_pid=$(start_group "$editor_log" env \
         DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland "$editor_launcher")
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone)
     EDITOR_PID="$editor_pid"
     log "OBSERVED GNOME live editor pid: $EDITOR_PID"
     editor_deadline=$((SECONDS + 20))
@@ -2157,7 +2096,6 @@ EOF
     run_gnome_live_app_checks
     run_gnome_live_tui_lifecycle
     stop_pid "$EDITOR_PID"
-    GNOME_LIVE_EDITOR_STOPPED=1
     gnome_live_finish
     set -e
 }
@@ -2501,30 +2439,6 @@ kde_live_preflight() {
     return 0
 }
 
-kde_live_write_valid_config() {
-    cat >"$CONFIG_PATH" <<'EOF'
-[[bindings]]
-hotkey = "Alt+Ctrl+Left"
-action = { type = "move-to-zone", zone = "left-half" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Up"
-action = { type = "move-to-zone", zone = "center-third" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Right"
-action = { type = "move-to-zone", zone = "left-two-thirds" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Down"
-action = { type = "move-to-next-display" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Shift+Right"
-action = { type = "move-to-previous-display" }
-EOF
-}
-
 kde_live_write_changed_config() {
     cat >"$CONFIG_PATH" <<'EOF'
 [[bindings]]
@@ -2664,37 +2578,7 @@ kde_live_find_window() {
 }
 
 kde_live_x11_geometry() {
-    local geometry='' key='' value='' x='' y='' width='' height=''
-    if [[ -z "${WINDOW_ID:-}" ]]; then
-        printf 'unavailable'
-        return 0
-    fi
-    geometry=$(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null || true)
-    while IFS='=' read -r key value; do
-        case "$key" in
-            X) x=$value ;;
-            Y) y=$value ;;
-            WIDTH) width=$value ;;
-            HEIGHT) height=$value ;;
-        esac
-    done <<<"$geometry"
-    local extents='' left=0 right=0 top=0 bottom=0
-    extents=$(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        xprop -id "$WINDOW_ID" _GTK_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p')
-    if [[ "$extents" =~ ^([0-9]+),\ ([0-9]+),\ ([0-9]+),\ ([0-9]+)$ ]]; then
-        left=${BASH_REMATCH[1]}
-        right=${BASH_REMATCH[2]}
-        top=${BASH_REMATCH[3]}
-        bottom=${BASH_REMATCH[4]}
-    fi
-    if [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ \
-        && "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
-        printf '%s,%s,%s,%s' "$((x + left))" "$((y + top))" \
-            "$((width - left - right))" "$((height - top - bottom))"
-    else
-        printf 'unavailable'
-    fi
+    gtk_x11_geometry "$KDE_XDISPLAY" "$KDE_XAUTHORITY"
 }
 
 kde_live_wait_focus() {
@@ -3308,41 +3192,15 @@ EOF
     assert_text 'KDE App names the accelerator owner' \
         'Window Zones conflict incumbent' "$(cat "$conflict_config_log" 2>/dev/null || true)"
     stop_app_cleanly 'KDE App with a conflicting accelerator quits cleanly' "$conflict_config_log"
-    kde_live_write_valid_config
+    write_five_binding_config
     set +e
     kde_live_unload_script window-zones-conflict
 }
 
 kde_live_tui_lifecycle() {
-    local tui_log="$KDE_ROOT/tui.log" before='' rc=0
-    kde_live_write_valid_config
-    start_fifo_app tui auto "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text 'KDE TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI starts' 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app reload
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'KDE TUI reload' 'Config:' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI reload' 'Config:' ''
-    fi
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app restart
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'KDE TUI restart' 'Hotkey state:' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI restart' 'Hotkey state:' ''
-    fi
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app status
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'KDE TUI status' 'Commands: reload' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI status' 'Commands: reload' ''
-    fi
+    local tui_log="$KDE_ROOT/tui.log"
+    write_five_binding_config
+    tui_begin auto KDE "$tui_log"
     kde_live_activate_window || true
     send_app 'dispatch alt+ctrl+left'
     wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 10 || true
@@ -3350,13 +3208,7 @@ kde_live_tui_lifecycle() {
         "$(cat "$tui_log" 2>/dev/null || true)"
     kde_live_refresh_targets
     kde_live_assert_zone 'KDE TUI dispatch geometry' left-half A
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero 'KDE TUI quit' "$rc" "tui log $tui_log"
+    tui_end KDE "$tui_log"
     set +e
 }
 
@@ -3531,7 +3383,7 @@ run_kde_live() {
         '/Window Zones KWin.*failed/p;/Window Zones KWin.*error/p;/KDE_CONFLICT_ERROR/p' \
         "$KDE_KWIN_LOG" 2>/dev/null || true)
     log "KDE nested KWin script diagnostics: ${kwin_diagnostics:-none}"
-    kde_live_write_valid_config
+    write_five_binding_config
     local auto_backend_output=''
     auto_backend_output=$(env -u GNOME_DESKTOP_SESSION_ID -u SWAYSOCK \
         -u HYPRLAND_INSTANCE_SIGNATURE DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
@@ -3647,7 +3499,7 @@ PY
     kde_live_adr9_window_checks
     log 'KDE native Wayland placement not exercised; test client used Xwayland'
 
-    kde_live_write_valid_config
+    write_five_binding_config
     kde_live_prepare_environment
     local run_log="$KDE_ROOT/run.log" app_bus=''
     start_fifo_app run auto "$run_log"
@@ -3808,7 +3660,7 @@ PY
     assert_eq 'KDE rejected replacement incumbent holds the accelerator' 1 \
         "$(( $(count_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_READY') > conflict_before ? 1 : 0 ))"
     refused_before=$(count_text "$run_log" 'were refused')
-    kde_live_write_valid_config
+    write_five_binding_config
     cat >>"$CONFIG_PATH" <<'EOF'
 
 [[bindings]]
@@ -3854,7 +3706,7 @@ EOF
         "$(( $(count_text "$run_log" 'binding count: 1') > bindings_before ? 1 : 0 ))"
     loaded_before=$(count_text "$run_log" 'Config state: Loaded')
     bindings_before=$(count_text "$run_log" 'binding count: 5')
-    kde_live_write_valid_config
+    write_five_binding_config
     sleep 0.4
     send_app reload
     sleep 0.3
@@ -3977,18 +3829,12 @@ EOF
     GNOME_TWO_THIRDS="$GNOME_X,$GNOME_Y,$((GNOME_W - GNOME_W / 3)),$GNOME_H"
     GNOME_SECOND_HALF="$GNOME_X2,$GNOME_Y2,$((GNOME_W2 / 2)),$GNOME_H2"
 
-    local editor_launcher="$GNOME_ROOT/launch-editor.sh" editor_log="$GNOME_ROOT/editor.log" editor_pid
-    cat >"$editor_launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec gnome-text-editor --standalone
-EOF
-    chmod +x "$editor_launcher"
+    local editor_log="$GNOME_ROOT/editor.log" editor_pid
     editor_pid=$(start_group "$editor_log" env \
         WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_RUNTIME_DIR="$GNOME_RUNTIME" \
         DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" XDG_CONFIG_HOME="$GNOME_CONFIG" \
         XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" GDK_BACKEND=wayland \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland "$editor_launcher")
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone)
     if wait_for_text "$editor_log" 'Text Editor' 15; then
         assert_text 'GNOME test window launched' 'Text Editor' "$(<"$editor_log")"
     else
@@ -4353,7 +4199,7 @@ EOF
     export XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME"
     export XDG_SESSION_TYPE=x11
     unset WAYLAND_DISPLAY
-    write_x11_valid_config
+    write_five_binding_config
     local auto_backend_output=''
     auto_backend_output=$(env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 \
         XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" \
@@ -4476,7 +4322,7 @@ EOF
     send_app status
     sleep 0.3
     assert_text 'X11 invalid reload preserves previous bindings' 'binding count: 5' "$(<"$run_log")"
-    write_x11_valid_config
+    write_five_binding_config
     sleep 0.3
     send_app reload
     sleep 0.5
@@ -4492,7 +4338,7 @@ EOF
         assert_text 'X11 competitor holds alt+ctrl+f8' 'GRABBED alt+ctrl+f8' \
             "$(cat "$grab_log" 2>/dev/null || true)"
         refused_before=$(count_text "$run_log" 'were refused')
-        write_x11_valid_config
+        write_five_binding_config
         cat >>"$CONFIG_PATH" <<'EOF'
 
 [[bindings]]
@@ -4530,7 +4376,7 @@ EOF
             "$rejected_geometry"
         stop_pid "$grab_pid"
         wait_pid "$grab_pid" 5 || true
-        write_x11_valid_config
+        write_five_binding_config
     else
         skip_assert 'X11 rejected replacement keeps the previous grab working' \
             'seam helper did not build; see X11 seam helper build assertion'
