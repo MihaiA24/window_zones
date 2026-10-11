@@ -2,12 +2,14 @@
 
 ## Prerequisites
 - Rust toolchain with `cargo` in `PATH`.
-- On Linux, `pkg-config` and D-Bus development headers are required for tray
-  and KWin companion support:
-  - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
-  - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
+- On Linux, `pkg-config`, D-Bus headers, and X11/XInput/XTest development libraries
+  are required; the current Linux build links the X11 hotkey adapter even when
+  the selected runtime integration is native Wayland:
+  - Arch/CachyOS: `sudo pacman -S --needed base-devel rust pkgconf dbus libx11 libxi libxtst`
+  - Debian/Ubuntu: `sudo apt install build-essential pkg-config libdbus-1-dev libx11-dev libxi-dev libxtst-dev`
+  - Fedora: `sudo dnf install gcc pkgconf-pkg-config dbus-devel libX11-devel libXi-devel libXtst-devel`
 - (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
-- For GNOME Wayland, GNOME Shell 50 and `gnome-extensions` are required when
+- For GNOME Wayland, GNOME Shell 50 or 51 and `gnome-extensions` are required when
   using the optional companion; install steps are in
   `docs/runbooks/gnome-wayland.md`.
 - For KDE Plasma Wayland, `kpackagetool6` is required to install the KWin

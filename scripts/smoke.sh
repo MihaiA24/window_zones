@@ -1768,7 +1768,7 @@ run_gnome_live() {
     if [[ "$companion_ready" -ne 1 ]]; then
         log 'BLOCKED GNOME live: companion is not active on the live session bus; log out and back in, then rerun gnome-live'
         gnome_live_skip_after_companion \
-            'org.window_zones.Gnome absent or extension remained INACTIVE on GNOME Shell 50.4'
+            'org.window_zones.Gnome absent or extension not ACTIVE; install the current companion and log out and back in'
         gnome_live_finish
         set -e
         return 0
@@ -3479,7 +3479,7 @@ EOF
         sleep 0.2
     done
     local extension_result
-    extension_result=$(gnome_shell_call /org/gnome/Shell/Extensions \
+    extension_result=$(gnome_shell_call /org/gnome/Shell \
         org.gnome.Shell.Extensions.EnableExtension "'window-zones@mihai-a24'" 2>&1 || true)
     log "GNOME extension enable: $extension_result"
     assert_text 'GNOME companion owns D-Bus name' 'org.window_zones.Gnome' "$service_list"

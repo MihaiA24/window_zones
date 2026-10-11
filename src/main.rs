@@ -1261,7 +1261,12 @@ fn execute_run_with_tray(
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<TrayItem, String> {
-    let mut tray = TrayItem::new("Window Zones", IconSource::Resource(""))
+    let icon_name = if cfg!(target_os = "linux") {
+        "view-grid-symbolic"
+    } else {
+        ""
+    };
+    let mut tray = TrayItem::new("Window Zones", IconSource::Resource(icon_name))
         .map_err(|error| error.to_string())?;
 
     for line in runtime_status_lines(app) {

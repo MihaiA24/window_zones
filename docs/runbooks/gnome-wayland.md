@@ -1,6 +1,6 @@
 # GNOME Wayland Runbook
 
-The GNOME integration targets GNOME Shell 50 and uses the in-repository Shell extension as the compositor companion. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session.
+The GNOME integration targets GNOME Shell 50 and 51 and uses the in-repository Shell extension as the compositor companion. Both versions are admitted by `metadata.json`; Shell version validation must remain enabled. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session. Admission and API compatibility are not a substitute for a passing Smoke run; exact verified configurations are recorded in [the testing runbook](testing.md).
 
 ## Target version
 
@@ -8,11 +8,13 @@ Record the exact point release before a manual run:
 
 ```bash
 gnome-shell --version
-# Local reference run: GNOME Shell 50.4
+# Current device: GNOME Shell 51.0; earlier reference: GNOME Shell 50.4
 ```
 
 ## Install and enable the companion
 
+For an upgrade, stop the App and disable the already-installed companion with
+`gnome-extensions disable window-zones@mihai-a24` before replacing its files.
 From the repository root:
 
 ```bash
@@ -20,29 +22,63 @@ extension_dir="$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24"
 mkdir -p "$extension_dir"
 install -m 0644 gnome-extension/metadata.json "$extension_dir/metadata.json"
 install -m 0644 gnome-extension/extension.js "$extension_dir/extension.js"
-gnome-extensions enable window-zones@mihai-a24
-gnome-extensions info window-zones@mihai-a24
 ```
 
-On GNOME Shell 50 a Wayland session activates extensions only at session start.
-`gnome-extensions enable` and the `EnableExtension` D-Bus method update the
-enabled list and return success, but the extension stays `State: INACTIVE`, and
-`ReloadExtension` now fails with
+After a new manual installation or source/metadata upgrade, log out and back in
+at a convenient time. Copying files does not refresh the running Shell's
+extension metadata or imported JavaScript. An extension already marked
+`OUT OF DATE` can therefore retain that state even after the corrected
+`metadata.json` is on disk. On Wayland, do not attempt an in-place Shell restart.
+The `ReloadExtension` D-Bus method is not a workaround: GNOME 50 and 51 return
 `org.freedesktop.DBus.Error.NotSupported: ReloadExtension is deprecated and does not work`.
-After installing or updating the companion, log out and back in, then confirm:
+Do not disable Shell version validation to bypass this admission gate.
+
+After logging back in, enable the companion and confirm both Shell state and
+the actual service:
 
 ```bash
+gnome-extensions enable window-zones@mihai-a24
 gnome-extensions info window-zones@mihai-a24   # expects State: ACTIVE
-busctl --user list | grep org.window_zones.Gnome
+gdbus call --session --dest org.window_zones.Gnome \
+  --object-path /org/window_zones/Gnome \
+  --method org.window_zones.Gnome1.GetCapabilities
 ```
 
-Disable it with:
+The service should report `focused-window`, `displays`, `move-resize`, and
+`hotkeys`. Enabling/disabling an already-discovered compatible extension takes
+effect in the running session on **both GNOME 50 and 51**; it does not require
+logout. Settings changes are processed asynchronously, so allow the transition
+to finish before inspecting state. `EnableExtension` returning success means
+the enabled-list update succeeded, not that the extension is `ACTIVE`.
+
+If it remains inactive, inspect:
+
+```bash
+gsettings get org.gnome.shell disable-user-extensions
+gnome-extensions info window-zones@mihai-a24
+gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+  --method org.gnome.Shell.Extensions.GetExtensionErrors window-zones@mihai-a24
+```
+
+With `disable-user-extensions true`, user extensions cannot activate. If you
+intend to enable them, use the Extensions application's master switch; this
+affects all user extensions, not just Window Zones. `OUT OF DATE` calls for
+compatible files and a new login, not repeated enable calls. Report extension
+errors rather than bypassing validation.
+
+Disable the loaded companion immediately with:
 
 ```bash
 gnome-extensions disable window-zones@mihai-a24
 ```
 
-Disabling also takes effect only after the session restarts.
+Disable releases accelerator grabs, disconnects the display signal,
+unsubscribes the client-owner watcher, unexports the D-Bus object, and releases
+the service name. Re-enable it with the same `gnome-extensions enable` command;
+the App can reconnect and re-register its current hotkeys without restarting.
+An empty hotkey set or the active controller's session-bus disconnect also
+releases its grabs and ownership of the registered set. Other App instances
+cannot replace a live controller's nonempty set.
 
 The companion owns:
 
@@ -100,16 +136,43 @@ $HOME/.local/bin/window_zones --backend auto --config ./path/to/config.toml run
 
 ## Manual smoke checklist
 
-Before the seated run, prepare the session:
+Before a seated run, inspect and save the current extension settings:
 
 ```bash
-gsettings set org.gnome.shell disable-user-extensions false
-gsettings get org.gnome.shell enabled-extensions      # save this list
-gsettings set org.gnome.shell enabled-extensions "['window-zones@mihai-a24']"
-sudo chmod 0666 /dev/uinput                           # real accelerator capture
+gsettings get org.gnome.shell disable-user-extensions
+gsettings get org.gnome.shell enabled-extensions
+gsettings get org.gnome.shell disabled-extensions
 ```
 
-The master switch has to be off: with `disable-user-extensions true` the Companion stays `INACTIVE` and `EnableExtension` still returns `true`, which looks exactly like a broken extension. Narrowing `enabled-extensions` keeps tiling extensions from moving the test window. `/dev/uinput` is required because Xwayland XTEST events never reach a compositor accelerator grab on GNOME 50. Restore the saved list and `sudo chmod 0600 /dev/uinput` afterwards.
+The companion must be `ACTIVE` and its service reachable before dependent
+checks can pass. Do not replace the user's entire enabled-extension list to
+isolate the test. If another tiling extension interferes, disable only that
+extension with the user's approval and restore it afterwards.
+
+Prefer physical key presses when the harness asks for a hotkey. Xwayland
+XTEST events do not prove compositor-level accelerator capture. The seated
+harness uses its narrow virtual-keyboard injector when `/dev/uinput` is already
+writable, otherwise it asks for physical input. Without either path, record
+hotkey delivery as unverified; a direct dispatch is not equivalent evidence.
+
+If an administrator explicitly approves temporary injector access, grant it
+only to the current user, save the original ACL, and restore it even if the
+run fails. Never make `/dev/uinput` world-writable:
+
+```bash
+(
+  set -e
+  acl_backup=$(mktemp)
+  getfacl -p /dev/uinput > "$acl_backup"
+  trap 'sudo setfacl --restore="$acl_backup" && rm -f "$acl_backup"' EXIT
+  sudo setfacl -m "u:$(id -un):rw" /dev/uinput
+  ./scripts/smoke.sh gnome-live
+)
+```
+
+This optional path needs `getfacl`, `setfacl`, and authorized `sudo`; do not
+attempt it unattended when those prerequisites are unavailable. If restoration
+fails, keep the backup and restore the ACL before leaving injector access open.
 
 Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
 
@@ -130,3 +193,21 @@ cargo test --locked gnome_integration
 ```
 
 The private fake-service tests cover the stable names and signatures, capability gating, negative coordinates, focused-window absence, exact move payloads, hotkey signals, atomic registration rejection, Busy, incompatible/denied responses, and disconnect/reconnect.
+
+## Compatibility and lifecycle sources
+
+The GNOME 51 API review used the installed `Meta-51.gir` and the JavaScript
+resources embedded in `libshell-51.so` (whose `Config.PACKAGE_VERSION` is
+`51.0`). The companion's existing focus, frame, work-area, move/resize, and
+accelerator calls remain available. `move_resize_frame` requests frame
+placement; Mutter's size constraints and asynchronous Wayland client
+configuration can affect the final geometry, so observe the settled frame
+during a seated run.
+
+Primary references:
+
+- [GNOME 51 extension manager](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/extensionSystem.js) and [GNOME 50 extension manager](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/50.4/js/ui/extensionSystem.js): live settings-driven enable/disable, metadata validation, and imported-module lifecycle.
+- [GNOME 51 Shell D-Bus implementation](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/shellDBus.js) and [GNOME 50 implementation](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/50.4/js/ui/shellDBus.js): `ReloadExtension` is unsupported.
+- [GNOME 51 layout manager](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/layout.js): `getWorkAreaForMonitor` returns workspace work areas rather than full monitor bounds.
+- [Mutter 51 window implementation](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/core/window.c) and [Mutter 50 public window API](https://gitlab.gnome.org/GNOME/mutter/-/blob/50.4/src/meta/window.h): frame placement, maximize flags, fullscreen and resize restrictions. Built-in side tiling sets the vertical maximize flag.
+- [GIO name ownership lifecycle](https://docs.gtk.org/gio/func.bus_own_name.html): export before name acquisition, teardown on name loss, and asynchronous ownership callbacks.

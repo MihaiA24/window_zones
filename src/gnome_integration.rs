@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use dbus::arg::{AppendAll, ReadAll};
 use dbus::blocking::Connection;
+use dbus::channel::MatchingReceiver;
 use dbus::message::MatchRule;
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -207,18 +208,26 @@ impl GnomeHotkeySystem {
             })
             .map_err(classify_dbus_error)?;
 
-        let owner_rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+        let owner_rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
+            .with_sender("org.freedesktop.DBus");
         connection
-            .add_match(
-                owner_rule,
-                move |(name, _old_owner, new_owner): (String, String, String), _, _| {
-                    if name == GNOME_SERVICE_NAME && new_owner.is_empty() {
-                        service_lost.store(true, Ordering::Relaxed);
-                    }
-                    true
-                },
-            )
+            .add_match_no_cb(&format!(
+                "{},arg0='{GNOME_SERVICE_NAME}'",
+                owner_rule.match_str()
+            ))
             .map_err(classify_dbus_error)?;
+        connection.start_receive(
+            owner_rule,
+            Box::new(move |message, _| {
+                if let Ok((name, _old_owner, new_owner)) = message.read3::<String, String, String>()
+                    && name == GNOME_SERVICE_NAME
+                    && new_owner.is_empty()
+                {
+                    service_lost.store(true, Ordering::Relaxed);
+                }
+                true
+            }),
+        );
 
         self.service_lost.store(false, Ordering::Relaxed);
         self.connection = Some(connection);
@@ -735,6 +744,40 @@ mod tests {
         bus.update_state(|state| {
             assert_eq!(state.registered_hotkeys, vec!["ctrl+alt+right".to_string()]);
         });
+    }
+
+    #[test]
+    fn inspection_connections_do_not_delay_hotkey_delivery() {
+        let mut state = FakeServiceState::complete();
+        state.signal_hotkey = None;
+        let bus = FakeBus::new(state);
+        let mut hotkey_system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
+        hotkey_system
+            .register_hotkeys(&["ctrl+alt+left".to_string()])
+            .unwrap();
+        let connection = hotkey_system.connection.as_ref().unwrap();
+        get_capabilities(connection).unwrap();
+        while connection.process(Duration::from_millis(0)).unwrap() {}
+
+        let window_system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        for _ in 0..8 {
+            window_system.capabilities().unwrap();
+        }
+        bus.update_state(|state| {
+            state.signal_hotkey = Some("ctrl+alt+left".to_string());
+        });
+        hotkey_system
+            .register_hotkeys(&["ctrl+alt+left".to_string()])
+            .unwrap();
+        // The reply follows the signal on this connection, making the poll deterministic.
+        get_capabilities(hotkey_system.connection.as_ref().unwrap()).unwrap();
+
+        assert_eq!(
+            hotkey_system.next_hotkey().unwrap(),
+            Some(HotkeyEvent::Pressed {
+                hotkey: "ctrl+alt+left".to_string()
+            })
+        );
     }
 
     #[test]

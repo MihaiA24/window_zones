@@ -22,7 +22,7 @@ The platform-neutral core and runtime paths currently include:
 - TOML config parsing, discovery, reload, and atomic rollback;
 - the `WindowSystem` and `HotkeySystem` adapter contracts;
 - action execution and config-driven dispatch;
-- GNOME Shell 50 companion integration over the versioned user-session D-Bus contract;
+- GNOME Shell 50/51 companion integration over the versioned user-session D-Bus contract;
 - native KDE Plasma Wayland KWin script and companion integration;
 - global hotkey registration on supported non-Wayland paths, GNOME, and KDE companion paths;
 - CLI, stdlib ANSI TUI, and optional Linux/Windows tray runtime controls.
