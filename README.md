@@ -50,7 +50,7 @@ Use these helper scripts for common workflows:
 - `./scripts/install.sh` — build and install the `window_zones` binary.
 - `./scripts/run.sh` — run the binary with safe defaults for quick checks.
 - `./scripts/test.sh` — run formatting, test, and lint checks.
-- `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs; `gnome-live` runs the seated GNOME session checks.
+- `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs; GNOME uses real interactive GTK windows and compositor-provided virtual input. `gnome-live` checks the seated session.
 
 - `docs/runbooks/installation.md`
 - `docs/runbooks/running.md`

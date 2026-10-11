@@ -97,6 +97,10 @@ $HOME/.local/bin/window_zones --backend auto status
 
 Expected status identifies `gnome-wayland` and reports the companion capabilities. If the extension is disabled or absent, status remains usable and reports the GNOME companion as unavailable. Actions and hotkey registration fail explicitly until the companion returns; X11 is not selected as a fallback.
 
+Save bindings to `$XDG_CONFIG_HOME/window_zones/config.toml`, or
+`~/.config/window_zones/config.toml` when `XDG_CONFIG_HOME` is unset. A missing
+file means zero bindings; starting `run` or `tui` does not create defaults.
+
 Use a config containing at least two bindings. GNOME already owns
 `<Control><Alt>Left` and `<Control><Alt>Right` for `switch-to-workspace-left`
 and `switch-to-workspace-right`, and `<Control><Alt>F1`-`<Control><Alt>F12`
@@ -126,13 +130,20 @@ action = { type = "move-to-zone", zone = "right-half" }
 [[bindings]]
 hotkey = "Cmd+Ctrl+Down"
 action = { type = "move-to-next-display" }
+
+[[bindings]]
+hotkey = "Cmd+Ctrl+Up"
+action = { type = "move-to-previous-display" }
 ```
 
-Run the interactive session with the explicit config path when testing an isolated file:
+With that default config saved, run either interactive interface:
 
 ```bash
-$HOME/.local/bin/window_zones --backend auto --config ./path/to/config.toml run
+$HOME/.local/bin/window_zones --backend auto run
+$HOME/.local/bin/window_zones --backend auto tui
 ```
+
+Use `--config ./path/to/config.toml` when testing an isolated file.
 
 ## Manual smoke checklist
 
@@ -194,15 +205,29 @@ cargo test --locked gnome_integration
 
 The private fake-service tests cover the stable names and signatures, capability gating, negative coordinates, focused-window absence, exact move payloads, hotkey signals, atomic registration rejection, Busy, incompatible/denied responses, and disconnect/reconnect.
 
+For real interactive Wayland and XWayland windows on an isolated GNOME 51
+compositor, run:
+
+```bash
+./scripts/smoke.sh --keep-logs gnome
+```
+
+This exercises native keyboard and mouse input, every zone, monitor moves,
+config rollback, CLI/TUI/tray lifecycle, companion recovery, and compositor
+screenshots through Mutter's RemoteDesktop and ScreenCast APIs. It does not
+need `/dev/uinput`, change the seated extension settings, or bypass Shell
+security. See [testing prerequisites](testing.md#v1-verification-matrix).
+
 ## Compatibility and lifecycle sources
 
 The GNOME 51 API review used the installed `Meta-51.gir` and the JavaScript
 resources embedded in `libshell-51.so` (whose `Config.PACKAGE_VERSION` is
 `51.0`). The companion's existing focus, frame, work-area, move/resize, and
-accelerator calls remain available. `move_resize_frame` requests frame
-placement; Mutter's size constraints and asynchronous Wayland client
-configuration can affect the final geometry, so observe the settled frame
-during a seated run.
+accelerator calls remain available. For cross-monitor moves, the companion
+calls `move_to_monitor` before `move_resize_frame` so Wayland clients receive
+the destination's size bounds; otherwise returning to a larger monitor can
+clip the requested height to the smaller monitor. Mutter's size constraints
+and asynchronous client configuration still affect settled geometry.
 
 Primary references:
 

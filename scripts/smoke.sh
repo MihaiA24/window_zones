@@ -534,22 +534,6 @@ stop_app_cleanly() {
     assert_rc_zero "$1" "$rc" "app log $2"
 }
 
-find_gnome_xwayland() {
-    GNOME_XDISPLAY=''
-    GNOME_XAUTHORITY=''
-    local line
-    while IFS= read -r line; do
-        if [[ "$line" =~ /Xwayland[[:space:]]+:([0-9]+).*-[aA]uth[[:space:]]([^[:space:]]+) ]]; then
-            if [[ "${BASH_REMATCH[2]}" == "$GNOME_ROOT"/* ]]; then
-                GNOME_XDISPLAY=":${BASH_REMATCH[1]}"
-                GNOME_XAUTHORITY="${BASH_REMATCH[2]}"
-                return 0
-            fi
-        fi
-    done < <(ps -eo args=)
-    return 1
-}
-
 gnome_call() {
     DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus call --session \
         --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome \
@@ -929,84 +913,10 @@ run_gnome_live_dispatch() {
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
 }
 
-snapshot_gnome() {
-    local label=$1
-    local path="$TMP_DIR/${CURRENT_GATE}-${label}.png" result=''
-    LAST_SHOT=''
-    if result=$(gnome_shell_call /org/gnome/Shell/Screenshot org.gnome.Shell.Screenshot.Screenshot false false "$path" 2>&1) \
-        && [[ "$result" == "(true,"* ]] && [[ -s "$path" ]]; then
-        LAST_SHOT="$path"
-    elif find_gnome_xwayland \
-        && timeout 5 import -display "$GNOME_XDISPLAY" -window root "$path" >/dev/null 2>&1 \
-        && [[ -s "$path" ]]; then
-        LAST_SHOT="$path"
-    elif find_gnome_xwayland && command -v ffmpeg >/dev/null 2>&1 \
-        && timeout 5 env DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-            ffmpeg -loglevel error -f x11grab -video_size 3520x1080 -i "$GNOME_XDISPLAY.0" -frames:v 1 "$path" >/dev/null 2>&1 \
-        && [[ -s "$path" ]]; then
-        LAST_SHOT="$path"
-    fi
-    if [[ -n "$LAST_SHOT" ]]; then
-        log "SCREENSHOT $label: $LAST_SHOT"
-    else
-        log "SCREENSHOT $label: unavailable (GNOME Shell Screenshot/import/ffmpeg failed)"
-    fi
-}
-
 get_gnome_focused() {
     local raw
     raw=$(gnome_call GetFocusedWindow 2>&1 || true)
     parse_gnome_focused "$raw"
-}
-
-wait_gnome_focused() {
-    local expected=$1 timeout_s=${2:-8} observed
-    local deadline=$((SECONDS + timeout_s))
-    while (( SECONDS < deadline )); do
-        observed=$(get_gnome_focused)
-        if [[ "$observed" == "$expected" ]]; then
-            printf '%s' "$observed"
-            return 0
-        fi
-        sleep 0.1
-    done
-    printf '%s' "$(get_gnome_focused)"
-    return 1
-}
-
-gnome_assert_geometry() {
-    local name=$1 expected=$2 observed
-    observed=$(wait_gnome_focused "$expected" 8 || true)
-    snapshot_gnome "$name"
-    if [[ -n "$LAST_SHOT" ]]; then
-        ASSERTIONS=$((ASSERTIONS + 1))
-        if [[ "$observed" == "$expected" ]]; then
-            log "PASS $name: expected '$expected' observed '$observed' (screenshot $LAST_SHOT)"
-        else
-            FAILURES=$((FAILURES + 1))
-            log "FAIL $name: expected '$expected' observed '$observed' (screenshot $LAST_SHOT)"
-        fi
-    else
-        assert_eq "$name" "$expected" "$observed"
-        log "Harness limitation $name screenshot: no usable screenshot tool"
-    fi
-}
-
-run_gnome_dispatch() {
-    local label=$1 hotkey=$2 rc=0
-    local out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log"
-    if env XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-        XDG_RUNTIME_DIR="$GNOME_RUNTIME" XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-        DCONF_PROFILE="$GNOME_DCONF_PROFILE" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-        XDG_CURRENT_DESKTOP=GNOME GNOME_DESKTOP_SESSION_ID=smoke \
-        "$BIN_PATH" --backend wayland --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
-    cat "$out" >>"$ASSERT_LOG"
-    assert_eq "$label dispatch exit" 0 "$rc"
-    assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
 }
 
 run_x11_dispatch() {
@@ -1038,127 +948,6 @@ run_x11_dispatch() {
 }
 
 
-run_gnome_atomic_registration() {
-    local helper="$GNOME_ROOT/register.js" monitor_log="$GNOME_ROOT/hotkey-monitor.log" helper_log="$GNOME_ROOT/register.log"
-    cat >"$helper" <<'EOF'
-import Gio from 'gi://Gio';
-import GLib from 'gi://GLib';
-const address = GLib.getenv('DBUS_SESSION_BUS_ADDRESS');
-const connection = Gio.DBusConnection.new_for_address_sync(
-    address,
-    Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
-    Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
-    null,
-    null);
-const proxy = Gio.DBusProxy.new_sync(
-    connection,
-    Gio.DBusProxyFlags.NONE,
-    null,
-    'org.window_zones.Gnome',
-    '/org/window_zones/Gnome',
-    'org.window_zones.Gnome1',
-    null);
-proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [['alt+ctrl+left']]), Gio.DBusCallFlags.NONE, 5000, null);
-print('VALID_OK');
-try {
-    proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [['alt+ctrl+left', 'alt+ctrl+F25']]), Gio.DBusCallFlags.NONE, 5000, null);
-    print('INVALID_ACCEPTED');
-} catch (error) {
-    print(`INVALID_REJECTED ${Gio.DBusError.get_remote_error(error)}`);
-}
-GLib.usleep(15000000);
-EOF
-    : >"$monitor_log"
-    local monitor_pid helper_pid rc=0
-    monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor --session \
-        --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome)
-    helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gjs -m "$helper")
-    if ! wait_for_text "$helper_log" 'VALID_OK' 8; then
-        assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(cat "$helper_log" 2>/dev/null || true)"
-        return 0
-    fi
-    assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(<"$helper_log")"
-    if wait_for_text "$helper_log" 'INVALID_REJECTED' 8; then
-        assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(<"$helper_log")"
-    else
-        assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
-    if find_gnome_xwayland; then
-        : >"$monitor_log"
-        env DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-            xdotool key --clearmodifiers alt+ctrl+Left >/dev/null 2>&1 || true
-        if wait_for_text "$monitor_log" 'HotkeyPressed' 5; then
-            assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(<"$monitor_log")"
-        else
-            assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(cat "$monitor_log" 2>/dev/null || true)"
-            log 'Harness limitation GNOME hotkey injection: headless Shell has no physical input seat'
-        fi
-    else
-        assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' 'Xwayland display/auth not found'
-        log 'Harness limitation GNOME hotkey injection: no Xwayland observer'
-    fi
-    stop_pid "$helper_pid"
-    stop_pid "$monitor_pid"
-}
-
-run_gnome_hotkey_and_disconnect() {
-    local run_log="$GNOME_ROOT/run.log" monitor_log="$GNOME_ROOT/app-hotkey-monitor.log" before rc=0
-    start_fifo_app run wayland "$run_log"
-    if wait_for_text "$run_log" 'Interactive session started' 15; then
-        assert_text 'GNOME run starts' 'Interactive session started' "$(<"$run_log")"
-    else
-        assert_text 'GNOME run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
-    assert_text 'GNOME hotkeys initially register' 'Hotkey registration initially' "$(cat "$run_log" 2>/dev/null || true)"
-    : >"$monitor_log"
-    local monitor_pid=''
-    if monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor \
-        --session --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome); then
-        if find_gnome_xwayland; then
-            env DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-                xdotool key --clearmodifiers alt+ctrl+Left >/dev/null 2>&1 || true
-            if wait_for_text "$monitor_log" 'HotkeyPressed' 5; then
-                assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' "$(<"$monitor_log")"
-                send_app status
-                sleep 0.5
-                assert_text 'GNOME signal resolves configured action' 'last action: alt+ctrl+left' "$(<"$run_log")"
-            else
-                assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' "$(cat "$monitor_log" 2>/dev/null || true)"
-                log 'Harness limitation GNOME hotkey injection: headless Shell has no physical input seat'
-            fi
-        else
-            assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' 'Xwayland display/auth not found'
-            log 'Harness limitation GNOME hotkey injection: no Xwayland observer'
-        fi
-    fi
-    stop_pid "$monitor_pid"
-
-    local disable_out enable_out service_list
-    disable_out=$(gnome_shell_call /org/gnome/Shell org.gnome.Shell.Extensions.DisableExtension window-zones@mihai-a24 2>&1 || true)
-    local deadline=$((SECONDS + 10))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        [[ "$service_list" != *'org.window_zones.Gnome'* ]] && break
-        sleep 0.2
-    done
-    assert_text 'GNOME companion disable call' 'true' "$disable_out"
-    assert_text 'GNOME disconnect surfaces explicit unavailable state' 'GNOME companion is unavailable' "$(cat "$run_log" 2>/dev/null || true)"
-
-    enable_out=$(gnome_shell_call /org/gnome/Shell org.gnome.Shell.Extensions.EnableExtension window-zones@mihai-a24 2>&1 || true)
-    deadline=$((SECONDS + 15))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        [[ "$service_list" == *'org.window_zones.Gnome'* ]] && break
-        sleep 0.2
-    done
-    assert_text 'GNOME companion restore call' 'true' "$enable_out"
-    if wait_for_text "$run_log" 'Hotkey registration now recovered' 12; then
-        assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(<"$run_log")"
-    else
-        assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
-    stop_app_cleanly 'GNOME run quits cleanly' "$run_log"
-}
 run_tui_lifecycle() {
     local backend=$1 label=$2
     local tui_log="$TMP_DIR/${CURRENT_GATE}-${label}-tui.log" before after rc=0
@@ -3415,175 +3204,22 @@ PY
 run_gnome() {
     CURRENT_GATE='gnome'
     GNOME_ROOT="$TMP_DIR/gnome"
-    GNOME_CONFIG="$GNOME_ROOT/config"
-    GNOME_DATA="$GNOME_ROOT/data"
-    GNOME_RUNTIME="$GNOME_ROOT/runtime"
-    GNOME_HOME="$GNOME_ROOT/home"
-    GNOME_DCONF_PROFILE="$GNOME_ROOT/dconf-profile"
-    CONFIG_PATH="$GNOME_ROOT/config.toml"
-    WAYLAND_DISPLAY="wayland-window-zones-smoke-$$"
-    export XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-        XDG_RUNTIME_DIR="$GNOME_RUNTIME" HOME="$GNOME_HOME" \
-        XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY
-    mkdir -p "$GNOME_CONFIG/dconf" "$GNOME_DATA" "$GNOME_RUNTIME" "$GNOME_HOME" "$GNOME_ROOT/keyfiles"
-    chmod 700 "$GNOME_RUNTIME" "$GNOME_HOME"
-    printf 'user-db:smoke\n' >"$GNOME_DCONF_PROFILE"
-    printf "[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24']\n" >"$GNOME_ROOT/keyfiles/shell"
-    dconf compile "$GNOME_CONFIG/dconf/smoke" "$GNOME_ROOT/keyfiles"
-    mkdir -p "$GNOME_DATA/gnome-shell/extensions/window-zones@mihai-a24"
-    install -m 0644 "$PROJECT_ROOT/gnome-extension/metadata.json" \
-        "$GNOME_DATA/gnome-shell/extensions/window-zones@mihai-a24/metadata.json"
-    install -m 0644 "$PROJECT_ROOT/gnome-extension/extension.js" \
-        "$GNOME_DATA/gnome-shell/extensions/window-zones@mihai-a24/extension.js"
-    record_versions_gnome
-    assert_eq 'GNOME isolated enabled extensions' "['window-zones@mihai-a24']" \
-        "$(DCONF_PROFILE="$GNOME_DCONF_PROFILE" XDG_CONFIG_HOME="$GNOME_CONFIG" dconf read /org/gnome/shell/enabled-extensions)"
-    local launcher="$GNOME_ROOT/launch-shell.sh" shell_log="$GNOME_ROOT/gnome-shell.log"
-    cat >"$launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$DBUS_SESSION_BUS_ADDRESS" >"$BUS_FILE"
-exec gnome-shell --headless --wayland-display "$WAYLAND_DISPLAY" \
-    --virtual-monitor 1920x1080 --virtual-monitor 1600x900
-EOF
-    chmod +x "$launcher"
-    BUS_FILE="$GNOME_ROOT/bus-address"
-    local shell_pid
-    shell_pid=$(start_group "$shell_log" env \
-        BUS_FILE="$BUS_FILE" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-        XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-        XDG_RUNTIME_DIR="$GNOME_RUNTIME" DCONF_PROFILE="$GNOME_DCONF_PROFILE" \
-        HOME="$GNOME_HOME" XDG_DATA_DIRS=/usr/local/share:/usr/share \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland GNOME_DESKTOP_SESSION_ID=smoke \
-        dbus-run-session -- "$launcher")
-    if wait_for_file "$BUS_FILE" 20; then
-        GNOME_BUS=$(<"$BUS_FILE")
-        export DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS"
-        if ! env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-            XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-            XDG_RUNTIME_DIR="$GNOME_RUNTIME" DCONF_PROFILE="$GNOME_DCONF_PROFILE" \
-            HOME="$GNOME_HOME" gnome-extensions enable window-zones@mihai-a24 \
-            >>"$shell_log" 2>&1; then
-            log 'Harness limitation GNOME extension CLI could not enable window-zones@mihai-a24'
+    local output="$TMP_DIR/gnome-native.log" rc=0 checks=0 failures=0
+    /usr/bin/python3 "$SCRIPT_DIR/gnome-smoke.py" --binary "$BIN_PATH" \
+        --output-dir "$GNOME_ROOT" --keep-logs >"$output" 2>&1 || rc=$?
+    log "$(<"$output")"
+    if [[ -f "$GNOME_ROOT/results.json" ]]; then
+        read -r checks failures < <(/usr/bin/python3 -c \
+            'import json, sys; rows = json.load(open(sys.argv[1])); print(len(rows), sum(not row["passed"] for row in rows))' \
+            "$GNOME_ROOT/results.json")
+        ASSERTIONS=$((ASSERTIONS + checks))
+        FAILURES=$((FAILURES + failures))
+        if [[ "$rc" -ne 0 && "$failures" -eq 0 ]]; then
+            assert_rc_zero 'GNOME native runner exit' "$rc" "$output"
         fi
     else
-        assert_text 'GNOME session bus address' 'unix:' "$(cat "$shell_log" 2>/dev/null || true)"
-        return 0
+        assert_rc_zero 'GNOME native evidence manifest' 1 "$output"
     fi
-    local service_list='' deadline=$((SECONDS + 30))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        if [[ "$service_list" == *'org.window_zones.Gnome'* ]]; then
-            break
-        fi
-        sleep 0.2
-    done
-    local extension_result
-    extension_result=$(gnome_shell_call /org/gnome/Shell \
-        org.gnome.Shell.Extensions.EnableExtension "'window-zones@mihai-a24'" 2>&1 || true)
-    log "GNOME extension enable: $extension_result"
-    assert_text 'GNOME companion owns D-Bus name' 'org.window_zones.Gnome' "$service_list"
-
-    local capabilities displays_raw display_lines first_display second_display
-    capabilities=$(gnome_call GetCapabilities 2>&1 || true)
-    assert_eq 'GNOME capability set' "(['focused-window', 'displays', 'move-resize', 'hotkeys'],)" "$capabilities"
-    displays_raw=$(gnome_call GetDisplays 2>&1 || true)
-    display_lines=$(parse_gnome_displays "$displays_raw" || true)
-    first_display=$(printf '%s\n' "$display_lines" | sed -n '1p')
-    second_display=$(printf '%s\n' "$display_lines" | sed -n '2p')
-    assert_text 'GNOME first virtual display' '|' "$first_display"
-    assert_text 'GNOME second virtual display' '|' "$second_display"
-    if [[ -z "$first_display" || -z "$second_display" ]]; then
-        return 0
-    fi
-    IFS='|' read -r GNOME_DISPLAY_ID GNOME_X GNOME_Y GNOME_W GNOME_H <<<"$first_display"
-    IFS='|' read -r GNOME_DISPLAY2_ID GNOME_X2 GNOME_Y2 GNOME_W2 GNOME_H2 <<<"$second_display"
-    GNOME_HALF="$GNOME_X,$GNOME_Y,$((GNOME_W / 2)),$GNOME_H"
-    GNOME_CENTER="$((GNOME_X + GNOME_W / 3)),$GNOME_Y,$((GNOME_W - 2 * (GNOME_W / 3))),$GNOME_H"
-    GNOME_TWO_THIRDS="$GNOME_X,$GNOME_Y,$((GNOME_W - GNOME_W / 3)),$GNOME_H"
-    GNOME_SECOND_HALF="$GNOME_X2,$GNOME_Y2,$((GNOME_W2 / 2)),$GNOME_H2"
-
-    local editor_launcher="$GNOME_ROOT/launch-editor.sh" editor_log="$GNOME_ROOT/editor.log" editor_pid
-    cat >"$editor_launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec gnome-text-editor --standalone
-EOF
-    chmod +x "$editor_launcher"
-    editor_pid=$(start_group "$editor_log" env \
-        WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_RUNTIME_DIR="$GNOME_RUNTIME" \
-        DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" XDG_CONFIG_HOME="$GNOME_CONFIG" \
-        XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" GDK_BACKEND=wayland \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland "$editor_launcher")
-    if wait_for_text "$editor_log" 'Text Editor' 15; then
-        assert_text 'GNOME test window launched' 'Text Editor' "$(<"$editor_log")"
-    else
-        # GTK may be quiet on a successful Wayland map; retain the process probe as evidence.
-        if kill -0 "$editor_pid" 2>/dev/null; then
-            assert_text 'GNOME test window launched' 'running editor pid' "running editor pid $editor_pid"
-        else
-            assert_text 'GNOME test window launched' 'Text Editor' "$(cat "$editor_log" 2>/dev/null || true)"
-        fi
-    fi
-    # A headless Shell has no seat: GetFocusedWindow stays false and grab_accelerator rejects every
-    # accelerator (ADR 0007). Record the seat-dependent checks as skipped instead of failing them;
-    # gnome-live carries them.
-    local focused
-    focused=$(wait_gnome_focused 'true|' 5 || true)
-    if [[ "$focused" == 'true|'* ]]; then
-        assert_text 'GNOME GetFocusedWindow reports test window' 'true|' "$focused"
-
-        run_gnome_dispatch half alt+ctrl+left
-        gnome_assert_geometry 'gnome-left-half' "true|$GNOME_DISPLAY_ID|$GNOME_X|$GNOME_Y|$((GNOME_W / 2))|$GNOME_H"
-        run_gnome_dispatch center-third alt+ctrl+up
-        gnome_assert_geometry 'gnome-center-third' "true|$GNOME_DISPLAY_ID|$((GNOME_X + GNOME_W / 3))|$GNOME_Y|$((GNOME_W - 2 * (GNOME_W / 3)))|$GNOME_H"
-        run_gnome_dispatch two-thirds alt+ctrl+right
-        gnome_assert_geometry 'gnome-left-two-thirds' "true|$GNOME_DISPLAY_ID|$GNOME_X|$GNOME_Y|$((GNOME_W - GNOME_W / 3))|$GNOME_H"
-        run_gnome_dispatch next-display alt+ctrl+down
-        gnome_assert_geometry 'gnome-next-display' "true|$GNOME_DISPLAY2_ID|$GNOME_X2|$GNOME_Y2|$GNOME_W2|$GNOME_H2"
-
-        run_gnome_atomic_registration
-        write_valid_config
-        run_gnome_hotkey_and_disconnect
-    else
-        local seatless_reason='not exercised: seatless Synthetic session reports no focused window and rejects every accelerator; covered by gnome-live'
-        skip_assert 'GNOME GetFocusedWindow reports test window' "$seatless_reason"
-        skip_assert 'GNOME zone placement' "$seatless_reason"
-        skip_assert 'GNOME cross-display move' "$seatless_reason"
-        skip_assert 'GNOME atomic hotkey registration' "$seatless_reason"
-        skip_assert 'GNOME companion hotkey signal' "$seatless_reason"
-        skip_assert 'GNOME companion disconnect and recovery' "$seatless_reason"
-        write_valid_config
-    fi
-
-    # Config reload must retain the last valid bindings while exposing a parse error.
-    local run_log="$GNOME_ROOT/reload-run.log" reload_rc=0
-    start_fifo_app run wayland "$run_log"
-    wait_for_text "$run_log" 'Interactive session started' 15 || true
-    sleep 0.3
-    write_invalid_config
-    send_app reload
-    sleep 0.5
-    send_app reload
-    if wait_for_text "$run_log" 'Config reload error' 8; then
-        assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(<"$run_log")"
-    else
-        assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
-    send_app status
-    sleep 0.3
-    assert_text 'GNOME invalid reload preserves previous bindings' 'binding count: 4' "$(<"$run_log")"
-    write_valid_config
-    sleep 0.3
-    send_app reload
-    sleep 0.5
-    send_app reload
-    assert_text 'GNOME config recovers after valid rewrite' 'Config state: Loaded' "$(<"$run_log")"
-    stop_app_cleanly 'GNOME reload run quits cleanly' "$run_log"
-
-    run_tui_lifecycle wayland 'gnome'
-    stop_pid "$editor_pid"
-    stop_pid "$shell_pid"
 }
 
 run_x11() {

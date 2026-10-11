@@ -8,6 +8,7 @@ cd "$PROJECT_ROOT"
 bash -n "$PROJECT_ROOT"/scripts/*.sh
 node --check "$PROJECT_ROOT/gnome-extension/extension.js"
 node --check "$PROJECT_ROOT/kwin-script/contents/code/main.js"
+/usr/bin/python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/gnome-smoke.py").read_text())'
 
 cargo fmt --all -- --check
 cargo test --locked

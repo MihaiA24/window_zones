@@ -317,6 +317,13 @@ class WindowZonesService {
                 'org.window_zones.Gnome.Error.InvalidWindowState',
                 'focused window does not allow resizing');
 
+        const targetMonitor = this._displayData().findIndex(item =>
+            containsPoint(item.rect, x + Math.floor(width / 2), y + Math.floor(height / 2)));
+        if (targetMonitor >= 0 && window.get_monitor() !== targetMonitor) {
+            // Update Wayland size bounds before requesting a frame on a larger monitor.
+            window.move_to_monitor(targetMonitor);
+        }
+
         window.move_resize_frame(true, x, y, width, height);
     }
 

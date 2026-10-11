@@ -60,4 +60,4 @@
 
 - **Gate status**: The recorded outcome of a Release gate: _pending_ when no Smoke run is on record, _blocking - pass_, _blocking - fail_, or _deferred - unverified_; an integration that does not build is not deferred, it is unimplemented.
 
-- **Seated session**: A desktop session attached to a login seat with real input devices and a screen; focus, placement, and accelerator capture can only be observed there, which is what a Synthetic session cannot provide. _Avoid_: real session, physical session.
+- **Seated session**: A desktop session attached to a login seat with real input devices and a screen; it can evidence physical display and input hardware behavior, unlike a Synthetic session. _Avoid_: real session, physical session.

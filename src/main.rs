@@ -680,33 +680,31 @@ fn is_wayland_session() -> bool {
         || env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
-fn runtime_status_lines(app: &App) -> Vec<String> {
-    let mut status = vec![
-        "Runtime status:".to_string(),
-        format!(
-            "  config path: {}",
-            app.config_path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unresolved>".to_string())
-        ),
-        format!("  binding count: {}", app.config().bindings.len()),
-        format!("  config state: {:?}", app.config_state()),
-        format!("  hotkey state: {:?}", app.hotkey_state()),
+fn runtime_status_lines(app: &App) -> [std::borrow::Cow<'static, str>; 9] {
+    [
+        "Runtime status:".into(),
+        match app.config_path() {
+            Some(path) => format!("  config path: {}", path.display()).into(),
+            None => "  config path: <unresolved>".into(),
+        },
+        format!("  binding count: {}", app.config().bindings.len()).into(),
+        format!("  config state: {:?}", app.config_state()).into(),
+        format!("  hotkey state: {:?}", app.hotkey_state()).into(),
         format!(
             "  last action: {}",
             app.last_dispatch_hotkey().unwrap_or("<none>")
-        ),
-        format!("  dispatch state: {:?}", app.dispatch_state()),
-    ];
-
-    if let ConfigState::Error(error) = app.config_state() {
-        status.push(format!("  config error: {error}"));
-    }
-    if let DispatchState::Error(error) = app.dispatch_state() {
-        status.push(format!("  dispatch error: {error}"));
-    }
-
-    status
+        )
+        .into(),
+        format!("  dispatch state: {:?}", app.dispatch_state()).into(),
+        match app.config_state() {
+            ConfigState::Error(error) => format!("  config error: {error}").into(),
+            _ => "  config error: <none>".into(),
+        },
+        match app.dispatch_state() {
+            DispatchState::Error(error) => format!("  dispatch error: {error}").into(),
+            _ => "  dispatch error: <none>".into(),
+        },
+    ]
 }
 
 fn print_status(app: &App) {
@@ -1170,7 +1168,7 @@ fn execute_run_with_tray(
     );
 
     let (tray_tx, tray_rx) = mpsc::sync_channel::<RuntimeTrayCommand>(16);
-    let mut tray = match build_tray_menu(&app, &tray_tx) {
+    let (mut tray, status_ids) = match build_tray_menu(&app, &tray_tx) {
         Ok(tray) => tray,
         Err(error) => {
             eprintln!("Failed to start tray surface: {error}");
@@ -1245,22 +1243,23 @@ fn execute_run_with_tray(
 
         let next_snapshot = runtime_status_lines(&app);
         if status_snapshot != next_snapshot {
-            tray = match build_tray_menu(&app, &tray_tx) {
-                Ok(new_tray) => {
-                    status_snapshot = next_snapshot;
-                    new_tray
-                }
-                Err(error) => {
-                    eprintln!("Failed to refresh tray status: {error}");
-                    tray
-                }
-            };
+            let result = status_ids
+                .iter()
+                .zip(&next_snapshot)
+                .try_for_each(|(&id, line)| tray.inner_mut().set_menu_item_label(line, id));
+            match result {
+                Ok(()) => status_snapshot = next_snapshot,
+                Err(error) => eprintln!("Failed to refresh tray status: {error}"),
+            }
         }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<TrayItem, String> {
+fn build_tray_menu(
+    app: &App,
+    tx: &SyncSender<RuntimeTrayCommand>,
+) -> Result<(TrayItem, [u32; 9]), String> {
     let icon_name = if cfg!(target_os = "linux") {
         "view-grid-symbolic"
     } else {
@@ -1269,8 +1268,16 @@ fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<Tra
     let mut tray = TrayItem::new("Window Zones", IconSource::Resource(icon_name))
         .map_err(|error| error.to_string())?;
 
-    for line in runtime_status_lines(app) {
-        tray.add_label(&line).map_err(|error| error.to_string())?;
+    let mut status_ids = [0; 9];
+    // ponytail: Linux tray-item labels are immutable; status rows open status until mutable labels exist.
+    for (index, line) in runtime_status_lines(app).iter().enumerate() {
+        let status_tx = tx.clone();
+        status_ids[index] = tray
+            .inner_mut()
+            .add_menu_item_with_id(line, move || {
+                let _ = status_tx.send(RuntimeTrayCommand::Status);
+            })
+            .map_err(|error| error.to_string())?;
     }
 
     let status_tx = tx.clone();
@@ -1297,7 +1304,7 @@ fn build_tray_menu(app: &App, tx: &SyncSender<RuntimeTrayCommand>) -> Result<Tra
     })
     .map_err(|error| error.to_string())?;
 
-    Ok(tray)
+    Ok((tray, status_ids))
 }
 
 fn print_help() {

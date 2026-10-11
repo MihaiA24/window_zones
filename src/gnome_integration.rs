@@ -32,7 +32,7 @@ type DisplayPayload = (String, i32, i32, u32, u32);
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GnomeIntegrationError {
     #[error(
-        "GNOME companion is unavailable: {message}; install and enable the GNOME Shell companion, then retry"
+        "GNOME companion is unavailable: {message}; install and enable the GNOME Shell companion; after installing or updating it, log out and back in, then retry"
     )]
     Unavailable { message: String },
     #[error(
