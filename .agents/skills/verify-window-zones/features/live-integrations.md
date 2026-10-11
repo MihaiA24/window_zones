@@ -1,6 +1,6 @@
 # Live integrations
 
-On a real desktop the same runtime moves real windows and captures real key presses through a platform backend: the GNOME Shell companion on GNOME Wayland, `XGrabKey` on X11, the KWin script and companion on KDE Plasma Wayland, the native hook on Windows and macOS, and compositor-bound `dispatch` on Sway and Hyprland. `run --tray` adds a tray menu on Linux and Windows, and the installed systemd user service runs `run` at login with desktop notifications for problems. None of this is reachable from the dry-run harness; every recipe below is blocked on a host without the matching desktop and is unverified by this skill.
+On a real desktop the runtime moves windows and captures keys through the GNOME companion, X11 exclusive grabs, KDE companion, or native Windows/macOS hook; Sway and Hyprland use compositor-bound dispatch. Linux/Windows can add a tray menu. Installed Linux systemd services and macOS LaunchAgents run at login and notify about background problems. These paths are outside `wzv`'s dry-run isolation; evidence is scoped to the exact backend, fixture, and entry point exercised.
 
 ## Sub-features
 
@@ -8,12 +8,12 @@ On a real desktop the same runtime moves real windows and captures real key pres
 - `x11` frame-geometry zones, next/previous display with wrap, real accelerator capture, invalid-config retention, TUI lifecycle (blocking gate).
 - `kde-wayland` the same checks against a nested KWin 6.x (deferred gate).
 - `windows` the manual Windows smoke run (deferred gate).
-- `macos` AppleScript/`System Events` backend with the grabbing hook (ungated).
+- `macos` retained native Accessibility window identity, usable-area placement, and grabbing-hook restart recovery (ungated).
 - `sway-hyprland` compositor keybindings calling `window_zones dispatch` (ungated).
 - `tray` `run --tray` status menu (Linux and Windows).
 - `notifications` desktop notifications from the service when stdout is not a terminal.
 - `single-instance` a second live `run`/`tui` exits with status `75`.
-- `service` `./scripts/install.sh --autostart` and the `window-zones` systemd user service.
+- `service` `./scripts/install.sh --autostart`: Linux `window-zones` systemd user service or macOS `org.window_zones.run` LaunchAgent.
 
 ## How to get to it (user POV)
 
@@ -27,19 +27,24 @@ On a real desktop the same runtime moves real windows and captures real key pres
 Preconditions:
 
 - Not drivable with `wzv`: it only runs `--backend dry-run`. These recipes need the platform named in each bullet, and `docs/runbooks/testing.md` is the record of gate status.
-- Record the attempted command and the unmet precondition when a path is blocked; on the macOS recording host every bullet below was blocked.
+- Own the runtime, config, HOME/TMPDIR, and disposable windows. Record a blocked command and its unmet precondition; do not stop a user's service or borrow their windows.
 
-- **GNOME synthetic gate.** On CachyOS/Linux with `gnome-shell` installed, run `./scripts/smoke.sh --keep-logs gnome`. The last line reads `Smoke assertions (gnome): N; passed: N; failed: 0; skipped: S`. Unverified here.
-- **GNOME seated gate.** In a logged-in GNOME Wayland session, run `./scripts/smoke.sh --keep-logs gnome-live`. Same summary line with `failed: 0`. Unverified here.
-- **X11 gate.** With Xvfb, Openbox and `xdotool`, run `./scripts/smoke.sh --keep-logs x11`. Same summary line with `failed: 0`; `docs/runbooks/testing.md` says the X11 results must be re-recorded after the `XGrabKey` cutover. Unverified here.
-- **KDE gate.** With KWin 6.x and `kpackagetool6`, run `./scripts/smoke.sh --keep-logs kde-live`. Same summary line with `failed: 0`. Unverified here.
-- **Windows gate.** Follow `docs/runbooks/windows-smoke.md` on a Windows desktop. Unverified here.
-- **macOS backend.** Grant Accessibility to the terminal, run `./scripts/run.sh run`, and press `Ctrl+Alt+Left` on a disposable window. Without the permission dispatch fails with `allow Window Zones (or its terminal) in System Settings > Privacy & Security > Accessibility`. Blocked here: it moves the user's real windows.
-- **Single instance.** In a desktop session with nothing else serving hotkeys, start `./scripts/run.sh run` twice; the second exits with status `75`. Never test this against the user's running service. Unverified here.
+- **GNOME synthetic gate.** With a compatible GNOME Shell and functional system/session buses, run `./scripts/smoke.sh --keep-logs gnome`. A healthy synthetic run has zero failures but skips seat-dependent checks. The reachable Shell 48.7 container failed `login1` activation; this is not GNOME 50 evidence.
+- **GNOME seated gate.** In a GNOME 50 login session with the current companion active and writable `/dev/uinput`, run `./scripts/smoke.sh --keep-logs gnome-live`. Expect zero failures, including ADR 0009 identity/state/refused-reload checks. Blocked here: no reachable seat and container `/dev/uinput` unavailable.
+- **X11 gate.** With Xvfb, Openbox and `xdotool`, run `./scripts/smoke.sh --keep-logs x11`. Exercised: 87 assertions, 87 passed, zero failed/skipped, including exclusive grabs, ADR 0009, rollback, and TUI lifecycle.
+- **KDE synthetic gate.** With KWin 6.x and working XTEST-to-EIS transport, run `./scripts/smoke.sh --keep-logs kde-live`. Window/state and explicit dispatch paths were exercised; input-dependent checks failed on this container. Follow the current [KDE evidence and prerequisites](../../../../docs/runbooks/kde-wayland.md#nested-kwin-gate). A passing nested run still does not close the seated KDE gate.
+- **Windows gate.** Follow `docs/runbooks/windows-smoke.md` on Windows. Unverified here.
+- **macOS backend.** Grant Accessibility/input capture to the responsible process. With an owned HOME/TMPDIR and config, run `target/debug/window_zones --backend macos --config "$CONFIG" run`; keep only a disposable window frontmost, trigger its configured key, and check the independent frame plus runtime `status`. Native public API and this raw CLI path were exercised with CGEvent-injected F8; physical-key capture and the `scripts/run.sh` entry point were not separately exercised.
+- **macOS expansion regression.** In a dedicated fixture process, put a normal resizable window low on the primary display, keep it frontmost, and run `WZ_MACOS_TEST_PID="$FIXTURE_PID" cargo test --locked --lib expansion_finishes_at_target_origin -- --ignored --test-threads=1`. It refuses a different window owner and asserts exact full-height half placement. Exercised; independent AppKit readback agreed. For native zoom/menu-tiling checks, wait for the external animation to settle, then move and sample the resulting frame after the move.
+- **macOS service.** On an otherwise unused GUI label, run `/bin/bash scripts/install.sh --debug --prefix "$PREFIX" --autostart` with an isolated installer HOME and a bootstrap wrapper that injects that HOME/TMPDIR/XDG environment into the owned plist before real `launchctl bootstrap`. Require a running PID, the chosen executable and config state; reinstall, replace prefixes, uninstall the stale prefix, then uninstall the replacement. Exercised: stale uninstall preserved the replacement PID/program; final uninstall removed the agent and kept config/logs. See the installation runbook for normal user commands.
+- **macOS notifications.** Run the owned live runtime with stdout redirected to a log. Reload invalid config, inspect `Window Zones needs attention` in Notification Center, restore valid config and inspect matching `Window Zones` recovery. Capture only the owned notice. Exercised: actual banner pixels and Notification Center text, Script Editor sender, quoted text unchanged, no preference changes.
+- **Single instance.** With no borrowed service, start two owned live `run` processes with the same isolated HOME/TMPDIR and explicit live backend; the second must exit `75`. The exact live CLI recipe remains unverified here.
 
 ## Gotchas
 
 - `./scripts/smoke.sh` is Linux-only (`setsid`, GNU `stat`, compositor binaries) and deletes its evidence in `/tmp/window_zones-smoke.$$` unless `--keep-logs` is passed.
-- A live `run` or `tui` takes the single-instance lock, so it collides with the user's `window-zones` service; stop nothing of theirs, report the collision instead.
-- The macOS and live Linux backends act on whatever window is focused. Only drive them with a disposable test window in front.
+- A live `run` or `tui` takes the single-instance lock. Use an owned TMPDIR; if a user's service collides, report it rather than stopping it.
+- Live dispatch operates on captured native window identity, but capture still starts from the focused window. Drive only disposable windows; verify the fixture's GUI PID before key injection.
+- An isolated installer HOME does not isolate the GUI LaunchAgent's loaded label or inherited environment. Inject the owned environment before bootstrap, verify program ownership before teardown, and leave an existing user's label untouched.
+- Empty sentinel logs cannot observe native Framework calls. Direct API proof does not prove a different CLI/TUI entry point.
 - Dry-run results never count as evidence for any row here.

@@ -55,7 +55,9 @@ Maximized and tiled windows are restored before they are placed; fullscreen wind
 
 ## Running in the background
 
-Start the listener with `window_zones run`, or install with `./scripts/install.sh --autostart` to run it as the `window-zones` systemd user service, which starts with every desktop login and stops at logout (`run` keeps serving hotkeys when stdin is closed). Manage it with `systemctl --user status|stop|start|restart window-zones`; `systemctl --user disable --now window-zones` turns it off. Only one `run`/`tui` session owns the hotkeys: while the service runs, a manual `run` or `tui` exits with status `75` and names the owning pid, so stop the service first. Logs: `journalctl --user -u window-zones -f`.
+Start the listener with `window_zones run`; it keeps serving hotkeys when stdin is closed. `./scripts/install.sh --autostart` installs the Linux `window-zones` systemd user service or the macOS `org.window_zones.run` LaunchAgent. Only one live `run`/`tui` session owns the hotkeys: a second exits with status `75` and names the owning pid. Do not stop someone else's session to run a smoke check.
+
+On Linux, manage the service with `systemctl --user status|stop|start|restart window-zones`; `systemctl --user disable --now window-zones` turns it off. Logs: `journalctl --user -u window-zones -f`. On macOS, use `launchctl print gui/$(id -u)/org.window_zones.run` and `launchctl kickstart -k gui/$(id -u)/org.window_zones.run`; logs are `~/Library/Logs/window_zones.log`. See [installation](installation.md#macos-launchagent) for loading, ownership, and permissions.
 
 The App prints runtime events once per change, never per retry:
 
@@ -66,7 +68,7 @@ The App prints runtime events once per change, never per retry:
 - `Hotkey registration failed: ...; retrying` — the companion is absent or busy; retried every second.
 - `Dispatch failed for <hotkey>: ...` — once per press.
 
-When stdout is not a terminal (the systemd service), problem events also raise a desktop notification that is updated in place and cleared by the matching recovery event. Config errors and refused hotkeys notify at once; an unavailable companion notifies only after 20 seconds without recovery, so the login race and companion restarts stay silent.
+With non-terminal stdout, Linux and macOS notify about background problems; `--backend dry-run` never does. Config errors and refused hotkeys notify at once; unavailable hotkeys notify only after 20 seconds without recovery. Linux updates the notification in place and clears it on matching recovery. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html). Actual problem and recovery banners and Notification Center content were observed, attributed to Script Editor; enable notifications for that sender if needed.
 
 `dispatch` exits `1` when the dispatch state is an error (no binding, no focused window, adapter failure); the state is still printed.
 
@@ -121,6 +123,26 @@ $HOME/.local/bin/window_zones run
 ```
 
 Use `docs/runbooks/gnome-wayland.md` for extension installation, reload/restart checks, companion disconnect recovery, and the full two-display smoke checklist.
+
+## macOS
+
+Use an explicit live backend: `./scripts/run.sh --backend macos run`; the runner's
+default is dry-run. Native Accessibility references preserve the selected window
+across title, focus, and ordering changes. Native display coordinates use
+`NSScreen.visibleFrame` converted to global top-left coordinates.
+
+Placement restores exposed zoom/minimized state, releases ordinary AppKit
+zoom/tiling through size and position, and verifies the resulting frame. Resize
+first releases native state; a resize clamped at the old origin is completed at
+the target origin. Fullscreen and unwritable geometry are rejected before
+mutation. App-imposed minimum sizes and other frame constraints remain errors.
+Let native zoom/tiling animations settle before checking final placement.
+
+If a native listener reports stopped/error, restore input/Accessibility permission
+and type `restart`. A live process-owned listener is reused; a recorded stopped
+one is replaced. There is no automatic hook reconstruction on registration
+retries. A LaunchAgent needs permission for its installed binary rather than
+relying on the terminal's grant.
 
 ## TUI
 

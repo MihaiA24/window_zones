@@ -1,13 +1,13 @@
 # window_zones verification map
 
-This directory is the maintained source for verifying the user-facing behavior of window_zones. Read the index before driving the app, then use the matching feature file as the recipe. Every recipe drives an owned `--backend dry-run` instance through `wzv` (see `../SKILL.md`).
+This directory is the maintained source for verifying the user-facing behavior of window_zones. Read the index before driving the app, then use the matching feature file as the recipe. Dry-run recipes drive owned instances through `wzv` (see `../SKILL.md`); `live-integrations.md` uses explicit live backends, platform gates, and disposable fixtures outside `wzv`.
 
 ## Baseline preconditions
 
 - Work from the repository root with `cargo build --locked --bin window_zones` passing; `wzv start` runs that build.
 - Put the helpers on `PATH`: `export PATH="$PWD/.agents/skills/verify-window-zones/scripts:$PATH"`.
 - Name the run and its directory: `RUN=<feature>-$(date +%s)` and `R="${WZV_ROOT:-target/verify-window-zones}/$RUN"`.
-- Each recipe starts its own run with `wzv start --run-id "$RUN"` and requires `wzv doctor "$RUN"` to print `doctor=ok`.
+- Each dry-run recipe starts its own run with `wzv start --run-id "$RUN"` and requires `wzv doctor "$RUN"` to print `doctor=ok`; live integrations have separate prerequisites.
 - The dry-run desktop is fixed: focused window `dry-run-window` at x=40 y=40 w=640 h=480 on `display-0` (0,0 1920x1080); `display-1` sits at 1920,0 with 1280x1024.
 - `wzv start` writes the starter config (18 `Ctrl+Alt` bindings) unless the recipe passes `--no-init`.
 - Never drive an instance this run did not start, the user's installed `window_zones`, or the `window-zones` systemd user service.
@@ -51,4 +51,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Run session](./run-session.md) covers the `run` stdin commands: `status`, `help`, `dispatch`, bare hotkeys, unknown hotkeys, `reload`, `restart`, and `exit`. Exercised.
 - [Live config reload](./config-reload.md) covers saving broken, invalid, fixed, and extended configs while the App runs. Exercised.
 - [TUI dashboard](./tui.md) covers the dashboard frame, dispatch, error and event lines, `refresh`, `reload`, `restart`, config errors, and quit. Exercised.
-- [Live integrations](./live-integrations.md) covers the GNOME, X11, KDE, macOS, Windows, Sway/Hyprland, tray, notification, single-instance, and service paths. Blocked on this host; verified with `scripts/smoke.sh` on a Linux desktop.
+- [Live integrations](./live-integrations.md) covers GNOME, X11, KDE, macOS, Windows, Sway/Hyprland, tray, notifications, single-instance, and services. X11 and owned macOS API/runtime/LaunchAgent/notification paths were exercised; GNOME's seated gate is blocked and synthetic KDE retains input-transport failures. See `docs/runbooks/testing.md` for exact evidence and limits; other live entries remain unverified.

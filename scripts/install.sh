@@ -17,7 +17,7 @@ Options:
       --release         Install a release build (default)
       --gnome-extension Install and enable the GNOME Shell companion
       --kwin-script     Install/upgrade the KWin script and Rust companion
-      --autostart       Start window_zones run with the graphical session
+      --autostart       Start window_zones run at login (systemd/XDG on Linux, LaunchAgent on macOS)
       --init-config     Write a starter config without overwriting an existing one
       --uninstall       Remove this prefix's recorded installations; keep config
   -h, --help            Show this help message
@@ -99,8 +99,15 @@ if [[ "$UNINSTALL" -eq 0 && ( "$AUTOSTART" -eq 1 || "$INIT_CONFIG" -eq 1 ) && "$
   echo '--autostart and --init-config require --binary window_zones (the App binary).' >&2
   exit 1
 fi
+OS="$(uname -s)"
+if [[ "$UNINSTALL" -eq 0 && "$OS" == Darwin && ( "$GNOME_EXTENSION" -eq 1 || "$KWIN_SCRIPT" -eq 1 ) ]]; then
+  echo '--gnome-extension and --kwin-script install Linux compositor companions; macOS needs neither.' >&2
+  exit 1
+fi
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+APP_CONFIG="$CONFIG_HOME/window_zones/config.toml"
+[[ "$OS" != Darwin ]] || APP_CONFIG="$HOME/Library/Application Support/window_zones/config.toml"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 INSTALL_DIR="$INSTALL_PREFIX/bin"
 INSTALL_RECORD="$INSTALL_PREFIX/share/window-zones/install-record"
@@ -111,6 +118,13 @@ GNOME_ID='window-zones@mihai-a24'
 GNOME_DIR="$DATA_HOME/gnome-shell/extensions/$GNOME_ID"
 KWIN_ID='window-zones'
 KWIN_DIR="$DATA_HOME/kwin/scripts/$KWIN_ID"
+LAUNCH_LABEL='org.window_zones.run'
+LAUNCH_AGENT="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
+# ponytail: launchd never rotates this log; add a newsyslog/rotation step if it grows large.
+LAUNCH_LOG="$HOME/Library/Logs/window_zones.log"
+LAUNCH_TARGET="gui/$UID/$LAUNCH_LABEL"
+# Bash < 4.4 (macOS /bin/bash 3.2) treats "${INSTALLED[@]}" of an empty array as
+# unset under set -u; expand it as ${INSTALLED[@]+"${INSTALLED[@]}"} instead.
 INSTALLED=()
 if [[ -f "$INSTALL_RECORD" ]]; then
   while IFS= read -r item || [[ -n "$item" ]]; do
@@ -121,7 +135,7 @@ fi
 # Record ownership so uninstall never guesses which other binaries/packages to remove.
 record_install() {
   local item
-  for item in "${INSTALLED[@]}"; do
+  for item in ${INSTALLED[@]+"${INSTALLED[@]}"}; do
     [[ "$item" != "$1" ]] || return 0
   done
   mkdir -p "$(dirname -- "$INSTALL_RECORD")"
@@ -133,8 +147,17 @@ user_systemd_available() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
 }
 
+launch_agent_loaded() {
+  launchctl print "$LAUNCH_TARGET" >/dev/null 2>&1
+}
+
+launch_agent_owned() {
+  [[ -f "$LAUNCH_AGENT" ]] \
+    && [[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$LAUNCH_AGENT" 2>/dev/null)" == "$INSTALL_DIR/window_zones" ]]
+}
+
 if [[ "$UNINSTALL" -eq 1 ]]; then
-  for item in "${INSTALLED[@]}"; do
+  for item in ${INSTALLED[@]+"${INSTALLED[@]}"}; do
     case "$item" in
       autostart)
         if user_systemd_available; then
@@ -145,6 +168,16 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
         rm -f -- "$UNIT_FILE" "$UNIT_DIR/graphical-session.target.wants/window-zones.service" "$AUTOSTART_FILE"
         if user_systemd_available; then
           systemctl --user daemon-reload || warn 'Could not reload user systemd; run systemctl --user daemon-reload when available.'
+        fi
+        ;;
+      launch-agent)
+        if launch_agent_owned; then
+          if launch_agent_loaded; then
+            launchctl bootout "$LAUNCH_TARGET" || warn "Could not stop $LAUNCH_LABEL; stop any running App before removing its binary."
+          fi
+          rm -f -- "$LAUNCH_AGENT"
+        else
+          warn 'LaunchAgent no longer references this prefix; leaving it untouched.'
         fi
         ;;
       gnome-extension)
@@ -171,7 +204,7 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     esac
   done
   # Stop the listener and unload companions before removing their binaries.
-  for item in "${INSTALLED[@]}"; do
+  for item in ${INSTALLED[@]+"${INSTALLED[@]}"}; do
     case "$item" in
       binary:*)
         name="${item#binary:}"
@@ -195,7 +228,7 @@ if [[ "$KWIN_SCRIPT" -eq 1 ]] && ! command -v kpackagetool6 >/dev/null 2>&1; the
   echo '--kwin-script requires kpackagetool6; install the Plasma 6 package tools and re-run this script.' >&2
   exit 1
 fi
-if [[ "$(uname -s)" == Linux ]]; then
+if [[ "$OS" == Linux ]]; then
   if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists dbus-1 x11 xtst xi; then
     echo 'Linux builds require pkg-config and D-Bus, X11, XTest, and Xi development libraries.' >&2
     echo 'Arch/CachyOS: sudo pacman -S --needed pkgconf dbus libx11 libxtst libxi' >&2
@@ -265,7 +298,59 @@ if [[ "$INIT_CONFIG" -eq 1 ]]; then
   "$INSTALL_DIR/window_zones" init || warn 'Starter config could not be initialized; run window_zones init and resolve the reported error.'
 fi
 
-if [[ "$AUTOSTART" -eq 1 ]]; then
+if [[ "$AUTOSTART" -eq 1 && "$OS" == Darwin ]]; then
+  mkdir -p "$(dirname -- "$LAUNCH_AGENT")" "$(dirname -- "$LAUNCH_LOG")"
+  xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+  RESTART_LOADED_AGENT=0
+  if launch_agent_loaded && launch_agent_owned; then
+    RESTART_LOADED_AGENT=1
+  fi
+  # No KeepAlive: launchd cannot exempt exit 75 (another instance owns the hotkeys)
+  # from restarts, so the agent starts once per login/load and is never respawned.
+  cat >"$LAUNCH_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LAUNCH_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$INSTALL_DIR/window_zones")</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "$LAUNCH_LOG")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "$LAUNCH_LOG")</string>
+</dict>
+</plist>
+EOF
+  # launchd refuses agents that are group/world writable (e.g. under umask 002).
+  chmod 644 "$LAUNCH_AGENT"
+  record_install launch-agent
+  if [[ "$RESTART_LOADED_AGENT" -eq 1 ]]; then
+    # Keep the loaded job: bootout followed immediately by bootstrap can race
+    # launchd's asynchronous teardown on reinstall.
+    launchctl kickstart -k "$LAUNCH_TARGET" || warn "Could not restart $LAUNCH_LABEL."
+    printf 'Autostart: %s (loaded; restart requested)\n' "$LAUNCH_AGENT"
+  else
+    if launch_agent_loaded; then
+      launchctl bootout "$LAUNCH_TARGET" || warn "Could not unload the previous $LAUNCH_LABEL."
+    fi
+    if launchctl bootstrap "gui/$UID" "$LAUNCH_AGENT"; then
+      printf 'Autostart: %s (loaded; starts at every login)\n' "$LAUNCH_AGENT"
+    else
+      warn "Could not load the LaunchAgent into gui/$UID; it loads at your next login, or run: launchctl bootstrap gui/$UID \"$LAUNCH_AGENT\""
+    fi
+  fi
+  printf 'Restart: launchctl kickstart -k %s\n' "$LAUNCH_TARGET"
+  printf 'Stop until next login: launchctl bootout %s\n' "$LAUNCH_TARGET"
+  printf 'Logs: tail -f "%s"\n' "$LAUNCH_LOG"
+  printf 'Allow %s in System Settings > Privacy & Security > Accessibility (again after each reinstall).\n' "$INSTALL_DIR/window_zones"
+elif [[ "$AUTOSTART" -eq 1 ]]; then
   mkdir -p "$UNIT_DIR"
   # systemd ExecStart quoting: escape quotes/backslashes, specifiers, and environment expansion.
   EXEC_PATH="$INSTALL_DIR/window_zones"
@@ -328,6 +413,15 @@ EOF
 fi
 
 # A running listener keeps executing the replaced binary until it restarts.
+if [[ "$AUTOSTART" -eq 0 && "$BINARY_NAME" == window_zones && "$OS" == Darwin ]] \
+  && launch_agent_owned && [[ "$(launchctl print "$LAUNCH_TARGET" 2>/dev/null)" == *'state = running'* ]]; then
+  if launchctl kickstart -k "$LAUNCH_TARGET"; then
+    echo "Restarted $LAUNCH_LABEL onto the new binary."
+  else
+    warn "Could not restart $LAUNCH_LABEL; run: launchctl kickstart -k $LAUNCH_TARGET"
+  fi
+fi
+
 if [[ "$AUTOSTART" -eq 0 && "$BINARY_NAME" == window_zones ]] && user_systemd_available \
   && systemctl --user is-active --quiet window-zones.service; then
   systemctl --user restart window-zones.service
@@ -352,7 +446,7 @@ else
   esac
 fi
 
-if [[ "$BINARY_NAME" == window_zones && "$INIT_CONFIG" -eq 0 && ! -e "$CONFIG_HOME/window_zones/config.toml" ]]; then
+if [[ "$BINARY_NAME" == window_zones && "$INIT_CONFIG" -eq 0 && ! -e "$APP_CONFIG" ]]; then
   echo 'Next: create a starter config with `window_zones init` (or re-run with --init-config).'
 fi
 if [[ "$BINARY_NAME" == window_zones && "$GNOME_EXTENSION" -eq 0 && ":${XDG_CURRENT_DESKTOP:-}:" == *:GNOME:* && ! -d "$GNOME_DIR" ]]; then

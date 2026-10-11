@@ -157,6 +157,22 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 8. Re-enable the extension. Verify the runtime reconnects, re-registers the current bindings, and emits one recovery diagnostic rather than repeating identical errors every retry.
 9. Restart the application and repeat one zone move and one display move.
 
+`gnome-live` checks item 4 and a refused replacement mechanically on test windows it starts itself: it captures one Text Editor's id, focuses a second, and moves the captured id over `MoveWindow`; closes the second and expects `WindowGone`; maximizes the first through EWMH, then edge-tiles it with a real Super+Left over `/dev/uinput`, and expects each move to clear the state and apply the frame; sets fullscreen and expects `leave fullscreen first` with state and frame unchanged. It then reloads a config adding the reserved `Alt+Ctrl+Left` and expects `were refused`, the previous four bindings, and the previous accelerator still moving the window. Setting EWMH states uses a helper crate the gate builds against the public `window_zones` API, so `cargo` needs the locked crates. Recorded GNOME results predate these assertions.
+
+The expanded seated GNOME 50 gate remains pending. The latest reachable
+container had GNOME Shell 48.7: after starting a real system bus, `gnome` ended
+with 6 assertions, 2 passed, 4 failed because `org.freedesktop.login1` could not
+activate. `gnome-live` stopped at its unwritable `/dev/uinput` preflight
+(2 assertions, 1 passed, 1 failed). The configured CachyOS SSH target was not
+reachable on port 22. These are environmental limits, not a passing GNOME 50
+configuration.
+
+To close the gate, run the expanded `gnome-live` checks on a reachable GNOME 50
+login seat, with the current companion active, `disable-user-extensions=false`,
+and writable `/dev/uinput`. Record the GNOME/Mutter versions, display
+layout, assertion summary, and retained logs. Contract tests and a synthetic
+Shell run do not replace this evidence; see [current readiness evidence](testing.md#current-readiness-evidence-2026-10-10).
+
 For isolated D-Bus client and real companion-dispatcher contract coverage, run:
 
 ```bash

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use std::sync::mpsc::{self, TryRecvError};
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use std::thread;
 
@@ -49,9 +49,10 @@ pub trait HotkeySystem {
 }
 
 /// Instances share one process-owned rdev listener: rdev's global callback must
-/// never be replaced by a second `listen`/`grab`. The singleton passes all input
-/// through after its active registration is dropped (apart from releases whose
-/// presses it already consumed); the next instance can reuse it on restart.
+/// never be replaced by a second `listen`/`grab` while a native hook runs. The
+/// singleton passes all input through after its active registration is dropped
+/// (apart from releases whose presses it already consumed). The next instance
+/// reuses it on restart, or starts a fresh one once the native hook stopped.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[derive(Debug)]
 pub struct RdevHotkeySystem {
@@ -85,6 +86,12 @@ impl RdevListener {
         self.bindings.clear();
         self.event_tx = None;
         self.owner = None;
+    }
+
+    /// Record that the native hook is not running; `new` may then replace it.
+    fn stop(&mut self, error: String) {
+        self.clear_registration();
+        self.error = Some(error);
     }
 
     /// Return true only when the native event should be consumed.
@@ -134,12 +141,37 @@ impl RdevListener {
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 impl RdevHotkeySystem {
     pub fn new() -> Self {
-        static LISTENER: LazyLock<Arc<Mutex<RdevListener>>> = LazyLock::new(|| {
-            let state = Arc::new(Mutex::new(RdevListener::default()));
-            RdevHotkeySystem::spawn_listener(Arc::clone(&state));
-            state
-        });
-        Self::with_listener(Arc::clone(&LISTENER))
+        static LISTENER: Mutex<Option<Arc<Mutex<RdevListener>>>> = Mutex::new(None);
+        Self::with_listener(Self::shared_listener(&LISTENER, Self::spawn_listener))
+    }
+
+    /// Reuse the shared listener while its native hook may still run; build a
+    /// new one only after the old hook stopped, so a single hook stays live.
+    fn shared_listener(
+        slot: &Mutex<Option<Arc<Mutex<RdevListener>>>>,
+        spawn: impl FnOnce(Arc<Mutex<RdevListener>>),
+    ) -> Arc<Mutex<RdevListener>> {
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(listener) = slot.as_ref() {
+            let running = listener
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    // A wrapper panicked mid-update: keep the hook, drop its registration.
+                    listener.clear_poison();
+                    let mut state = poisoned.into_inner();
+                    state.clear_registration();
+                    state
+                })
+                .error
+                .is_none();
+            if running {
+                return Arc::clone(listener);
+            }
+        }
+        let listener = Arc::new(Mutex::new(RdevListener::default()));
+        spawn(Arc::clone(&listener));
+        *slot = Some(Arc::clone(&listener));
+        listener
     }
 
     fn with_listener(listener: Arc<Mutex<RdevListener>>) -> Self {
@@ -177,20 +209,20 @@ impl RdevHotkeySystem {
                 Ok(Ok(())) => "native listener exited".to_string(),
                 Err(_) => "native listener panicked".to_string(),
             };
-            if let Ok(mut state) = error_state.lock() {
-                state.clear_registration();
-                state.error = Some(format!(
+            error_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stop(format!(
                     "global hotkey listener stopped: {details}; restore input/Accessibility permission and restart Window Zones"
                 ));
-            }
         });
-        if let Err(error) = spawn
-            && let Ok(mut state) = spawn_error_state.lock()
-        {
-            state.clear_registration();
-            state.error = Some(format!(
-                "failed to start global hotkey listener: {error}; restart Window Zones"
-            ));
+        if let Err(error) = spawn {
+            spawn_error_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stop(format!(
+                    "failed to start global hotkey listener: {error}; restart Window Zones"
+                ));
         }
     }
 }
@@ -626,6 +658,40 @@ mod tests {
             system.next_hotkey(),
             Err(HotkeySystemError::Unavailable("EventTapError".to_string()))
         );
+    }
+
+    #[test]
+    fn restart_reuses_a_live_listener_and_rebuilds_a_stopped_one() {
+        let slot = Mutex::new(None);
+        let mut spawned = 0;
+        let mut shared = || {
+            RdevHotkeySystem::with_listener(RdevHotkeySystem::shared_listener(&slot, |_| {
+                spawned += 1
+            }))
+        };
+        let first = shared();
+        let mut second = shared();
+        second.register_hotkeys(&["a".to_string()]).unwrap();
+        assert!(press(&second, Key::KeyA, true));
+        listener_state(&second).stop("EventTapError".to_string());
+        drop(first);
+        let mut restarted = shared();
+        let _reused = shared();
+        assert_eq!(spawned, 2);
+
+        restarted.register_hotkeys(&["a".to_string()]).unwrap();
+        assert!(!release(&restarted, Key::KeyA, true));
+        assert!(press(&restarted, Key::KeyA, true));
+        assert_eq!(
+            restarted.next_hotkey().unwrap(),
+            Some(HotkeyEvent::Pressed {
+                hotkey: "a".to_string()
+            })
+        );
+        assert!(matches!(
+            second.register_hotkeys(&["a".to_string()]),
+            Err(HotkeySystemError::Unavailable(_))
+        ));
     }
 
     #[test]

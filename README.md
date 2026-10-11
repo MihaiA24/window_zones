@@ -43,7 +43,7 @@ The platform-neutral core and runtime paths currently include:
 
 - Blocking Release gates: GNOME Wayland (`./scripts/smoke.sh gnome` in a Synthetic session plus `./scripts/smoke.sh gnome-live` on the seated session) and Linux X11 (`./scripts/smoke.sh x11`), each including the TUI lifecycle Smoke run.
 - KDE Plasma Wayland (`./scripts/smoke.sh kde-live` on a nested KWin) and Windows (`docs/runbooks/windows-smoke.md`) are implemented but deferred and non-blocking until a seated KWin 6.x Smoke run and the manual Windows run pass.
-- macOS, Sway, and Hyprland are ungated integrations: they build and ship without a Smoke run on record. Sway and Hyprland have no global hotkey capability and use compositor-bound dispatch (`window_zones dispatch <hotkey>` from the compositor keybinding config).
+- macOS is ungated, with native window, hotkey-restart, LaunchAgent, and visible problem/recovery notification evidence in `docs/runbooks/testing.md`. Sway and Hyprland have no Smoke run on record or global hotkey capability and use compositor-bound dispatch (`window_zones dispatch <hotkey>` from the compositor keybinding config).
 - `docs/runbooks/testing.md` is the record of record for gate status.
 
 ## Configuration discovery
@@ -60,7 +60,7 @@ A missing file boots with empty bindings and `ConfigState::Missing`; `window_zon
 
 Use these helper scripts for common workflows:
 
-- `./scripts/install.sh` — build and install the binary; optional `--gnome-extension`, `--kwin-script`, `--init-config`, `--autostart` (systemd user service), `--uninstall`.
+- `./scripts/install.sh` — build and install the binary; optional `--gnome-extension`, `--kwin-script`, `--init-config`, `--autostart` (Linux systemd user service or macOS LaunchAgent), `--uninstall`.
 - `./scripts/run.sh` — run the binary with safe defaults for quick checks.
 - `./scripts/test.sh` — run formatting, test, lint, and GNOME companion contract checks.
 - `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs; `gnome-live` runs the seated GNOME session checks.
@@ -73,7 +73,11 @@ Use these helper scripts for common workflows:
 
 ## macOS adapter caveats
 
-The macOS backend uses AppleScript (`osascript`) and `System Events`.
-Focus and move calls require Accessibility permissions for the host process under
+The macOS backend retains native Accessibility window references and reads
+`NSScreen.visibleFrame`; titles and focus changes do not redirect captured moves.
+Allow Window Zones (or its terminal) under
 `System Settings -> Privacy & Security -> Accessibility`.
-Without permission, backend actions fail with a `WindowSystemError::Platform` diagnostic.
+Fullscreen and non-resizable windows are refused before changes. App-imposed
+frame constraints are reported explicitly, not as successful placement.
+A recorded failed hotkey listener is replaced by runtime `restart`; a live one is
+reused. See the installation and running runbooks for LaunchAgent permissions.

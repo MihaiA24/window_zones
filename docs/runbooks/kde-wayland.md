@@ -179,6 +179,37 @@ global-accelerator entries.
 
 It is not a substitute for this checklist on a seated Plasma session. KWin's nested and virtual backends use a `Session::Type::Noop` session and never own the login seat; the gate's accelerator capture goes through Xwayland XTEST into KWin's EIS input path, which evidences compositor dispatch rather than physical-seat input. Three limitations are recorded as named skips rather than silently passed: seated accelerator capture, Plasma panel exclusion (the fixture runs no `plasmashell`), and negative-coordinate output movement (KWin places the virtual outputs side by side at non-negative origins).
 
+The fixture also requires `dbus-update-activation-environment`. It seeds the
+private bus with its own `WAYLAND_DISPLAY` before KWin starts: Xwayland can
+activate the desktop portal before the first graphical client connects.
+KWin 6.3.6 [launches Xwayland with `-enable-ei-portal` when supported](https://raw.githubusercontent.com/KDE/kwin/v6.3.6/src/xwayland/xwaylandlauncher.cpp);
+that path needs a working graphical portal and authorized EIS input delivery.
+Installing KWin alone does not prove the transport.
+
+Current expanded evidence used KWin 6.3.6 and Xwayland 24.1.6 in the owned
+Debian 13 aarch64 container:
+
+| Synthetic run | Assertions | Passed | Failed | Skipped |
+|---|---:|---:|---:|---:|
+| Reload assertions synchronized to new output | 179 | 161 | 15 | 3 |
+| Private portal graphical environment fixed | 180 | 162 | 15 | 3 |
+| Same gate with an owned private PipeWire daemon | 180 | 162 | 15 | 3 |
+
+The graphical-environment fix made the KDE portal activate successfully instead
+of failing to create `wl_display`. The PipeWire probe did not restore input
+delivery and was not promoted into the harness. Explicit dispatch and window
+identity/state checks passed; all 15 failures depended on injected accelerator
+delivery, including retained-binding delivery after a refused reload. The
+remaining XTEST-to-EIS failure cause is unresolved in this fixture, not a
+verified product defect or a passing shortcut path.
+
+Evidence under `target/verify-window-zones/`: `readiness-linux-kde-final/`
+(reload synchronization), `readiness-linux-kde-activation/`, and
+`readiness-linux-kde-pipewire/`. The fixture used Xwayland Text Editors;
+native-Wayland client placement and seated Plasma remain unverified.
+
+For ADR 0009 the gate also starts a second Text Editor and, through `MoveWindow` on the companion bus, moves the first window's captured id after focus changed, expects `WindowGone` once the second window is closed, and expects a quick-tiled (`slotWindowQuickTileLeft`) and a maximized window to be restored before the frame is applied and a fullscreen window to be rejected unchanged. It reads KWin's own `tile`, `maximizeMode`, `fullScreen`, and `frameGeometry` through throwaway scripts and `_NET_WM_STATE` through `xprop`. It then reloads a config adding the incumbent's `Alt+Ctrl+F24` and expects `were refused` naming the owner, the previous five bindings, and `Alt+Ctrl+Left` still moving the window. These need KWin 6 scripting with the `tile` property; the current window-state checks exercised them, but retained-binding accelerator delivery remains unverified.
+
 Its first run found two defects, both fixed:
 
 - `workspace.clientArea(KWin.WorkArea, output, desktop)` ignores the output and returns the desktop-wide union, so every display reported the same rectangle and zones were computed against all monitors joined. The per-output area is `KWin.MaximizeArea`.

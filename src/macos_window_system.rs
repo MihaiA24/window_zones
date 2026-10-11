@@ -1,423 +1,59 @@
-//! macOS adapter for `WindowSystem`.
+//! macOS adapter using retained Accessibility window references.
 //!
-//! System Events does not expose a stable native window handle. Identities are
-//! `<pid>:name:<title>` for uniquely titled windows, otherwise `<pid>:index:<n>`
-//! (one-based). Titles can change and unnamed/duplicate windows can reorder;
-//! these identities cannot distinguish a closed window from its replacement.
-//! AXFullScreen is rejected; AXZoomed and AXMinimized are cleared when exposed.
-//! Apps that do not expose AXZoomed cannot have their zoom state restored here.
+//! Window identity is adapter-scoped and independent of titles, window order,
+//! and focus. Fullscreen and non-resizable windows are rejected before changes.
+//! AXZoomed/AXMinimized are restored when exposed; ordinary AppKit zoom/tiling
+//! is released by setting the window's size and position.
 
 use crate::{
     DisplayGeometry, FocusedWindow, Rect, WindowId, WindowMove, WindowSystem, WindowSystemError,
 };
-use serde::Deserialize;
+use std::cell::RefCell;
 use std::convert::TryFrom;
-use std::io::{self, Read};
-use std::process::{Command, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::{Duration, Instant};
-
-const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCESSIBILITY_HINT: &str =
     "allow Window Zones (or its terminal) in System Settings > Privacy & Security > Accessibility";
 
 #[derive(Debug, Default)]
-pub struct MacOSWindowSystem;
+pub struct MacOSWindowSystem {
+    accessibility: native::Accessibility,
+    windows: RefCell<Vec<(WindowId, native::Value)>>,
+}
 
 impl MacOSWindowSystem {
     pub fn new() -> Self {
-        Self
-    }
-
-    fn run_osascript(script: &str) -> Result<String, WindowSystemError> {
-        let mut command = Command::new("osascript");
-        command.arg("-l").arg("JavaScript").arg("-e").arg(script);
-        let output = run_command_with_timeout(&mut command, OSASCRIPT_TIMEOUT)?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let details = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                "unknown osascript error".to_string()
-            };
-
-            return Err(WindowSystemError::Platform(format!(
-                "osascript failed: {details}; {ACCESSIBILITY_HINT}"
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    fn focused_window_payload() -> Result<FocusedWindowPayload, WindowSystemError> {
-        let output = Self::run_osascript(
-            r#"
-            var se = Application("System Events");
-
-            function focused_payload() {
-                var procs = se.processes.whose({ frontmost: true })();
-                if (procs.length === 0) {
-                    return { focused: false };
-                }
-
-                var process = procs[0];
-                var windows = process.windows();
-                if (windows.length === 0) {
-                    return { focused: false };
-                }
-
-                var window = windows[0];
-                var name = window.name();
-                var uniqueName = typeof name === "string" && name.length > 0 &&
-                    windows.filter(function(candidate) { return candidate.name() === name; }).length === 1;
-                var position = window.position();
-                var size = window.size();
-                return {
-                    focused: true,
-                    pid: process.unixId(),
-                    window_name: uniqueName ? name : null,
-                    window_index: uniqueName ? null : 1,
-                    x: position[0],
-                    y: position[1],
-                    width: size[0],
-                    height: size[1],
-                };
-            }
-
-            JSON.stringify(focused_payload());
-            "#,
-        )?;
-        parse_focused_window_payload(&output)
-    }
-
-    fn displays_payload() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-        let output = Self::run_osascript(
-            r#"
-            ObjC.import("Cocoa");
-            var out = [];
-            var screens = $.NSScreen.screens;
-            var mainScreenFrameHeight = screens.objectAtIndex(0).frame.size.height;
-            for (var i = 0; i < screens.count; i++) {
-                var screen = screens.objectAtIndex(i);
-                var bounds = screen.visibleFrame;
-                out.push({
-                    id: "display-" + i,
-                    x: bounds.origin.x,
-                    y: mainScreenFrameHeight - (bounds.origin.y + bounds.size.height),
-                    width: bounds.size.width,
-                    height: bounds.size.height,
-                });
-            }
-            JSON.stringify(out);
-            "#,
-        )?;
-
-        parse_display_payloads(&output)
-    }
-
-    fn move_window_payload(window_move: &WindowMove) -> Result<(), WindowSystemError> {
-        let script = move_script(window_move)?;
-        let output = Self::run_osascript(&script)?;
-        match output.as_str() {
-            "gone" => Err(WindowSystemError::WindowGone(window_move.window.clone())),
-            "fullscreen" => Err(WindowSystemError::Platform(
-                "fullscreen window cannot be moved; leave fullscreen first".to_string(),
-            )),
-            "ok" => Ok(()),
-            _ => Err(WindowSystemError::Platform(format!(
-                "unexpected osascript move response: {output}"
-            ))),
-        }
+        Self::default()
     }
 }
 
 impl WindowSystem for MacOSWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-        let payload = Self::focused_window_payload()?;
-        if !payload.focused {
+        let Some(window) = self.accessibility.focused_window()? else {
             return Ok(None);
-        }
-
-        Ok(Some(FocusedWindow::new(
-            focused_identity(&payload)?,
-            Rect::new(
-                as_i32("x", payload.x)?,
-                as_i32("y", payload.y)?,
-                as_u32("width", payload.width)?,
-                as_u32("height", payload.height)?,
-            ),
-        )))
+        };
+        let frame = self.accessibility.frame(&window, None)?;
+        let mut windows = self.windows.borrow_mut();
+        let id = if let Some((id, _)) = windows.iter().find(|(_, saved)| saved.same(&window)) {
+            id.clone()
+        } else {
+            let id = WindowId::new(format!("macos:{}", windows.len()));
+            windows.push((id.clone(), window));
+            id
+        };
+        Ok(Some(FocusedWindow::new(id, frame)))
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-        Self::displays_payload()
+        native::displays()
     }
 
     fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
-        Self::move_window_payload(window_move)
+        let windows = self.windows.get_mut();
+        let (_, window) = windows
+            .iter()
+            .find(|(id, _)| id == &window_move.window)
+            .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+        self.accessibility.place(window, window_move)
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct FocusedWindowPayload {
-    focused: bool,
-    pid: Option<u32>,
-    window_name: Option<String>,
-    window_index: Option<usize>,
-    #[serde(default)]
-    x: f64,
-    #[serde(default)]
-    y: f64,
-    #[serde(default)]
-    width: f64,
-    #[serde(default)]
-    height: f64,
-}
-
-fn focused_identity(payload: &FocusedWindowPayload) -> Result<WindowId, WindowSystemError> {
-    let pid = payload.pid.filter(|pid| *pid > 0).ok_or_else(|| {
-        WindowSystemError::Platform("focused-window payload has no valid process id".to_string())
-    })?;
-    if let Some(name) = &payload.window_name
-        && !name.is_empty()
-    {
-        return Ok(WindowId::new(format!("{pid}:name:{name}")));
-    }
-    let index = payload
-        .window_index
-        .filter(|index| *index > 0)
-        .ok_or_else(|| {
-            WindowSystemError::Platform("focused-window payload has no window selector".to_string())
-        })?;
-    Ok(WindowId::new(format!("{pid}:index:{index}")))
-}
-
-fn move_script(window_move: &WindowMove) -> Result<String, WindowSystemError> {
-    let invalid_id = || WindowSystemError::Platform("invalid macOS window identity".to_string());
-    let (pid, selector) = window_move
-        .window
-        .as_str()
-        .split_once(':')
-        .ok_or_else(invalid_id)?;
-    let pid = pid
-        .parse::<u32>()
-        .ok()
-        .filter(|pid| *pid > 0)
-        .ok_or_else(invalid_id)?;
-    let selector = if let Some(name) = selector.strip_prefix("name:") {
-        if name.is_empty() {
-            return Err(invalid_id());
-        }
-        let name = serde_json::to_string(name)
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to encode window name: {error}"))
-            })?
-            .replace('\u{2028}', "\\u2028")
-            .replace('\u{2029}', "\\u2029");
-        format!(
-            "var matches = windows.filter(function(candidate) {{ return candidate.name() === {name}; }});\n\
-             if (matches.length !== 1) return \"gone\";\n\
-             window = matches[0];"
-        )
-    } else if let Some(index) = selector.strip_prefix("index:") {
-        let index = index
-            .parse::<usize>()
-            .ok()
-            .filter(|index| *index > 0)
-            .ok_or_else(invalid_id)?;
-        format!(
-            "if (windows.length < {index}) return \"gone\";\nwindow = windows[{}];",
-            index - 1
-        )
-    } else {
-        return Err(invalid_id());
-    };
-    let Rect {
-        x,
-        y,
-        width,
-        height,
-    } = window_move.target;
-    Ok(format!(
-        r#"
-        var se = Application("System Events");
-        function move_payload() {{
-            var window = null;
-            try {{
-                var procs = se.processes.whose({{ unixId: {pid} }})();
-                if (procs.length === 0) return "gone";
-                var windows = procs[0].windows();
-                {selector}
-                var fullscreen = window.attributes.byName("AXFullScreen");
-                if (fullscreen.exists() && fullscreen.value()) return "fullscreen";
-                ["AXZoomed", "AXMinimized"].forEach(function(name) {{
-                    var attribute = window.attributes.byName(name);
-                    if (attribute.exists() && attribute.value()) {{
-                        if (!attribute.settable()) {{
-                            throw new Error(name + " cannot be restored; restore the window first");
-                        }}
-                        attribute.value = false;
-                    }}
-                }});
-                window.position = [{x}, {y}];
-                window.size = [{width}, {height}];
-                return "ok";
-            }} catch (error) {{
-                if (se.processes.whose({{ unixId: {pid} }})().length === 0 ||
-                    (window !== null && !window.exists())) return "gone";
-                throw error;
-            }}
-        }}
-        move_payload();
-        "#,
-    ))
-}
-
-fn run_command_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-) -> Result<Output, WindowSystemError> {
-    let deadline = Instant::now() + timeout;
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            WindowSystemError::Platform(format!(
-                "failed to execute osascript: {error}; {ACCESSIBILITY_HINT}"
-            ))
-        })?;
-    let result = (|| {
-        let stdout = child.stdout.take().ok_or_else(|| {
-            WindowSystemError::Platform("osascript stdout was not piped".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            WindowSystemError::Platform("osascript stderr was not piped".to_string())
-        })?;
-        // Drain both pipes concurrently: a full pipe must not stall the child.
-        let stdout_rx = read_pipe(stdout)?;
-        let stderr_rx = read_pipe(stderr)?;
-        let mut status = None;
-        let mut stdout = None;
-        let mut stderr = None;
-        loop {
-            if status.is_none() {
-                status = child.try_wait().map_err(|error| {
-                    WindowSystemError::Platform(format!(
-                        "failed to wait for osascript: {error}; {ACCESSIBILITY_HINT}"
-                    ))
-                })?;
-            }
-            receive_pipe(&stdout_rx, &mut stdout)?;
-            receive_pipe(&stderr_rx, &mut stderr)?;
-            if let Some(status) = status
-                && stdout.is_some()
-                && stderr.is_some()
-            {
-                return Ok(Output {
-                    status,
-                    stdout: stdout.unwrap(),
-                    stderr: stderr.unwrap(),
-                });
-            }
-            if Instant::now() >= deadline {
-                return Err(WindowSystemError::Platform(format!(
-                    "osascript timed out after {} ms; {ACCESSIBILITY_HINT}",
-                    timeout.as_millis(),
-                )));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    })();
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    result
-}
-
-fn read_pipe(
-    mut pipe: impl Read + Send + 'static,
-) -> Result<Receiver<io::Result<Vec<u8>>>, WindowSystemError> {
-    let (tx, rx) = mpsc::channel();
-    thread::Builder::new()
-        .name("window-zones-osascript-output".to_string())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
-            let _ = tx.send(result);
-        })
-        .map_err(|error| {
-            WindowSystemError::Platform(format!(
-                "failed to read osascript output: {error}; {ACCESSIBILITY_HINT}"
-            ))
-        })?;
-    Ok(rx)
-}
-
-fn receive_pipe(
-    rx: &Receiver<io::Result<Vec<u8>>>,
-    bytes: &mut Option<Vec<u8>>,
-) -> Result<(), WindowSystemError> {
-    if bytes.is_none() {
-        match rx.try_recv() {
-            Ok(result) => {
-                *bytes = Some(result.map_err(|error| {
-                    WindowSystemError::Platform(format!(
-                        "failed to read osascript output: {error}; {ACCESSIBILITY_HINT}"
-                    ))
-                })?)
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                return Err(WindowSystemError::Platform(format!(
-                    "osascript output reader stopped; {ACCESSIBILITY_HINT}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct DisplayPayload {
-    id: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-fn parse_focused_window_payload(raw: &str) -> Result<FocusedWindowPayload, WindowSystemError> {
-    serde_json::from_str::<FocusedWindowPayload>(raw).map_err(|error| {
-        WindowSystemError::Platform(format!("failed to parse focused-window payload: {error}"))
-    })
-}
-
-fn parse_display_payloads(raw: &str) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-    let payload = serde_json::from_str::<Vec<DisplayPayload>>(raw).map_err(|error| {
-        WindowSystemError::Platform(format!("failed to parse display payload: {error}"))
-    })?;
-
-    payload
-        .into_iter()
-        .map(|entry| {
-            Ok(DisplayGeometry::new(
-                entry.id,
-                Rect::new(
-                    as_i32("x", entry.x)?,
-                    as_i32("y", entry.y)?,
-                    as_u32("width", entry.width)?,
-                    as_u32("height", entry.height)?,
-                ),
-            ))
-        })
-        .collect()
 }
 
 fn as_i32(field: &str, value: f64) -> Result<i32, WindowSystemError> {
@@ -469,112 +105,489 @@ fn as_u32(field: &str, value: f64) -> Result<u32, WindowSystemError> {
         .map_err(|_| WindowSystemError::Platform(format!("{field} out of u32 range: {value}")))
 }
 
+/// Owned Core Foundation values; all Accessibility messaging stays on the
+/// calling thread. The SDK defines AXUIElement identity through CFEqual.
+mod native {
+    use super::*;
+    use cocoa::appkit::NSScreen;
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::NSArray;
+    use objc::Message;
+    use objc::rc::autoreleasepool;
+    use objc::runtime::{Class, Sel};
+    use std::ffi::{CStr, c_void};
+    use std::ptr::{self, NonNull};
+
+    type Ref = *const c_void;
+    const INVALID_ELEMENT: i32 = -25202;
+    const CANNOT_COMPLETE: i32 = -25204;
+    const UNSUPPORTED: i32 = -25205;
+    const NO_VALUE: i32 = -25212;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+        fn AXUIElementCreateSystemWide() -> Ref;
+        fn AXUIElementCreateApplication(pid: i32) -> Ref;
+        fn AXUIElementSetMessagingTimeout(element: Ref, seconds: f32) -> i32;
+        fn AXUIElementCopyAttributeValue(element: Ref, name: Ref, value: *mut Ref) -> i32;
+        fn AXUIElementIsAttributeSettable(element: Ref, name: Ref, settable: *mut u8) -> i32;
+        fn AXUIElementSetAttributeValue(element: Ref, name: Ref, value: Ref) -> i32;
+        fn AXUIElementGetPid(element: Ref, pid: *mut i32) -> i32;
+        fn AXUIElementGetTypeID() -> usize;
+        fn AXValueGetTypeID() -> usize;
+        fn AXValueCreate(kind: u32, value: *const c_void) -> Ref;
+        fn AXValueGetValue(value: Ref, kind: u32, result: *mut c_void) -> u8;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: Ref);
+        fn CFEqual(first: Ref, second: Ref) -> u8;
+        fn CFGetTypeID(value: Ref) -> usize;
+        fn CFStringCreateWithCString(allocator: Ref, string: *const i8, encoding: u32) -> Ref;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(value: Ref) -> u8;
+        static kCFBooleanFalse: Ref;
+    }
+
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Value(NonNull<c_void>);
+
+    impl Value {
+        // Create/Copy APIs return one ownership reference. Null here is allocation
+        // failure, not an absent AX attribute (which is handled before wrapping).
+        fn owned(value: Ref) -> Self {
+            Self(NonNull::new(value.cast_mut()).expect("Core Foundation allocation failed"))
+        }
+
+        fn raw(&self) -> Ref {
+            self.0.as_ptr()
+        }
+
+        pub(super) fn same(&self, other: &Self) -> bool {
+            // SAFETY: both values remain retained during this call.
+            unsafe { CFEqual(self.raw(), other.raw()) != 0 }
+        }
+    }
+
+    impl Drop for Value {
+        fn drop(&mut self) {
+            // SAFETY: this value owns exactly one Create/Copy reference.
+            unsafe { CFRelease(self.raw()) };
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Pair {
+        first: f64,
+        second: f64,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Attribute {
+        Window,
+        Position,
+        Size,
+        Fullscreen,
+        Minimized,
+        Zoomed,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Accessibility {
+        system: Value,
+        attributes: [Value; 6],
+    }
+
+    impl Default for Accessibility {
+        fn default() -> Self {
+            let names: [&CStr; 6] = [
+                c"AXFocusedWindow",
+                c"AXPosition",
+                c"AXSize",
+                c"AXFullScreen",
+                c"AXMinimized",
+                c"AXZoomed",
+            ];
+            Self {
+                // SAFETY: Create returns a retained system-wide element.
+                system: Value::owned(unsafe { AXUIElementCreateSystemWide() }),
+                attributes: names.map(|name| {
+                    // SAFETY: names are static NUL-terminated ASCII/UTF-8 strings.
+                    Value::owned(unsafe {
+                        CFStringCreateWithCString(ptr::null(), name.as_ptr(), 0x0800_0100)
+                    })
+                }),
+            }
+        }
+    }
+
+    impl Accessibility {
+        fn name(&self, attribute: Attribute) -> Ref {
+            self.attributes[attribute as usize].raw()
+        }
+
+        fn check(
+            code: i32,
+            operation: &str,
+            id: Option<&WindowId>,
+        ) -> Result<(), WindowSystemError> {
+            if code == 0 {
+                return Ok(());
+            }
+            if code == INVALID_ELEMENT
+                && let Some(id) = id
+            {
+                return Err(WindowSystemError::WindowGone(id.clone()));
+            }
+            Err(WindowSystemError::Platform(format!(
+                "Accessibility {operation} failed ({code}); {ACCESSIBILITY_HINT}"
+            )))
+        }
+
+        fn check_window(
+            code: i32,
+            operation: &str,
+            window: &Value,
+            id: Option<&WindowId>,
+        ) -> Result<(), WindowSystemError> {
+            // AX reports messaging failure rather than invalid-element when the
+            // owning process exits. Do not classify a busy, live app as gone.
+            if code == CANNOT_COMPLETE
+                && let Some(id) = id
+            {
+                let mut pid = 0;
+                // SAFETY: the retained element provides its positive process id;
+                // signal 0 only checks existence (Darwin ESRCH is 3).
+                let gone = unsafe {
+                    AXUIElementGetPid(window.raw(), &mut pid) == 0
+                        && pid > 0
+                        && kill(pid, 0) != 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(3)
+                };
+                if gone {
+                    return Err(WindowSystemError::WindowGone(id.clone()));
+                }
+            }
+            Self::check(code, operation, id)
+        }
+
+        fn attribute(
+            &self,
+            element: &Value,
+            name: Attribute,
+            id: Option<&WindowId>,
+        ) -> Result<Option<Value>, WindowSystemError> {
+            let mut value = ptr::null();
+            // SAFETY: element and name are retained; output receives a Copy reference.
+            let code = unsafe {
+                AXUIElementCopyAttributeValue(element.raw(), self.name(name), &mut value)
+            };
+            if code == UNSUPPORTED || code == NO_VALUE {
+                return Ok(None);
+            }
+            Self::check_window(code, "read attribute", element, id)?;
+            if value.is_null() {
+                return Err(WindowSystemError::Platform(
+                    "Accessibility returned no value".into(),
+                ));
+            }
+            Ok(Some(Value::owned(value)))
+        }
+
+        fn boolean(
+            &self,
+            window: &Value,
+            name: Attribute,
+            id: Option<&WindowId>,
+        ) -> Result<bool, WindowSystemError> {
+            let Some(value) = self.attribute(window, name, id)? else {
+                return Ok(false);
+            };
+            // SAFETY: validate the remote value's type before interpreting it.
+            if unsafe { CFGetTypeID(value.raw()) != CFBooleanGetTypeID() } {
+                return Err(WindowSystemError::Platform(
+                    "invalid Accessibility boolean".into(),
+                ));
+            }
+            Ok(unsafe { CFBooleanGetValue(value.raw()) != 0 })
+        }
+
+        fn settable(
+            &self,
+            window: &Value,
+            name: Attribute,
+            id: &WindowId,
+        ) -> Result<bool, WindowSystemError> {
+            let mut settable = 0;
+            // SAFETY: window and name are retained; output is a Boolean.
+            let code = unsafe {
+                AXUIElementIsAttributeSettable(window.raw(), self.name(name), &mut settable)
+            };
+            Self::check_window(code, "check writable attribute", window, Some(id))?;
+            Ok(settable != 0)
+        }
+
+        fn set(
+            &self,
+            window: &Value,
+            name: Attribute,
+            value: Ref,
+            id: &WindowId,
+        ) -> Result<(), WindowSystemError> {
+            // SAFETY: window, attribute and the correctly typed value live across the call.
+            let code =
+                unsafe { AXUIElementSetAttributeValue(window.raw(), self.name(name), value) };
+            Self::check_window(code, "set attribute", window, Some(id))
+        }
+
+        pub(super) fn focused_window(&self) -> Result<Option<Value>, WindowSystemError> {
+            // SAFETY: neither function takes ownership; the timeout is positive.
+            if unsafe { AXIsProcessTrusted() } == 0 {
+                return Err(WindowSystemError::Platform(ACCESSIBILITY_HINT.into()));
+            }
+            Self::check(
+                unsafe { AXUIElementSetMessagingTimeout(self.system.raw(), 2.0) },
+                "set timeout",
+                None,
+            )?;
+            let pid = autoreleasepool(|| unsafe {
+                // NSWorkspace is the native frontmost-application source.
+                let workspace: id = Class::get("NSWorkspace")
+                    .expect("AppKit NSWorkspace")
+                    .send_message(Sel::register("sharedWorkspace"), ())
+                    .expect("sharedWorkspace");
+                let application: id = (&*workspace)
+                    .send_message(Sel::register("frontmostApplication"), ())
+                    .expect("frontmostApplication");
+                if application == nil {
+                    return None;
+                }
+                let pid: i32 = (&*application)
+                    .send_message(Sel::register("processIdentifier"), ())
+                    .expect("processIdentifier");
+                (pid > 0).then_some(pid)
+            });
+            let Some(pid) = pid else {
+                return Ok(None);
+            };
+            // SAFETY: Create returns a retained application Accessibility element.
+            let application = Value::owned(unsafe { AXUIElementCreateApplication(pid) });
+            let window = self.attribute(&application, Attribute::Window, None)?;
+            if let Some(window) = &window
+                && unsafe { CFGetTypeID(window.raw()) != AXUIElementGetTypeID() }
+            {
+                return Err(WindowSystemError::Platform(
+                    "invalid Accessibility window".into(),
+                ));
+            }
+            Ok(window)
+        }
+
+        fn pair(
+            &self,
+            window: &Value,
+            name: Attribute,
+            kind: u32,
+            id: Option<&WindowId>,
+        ) -> Result<Pair, WindowSystemError> {
+            let value = self.attribute(window, name, id)?.ok_or_else(|| {
+                WindowSystemError::Platform("window has no Accessibility geometry".into())
+            })?;
+            let mut pair = Pair::default();
+            // SAFETY: CGPoint and CGSize each consist of two CGFloat (f64) fields.
+            let valid = unsafe {
+                CFGetTypeID(value.raw()) == AXValueGetTypeID()
+                    && AXValueGetValue(value.raw(), kind, (&mut pair as *mut Pair).cast()) != 0
+            };
+            if !valid {
+                return Err(WindowSystemError::Platform(
+                    "invalid Accessibility geometry".into(),
+                ));
+            }
+            Ok(pair)
+        }
+
+        pub(super) fn frame(
+            &self,
+            window: &Value,
+            id: Option<&WindowId>,
+        ) -> Result<Rect, WindowSystemError> {
+            let position = self.pair(window, Attribute::Position, 1, id)?;
+            let size = self.pair(window, Attribute::Size, 2, id)?;
+            Ok(Rect::new(
+                as_i32("x", position.first)?,
+                as_i32("y", position.second)?,
+                as_u32("width", size.first)?,
+                as_u32("height", size.second)?,
+            ))
+        }
+
+        pub(super) fn place(
+            &self,
+            window: &Value,
+            movement: &WindowMove,
+        ) -> Result<(), WindowSystemError> {
+            let id = &movement.window;
+            // Read geometry first to distinguish a closed native object from an
+            // app that merely omits optional state attributes.
+            self.frame(window, Some(id))?;
+            if self.boolean(window, Attribute::Fullscreen, Some(id))? {
+                return Err(WindowSystemError::Platform(
+                    "fullscreen window cannot be moved; leave fullscreen first".into(),
+                ));
+            }
+            if !self.settable(window, Attribute::Position, id)?
+                || !self.settable(window, Attribute::Size, id)?
+            {
+                return Err(WindowSystemError::Platform(
+                    "window is not movable/resizable".into(),
+                ));
+            }
+            if movement.target.width == 0 || movement.target.height == 0 {
+                return Err(WindowSystemError::Platform(
+                    "window dimensions must be positive".into(),
+                ));
+            }
+            for name in [Attribute::Zoomed, Attribute::Minimized] {
+                if self.boolean(window, name, Some(id))? {
+                    if !self.settable(window, name, id)? {
+                        return Err(WindowSystemError::Platform(
+                            "window state cannot be restored".into(),
+                        ));
+                    }
+                    self.set(window, name, unsafe { kCFBooleanFalse }, id)?;
+                }
+            }
+            let position = Pair {
+                first: f64::from(movement.target.x),
+                second: f64::from(movement.target.y),
+            };
+            let size = Pair {
+                first: f64::from(movement.target.width),
+                second: f64::from(movement.target.height),
+            };
+            // SAFETY: AXValueCreate copies the matching CGPoint/CGSize layouts.
+            let position =
+                Value::owned(unsafe { AXValueCreate(1, (&position as *const Pair).cast()) });
+            let size = Value::owned(unsafe { AXValueCreate(2, (&size as *const Pair).cast()) });
+            // Resize first to release native zoom/tiling. Growth can clamp at
+            // the old origin, so complete that resize only after moving.
+            self.set(window, Attribute::Size, size.raw(), id)?;
+            self.set(window, Attribute::Position, position.raw(), id)?;
+            let mut observed = self.frame(window, Some(id))?;
+            if observed.width != movement.target.width || observed.height != movement.target.height
+            {
+                self.set(window, Attribute::Size, size.raw(), id)?;
+                observed = self.frame(window, Some(id))?;
+                if observed.x != movement.target.x || observed.y != movement.target.y {
+                    self.set(window, Attribute::Position, position.raw(), id)?;
+                    observed = self.frame(window, Some(id))?;
+                }
+            }
+            if observed != movement.target {
+                return Err(WindowSystemError::Platform(format!(
+                    "window constrained placement: requested {:?}, observed {observed:?}",
+                    movement.target
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) fn displays() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        autoreleasepool(|| {
+            // SAFETY: NSScreen provides Cocoa screen rectangles in points;
+            // objects stay alive in this autorelease pool.
+            unsafe {
+                let screens = NSScreen::screens(nil);
+                let count = screens.count();
+                if count == 0 {
+                    return Ok(Vec::new());
+                }
+                let first = screens.objectAtIndex(0);
+                let main_height = first.frame().size.height;
+                let mut displays = Vec::with_capacity(count as usize);
+                for index in 0..count {
+                    let screen = screens.objectAtIndex(index);
+                    let frame = screen.visibleFrame();
+                    displays.push(DisplayGeometry::new(
+                        format!("display-{index}"),
+                        Rect::new(
+                            as_i32("x", frame.origin.x)?,
+                            as_i32("y", main_height - frame.origin.y - frame.size.height)?,
+                            as_u32("width", frame.size.width)?,
+                            as_u32("height", frame.size.height)?,
+                        ),
+                    ));
+                }
+                Ok(displays)
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "needs an owned lower-screen window and WZ_MACOS_TEST_PID"]
+        fn expansion_finishes_at_target_origin() {
+            let expected_pid: i32 = std::env::var("WZ_MACOS_TEST_PID")
+                .expect("set WZ_MACOS_TEST_PID to the owned fixture PID")
+                .parse()
+                .expect("fixture PID");
+            assert!(expected_pid > 0);
+            let mut system = MacOSWindowSystem::new();
+            let captured = system.focused_window().unwrap().unwrap();
+            let mut actual_pid = 0;
+            // SAFETY: the captured element is retained by this adapter.
+            assert_eq!(
+                unsafe { AXUIElementGetPid(system.windows.borrow()[0].1.raw(), &mut actual_pid) },
+                0
+            );
+            assert_eq!(
+                actual_pid, expected_pid,
+                "refusing to move an unowned window"
+            );
+            let area = system.displays().unwrap()[0].usable_area;
+            assert!(
+                captured.geometry.y > area.y,
+                "start below the target origin"
+            );
+            assert!(
+                captured.geometry.height < area.height,
+                "start with a small window"
+            );
+            let target = Rect::new(area.x, area.y, area.width / 2, area.height);
+            system
+                .move_window(&WindowMove::new(captured.id.clone(), target))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let observed = system.focused_window().unwrap().unwrap();
+            assert_eq!(observed.id, captured.id);
+            assert_eq!(observed.geometry, target);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_focused_window_payload_from_focusless_response() {
-        let payload = parse_focused_window_payload(r#"{"focused":false}"#).unwrap();
-        assert!(!payload.focused);
-    }
-
-    #[test]
-    fn parse_focused_window_payload_rejects_invalid_payload() {
-        assert!(parse_focused_window_payload("not json").is_err());
-    }
-
-    #[test]
-    fn parse_display_payload_from_json() {
-        let payload = parse_display_payloads(
-            r#"[{"id":"display-0","x":0,"y":0,"width":1920,"height":1080}]"#,
-        )
-        .unwrap();
+    fn unknown_window_identity_is_gone_without_accessing_another_window() {
+        let mut system = MacOSWindowSystem::new();
+        let id = WindowId::new("not-from-this-adapter");
         assert_eq!(
-            payload,
-            vec![DisplayGeometry::new(
-                "display-0",
-                Rect::new(0, 0, 1920, 1080)
-            )]
+            system.move_window(&WindowMove::new(id.clone(), Rect::new(100, 100, 300, 200))),
+            Err(WindowSystemError::WindowGone(id)),
         );
-    }
-
-    #[test]
-    fn focused_identity_uses_process_and_unique_name_or_index() {
-        let named = parse_focused_window_payload(
-            r#"{"focused":true,"pid":42,"window_name":"document: one","x":0,"y":0,"width":10,"height":20}"#,
-        ).unwrap();
-        assert_eq!(
-            focused_identity(&named).unwrap().as_str(),
-            "42:name:document: one"
-        );
-        let unnamed =
-            parse_focused_window_payload(r#"{"focused":true,"pid":42,"window_index":1}"#).unwrap();
-        assert_eq!(focused_identity(&unnamed).unwrap().as_str(), "42:index:1");
-        assert!(
-            focused_identity(&parse_focused_window_payload(r#"{"focused":true}"#).unwrap())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn move_script_targets_original_process_and_escapes_window_name() {
-        let title = "a\"; throw new Error('injected'); //\\\n\u{2028}";
-        let movement = WindowMove::new(
-            WindowId::new(format!("42:name:{title}")),
-            Rect::new(-100, 20, 300, 400),
-        );
-        let script = move_script(&movement).unwrap();
-        assert!(script.contains("unixId: 42"));
-        assert!(!script.contains("frontmost"));
-        assert!(
-            script.contains(
-                &serde_json::to_string(title)
-                    .unwrap()
-                    .replace('\u{2028}', "\\u2028")
-            )
-        );
-        assert!(!script.contains(title));
-        assert!(script.contains("window.position = [-100, 20]"));
-        assert!(script.contains("AXFullScreen"));
-        assert!(script.contains("AXZoomed"));
-    }
-
-    #[test]
-    fn move_script_rejects_invalid_or_injected_identity() {
-        for id in [
-            "0:index:1",
-            "42:index:0",
-            "42:index:1;quit()",
-            "42:name:",
-            "evil:index:1",
-        ] {
-            assert!(
-                move_script(&WindowMove::new(WindowId::new(id), Rect::new(0, 0, 1, 1))).is_err()
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_deadline_kills_a_hung_child_without_accessing_desktop() {
-        let mut command = Command::new("sleep");
-        command.arg("5");
-        let started = Instant::now();
-        let error = run_command_with_timeout(&mut command, Duration::from_millis(40)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(matches!(error, WindowSystemError::Platform(message)
-            if message.contains("timed out") && message.contains("Accessibility")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_deadline_drains_output_larger_than_a_pipe_buffer() {
-        let mut command = Command::new("printf");
-        command.args(["%070000d", "0"]);
-        let output = run_command_with_timeout(&mut command, Duration::from_secs(2)).unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 70_000);
-        assert!(output.stdout.iter().all(|byte| *byte == b'0'));
     }
 }

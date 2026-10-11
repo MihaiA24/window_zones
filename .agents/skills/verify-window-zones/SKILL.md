@@ -79,7 +79,7 @@ Proof standards:
 
 - Drive the user path: session lines, saved config files and CLI arguments, never internal setters or unit-test hooks. Capture the action and the resulting state (`last move: x= y= w= h=`, `Config state:`, TUI `Last action:`/`Last error:` lines), not only the final screen.
 - Check side effects next to visible output: `wzv stop` must report `live_backend_tool_calls=0`, `instance_locks=0`, and `home_files=` equal to the files you expect (1 after `init`: the config).
-- Dry-run is verified, not trusted: the instance runs under `env -i` with its own HOME, `XDG_*`, `TMPDIR`, `XDG_RUNTIME_DIR`, a dead `DBUS_SESSION_BUS_ADDRESS`, and `PATH=<scratch>/bin:/usr/bin:/bin`, where `osascript swaymsg hyprctl gdbus dbus-daemon dbus-launch dbus-send busctl notify-send xdotool kpackagetool6 qdbus` are shims that log to `sentinel.log` and exit 127. Positive control, observed on macOS: the same environment with `--backend macos` logged an `osascript -l JavaScript` call there. Dry-run also skips the single-instance lock, so parallel runs are safe.
+- Dry-run is isolated under `env -i` with its own HOME, `XDG_*`, `TMPDIR`, `XDG_RUNTIME_DIR`, a dead `DBUS_SESSION_BUS_ADDRESS`, and `PATH=<scratch>/bin:/usr/bin:/bin`. The sentinel programs listed in `scripts/wzv` log to `sentinel.log` and exit 127. They observe external-program calls only: native macOS Accessibility/Cocoa/window and event-tap APIs bypass them, so an empty log does not prove zero native Framework calls. Dry-run skips background notifications and the single-instance lock.
 - Dry-run proves the runtime: config handling, bindings, zone math, cycling, restore, display moves, session/TUI commands, exit codes. It does not prove that a real compositor moved a real window or that a real key press was captured; never report a live backend as verified from a dry-run.
 - With every claim, report the run id, the commands, and the evidence path.
 
@@ -127,7 +127,7 @@ wzv cleanup --dry-run "$RUN"        # would-remove .../scratch; nothing changes
 wzv cleanup "$RUN"                  # removed .../scratch; kept .../evidence
 ```
 
-Recorded result, run `replay-3` (2026-10-08, commit `b0f37cd`): 21/21 steps `PASS`, `RESULT: PASS`, every recorded pid gone afterwards; evidence in `target/verify-window-zones/replay-3-s1/evidence/` and `replay-3-failed/evidence/`, log `target/verify-window-zones/replay-3.log`.
+Recorded result, run `replay-3` (2026-10-08, commit `b0f37cd`): 21/21 steps `PASS`, `RESULT: PASS`, every recorded pid gone afterwards; evidence in `target/verify-window-zones/replay-3-s1/evidence/` and `replay-3-failed/evidence/`, log `target/verify-window-zones/replay-3.log`. Replayed against the readiness implementation as `readiness-20261010-final`: 21/21 passed, zero live-backend program calls and instance locks, owned scratch/processes cleaned; log `target/verify-window-zones/readiness-20261010-final.log`.
 
 ## Failure drill and cleanup safety
 
@@ -154,8 +154,9 @@ A scenario step that fails makes `scenario.sh` print `FAIL <step>` and `RESULT: 
 | TUI dashboard: frame, dispatch, error line, `refresh`, `reload`, `restart`, config error, quit | exercised (dry-run), run `map-tui-005616` | `features/tui.md` |
 | `wzv` on Linux | unverified: written for GNU and BSD userland, run only on macOS | this file |
 | `start` readiness-timeout cleanup branch | unverified: dry-run is always ready in under a second | `wzv` |
-| GNOME Wayland, Linux X11, KDE Plasma Wayland gates | blocked here (needs a Linux desktop): `./scripts/smoke.sh gnome`, `gnome-live`, `x11`, `kde-live` | `features/live-integrations.md` |
-| macOS live backend, Windows, Sway/Hyprland, tray, desktop notifications, single-instance lock (status 75), systemd service | blocked here (real windows, other OS, or the user's session) | `features/live-integrations.md` |
+| GNOME Wayland, Linux X11, KDE Plasma Wayland gates | X11 expanded gate exercised; GNOME 50 seat unavailable; synthetic KWin window/state checks exercised, input-transport checks fail; no seated KDE evidence | `features/live-integrations.md`, `docs/runbooks/testing.md` |
+| macOS native API/raw CLI, listener restart, LaunchAgent lifecycle/ownership, config-error/recovery notifications | exercised on owned AppKit windows and isolated homes; actual injected F8 and problem/recovery banner pixels recorded | `features/live-integrations.md`, `target/verify-window-zones/readiness-macos/` |
+| Windows, Sway/Hyprland, tray, live single-instance CLI (status 75), Linux systemd service | no new live verification in this readiness work | `features/live-integrations.md` |
 
 ## Isolation
 

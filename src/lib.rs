@@ -15,7 +15,7 @@ pub mod gnome_integration;
 pub mod hotkey_system;
 #[cfg(target_os = "linux")]
 pub mod kwin_integration;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub mod macos_window_system;
 pub mod runtime;
 #[cfg(target_os = "linux")]

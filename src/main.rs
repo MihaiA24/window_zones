@@ -1258,17 +1258,17 @@ impl Surface for TraySurface {
 /// How long hotkeys may stay unavailable before a notification is shown. Short
 /// outages fix themselves: at login the App can start before GNOME Shell has
 /// loaded the companion, and a Shell or companion restart reconnects within seconds.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const HOTKEY_OUTAGE_GRACE: Duration = Duration::from_secs(20);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProblemKind {
     Config,
     Hotkeys,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, PartialEq, Eq)]
 enum Notification {
     Problem(String),
@@ -1279,14 +1279,14 @@ enum Notification {
 /// and refused hotkeys are shown at once; unavailable hotkeys only once the
 /// outage outlasts `HOTKEY_OUTAGE_GRACE`. A resolution is shown only for the
 /// problem currently on screen.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Default)]
 struct NotificationPolicy {
     pending_outage: Option<(Instant, String)>,
     shown: Option<ProblemKind>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NotificationPolicy {
     fn event(&mut self, event: &RuntimeEvent, now: Instant) -> Option<Notification> {
         let resolved = match event {
@@ -1332,21 +1332,25 @@ impl NotificationPolicy {
     }
 }
 
-/// Desktop notifications for problems while no terminal is attached, so a
-/// background App does not fail silently. One notification is updated in place.
-#[cfg(target_os = "linux")]
+/// Desktop notifications for problems while no terminal is attached.
+/// Linux updates one notification in place; macOS uses Notification Center.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Notifier {
     policy: NotificationPolicy,
+    #[cfg(target_os = "linux")]
     connection: Option<dbus::blocking::Connection>,
+    #[cfg(target_os = "linux")]
     notification_id: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Notifier {
     fn new() -> Option<Self> {
         Some(Self {
             policy: NotificationPolicy::default(),
+            #[cfg(target_os = "linux")]
             connection: None,
+            #[cfg(target_os = "linux")]
             notification_id: 0,
         })
     }
@@ -1363,6 +1367,7 @@ impl Notifier {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn show(&mut self, notification: Notification) {
         let (summary, body) = match &notification {
             Notification::Problem(body) => ("Window Zones needs attention", body),
@@ -1402,12 +1407,36 @@ impl Notifier {
             }
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn show(&mut self, notification: Notification) {
+        let (summary, body) = match notification {
+            Notification::Problem(body) => ("Window Zones needs attention", body),
+            Notification::Resolved(body) => ("Window Zones", body),
+        };
+        // argv transports user/config text without interpreting it as a script.
+        // Delivery runs off the hotkey thread and its child is always reaped.
+        thread::spawn(move || {
+            let result = std::process::Command::new("osascript")
+                .args([
+                    "-l", "JavaScript", "-e",
+                    "function run(argv) { const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification(argv[1], {withTitle: argv[0]}); }",
+                    "--", summary, &body,
+                ])
+                .status();
+            match result {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!("Desktop notification failed: {status}"),
+                Err(error) => eprintln!("Desktop notification failed: {error}"),
+            }
+        });
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct Notifier;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Notifier {
     fn new() -> Option<Self> {
         None
@@ -1601,7 +1630,7 @@ fn execute_session(
     let mut surface = CliSurface {
         prompt: interactive,
         // Without a terminal nobody reads stdout live: surface problems on the desktop.
-        notifier: if io::stdout().is_terminal() {
+        notifier: if io::stdout().is_terminal() || matches!(backend, RuntimeBackend::DryRun) {
             None
         } else {
             Notifier::new()
@@ -2091,7 +2120,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn short_hotkey_outages_never_notify_and_long_ones_notify_once() {
         let unavailable = RuntimeEvent::HotkeysUnavailable {
@@ -2131,7 +2160,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn config_problems_notify_at_once_and_only_their_own_fix_resolves_them() {
         let start = Instant::now();
