@@ -25,7 +25,7 @@
 - **Display identity**: An opaque identifier used within one compositor session to correlate a Window with a Display; it is not persistent across companion restarts or monitor changes. _Avoid_: connector identity, monitor index.
 
 
-- **Window state**: A compositor condition that can constrain a move, such as maximized, fullscreen, tiled, or non-resizable; a rejected move does not change that state.
+- **Window state**: A compositor condition such as maximized, tiled, fullscreen, or non-resizable; placement may restore a maximized or tiled window, while a rejected move preserves its state.
 - **Session identity**: The resolved desktop-session protocol and compositor represented by normalized session signals; unknown or conflicting signals mean the identity is unresolved. _Avoid_: environment heuristic.
 
 - **Integration diagnostic**: An action-oriented report of companion state and required user remediation, distinguishing absence, incompatibility, denial, unavailability, and operation failure.

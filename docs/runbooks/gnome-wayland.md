@@ -44,8 +44,8 @@ gdbus call --session --dest org.window_zones.Gnome \
   --method org.window_zones.Gnome1.GetCapabilities
 ```
 
-The service should report `focused-window`, `displays`, `move-resize`, and
-`hotkeys`. Enabling/disabling an already-discovered compatible extension takes
+The service should report `focused-window`, `displays`, `move-resize`,
+`hotkeys`, and optional `transition-metrics`. Enabling/disabling an already-discovered compatible extension takes
 effect in the running session on **both GNOME 50 and 51**; it does not require
 logout. Settings changes are processed asynchronously, so allow the transition
 to finish before inspecting state. `EnableExtension` returning success means
@@ -96,6 +96,20 @@ $HOME/.local/bin/window_zones --backend auto status
 ```
 
 Expected status identifies `gnome-wayland` and reports the companion capabilities. If the extension is disabled or absent, status remains usable and reports the GNOME companion as unavailable. Actions and hotkey registration fail explicitly until the companion returns; X11 is not selected as a fallback.
+
+Zone and display actions automatically restore a maximized or GNOME-tiled
+window before applying the requested frame. A maximized window moved to
+another display fills that display's usable area; a tiled half retains its
+half on the destination. Fullscreen and genuinely non-resizable windows
+remain rejected without changing their state.
+
+Repeated left/right-half placement crosses to the nearest physically
+left/right display and lands on the half nearest the source. With no
+neighbour it stays at the outer edge; explicit next/previous-display actions
+still wrap. Normal, maximized, and tiled placements use a single 250 ms
+compositor transition, respecting disabled animations and reduced motion.
+Use [`--perf-log PATH`](running.md#performance-logging) to record per-move
+request/completion times and Linux App-process memory.
 
 Save bindings to `$XDG_CONFIG_HOME/window_zones/config.toml`, or
 `~/.config/window_zones/config.toml` when `XDG_CONFIG_HOME` is unset. A missing
@@ -187,15 +201,17 @@ fails, keep the backup and restore the ACL before leaving injector access open.
 
 Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
 
-1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, and `hotkeys`.
+1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, `hotkeys`, and `transition-metrics`.
 2. With a normal focused window, move it to left half, right half, a third, two-thirds, maximize, and the next/previous display. Verify frame coordinates, sizes, and usable-area boundaries on two displays, including a display with negative global coordinates.
 3. Focus a desktop/dock surface or remove focus and verify the action fails without moving another window.
-4. Maximize, tile, or fullscreen a window and verify move/resize is rejected without changing the window state.
+4. Maximize or tile a resizable window, then apply a built-in/custom zone or move to the next/previous display. Verify automatic restoration and the destination geometry. Fullscreen and non-resizable windows must still reject placement without changing their state.
 5. Trigger each registered hotkey and verify the configured action runs. Change the config while the session is running and verify the new complete hotkey set replaces the old set atomically.
 6. Introduce malformed config, reload, and verify the last valid bindings remain active. Restore valid config and verify recovery.
 7. Disable the extension. Verify status, reload, and quit remain usable; verify actions and registration report the unavailable companion and do not use X11.
 8. Re-enable the extension. Verify the runtime reconnects, re-registers the current bindings, and emits one recovery diagnostic rather than repeating identical errors every retry.
 9. Restart the application and repeat one zone move and one display move.
+10. Repeat Ctrl+Super+Left/Right at a matching half. Verify crossing to the neighbouring display's nearest half, different-size destinations, and no directional wrap at the outer edge.
+11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Restore desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
 
 For D-Bus-level contract coverage, run:
 
@@ -224,10 +240,19 @@ The GNOME 51 API review used the installed `Meta-51.gir` and the JavaScript
 resources embedded in `libshell-51.so` (whose `Config.PACKAGE_VERSION` is
 `51.0`). The companion's existing focus, frame, work-area, move/resize, and
 accelerator calls remain available. For cross-monitor moves, the companion
-calls `move_to_monitor` before `move_resize_frame` so Wayland clients receive
-the destination's size bounds; otherwise returning to a larger monitor can
-clip the requested height to the smaller monitor. Mutter's size constraints
-and asynchronous client configuration still affect settled geometry.
+waits for the restore `size-changed` notification, then calls `move_to_monitor`
+before `move_resize_frame`. This avoids a late restore acknowledgement
+overwriting the target and supplies the destination's Wayland size bounds.
+Completion waits for settled geometry and animation, and rechecks the final
+frame; request submission alone is not success.
+
+`Window.unmaximize()` takes no arguments in the reviewed Mutter 50/51 APIs;
+on tested GNOME 51 it clears maximization and native side tiling. Resize eligibility uses the intrinsic `resizeable`
+property: `allows_resize()` also returns false solely because a window is
+maximized, so using it as a client restriction would incorrectly reject the
+requested restoration. Target validation, fullscreen, and intrinsic client
+restrictions are checked before changing state. The App calculates display
+placement from the original frame, not the window's saved restore rectangle.
 
 Primary references:
 
@@ -235,4 +260,6 @@ Primary references:
 - [GNOME 51 Shell D-Bus implementation](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/shellDBus.js) and [GNOME 50 implementation](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/50.4/js/ui/shellDBus.js): `ReloadExtension` is unsupported.
 - [GNOME 51 layout manager](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/layout.js): `getWorkAreaForMonitor` returns workspace work areas rather than full monitor bounds.
 - [Mutter 51 window implementation](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/core/window.c) and [Mutter 50 public window API](https://gitlab.gnome.org/GNOME/mutter/-/blob/50.4/src/meta/window.h): frame placement, maximize flags, fullscreen and resize restrictions. Built-in side tiling sets the vertical maximize flag.
+- [GNOME 51 window animation lifecycle](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/windowManager.js): compositor snapshots, actor freeze/thaw, transforms, effect cancellation, and the 250 ms size-transition duration.
 - [GIO name ownership lifecycle](https://docs.gtk.org/gio/func.bus_own_name.html): export before name acquisition, teardown on name loss, and asynchronous ownership callbacks.
+- [Rectangle window execution](https://github.com/rxhanson/Rectangle/blob/main/Rectangle/WindowManager.swift) and [next/previous display calculation](https://github.com/rxhanson/Rectangle/blob/main/Rectangle/WindowCalculation/NextPrevDisplayCalculation.swift): frame-based placement, replayed layouts, and maximized geometry on destination displays.

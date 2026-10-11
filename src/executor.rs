@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::actions::Action;
-use crate::display_movement::move_window_to_display;
+use crate::display_movement::{KNOWN_ZONE_MATCH_TOLERANCE_PX, move_window_to_display};
 use crate::geometry::DisplayGeometry;
 use crate::window_system::{WindowMove, WindowSystem, WindowSystemError};
-use crate::zones::{ZoneDefinition, rect_for_zone};
+use crate::zones::{BuiltInZone, ZoneDefinition, rect_for_built_in_zone, rect_for_zone};
 
 /// Errors the platform-neutral executor can classify before or after calling
 /// the platform adapter.
@@ -50,14 +50,33 @@ pub fn execute_action<W: WindowSystem>(
         })?;
 
     let target = match action {
-        Action::MoveToZone { zone } => rect_for_zone(
-            zone,
-            displays[current_display_index].usable_area,
-            custom_zones,
-        )
-        .ok_or_else(|| ExecuteActionError::UnknownZone {
-            zone: zone.to_string(),
-        })?,
+        Action::MoveToZone { zone } => {
+            let target = rect_for_zone(
+                zone,
+                displays[current_display_index].usable_area,
+                custom_zones,
+            )
+            .ok_or_else(|| ExecuteActionError::UnknownZone {
+                zone: zone.to_string(),
+            })?;
+            let direction = match zone.as_str() {
+                "left-half" => Some((true, BuiltInZone::RightHalf)),
+                "right-half" => Some((false, BuiltInZone::LeftHalf)),
+                _ => None,
+            };
+
+            if let Some((left, landing_zone)) = direction
+                && focused
+                    .geometry
+                    .nearly_equals(target, KNOWN_ZONE_MATCH_TOLERANCE_PX)
+                && let Some(neighbour) =
+                    horizontal_neighbour(&displays, current_display_index, left)
+            {
+                rect_for_built_in_zone(landing_zone, neighbour.usable_area)
+            } else {
+                target
+            }
+        }
         Action::MoveToNextDisplay => {
             let target_display = next_display(&displays, current_display_index);
             move_window_to_display(
@@ -78,6 +97,52 @@ pub fn execute_action<W: WindowSystem>(
 
     window_system.move_focused_window(WindowMove::new(target))?;
     Ok(())
+}
+
+fn horizontal_neighbour(
+    displays: &[DisplayGeometry],
+    current_index: usize,
+    left: bool,
+) -> Option<&DisplayGeometry> {
+    let current = &displays[current_index];
+    let source = current.usable_area;
+    let source_right = i64::from(source.x) + i64::from(source.width);
+    let source_bottom = i64::from(source.y) + i64::from(source.height);
+    let source_center_y = 2 * i64::from(source.y) + i64::from(source.height);
+
+    displays
+        .iter()
+        .filter(|display| display.id != current.id)
+        .filter_map(|display| {
+            let area = display.usable_area;
+            let right = i64::from(area.x) + i64::from(area.width);
+            let bottom = i64::from(area.y) + i64::from(area.height);
+            if source_bottom.min(bottom) <= i64::from(source.y).max(i64::from(area.y)) {
+                return None;
+            }
+            let gap = if left {
+                i64::from(source.x) - right
+            } else {
+                i64::from(area.x) - source_right
+            };
+            if gap < 0 {
+                return None;
+            }
+            let alignment =
+                (source_center_y - (2 * i64::from(area.y) + i64::from(area.height))).abs();
+            Some((
+                (
+                    gap,
+                    alignment,
+                    i64::from(area.y),
+                    i64::from(area.x),
+                    &display.id,
+                ),
+                display,
+            ))
+        })
+        .min_by(|(key, _), (other_key, _)| key.cmp(other_key))
+        .map(|(_, display)| display)
 }
 
 fn next_display(displays: &[DisplayGeometry], current_index: usize) -> &DisplayGeometry {
@@ -149,15 +214,223 @@ mod tests {
 
     #[test]
     fn moves_focused_window_to_zone_on_current_display() {
-        let mut fake = fake_with_focus("left", Rect::new(100, 100, 800, 600));
+        for (zone, geometry, expected) in [
+            (
+                "left-half",
+                Rect::new(100, 100, 800, 600),
+                Rect::new(0, 0, 960, 1080),
+            ),
+            (
+                "right-half",
+                Rect::new(100, 100, 800, 600),
+                Rect::new(960, 0, 960, 1080),
+            ),
+            (
+                "left-half",
+                Rect::new(960, 0, 960, 1080),
+                Rect::new(0, 0, 960, 1080),
+            ),
+            (
+                "right-half",
+                Rect::new(0, 0, 960, 1080),
+                Rect::new(960, 0, 960, 1080),
+            ),
+        ] {
+            let mut fake = fake_with_focus("left", geometry);
+            execute_action(
+                &Action::MoveToZone {
+                    zone: zone.to_string(),
+                },
+                &BTreeMap::new(),
+                &mut fake,
+            )
+            .unwrap();
 
-        let (zone, zones) = move_to_left_half_action();
-        execute_action(&crate::Action::MoveToZone { zone }, &zones, &mut fake).unwrap();
+            assert_eq!(fake.moves, vec![WindowMove::new(expected)], "{zone}");
+        }
+    }
 
-        assert_eq!(
-            fake.moves,
-            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
-        );
+    #[test]
+    fn repeated_halves_land_on_nearest_edges_of_physical_neighbours() {
+        for (zone, geometry, expected) in [
+            (
+                "left-half",
+                Rect::new(0, 0, 960, 1080),
+                Rect::new(-800, -200, 800, 1200),
+            ),
+            (
+                "right-half",
+                Rect::new(960, 0, 960, 1080),
+                Rect::new(1920, 80, 1280, 1440),
+            ),
+        ] {
+            let mut fake = fake_with_focus("current", geometry);
+            fake.displays = Ok(vec![
+                DisplayGeometry::new("far-right", Rect::new(5000, 0, 1600, 900)),
+                DisplayGeometry::new("left", Rect::new(-1600, -200, 1600, 1200)),
+                DisplayGeometry::new("right", Rect::new(1920, 80, 2560, 1440)),
+                DisplayGeometry::new("current", Rect::new(0, 0, 1920, 1080)),
+                DisplayGeometry::new("far-left", Rect::new(i32::MIN, 0, 1600, 900)),
+            ]);
+            execute_action(
+                &Action::MoveToZone {
+                    zone: zone.to_string(),
+                },
+                &BTreeMap::new(),
+                &mut fake,
+            )
+            .unwrap();
+
+            assert_eq!(fake.moves, vec![WindowMove::new(expected)], "{zone}");
+        }
+    }
+
+    #[test]
+    fn neighbours_require_vertical_overlap_then_rank_gap_and_alignment_without_list_order() {
+        for (neighbours, expected) in [
+            (
+                vec![
+                    DisplayGeometry::new("below", Rect::new(1920, 1080, 1280, 720)),
+                    DisplayGeometry::new("above", Rect::new(1920, -720, 1280, 720)),
+                    DisplayGeometry::new("overlapping", Rect::new(2200, 200, 1600, 1000)),
+                ],
+                Rect::new(2200, 200, 800, 1000),
+            ),
+            (
+                vec![
+                    DisplayGeometry::new("far-aligned", Rect::new(2200, 0, 1600, 1080)),
+                    DisplayGeometry::new("near-offset", Rect::new(1920, 700, 1280, 1080)),
+                ],
+                Rect::new(1920, 700, 640, 1080),
+            ),
+            (
+                vec![
+                    DisplayGeometry::new("offset", Rect::new(1920, 400, 1280, 1080)),
+                    DisplayGeometry::new("aligned", Rect::new(1920, -100, 1600, 1280)),
+                ],
+                Rect::new(1920, -100, 800, 1280),
+            ),
+            (
+                vec![
+                    DisplayGeometry::new("lower", Rect::new(1920, 200, 1280, 1080)),
+                    DisplayGeometry::new("upper", Rect::new(1920, -200, 1280, 1080)),
+                ],
+                Rect::new(1920, -200, 640, 1080),
+            ),
+        ] {
+            for reverse in [false, true] {
+                let mut fake = fake_with_focus("current", Rect::new(960, 0, 960, 1080));
+                let mut displays = neighbours.clone();
+                displays.push(DisplayGeometry::new("current", Rect::new(0, 0, 1920, 1080)));
+                if reverse {
+                    displays.reverse();
+                }
+                fake.displays = Ok(displays);
+                execute_action(
+                    &Action::MoveToZone {
+                        zone: "right-half".to_string(),
+                    },
+                    &BTreeMap::new(),
+                    &mut fake,
+                )
+                .unwrap();
+
+                assert_eq!(
+                    fake.moves,
+                    vec![WindowMove::new(expected)],
+                    "reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_halves_stay_at_outer_edges_and_on_a_single_display() {
+        for (zone, display_id, geometry, single_display) in [
+            ("left-half", "left", Rect::new(0, 0, 960, 1080), false),
+            ("right-half", "right", Rect::new(3200, 0, 1280, 1440), false),
+            ("left-half", "left", Rect::new(0, 0, 960, 1080), true),
+            ("right-half", "left", Rect::new(960, 0, 960, 1080), true),
+        ] {
+            let mut fake = fake_with_focus(display_id, geometry);
+            if single_display {
+                fake.displays = Ok(vec![DisplayGeometry::new(
+                    "left",
+                    Rect::new(0, 0, 1920, 1080),
+                )]);
+            }
+            execute_action(
+                &Action::MoveToZone {
+                    zone: zone.to_string(),
+                },
+                &BTreeMap::new(),
+                &mut fake,
+            )
+            .unwrap();
+
+            assert_eq!(
+                fake.moves,
+                vec![WindowMove::new(geometry)],
+                "{zone}, single={single_display}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_half_matching_includes_two_pixels_but_not_three_on_any_edge() {
+        for (geometry, expected) in [
+            (Rect::new(962, 2, 960, 1080), Rect::new(1920, 0, 1280, 1440)),
+            (Rect::new(963, 0, 957, 1080), Rect::new(960, 0, 960, 1080)),
+            (Rect::new(960, -3, 960, 1083), Rect::new(960, 0, 960, 1080)),
+            (Rect::new(960, 0, 963, 1080), Rect::new(960, 0, 960, 1080)),
+            (Rect::new(960, 0, 960, 1083), Rect::new(960, 0, 960, 1080)),
+        ] {
+            let mut fake = fake_with_focus("left", geometry);
+            execute_action(
+                &Action::MoveToZone {
+                    zone: "right-half".to_string(),
+                },
+                &BTreeMap::new(),
+                &mut fake,
+            )
+            .unwrap();
+
+            assert_eq!(fake.moves, vec![WindowMove::new(expected)], "{geometry:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_non_half_zones_remain_on_current_display() {
+        for (zone, expected) in [
+            ("side", Rect::new(1920, 0, 1280, 1440)),
+            ("left-third", Rect::new(1920, 0, 853, 1440)),
+            ("center-third", Rect::new(2773, 0, 854, 1440)),
+            ("right-third", Rect::new(3627, 0, 853, 1440)),
+            ("left-two-thirds", Rect::new(1920, 0, 1707, 1440)),
+            ("right-two-thirds", Rect::new(2773, 0, 1707, 1440)),
+            ("maximize", Rect::new(1920, 0, 2560, 1440)),
+        ] {
+            let mut fake = fake_with_focus("right", expected);
+            let zones = BTreeMap::from([(
+                "side".to_string(),
+                ZoneDefinition {
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 100,
+                },
+            )]);
+            execute_action(
+                &Action::MoveToZone {
+                    zone: zone.to_string(),
+                },
+                &zones,
+                &mut fake,
+            )
+            .unwrap();
+
+            assert_eq!(fake.moves, vec![WindowMove::new(expected)], "{zone}");
+        }
     }
 
     #[test]

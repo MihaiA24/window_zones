@@ -53,6 +53,7 @@ enum Command {
 struct CliArgs {
     command: Command,
     config_path: Option<PathBuf>,
+    perf_log_path: Option<PathBuf>,
     backend: BackendPreference,
     show_tray: bool,
 }
@@ -76,6 +77,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
 
     let mut command = Command::Run;
     let mut config_path = None;
+    let mut perf_log_path = None;
     let mut backend = BackendPreference::Auto;
     let mut show_tray = false;
 
@@ -90,6 +92,13 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
                 };
 
                 config_path = Some(PathBuf::from(next));
+                index += 1;
+            }
+            "--perf-log" => {
+                let Some(next) = args.get(index + 1) else {
+                    return ParseStatus::Err("--perf-log requires a path argument".to_string());
+                };
+                perf_log_path = Some(PathBuf::from(next));
                 index += 1;
             }
             "--backend" => {
@@ -170,10 +179,16 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
     if show_tray && !matches!(command, Command::Run) {
         return ParseStatus::Err("--tray is only valid with the `run` command".to_string());
     }
+    if perf_log_path.is_some() && matches!(command, Command::Status) {
+        return ParseStatus::Err(
+            "--perf-log is only valid with `dispatch`, `run`, or `tui`".to_string(),
+        );
+    }
 
     ParseStatus::Ok(CliArgs {
         command,
         config_path,
+        perf_log_path,
         backend,
         show_tray,
     })
@@ -441,6 +456,19 @@ impl WindowSystem for RuntimeWindowSystem {
                 "window-system adapter is unsupported on this platform".to_string(),
             )),
         }
+    }
+
+    fn transition_metrics(
+        &self,
+    ) -> Result<
+        Option<window_zones::window_system::TransitionMetrics>,
+        window_zones::WindowSystemError,
+    > {
+        #[cfg(target_os = "linux")]
+        if let Self::Gnome(system) = self {
+            return system.transition_metrics();
+        }
+        Ok(None)
     }
 }
 
@@ -901,6 +929,9 @@ fn tui_last_error(app: &App, capabilities: &TuiCapabilityStatus) -> String {
     if let ConfigState::Error(error) = app.config_state() {
         return format!("config: {error}");
     }
+    if let Some(error) = app.perf_log_error() {
+        return error.to_string();
+    }
 
     capabilities
         .diagnostic
@@ -955,7 +986,6 @@ fn execute_runtime_loop(
     mut window_system: RuntimeWindowSystem,
     surface: RuntimeSurface,
 ) {
-    let config_path = app.config_path().map(PathBuf::from);
     let instruction_rx = runtime_instruction_receiver();
 
     let mut hotkey_system = RuntimeHotkeySystem::new(backend);
@@ -1030,7 +1060,7 @@ fn execute_runtime_loop(
                         }
                     }
                     RuntimeInstruction::Restart => {
-                        app = build_app(config_path.as_ref());
+                        app.restart();
                         cached_hotkeys.clear();
                         hotkeys_are_valid = false;
                         last_registration_error = None;
@@ -1151,7 +1181,6 @@ fn execute_run_with_tray(
     backend: RuntimeBackend,
     mut window_system: RuntimeWindowSystem,
 ) {
-    let config_path = app.config_path().map(PathBuf::from);
     let mut hotkey_system = RuntimeHotkeySystem::new(backend);
     let mut cached_hotkeys = configured_hotkeys_for_runtime(&app);
     let mut hotkeys_are_valid = false;
@@ -1192,7 +1221,7 @@ fn execute_run_with_tray(
                 }
             }
             Ok(RuntimeTrayCommand::Restart) => {
-                app = build_app(config_path.as_ref());
+                app.restart();
                 cached_hotkeys.clear();
                 hotkeys_are_valid = false;
                 last_registration_error = None;
@@ -1311,16 +1340,16 @@ fn print_help() {
     println!("window_zones: execute configured window movement actions");
     println!("Usage:");
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] status"
+        "  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] status"
     );
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] dispatch <HOTKEY>"
+        "  window_zones [--perf-log <path>] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] dispatch <HOTKEY>"
     );
     println!(
-        "  window_zones [--tray] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] run"
+        "  window_zones [--tray] [--perf-log <path>] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] run"
     );
     println!(
-        "  window_zones [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] tui"
+        "  window_zones [--perf-log <path>] [--config <path>] [--backend <auto|x11|wayland|windows|macos|dry-run>] tui"
     );
     println!("Commands:");
     println!("  status           print runtime state and exit");
@@ -1329,6 +1358,11 @@ fn print_help() {
     println!("  run --tray       start optional tray/menu surface (reload/restart/quit)");
     println!("  tui              start the ANSI runtime dashboard");
     println!("  q/quit/exit      leave interactive session");
+    println!("Options:");
+    println!("  --perf-log PATH  append JSONL dispatch timings and app-process memory");
+    println!(
+        "                   Linux RSS/peak RSS exclude GNOME Shell; unavailable values are null"
+    );
 }
 
 fn main() {
@@ -1355,7 +1389,13 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let app = build_app(config.config_path.as_ref());
+            let mut app = build_app(config.config_path.as_ref());
+            if let Some(path) = config.perf_log_path.as_ref()
+                && let Err(error) = app.enable_perf_log(path)
+            {
+                eprintln!("Cannot open performance log at {}: {error}", path.display());
+                std::process::exit(1);
+            }
             let window_system = RuntimeWindowSystem::with_backend(backend);
 
             match config.command {
@@ -1382,6 +1422,31 @@ mod tests {
         };
         assert!(matches!(args.command, Command::Run));
         assert!(args.show_tray);
+    }
+
+    #[test]
+    fn parses_perf_log_for_dispatch_run_tui_and_tray() {
+        for command in [
+            vec!["dispatch", "Ctrl+Alt+Left"],
+            vec!["run"],
+            vec!["tui"],
+            vec!["run", "--tray"],
+        ] {
+            let mut inputs = vec!["--perf-log", "/tmp/window-zones.jsonl"];
+            inputs.extend(command);
+            let ParseStatus::Ok(args) = parse(&inputs) else {
+                panic!("expected performance-log args");
+            };
+            assert_eq!(
+                args.perf_log_path,
+                Some(PathBuf::from("/tmp/window-zones.jsonl"))
+            );
+        }
+        assert!(matches!(parse(&["run", "--perf-log"]), ParseStatus::Err(_)));
+        assert!(matches!(
+            parse(&["status", "--perf-log", "/tmp/window-zones.jsonl"]),
+            ParseStatus::Err(_)
+        ));
     }
 
     #[test]

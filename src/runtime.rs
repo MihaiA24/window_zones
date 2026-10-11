@@ -1,22 +1,122 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use thiserror::Error;
 
+use crate::actions::Action;
 use crate::config::{
     AppConfig, BindingValidationError, ConfigError, normalize_hotkey, parse_config,
     validate_and_normalize_app_config,
 };
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
-use crate::window_system::WindowSystem;
+use crate::window_system::{TransitionMetrics, WindowSystem};
 const CONFIG_DIRECTORY: &str = "window_zones";
 const CONFIG_FILE: &str = "config.toml";
 const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
+
+#[derive(Debug)]
+struct PerfLog {
+    path: PathBuf,
+    writer: BufWriter<fs::File>,
+}
+
+impl PerfLog {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut log = Self {
+            path: path.to_owned(),
+            writer: BufWriter::new(file),
+        };
+        log.write(&PerfLogRow::new("session"))?;
+        Ok(log)
+    }
+
+    fn write(&mut self, row: &PerfLogRow<'_>) -> io::Result<()> {
+        serde_json::to_writer(&mut self.writer, row).map_err(io::Error::other)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+}
+
+#[derive(Serialize)]
+struct PerfLogRow<'a> {
+    event: &'static str,
+    timestamp_ms: Option<u128>,
+    pid: u32,
+    memory_scope: &'static str,
+    rss_kib: Option<u64>,
+    peak_rss_kib: Option<u64>,
+    hotkey: Option<&'a str>,
+    action: Option<&'a Action>,
+    result: Option<&'static str>,
+    error: Option<String>,
+    dispatch_ms: Option<f64>,
+    request_ms: Option<f64>,
+    completion_ms: Option<f64>,
+    metrics_error: Option<String>,
+}
+
+impl PerfLogRow<'_> {
+    fn new(event: &'static str) -> Self {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_millis());
+        let (rss_kib, peak_rss_kib) = process_memory();
+        Self {
+            event,
+            timestamp_ms,
+            pid: std::process::id(),
+            memory_scope: "window_zones-process",
+            rss_kib,
+            peak_rss_kib,
+            hotkey: None,
+            action: None,
+            result: None,
+            error: None,
+            dispatch_ms: None,
+            request_ms: None,
+            completion_ms: None,
+            metrics_error: None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory() -> (Option<u64>, Option<u64>) {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return (None, None);
+    };
+    let mut rss = None;
+    let mut peak = None;
+    for line in status.lines() {
+        let mut fields = line.split_whitespace();
+        let destination = match fields.next() {
+            Some("VmRSS:") => &mut rss,
+            Some("VmHWM:") => &mut peak,
+            _ => continue,
+        };
+        let value = fields.next().and_then(|value| value.parse().ok());
+        if fields.next() == Some("kB") {
+            *destination = value;
+        }
+    }
+    (rss, peak)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigFileSignature {
@@ -94,6 +194,8 @@ pub struct App {
     hotkey_state: HotkeyRegistrationState,
     last_config_signature: Option<ConfigFileSignature>,
     reload_deadline: Option<Instant>,
+    perf_log: Option<PerfLog>,
+    perf_log_error: Option<String>,
 }
 
 impl App {
@@ -111,6 +213,29 @@ impl App {
         app.reload_config();
         app.register_config_watcher();
         app
+    }
+
+    /// Opens an append-only JSONL log and records this process's initial memory.
+    /// A startup write failure is returned before any actions are dispatched.
+    pub fn enable_perf_log(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.perf_log = Some(PerfLog::open(path.as_ref())?);
+        self.perf_log_error = None;
+        Ok(())
+    }
+
+    pub fn perf_log_error(&self) -> Option<&str> {
+        self.perf_log_error.as_deref()
+    }
+
+    /// Rebuilds runtime state without reopening or losing the performance log.
+    pub fn restart(&mut self) {
+        let mut restarted = match self.config_path.as_ref() {
+            Some(path) => Self::start_at(path),
+            None => Self::start(),
+        };
+        restarted.perf_log = self.perf_log.take();
+        restarted.perf_log_error = self.perf_log_error.take();
+        *self = restarted;
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -216,6 +341,7 @@ impl App {
         hotkey: &str,
         window_system: &mut W,
     ) -> &DispatchState {
+        let started = self.perf_log.as_ref().map(|_| Instant::now());
         // State names the canonical binding, so a Companion hotkey event and a manual `dispatch`
         // of the same binding report one spelling instead of two.
         self.last_dispatch_hotkey =
@@ -224,6 +350,16 @@ impl App {
             Ok(()) => DispatchState::Succeeded,
             Err(error) => DispatchState::Error(error),
         };
+        if let Some(started) = started {
+            // Stop before metrics retrieval, memory sampling, serialization, and log I/O.
+            let dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let metrics = if matches!(self.dispatch_state, DispatchState::Succeeded) {
+                window_system.transition_metrics()
+            } else {
+                Ok(None)
+            };
+            self.log_dispatch(dispatch_ms, metrics);
+        }
         &self.dispatch_state
     }
 
@@ -237,6 +373,48 @@ impl App {
         };
 
         Ok(self.dispatch_hotkey(&hotkey, window_system))
+    }
+
+    fn log_dispatch(
+        &mut self,
+        dispatch_ms: f64,
+        metrics: Result<Option<TransitionMetrics>, crate::window_system::WindowSystemError>,
+    ) {
+        let mut row = PerfLogRow::new("dispatch");
+        row.hotkey = self.last_dispatch_hotkey.as_deref();
+        row.action = self
+            .config
+            .bindings
+            .iter()
+            .find(|binding| Some(binding.hotkey.as_str()) == row.hotkey)
+            .map(|binding| &binding.action);
+        let (result, error) = match &self.dispatch_state {
+            DispatchState::Succeeded => ("ok", None),
+            DispatchState::Error(error) => ("error", Some(error.to_string())),
+            DispatchState::Idle => return,
+        };
+        row.result = Some(result);
+        row.error = error;
+        row.dispatch_ms = Some(dispatch_ms);
+        match metrics {
+            Ok(Some(metrics)) => {
+                row.request_ms = Some(metrics.request_ms);
+                row.completion_ms = Some(metrics.completion_ms);
+            }
+            Ok(None) => {}
+            Err(error) => row.metrics_error = Some(error.to_string()),
+        }
+        if let Some(log) = self.perf_log.as_mut()
+            && let Err(error) = log.write(&row)
+        {
+            let diagnostic = format!(
+                "Performance log write failed at {}: {error}; logging disabled.",
+                log.path.display()
+            );
+            eprintln!("{diagnostic}");
+            self.perf_log_error = Some(diagnostic);
+            self.perf_log = None;
+        }
     }
 
     fn register_config_watcher(&mut self) {
@@ -256,6 +434,8 @@ impl App {
             hotkey_state: HotkeyRegistrationState::Unregistered,
             last_config_signature: None,
             reload_deadline: None,
+            perf_log: None,
+            perf_log_error: None,
         }
     }
 }
@@ -499,6 +679,145 @@ mod tests {
         let app = App::start_at(&path);
 
         assert_eq!(app.last_dispatch_hotkey(), None);
+    }
+
+    #[test]
+    fn perf_log_appends_failures_and_survives_restart() {
+        let directory = test_directory("perf_log_restart");
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join(CONFIG_FILE);
+        fs::write(
+            &config_path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+        let log_path = directory.join("performance.jsonl");
+        fs::write(&log_path, "{\"prior\":true}\n").unwrap();
+        let mut app = App::start_at(&config_path);
+        app.enable_perf_log(&log_path).unwrap();
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+
+        assert!(matches!(
+            app.dispatch_hotkey("Ctrl+Alt+Right", &mut window_system),
+            DispatchState::Error(_)
+        ));
+        window_system.focused_window = Ok(None);
+        assert!(matches!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system),
+            DispatchState::Error(_)
+        ));
+        app.restart();
+        window_system.focused_window = Ok(Some(FocusedWindow::new(
+            "left",
+            Rect::new(200, 200, 800, 600),
+        )));
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system),
+            &DispatchState::Succeeded
+        );
+        assert_eq!(window_system.moves.len(), 1);
+
+        let contents = fs::read_to_string(&log_path).unwrap();
+        let rows: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], serde_json::json!({"prior": true}));
+        assert_eq!(rows[1]["event"], "session");
+        assert!(rows[1]["dispatch_ms"].is_null());
+        assert_eq!(rows[1]["pid"], std::process::id());
+        assert!(rows[1]["timestamp_ms"].as_u64().unwrap() > 0);
+        #[cfg(target_os = "linux")]
+        {
+            let rss = rows[1]["rss_kib"].as_u64().unwrap();
+            assert!(rss > 0);
+            assert!(rows[1]["peak_rss_kib"].as_u64().unwrap() >= rss);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(rows[1]["rss_kib"].is_null());
+            assert!(rows[1]["peak_rss_kib"].is_null());
+        }
+        assert_eq!(rows[2]["result"], "error");
+        assert!(rows[2]["action"].is_null());
+        assert!(
+            rows[2]["error"]
+                .as_str()
+                .unwrap()
+                .contains("no binding configured")
+        );
+        assert_eq!(rows[3]["result"], "error");
+        assert_eq!(rows[3]["error"], "no focused window");
+        assert_eq!(rows[3]["action"]["type"], "move-to-zone");
+        assert_eq!(rows[4]["event"], "dispatch");
+        assert_eq!(rows[4]["result"], "ok");
+        assert!(rows[4]["error"].is_null());
+        for row in &rows[2..] {
+            assert!(row["dispatch_ms"].as_f64().unwrap() >= 0.0);
+            assert!(row["request_ms"].is_null());
+            assert!(row["completion_ms"].is_null());
+        }
+        drop(app);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn perf_log_rejects_unwritable_startup_destination() {
+        let directory = test_directory("perf_log_open_error");
+        fs::create_dir_all(&directory).unwrap();
+        let mut app = App::start_at(directory.join(CONFIG_FILE));
+        assert!(app.enable_perf_log(&directory).is_err());
+        assert!(app.perf_log.is_none());
+        #[cfg(target_os = "linux")]
+        assert!(app.enable_perf_log("/dev/full").is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perf_log_write_failure_disables_logging_without_stopping_moves() {
+        let directory = test_directory("perf_log_write_error");
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join(CONFIG_FILE);
+        fs::write(
+            &config_path,
+            r#"[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+        let mut app = App::start_at(&config_path);
+        let log_path = directory.join("performance.jsonl");
+        app.enable_perf_log(&log_path).unwrap();
+        app.perf_log.as_mut().unwrap().writer = std::io::BufWriter::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        );
+        let mut window_system = FakeWindowSystem::with_focus("left", Rect::new(200, 200, 800, 600));
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system),
+            &DispatchState::Succeeded
+        );
+        assert!(app.perf_log.is_none());
+        let diagnostic = app.perf_log_error().unwrap().to_owned();
+        assert!(diagnostic.contains("logging disabled"));
+        app.restart();
+        assert!(app.perf_log.is_none());
+        assert_eq!(app.perf_log_error(), Some(diagnostic.as_str()));
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system),
+            &DispatchState::Succeeded
+        );
+        assert_eq!(window_system.moves.len(), 2);
+        assert_eq!(fs::read_to_string(&log_path).unwrap().lines().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

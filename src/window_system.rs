@@ -32,6 +32,13 @@ impl WindowMove {
     }
 }
 
+/// Compositor-measured placement request and visual completion times.
+#[derive(Debug, Clone, Copy)]
+pub struct TransitionMetrics {
+    pub request_ms: f64,
+    pub completion_ms: f64,
+}
+
 /// Errors produced by platform-specific window integrations.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WindowSystemError {
@@ -49,4 +56,9 @@ pub trait WindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError>;
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError>;
     fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError>;
+
+    /// Absent when the adapter cannot measure visual completion.
+    fn transition_metrics(&self) -> Result<Option<TransitionMetrics>, WindowSystemError> {
+        Ok(None)
+    }
 }

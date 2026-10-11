@@ -28,10 +28,11 @@ impl Rect {
     }
 
     pub fn nearly_equals(self, other: Self, tolerance_px: i32) -> bool {
-        (self.x - other.x).abs() <= tolerance_px
-            && (self.y - other.y).abs() <= tolerance_px
-            && (self.right() - other.right()).abs() <= tolerance_px
-            && (self.bottom() - other.bottom()).abs() <= tolerance_px
+        let tolerance = i64::from(tolerance_px);
+        (i64::from(self.x) - i64::from(other.x)).abs() <= tolerance
+            && (i64::from(self.y) - i64::from(other.y)).abs() <= tolerance
+            && (i64::from(self.right()) - i64::from(other.right())).abs() <= tolerance
+            && (i64::from(self.bottom()) - i64::from(other.bottom())).abs() <= tolerance
     }
 }
 

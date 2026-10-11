@@ -19,13 +19,17 @@ The platform-neutral core and runtime paths currently include:
 - integer pixel geometry;
 - built-in and validated custom zones;
 - display-to-display movement calculations;
+- repeated left/right-half actions cross to the nearest physical neighbouring display, landing on its nearest half without wrapping;
 - TOML config parsing, discovery, reload, and atomic rollback;
 - the `WindowSystem` and `HotkeySystem` adapter contracts;
 - action execution and config-driven dispatch;
 - GNOME Shell 50/51 companion integration over the versioned user-session D-Bus contract;
+- automatic restoration of GNOME-maximized/tiled windows for zones and display moves, preserving their layout on the destination display;
+- GNOME compositor animations for placement and display moves, respecting disabled animations and reduced motion;
 - native KDE Plasma Wayland KWin script and companion integration;
 - global hotkey registration on supported non-Wayland paths, GNOME, and KDE companion paths;
-- CLI, stdlib ANSI TUI, and optional Linux/Windows tray runtime controls.
+- CLI, stdlib ANSI TUI, and optional Linux/Windows tray runtime controls;
+- opt-in `--perf-log PATH` JSONL profiling for dispatch/transition timing and Linux process RSS/peak RSS; see [profiling commands and measurement scope](docs/runbooks/running.md#performance-logging).
 
 ## Remaining V1 verification
 

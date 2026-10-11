@@ -72,7 +72,9 @@ def test_window(title):
     last = None
     def geometry():
         nonlocal last
-        current = (window.get_width(), window.get_height(), window.is_active(), window.is_maximized(), window.is_fullscreen(), window.get_resizable())
+        surface = window.get_surface()
+        tiled = bool(surface and surface.get_state() & Gdk.ToplevelState.TILED)
+        current = (window.get_width(), window.get_height(), window.is_active(), window.is_maximized(), window.is_fullscreen(), window.get_resizable(), tiled)
         if current != last:
             print('WINDOW_STATE', json.dumps(current), flush=True)
             for name, widget in (('ENTRY_CENTER', entry), ('BUTTON_CENTER', button)):
@@ -172,6 +174,17 @@ def run(binary, keep_logs, output_dir=None):
         (work / (name + '-dispatch.log')).write_text(result.stdout + result.stderr)
         check(name + ' dispatch', 'Dispatch state: Succeeded' in result.stdout, result.stdout.strip())
         assert_frame(name + ' native and client geometry', expected, log)
+    def maximize_dispatch(fixture, log, hotkey, expected, name):
+        send(fixture, 'maximize')
+        check(name + ' starts natively maximized', wait_for(lambda: window_state(log)[3]), window_state(log))
+        dispatch(hotkey, expected, name, log)
+        check(name + ' clears native maximization', wait_for(lambda: not window_state(log)[3]), window_state(log))
+    def tile_dispatch(log, key, tiled_frame, hotkey, expected, name):
+        inject([125, key])
+        assert_frame(name + ' starts in native tile', tiled_frame, log)
+        check(name + ' reports native tiling', window_state(log)[6], window_state(log))
+        dispatch(hotkey, expected, name, log)
+        check(name + ' clears native tiling', wait_for(lambda: not window_state(log)[6]), window_state(log))
     zones = ['left-half', 'right-half', 'left-third', 'center-third', 'right-third', 'left-two-thirds', 'right-two-thirds', 'maximize']
     keycodes = [30, 48, 46, 32, 18, 33, 34, 35]
     hotkeys = ['Alt+Ctrl+Cmd+' + key for key in 'abcdefgh']
@@ -246,7 +259,7 @@ def run(binary, keep_logs, output_dir=None):
         env.pop('XAUTHORITY', None)
         connection = Gio.DBusConnection.new_for_address_sync(address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
         shell, shell_log = start(['gnome-shell', '--headless', '--wayland-display', env['WAYLAND_DISPLAY'], '--virtual-monitor', '1920x1080', '--virtual-monitor', '1600x900'], 'shell')
-        check('Companion loaded by real GNOME', wait_for(lambda: companion('GetCapabilities')[0] == ['focused-window', 'displays', 'move-resize', 'hotkeys'], 20), 'GNOME ' + subprocess.check_output(['gnome-shell', '--version'], text=True).strip())
+        check('Companion loaded by real GNOME', wait_for(lambda: 'move-resize' in companion('GetCapabilities')[0], 20), 'GNOME ' + subprocess.check_output(['gnome-shell', '--version'], text=True).strip())
         displays = companion('GetDisplays')[0]
         check('Two real compositor displays and reserved panel area', len(displays) == 2 and displays[0][2] > 0, displays)
         area = displays[0][1:]
@@ -282,6 +295,15 @@ def run(binary, keep_logs, output_dir=None):
         custom = (x + w * 20 // 100, y + h * 20 // 100, w * 80 // 100 - w * 20 // 100, h * 80 // 100 - h * 20 // 100)
         dispatch('Alt+Ctrl+Cmd+i', custom, 'custom-center', window_log)
         dispatch(hotkeys[0], expected_zones[0], 'monitor-baseline', window_log)
+        # Opposite-half landing on the physically adjacent display, not enumeration wrapping.
+        dispatch(hotkeys[1], expected_zones[1], 'directional-right-first-snap', window_log)
+        dispatch(hotkeys[1], targets(second_area)[0], 'directional-right-crosses-display', window_log)
+        dispatch(hotkeys[1], targets(second_area)[1], 'directional-right-next-snap', window_log)
+        dispatch(hotkeys[1], targets(second_area)[1], 'directional-right-outer-edge', window_log)
+        dispatch(hotkeys[0], targets(second_area)[0], 'directional-left-first-snap', window_log)
+        dispatch(hotkeys[0], expected_zones[1], 'directional-left-crosses-display', window_log)
+        dispatch(hotkeys[0], expected_zones[0], 'directional-left-next-snap', window_log)
+        dispatch(hotkeys[0], expected_zones[0], 'directional-left-outer-edge', window_log)
         dispatch('Alt+Ctrl+Cmd+n', targets(second_area)[0], 'next-monitor-preserves-half', window_log)
         dispatch('Alt+Ctrl+Cmd+p', expected_zones[0], 'previous-monitor-preserves-half', window_log)
         dispatch('Alt+Ctrl+Cmd+p', targets(second_area)[0], 'previous-monitor-wraps', window_log)
@@ -337,9 +359,10 @@ def run(binary, keep_logs, output_dir=None):
             assert_frame(name + ' retains last valid config', expected, window_log)
         checkpoint = len(text(runtime_log))
         config.unlink()
-        time.sleep(0.7)
-        send(runtime, 'status')
-        check('Deleted config resets bindings', wait_for(lambda: 'binding count: 0' in text(runtime_log)[checkpoint:] and 'config state: Missing' in text(runtime_log)[checkpoint:]), text(runtime_log)[checkpoint:])
+        def config_deleted_status():
+            send(runtime, 'status')
+            return 'binding count: 0' in text(runtime_log)[checkpoint:] and 'config state: Missing' in text(runtime_log)[checkpoint:]
+        check('Deleted config resets bindings', wait_for(config_deleted_status), text(runtime_log)[checkpoint:])
         checkpoint = len(text(window_log))
         shortcut(keycodes[0])
         check('Removed hotkey reaches GTK instead of moving the window', wait_for(lambda: 'KEY_RECEIVED a ' in text(window_log)[checkpoint:]) and tuple(focused()[2:]) == tuple(expected_zones[1]), text(window_log)[checkpoint:])
@@ -411,6 +434,7 @@ def run(binary, keep_logs, output_dir=None):
         check('Config error and recovery preserve one tray icon', len(tray_items()) == 1, tray_items())
         shortcut(keycodes[2])
         assert_frame('Recovered tray configuration moves the native window', expected_zones[2], window_log)
+        check('Tray transition finishes before pointer interaction', wait_for(lambda: '  last action: alt+ctrl+cmd+c' in tray_labels() and '  dispatch state: Succeeded' in tray_labels()), tray_labels())
         button_x, button_y = json.loads(re.findall(r'^BUTTON_CENTER (.+)$', text(window_log), re.M)[-1])
         frame = focused()
         remote('NotifyPointerMotionAbsolute', GLib.Variant('(sdd)', (stream, frame[2] + button_x, frame[3] + button_y)))
@@ -422,12 +446,9 @@ def run(binary, keep_logs, output_dir=None):
         tray.wait(timeout=8)
         check('Tray quit terminates cleanly', tray.returncode == 0, tray.returncode)
         config.write_text(valid_config())
-        send(window, 'maximize')
-        check('Real GTK maximized state enters compositor', wait_for(lambda: window_state(window_log)[3]), window_state(window_log))
-        rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
-        check('Maximized window action is rejected without clearing state', 'Dispatch state: Error' in rejected and window_state(window_log)[3], rejected.strip())
-        send(window, 'restore')
-        check('Window restores after maximize check', wait_for(lambda: not window_state(window_log)[3]), window_state(window_log))
+        maximize_dispatch(window, window_log, hotkeys[0], expected_zones[0], 'zone-from-maximized')
+        maximize_dispatch(window, window_log, 'Alt+Ctrl+Cmd+n', second_area, 'next-display-from-maximized')
+        maximize_dispatch(window, window_log, 'Alt+Ctrl+Cmd+p', area, 'previous-display-from-maximized')
         send(window, 'fullscreen')
         check('Real GTK fullscreen state enters compositor', wait_for(lambda: window_state(window_log)[4]), window_state(window_log))
         rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
@@ -442,12 +463,10 @@ def run(binary, keep_logs, output_dir=None):
         send(window, 'restore')
         check('Window becomes resizable again', wait_for(lambda: window_state(window_log)[5]), window_state(window_log))
         dispatch('Alt+Ctrl+Cmd+i', custom, 'tiling-baseline', window_log)
-        inject([125, 105])
-        assert_frame('GNOME tiles the real native window', expected_zones[0], window_log)
-        rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[1]], env=env, text=True)
-        check('Native tiled window is rejected', 'Dispatch state: Error' in rejected and 'maximized or tiled' in rejected and tuple(focused()[2:]) == tuple(expected_zones[0]), rejected.strip())
-        inject([125, 105])
-        dispatch('Alt+Ctrl+Cmd+i', custom, 'dispatch-after-native-untile', window_log)
+        tile_dispatch(window_log, 105, expected_zones[0], 'Alt+Ctrl+Cmd+i', custom, 'custom-zone-from-tiled')
+        tile_dispatch(window_log, 105, expected_zones[0], 'Alt+Ctrl+Cmd+n', targets(second_area)[0], 'next-display-from-tiled')
+        tile_dispatch(window_log, 106, targets(second_area)[1], 'Alt+Ctrl+Cmd+p', expected_zones[1], 'previous-display-from-tiled')
+        dispatch('Alt+Ctrl+Cmd+i', custom, 'overview-baseline', window_log)
         inject([125])
         check('Overview excludes the application from focused-window actions', wait_for(lambda: not focused()[0]), focused())
         rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
@@ -499,15 +518,83 @@ action = { type = "move-to-previous-display" }
         runtime, runtime_log = start([launcher, '--backend', 'auto', 'run'], 'default-launcher-auto-run', launcher_env)
         send(runtime, 'status')
         check('Auto run discovers and registers default arrow bindings', wait_for(lambda: 'hotkey state: Registered' in text(runtime_log) and 'binding count: 4' in text(runtime_log)), text(runtime_log))
-        for code, expected, name in ((105, expected_zones[0], 'left'), (106, expected_zones[1], 'right'), (108, targets(second_area)[1], 'next monitor'), (103, expected_zones[1], 'previous monitor')):
+        for code, expected, name in ((105, expected_zones[0], 'left'), (106, expected_zones[1], 'right'), (108, second_area, 'next monitor'), (103, area, 'previous monitor')):
+            if code in (108, 103):
+                send(window, 'maximize')
+                check('Default ' + name + ' shortcut starts maximized', wait_for(lambda: window_state(window_log)[3]), window_state(window_log))
             inject([29, 125, code])
             assert_frame('Default Ctrl+Super arrow: ' + name, expected, window_log)
+            if code in (108, 103):
+                check('Default ' + name + ' shortcut restores maximized window', wait_for(lambda: not window_state(window_log)[3]), window_state(window_log))
         stop(runtime)
         check('Default auto run quits cleanly', runtime.returncode == 0, runtime.returncode)
         runtime, runtime_log = start([launcher, '--backend', 'auto', 'tui'], 'default-launcher-auto-tui', launcher_env)
         check('Auto TUI discovers default config and native capability', wait_for(lambda: 'Window Zones TUI' in text(runtime_log) and 'Hotkey state: Registered' in text(runtime_log) and str(default_config) in text(runtime_log)), text(runtime_log))
+        send(window, 'maximize')
+        check('Default auto TUI shortcut starts from native maximization', wait_for(lambda: window_state(window_log)[3]), window_state(window_log))
         inject([29, 125, 105])
         assert_frame('Default auto TUI handles real Ctrl+Super+Left', expected_zones[0], window_log)
+        check('Default auto TUI shortcut restores maximized window', wait_for(lambda: not window_state(window_log)[3]), window_state(window_log))
+        # A rapid double press must not drop the second move or lose logging.
+        stop(runtime)
+        perf_path = work / 'transitions.jsonl'
+        runtime, runtime_log = start([str(binary), '--backend', 'auto', '--perf-log', str(perf_path), 'tui'], 'performance-tui')
+        check('Performance TUI registers arrow bindings', wait_for(lambda: 'Hotkey state: Registered' in text(runtime_log)), text(runtime_log))
+        def perf_rows():
+            return [json.loads(line) for line in perf_path.read_text().splitlines()] if perf_path.exists() else []
+        session = perf_rows()[0]
+        check('Logger records actual process memory before moving', session['pid'] == runtime.pid and session['rss_kib'] > 0 and session['peak_rss_kib'] >= session['rss_kib'], session)
+        for _ in range(2):
+            for code in (29, 125, 106):
+                remote('NotifyKeyboardKeycode', GLib.Variant('(ub)', (code, True)))
+            for code in (106, 125, 29):
+                remote('NotifyKeyboardKeycode', GLib.Variant('(ub)', (code, False)))
+            time.sleep(0.03)
+        assert_frame('Rapid Right twice lands on next display nearest half', targets(second_area)[0], window_log)
+        check('Logger retains both rapid transitions', wait_for(lambda: len([row for row in perf_rows() if row['event'] == 'dispatch']) == 2), perf_rows())
+        rows = [row for row in perf_rows() if row['event'] == 'dispatch']
+        check('Transition completion includes real animation rather than request acknowledgment', all(row['result'] == 'ok' and row['metrics_error'] is None and 0 <= row['request_ms'] < 100 and 200 <= row['completion_ms'] <= row['dispatch_ms'] and row['rss_kib'] > 0 for row in rows), rows)
+        metrics_isolated = False
+        try:
+            companion('GetLastTransitionMetrics')
+        except GLib.Error as error:
+            metrics_isolated = Gio.DBusError.get_remote_error(error) == 'org.window_zones.Gnome.Error.InvalidWindowState'
+        check('Independent caller cannot read another controller transition metrics', metrics_isolated)
+        send(runtime, 'restart')
+        check('Performance TUI restarts without losing logger', wait_for(lambda: text(runtime_log).count('Last action: <none>') >= 2), text(runtime_log))
+        inject([29, 125, 105])
+        assert_frame('Left returns to previous display nearest half after restart', expected_zones[1], window_log)
+        check('Transition after restart appends to the same log', wait_for(lambda: len([row for row in perf_rows() if row['event'] == 'dispatch']) == 3), perf_rows())
+        send(window, 'maximize')
+        check('Performance fixture enters maximized state', wait_for(lambda: window_state(window_log)[3]), window_state(window_log))
+        inject([29, 125, 106])
+        assert_frame('Maximized transition reaches right half', expected_zones[1], window_log)
+        check('Maximized completion includes the finished visual transition', wait_for(lambda: len(perf_rows()) == 5) and perf_rows()[-1]['result'] == 'ok' and 200 <= perf_rows()[-1]['completion_ms'] <= perf_rows()[-1]['dispatch_ms'], perf_rows()[-1])
+        subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'false'], env=env, check=True)
+        time.sleep(0.1)
+        inject([29, 125, 105])
+        assert_frame('Disabled animation still places window correctly', expected_zones[0], window_log)
+        check('Disabled animation logs completion without animation delay', wait_for(lambda: len(perf_rows()) == 6) and perf_rows()[-1]['result'] == 'ok' and perf_rows()[-1]['completion_ms'] < 200, perf_rows()[-1])
+        subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'true'], env=env, check=True)
+        subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'reduce'], env=env, check=True)
+        time.sleep(0.1)
+        inject([29, 125, 106])
+        assert_frame('Reduced motion still places window correctly', expected_zones[1], window_log)
+        check('Reduced motion avoids custom movement animation', wait_for(lambda: len(perf_rows()) == 7) and perf_rows()[-1]['result'] == 'ok' and perf_rows()[-1]['completion_ms'] < 200, perf_rows()[-1])
+        subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'no-preference'], env=env, check=True)
+        send(window, 'fullscreen')
+        check('Performance fixture enters fullscreen', wait_for(lambda: window_state(window_log)[4]), window_state(window_log))
+        inject([29, 125, 106])
+        check('Rejected transition is logged without stale success timings', wait_for(lambda: perf_rows()[-1]['result'] == 'error') and perf_rows()[-1]['request_ms'] is None and perf_rows()[-1]['completion_ms'] is None and 'fullscreen' in perf_rows()[-1]['error'], perf_rows()[-1])
+        send(window, 'restore')
+        check('Performance fixture restores after rejection', wait_for(lambda: not window_state(window_log)[4]), window_state(window_log))
+        # Capture real compositor frames while moving, for visual proof of intermediate placement.
+        dispatch('Alt+Ctrl+Cmd+i', custom, 'animation-capture-baseline', window_log)
+        recording, recording_log = start(['gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]), 'num-buffers=16', '!', 'videoconvert', '!', 'pngenc', '!', 'multifilesink', 'location=' + str(work / 'animation-%02d.png')], 'animation-frames')
+        inject([29, 125, 105])
+        recording.wait(timeout=8)
+        assert_frame('Animated move ends at requested geometry', expected_zones[0], window_log)
+        check('Compositor transition capture finishes successfully', recording.returncode == 0, text(recording_log))
         inject([29, 125, 106])
         assert_frame('Default auto TUI handles real Ctrl+Super+Right', expected_zones[1], window_log)
         stop(runtime)
@@ -525,6 +612,16 @@ action = { type = "move-to-previous-display" }
         dispatch(hotkeys[0], expected_zones[0], 'xwayland-left-half', xwindow_log)
         dispatch('Alt+Ctrl+Cmd+n', targets(second_area)[0], 'xwayland-next-monitor', xwindow_log)
         dispatch('Alt+Ctrl+Cmd+p', expected_zones[0], 'xwayland-larger-monitor-return', xwindow_log)
+        dispatch(hotkeys[1], expected_zones[1], 'xwayland-directional-right-first', xwindow_log)
+        dispatch(hotkeys[1], targets(second_area)[0], 'xwayland-directional-right-crosses', xwindow_log)
+        dispatch(hotkeys[0], expected_zones[1], 'xwayland-directional-left-crosses', xwindow_log)
+        maximize_dispatch(xwindow, xwindow_log, hotkeys[0], expected_zones[0], 'xwayland-zone-from-maximized')
+        maximize_dispatch(xwindow, xwindow_log, 'Alt+Ctrl+Cmd+n', second_area, 'xwayland-next-from-maximized')
+        maximize_dispatch(xwindow, xwindow_log, 'Alt+Ctrl+Cmd+p', area, 'xwayland-previous-from-maximized')
+        tile_dispatch(xwindow_log, 105, expected_zones[0], 'Alt+Ctrl+Cmd+i', custom, 'xwayland-custom-from-tiled')
+        tile_dispatch(xwindow_log, 105, expected_zones[0], 'Alt+Ctrl+Cmd+n', targets(second_area)[0], 'xwayland-next-from-tiled')
+        tile_dispatch(xwindow_log, 106, targets(second_area)[1], 'Alt+Ctrl+Cmd+p', expected_zones[1], 'xwayland-previous-from-tiled')
+        dispatch(hotkeys[0], expected_zones[0], 'xwayland-final-left-half', xwindow_log)
         capture_screen('native-and-xwayland-windows')
         stop(xwindow)
         assert_frame('Closing XWayland restores native window focus', expected_zones[1], window_log)

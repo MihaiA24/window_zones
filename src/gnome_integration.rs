@@ -11,6 +11,7 @@ use dbus::message::MatchRule;
 use parking_lot::Mutex;
 use thiserror::Error;
 
+use crate::window_system::TransitionMetrics;
 use crate::{
     DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowMove,
     WindowSystem, WindowSystemError,
@@ -26,6 +27,7 @@ const FOCUSED_WINDOW_CAPABILITY: &str = "focused-window";
 const DISPLAYS_CAPABILITY: &str = "displays";
 const MOVE_RESIZE_CAPABILITY: &str = "move-resize";
 const HOTKEYS_CAPABILITY: &str = "hotkeys";
+const TRANSITION_METRICS_CAPABILITY: &str = "transition-metrics";
 
 type DisplayPayload = (String, i32, i32, u32, u32);
 
@@ -63,14 +65,37 @@ impl GnomeIntegrationError {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct GnomeWindowSystem {
     bus_address: Option<String>,
+    // Keep the move's sender alive so its metrics cannot be confused with another client.
+    metrics_connection: Option<Connection>,
+}
+
+impl fmt::Debug for GnomeWindowSystem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GnomeWindowSystem")
+            .field("bus_address", &self.bus_address)
+            .field("has_metrics_connection", &self.metrics_connection.is_some())
+            .finish()
+    }
+}
+
+impl Clone for GnomeWindowSystem {
+    fn clone(&self) -> Self {
+        Self {
+            bus_address: self.bus_address.clone(),
+            metrics_connection: None,
+        }
+    }
 }
 
 impl GnomeWindowSystem {
     pub fn new() -> Self {
-        Self { bus_address: None }
+        Self {
+            bus_address: None,
+            metrics_connection: None,
+        }
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, GnomeIntegrationError> {
@@ -82,6 +107,7 @@ impl GnomeWindowSystem {
     fn with_bus_address(bus_address: impl Into<String>) -> Self {
         Self {
             bus_address: Some(bus_address.into()),
+            metrics_connection: None,
         }
     }
 
@@ -141,14 +167,46 @@ impl WindowSystem for GnomeWindowSystem {
     }
 
     fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
-        let target = window_move.target;
-        let result: Result<(), GnomeIntegrationError> = self.call_with_capability(
-            MOVE_RESIZE_CAPABILITY,
-            "MoveFocusedWindow",
-            (target.x, target.y, target.width, target.height),
-        );
-
+        self.metrics_connection = None;
+        let result = (|| {
+            let connection = connect(self.bus_address.as_deref())?;
+            let capabilities = get_capabilities(&connection)?;
+            require_capability(&capabilities, MOVE_RESIZE_CAPABILITY)?;
+            let target = window_move.target;
+            let proxy = connection.with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
+            proxy
+                .method_call::<(), _, _, _>(
+                    GNOME_INTERFACE,
+                    "MoveFocusedWindow",
+                    (target.x, target.y, target.width, target.height),
+                )
+                .map_err(classify_dbus_error)?;
+            if capabilities
+                .iter()
+                .any(|value| value == TRANSITION_METRICS_CAPABILITY)
+            {
+                self.metrics_connection = Some(connection);
+            }
+            Ok::<(), GnomeIntegrationError>(())
+        })();
         result.map_err(|error| WindowSystemError::Platform(error.to_string()))
+    }
+
+    fn transition_metrics(&self) -> Result<Option<TransitionMetrics>, WindowSystemError> {
+        let Some(connection) = self.metrics_connection.as_ref() else {
+            return Ok(None);
+        };
+        let proxy = connection.with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
+        let result: Result<(f64, f64), _> =
+            proxy.method_call(GNOME_INTERFACE, "GetLastTransitionMetrics", ());
+        result
+            .map(|(request_ms, completion_ms)| {
+                Some(TransitionMetrics {
+                    request_ms,
+                    completion_ms,
+                })
+            })
+            .map_err(|error| WindowSystemError::Platform(classify_dbus_error(error).to_string()))
     }
 }
 
