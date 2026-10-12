@@ -1,6 +1,6 @@
 # GNOME Wayland Runbook
 
-The GNOME integration targets GNOME Shell 50 and 51 and uses the in-repository Shell extension as the compositor companion. Both versions are admitted by `metadata.json`; Shell version validation must remain enabled. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session. Admission and API compatibility are not a substitute for a passing Smoke run; exact verified configurations are recorded in [the testing runbook](testing.md).
+The GNOME integration targets GNOME Shell 50 and 51 and uses the in-repository Shell extension as the compositor companion. Both versions are admitted by `metadata.json`; Shell version validation must remain enabled. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session. Admission and API compatibility are not a substitute for a passing smoke run. Record exact configurations, observed results, and limitations only in the PR description; verification artifacts are temporary and must not be checked in.
 
 ## Target version
 
@@ -8,7 +8,6 @@ Record the exact point release before a manual run:
 
 ```bash
 gnome-shell --version
-# Current device: GNOME Shell 51.0; earlier reference: GNOME Shell 50.4
 ```
 
 ## Install and enable the companion
@@ -216,10 +215,9 @@ isolate the test. If another tiling extension interferes, disable only that
 extension with the user's approval and restore it afterwards.
 
 Automated `gnome-live` requires writable `/dev/uinput` and fails its preflight
-without it; it has no XTEST or physical-key fallback. Xwayland XTEST events
-did not reach compositor accelerators in the recorded GNOME 50 configuration.
-Physical key presses can provide separate manual evidence, but a direct
-dispatch is not accelerator-delivery evidence.
+without it; it has no XTEST or physical-key fallback. Physical key presses can
+provide separate manual evidence, but a direct dispatch is not
+accelerator-delivery evidence.
 
 If an administrator explicitly approves temporary injector access, grant it
 only to the current user, save the original ACL, and restore it even if the
@@ -241,7 +239,7 @@ This authorized path needs `getfacl`, `setfacl`, and authorized `sudo`; do not
 attempt it unattended when those prerequisites are unavailable. If restoration
 fails, keep the backup and restore the ACL before leaving injector access open.
 
-Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
+Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item in the PR description:
 
 1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, and `hotkeys`; the combined companion also advertises optional `transition-metrics`.
 2. With a normal focused window, move it to every built-in and a custom zone, the next/previous display, and a display in each available explicit direction. Check center (size retained unless it must shrink) and restore in the same runtime session. Verify frame coordinates, sizes, and usable-area boundaries on two displays, including a display with negative global coordinates.
@@ -255,26 +253,16 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 10. Repeat Ctrl+Super+Left/Right at a matching half. Verify crossing to the neighbouring display's nearest half, different-size destinations, and no directional wrap at the outer edge.
 11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Restore desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
 
-`gnome-live` checks item 4 and a refused replacement mechanically on test windows it starts itself: it captures one Text Editor's id, focuses a second, and moves the captured id over `MoveWindow`; closes the second and expects `WindowGone`; maximizes the first through EWMH, then edge-tiles it with a real Super+Left over `/dev/uinput`, and expects each move to clear the state and apply the frame; sets fullscreen and expects `leave fullscreen first` with state and frame unchanged. It then reloads a config adding the reserved `Alt+Ctrl+Left` and expects `were refused`, the previous four bindings, and the previous accelerator still moving the window. Setting EWMH states uses a helper crate the gate builds against the public `window_zones` API, so `cargo` needs the locked crates. The local GNOME 51 driver and earlier seated GNOME 50 records predate these identified-move assertions; they do not establish a combined pass.
+`gnome-live` checks item 4 and a refused replacement mechanically on test windows it starts itself: it captures one Text Editor's id, focuses a second, and moves the captured id over `MoveWindow`; closes the second and expects `WindowGone`; maximizes the first through EWMH, then edge-tiles it with a real Super+Left over `/dev/uinput`, and expects each move to clear the state and apply the frame; sets fullscreen and expects `leave fullscreen first` with state and frame unchanged. It then reloads a config adding the reserved `Alt+Ctrl+Left` and expects `were refused`, the previous four bindings, and the previous accelerator still moving the window. Setting EWMH states uses a helper crate the gate builds against the public `window_zones` API, so `cargo` needs the locked crates.
 
-Incoming readiness evidence (2026-10-10) left the expanded seated GNOME 50
-gate pending. Its reachable container had GNOME Shell 48.7: after starting a
-real system bus, `gnome` ended with 6 assertions, 2 passed, 4 failed because
-`org.freedesktop.login1` could not activate. `gnome-live` stopped at its
-unwritable `/dev/uinput` preflight (2 assertions, 1 passed, 1 failed), and its
-configured CachyOS SSH target was not reachable on port 22. These are limits
-of that recorded environment, not a passing GNOME 50 configuration or a
-claim that the local GNOME 51 seat is unreachable.
-
-Local 2026-10-11 GNOME 51 animation/profiling evidence comes from a separate
-pre-merge tree. Neither branch's results verify the combined `Gnome2`
-companion. To close the combined gate, run the expanded Synthetic and seated
+To verify the combined `Gnome2` companion, run the expanded Synthetic and seated
 checks on the exact GNOME 50 or 51 configuration being claimed, with the
 upgraded companion loaded after a fresh login, `disable-user-extensions=false`,
 and authorized writable `/dev/uinput` for `gnome-live`. Record GNOME/Mutter
-versions, display layout, assertion summary, and retained logs. Contract
-tests and Synthetic results do not replace seated evidence; see the separate
-branch records in [the testing runbook](testing.md#v1-verification-matrix).
+versions, display layout, assertion summary, and limitations in the PR
+description only. Logs are temporary verification artifacts, not repository
+content. Contract tests and Synthetic results do not replace seated evidence;
+see [testing prerequisites](testing.md#v1-verification-matrix).
 
 For isolated D-Bus client and real companion-dispatcher contract coverage, run:
 
@@ -300,10 +288,8 @@ security. See [testing prerequisites](testing.md#v1-verification-matrix).
 
 ## Compatibility and lifecycle sources
 
-The local GNOME 51 API review used the installed `Meta-51.gir` and the JavaScript
-resources embedded in `libshell-51.so` (whose `Config.PACKAGE_VERSION` is
-`51.0`). The companion's existing focus, frame, work-area, move/resize, and
-accelerator calls remain available. For cross-monitor moves, the companion
+The companion uses Shell/Mutter focus, frame, work-area, move/resize, and
+accelerator APIs. For cross-monitor moves, the companion
 waits for the restore `size-changed` notification, then calls `move_to_monitor`
 before `move_resize_frame`. This avoids a late restore acknowledgement
 overwriting the target and supplies the destination's Wayland size bounds.
@@ -315,8 +301,8 @@ Shell-owned windows are excluded using the cached process ID from
 the contract harness leaves that nonexistent API unstubbed and uses real GIO
 credentials for the process-exclusion regression.
 
-`Window.unmaximize()` takes no arguments in the reviewed Mutter 50/51 APIs;
-on tested GNOME 51 it clears maximization and native side tiling. Resize eligibility uses the intrinsic `resizeable`
+`Window.unmaximize()` takes no arguments in the Mutter 50/51 APIs and clears
+maximization and native side tiling. Resize eligibility uses the intrinsic `resizeable`
 property: `allows_resize()` also returns false solely because a window is
 maximized, so using it as a client restriction would incorrectly reject the
 requested restoration. Target validation, fullscreen, and intrinsic client

@@ -13,6 +13,6 @@ The original decision made adapters report only frame geometry and the executor 
 
 ## Consequences
 
-- Sway, Hyprland, and macOS are Ungated integrations: implemented and built in CI. Sway and Hyprland have no Smoke run on record; incoming readiness work subsequently recorded macOS evidence in the testing runbook, without creating a release gate.
+- Sway, Hyprland, and macOS are Ungated integrations: implemented and built in CI.
 - The automated seated GNOME gate requires authorized writable `/dev/uinput` and fails, rather than falling back to XTEST or physical input, when it is absent.
 - X11 placement uses the frame (`TranslateCoordinates` + `_NET_FRAME_EXTENTS`) and restores maximization before configuring. ADR 0009 amends the original full-monitor usable areas: `_NET_WM_STRUT(_PARTIAL)` panel reservations are now subtracted per monitor.

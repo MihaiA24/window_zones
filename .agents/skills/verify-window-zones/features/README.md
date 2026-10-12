@@ -20,16 +20,16 @@ This directory is the maintained source for verifying the user-facing behavior o
 - `--expect` holds the exact text the app prints. A recipe command that exits 0 has passed its check; `wzv exec --expect-exit 1` passes when the app exits 1.
 - Hotkeys are case-insensitive on input; the app reports them in canonical `alt+ctrl+shift+cmd+key` order.
 - Write fixture files under `"$R/scratch/"`; cleanup removes them.
-- Finish with `wzv stop "$RUN"` and `wzv cleanup "$RUN"`. Cleanup keeps `"$R/evidence/"`.
+- Finish with `wzv stop "$RUN"` and `wzv cleanup "$RUN"`. Cleanup removes scratch files but keeps `"$R/evidence/"`, `meta.env` and `pids`; after reporting results in the PR description, remove your owned run directory with `rm -rf -- "$R"` once no caller is using it.
 
 ## Proof and skip reporting
 
-- Proof is the run's `evidence/` directory: `transcript.log` (each typed line, its output, one-shot commands with `exit_code=`, `[expect ok]`/`[expect FAIL]`), `app.log`, `config-NN.toml`, `side-effects.txt`, `sentinel.log`, `exit-code`.
+- Inspect the run's temporary `evidence/` directory: `transcript.log` (each typed line, its output, one-shot commands with `exit_code=`, `[expect ok]`/`[expect FAIL]`), `app.log`, `config-NN.toml`, `side-effects.txt`, `sentinel.log`, `exit-code`. These artifacts are not checked in or retained as repository documentation.
 - Capture the user action and the resulting state: the `last move:` geometry, `Config state:`, `Dispatch state:`, or the TUI `Last action:`/`Last error:`/`Last event:` lines.
 - `wzv stop` must report `exit_code=0`, `live_backend_tool_calls=0`, and `instance_locks=0`; report `home_files` with the files you expected.
-- Report the feature file, the run id, and the evidence path with every result.
+- Report the feature file, run id, commands, observed results and limitations only in the PR description; do not require a retained evidence path.
 - Dry-run proves runtime behavior, not real window movement or real key capture. Never report a live backend as verified through dry-run.
-- Report an unreachable path with the attempted command and the unmet precondition (see `live-integrations.md`).
+- Report an unreachable path in the PR description with the attempted command and the unmet precondition (see `live-integrations.md`).
 - Do not report a skipped entry point as verified through a different one: a one-shot `dispatch` does not prove the session path, and the reverse.
 
 ## Feature entry contract
@@ -41,14 +41,14 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 3. `Driving it with wzv` starts with `Preconditions:` and uses labeled bullets that pair each user action with an exact command and observable result.
 4. `Gotchas` lists traps that can waste or invalidate a verification run.
 
-Keep implementation details out of the map. Name only user paths, stable handles, required state, commands, and observable proof. Mark a recipe `unverified` until its commands have been run against the current build.
+Keep implementation details out of the map. Name only user paths, stable handles, required state, commands, and expected invariants. Verification status, including anything not run against the current build, belongs only in the PR description.
 
 ## Features
 
-- [Starter config](./starter-config.md) covers `init` with the default chord, a chosen chord, `--force`, refusal to overwrite, an invalid chord, and `--config` paths. Exercised.
-- [One-shot commands](./one-shot-commands.md) covers `status`, `dispatch HOTKEY`, exit codes, missing config, and argument errors. Combined recipe exercised as `merged-one-shot-20261012`.
-- [Move the window](./move-window.md) covers every starter zone, repeated-half display crossing without wrap, center, maximize, restore, next and previous display with wrap, custom zones, and `move-to-display`. Combined recipe exercised as `merged-movement-20261012`.
-- [Run session](./run-session.md) covers the `run` stdin commands: `status`, `help`, `dispatch`, bare hotkeys, unknown hotkeys, `reload`, `restart`, and `exit`. Exercised.
-- [Live config reload](./config-reload.md) covers saving broken, invalid, fixed, and extended configs while the App runs. Exercised.
-- [TUI dashboard](./tui.md) covers the dashboard frame, dispatch, error and event lines, `refresh`, `reload`, `restart`, config errors, and quit. Exercised.
-- [Live integrations](./live-integrations.md) covers GNOME, X11, KDE, macOS, Windows, Sway/Hyprland, tray, notifications, single-instance and services. Combined X11 and GNOME 51 Synthetic runs passed; GNOME's seated gate remains pending. Historical macOS and synthetic KDE results are separate pre-merge evidence. See `docs/runbooks/testing.md` for exact evidence and limits.
+- [Starter config](./starter-config.md) covers `init` with the default chord, a chosen chord, `--force`, refusal to overwrite, an invalid chord, and `--config` paths.
+- [One-shot commands](./one-shot-commands.md) covers `status`, `dispatch HOTKEY`, exit codes, missing config, and argument errors.
+- [Move the window](./move-window.md) covers every starter zone, repeated-half display crossing without wrap, center, maximize, restore, next and previous display with wrap, custom zones, and `move-to-display`.
+- [Run session](./run-session.md) covers the `run` stdin commands: `status`, `help`, `dispatch`, bare hotkeys, unknown hotkeys, `reload`, `restart`, and `exit`.
+- [Live config reload](./config-reload.md) covers saving broken, invalid, fixed, and extended configs while the App runs.
+- [TUI dashboard](./tui.md) covers the dashboard frame, dispatch, error and event lines, `refresh`, `reload`, `restart`, config errors, and quit.
+- [Live integrations](./live-integrations.md) covers GNOME, X11, KDE, macOS, Windows, Sway/Hyprland, tray, notifications, single-instance and services. See `docs/runbooks/testing.md` for platform procedures, gate policy and limits.

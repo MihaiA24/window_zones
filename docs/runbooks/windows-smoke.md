@@ -1,14 +1,14 @@
 # Windows Smoke Runbook
 
 > **Windows is currently a DEFERRED, non-blocking V1 release gate.** The GitHub
-> Actions Windows job proves the Windows code compiles and unit-tests. Run this
-> procedure later on a real Windows desktop before changing the matrix to a
-> blocking pass or fail.
+> Actions Windows job checks compilation and unit tests, not desktop behavior.
+> Run this procedure on a real Windows desktop before making it a blocking gate.
 
 This procedure uses the real `window_zones.exe`, real Win32 windows, the real
 monitor work areas, and real keyboard input. Do not use Wine or a cross-compile
-as evidence. Keep screenshots outside the repository; screenshots are
-out-of-band evidence and are not committed.
+as evidence. Keep transcripts and screenshots as temporary artifacts outside
+the repository; do not commit them. Observed results and limitations belong
+only in the completed report in the PR description.
 
 ## Prerequisites
 
@@ -378,11 +378,12 @@ When a check fails, preserve the command output, the exact monitor layout,
 the observed/expected rectangles, and an external screenshot. Do not change
 product code as part of this run; report the defect instead.
 
-## Results to paste into `docs/runbooks/testing.md`
+## Report for the PR description
 
-Replace the placeholders after the manual run. Keep `deferred - unverified`
-until all required evidence is captured; use `blocking - pass` or
-`blocking - fail` only after the run is complete.
+Replace the placeholders after the manual run and paste the completed report
+only into the PR description, never into repository documentation or other
+files. Keep `deferred - unverified` until all required evidence is captured;
+use `blocking - pass` or `blocking - fail` only after the run is complete.
 
 ```markdown
 | Gate | Status | Environment | Verified configuration | Date | How to reproduce |

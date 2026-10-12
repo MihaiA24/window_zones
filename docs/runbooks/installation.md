@@ -264,15 +264,14 @@ launchd the installed `<prefix>/bin/window_zones` binary needs the grant:
 If macOS no longer recognizes the grant after a rebuild or reinstall, re-add the
 installed binary, then
 `launchctl kickstart -k gui/$(id -u)/org.window_zones.run`. A terminal run may use
-the terminal app's permission instead. A recorded failed listener needs runtime
-`restart` or a process restart after permission is restored; registration retries
-alone do not reconstruct it.
+the terminal app's permission instead. A listener that failed to register needs
+runtime `restart` or a process restart after permission is restored;
+registration retries alone do not reconstruct it.
 
 Background problem/recovery notices use `osascript` Standard Additions, with
-text passed as arguments rather than interpolated code. Incoming pre-merge
-readiness work observed error and recovery banners and Notification Center
-content attributed to **Script Editor**; that sender's preferences control
-visibility. See [the separately qualified evidence](testing.md#macos-native-smoke-ungated).
+text passed as arguments rather than interpolated code. Check the sender shown
+in Notification Center and its preferences when notices are not visible.
+Follow the [native macOS smoke procedure](testing.md#macos-native-smoke-ungated).
 
 ## Verify and uninstall
 
@@ -282,7 +281,9 @@ visibility. See [the separately qualified evidence](testing.md#macos-native-smok
 ```
 
 Substitute your prefix if it differs. Follow the compositor-specific runbook for
-companion and hotkey verification.
+companion and hotkey verification. Record observed results and limitations only
+in the PR description; verification artifacts are temporary and must not be
+checked in.
 
 Uninstall using the same prefix used for installation:
 

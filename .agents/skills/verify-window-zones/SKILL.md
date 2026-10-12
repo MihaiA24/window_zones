@@ -1,6 +1,6 @@
 ---
 name: verify-window-zones
-description: "Drive and prove window_zones (Rust window-zone/hotkey utility) the way a user does: the one-shot CLI (init, status, dispatch), the line-driven `run` session, and the ANSI `tui`, all on owned, isolated `--backend dry-run` instances via the bundled `wzv` helper, with transcripts and side-effect evidence that survive cleanup. Use it whenever you change window_zones behavior and must show it works, reproduce a CLI/session/TUI bug, or check the recorded scenario still passes. Live desktop backends (GNOME, X11, KDE, macOS, Windows, tray) are mapped here but are verified with scripts/smoke.sh on a Linux desktop, not by this helper."
+description: "Drive and check window_zones (Rust window-zone/hotkey utility) the way a user does: the one-shot CLI (init, status, dispatch), the line-driven `run` session, and the ANSI `tui`, all on owned, isolated `--backend dry-run` instances via the bundled `wzv` helper. Use it whenever you change window_zones behavior, reproduce a CLI/session/TUI bug, or run the reproducible scenario. Report results only in the PR description and remove temporary artifacts afterward. Live desktop backends (GNOME, X11, KDE, macOS, Windows, tray) need the separate platform procedures in the feature map, not this helper."
 ---
 
 # Verify window_zones
@@ -15,9 +15,9 @@ export PATH="$PWD/.agents/skills/verify-window-zones/scripts:$PATH"
 
 ## Prerequisites and baseline
 
-- macOS or Linux, `bash` (3.2 is enough), `cargo` (1.95 used for the recording; `cargo build --locked --bin window_zones` must pass), `mkfifo`, `ps -o lstart=`.
+- macOS or Linux, `bash` (3.2 is enough), `cargo` (`cargo build --locked --bin window_zones` must pass), `mkfifo`, `ps -o lstart=`.
 - Nothing else: no desktop session, no Accessibility permission, no D-Bus, no network after the first build.
-- Record the baseline before you change anything: `git rev-parse HEAD`, `git status --porcelain`, and `./scripts/test.sh` (fmt, tests, clippy, script syntax; it skips `gjs`/`qmllint` steps when those tools are missing). `wzv start` stores HEAD and the local-change count in `meta.env`; `wzv doctor` prints them.
+- Capture the baseline for the PR description before you change anything: `git rev-parse HEAD`, `git status --porcelain`, and `./scripts/test.sh` (fmt, tests, clippy, script syntax; it skips `gjs`/`qmllint` steps when those tools are missing). `wzv start` stores HEAD and the local-change count in temporary `meta.env`; `wzv doctor` prints them.
 - Never drive an instance you did not start in this run, never the user's installed `window_zones`, and never the `window-zones` systemd user service.
 
 ## Launch
@@ -61,9 +61,9 @@ One `ok`/`FAIL` line per check, then `doctor=ok` (exit 0) or `doctor=fail` (exit
 
 Hotkeys are case-insensitive on input (`dispatch Ctrl+Alt+Left` and `dispatch ctrl+alt+left` are the same); the app reports them canonically (`alt+ctrl+shift+cmd+key`). In `run`, a line that is not a session command is dispatched as a hotkey. Each recipe in `features/` uses `--expect` with the exact text the app prints, so a recipe command exiting 0 is the check. Use `"$R/scratch/"` (with `R=target/verify-window-zones/RUN`, from the repository root) for fixture files; cleanup removes it.
 
-## Evidence and proof standards
+## Temporary artifacts and verification standards
 
-Everything lives in `target/verify-window-zones/<run-id>/` (override the root with `WZV_ROOT`; `cargo clean` deletes `target/`, so copy evidence elsewhere if it must outlive that):
+Temporary artifacts live in `target/verify-window-zones/<run-id>/` (override the root with `WZV_ROOT`; `cargo clean` deletes `target/`). Inspect them while checking the run; do not check them in or copy verification records into repository documentation:
 
 | Path | Content |
 |---|---|
@@ -81,7 +81,7 @@ Proof standards:
 - Check side effects next to visible output: `wzv stop` must report `live_backend_tool_calls=0`, `instance_locks=0`, and `home_files=` equal to the files you expect (1 after `init`: the config).
 - Dry-run is isolated under `env -i` with its own HOME, `XDG_*`, `TMPDIR`, `XDG_RUNTIME_DIR`, a dead `DBUS_SESSION_BUS_ADDRESS`, and `PATH=<scratch>/bin:/usr/bin:/bin`. The sentinel programs listed in `scripts/wzv` log to `sentinel.log` and exit 127. They observe external-program calls only: native macOS Accessibility/Cocoa/window and event-tap APIs bypass them, so an empty log does not prove zero native Framework calls. Dry-run skips background notifications and the single-instance lock.
 - Dry-run proves the runtime: config handling, bindings, zone math, repeated-half display crossing, restore, display moves, session/TUI commands, exit codes. It does not prove that a real compositor moved a real window or that a real key press was captured; never report a live backend as verified from a dry-run.
-- With every claim, report the run id, the commands, and the evidence path.
+- Report the run id, commands, observed results and limitations only in the PR description. Remove the temporary artifacts after reporting; do not require a retained evidence path.
 
 ## Cleanup
 
@@ -90,16 +90,16 @@ wzv cleanup --dry-run my-check   # plan only: would-kill / would-remove lines, n
 wzv cleanup my-check             # kill what is still running, remove scratch/, keep evidence
 ```
 
-`cleanup` acts only on the pids in `<run>/pids`, and only when the pid's current start time equals the recorded one (`skip-not-owned` otherwise: a reused pid is never signalled). It removes `scratch/` (HOME, TMPDIR, FIFO, fixtures) and prints `kept <evidence_dir>`; it never deletes `evidence/`, `meta.env` or `pids`. A TUI exits on its own when stdin closes; `run` keeps serving without a terminal and gets SIGTERM. Run it after every failed attempt too. `wzv cleanup --all` covers every run under the root, including other agents' live runs in this checkout: run `wzv cleanup --all --dry-run` first. Delete old evidence yourself with `rm -rf target/verify-window-zones/<run-id>` once nobody needs it.
+`cleanup` acts only on the pids in `<run>/pids`, and only when the pid's current start time equals the recorded one (`skip-not-owned` otherwise: a reused pid is never signalled). It removes `scratch/` (HOME, TMPDIR, FIFO, fixtures) and prints `kept <evidence_dir>`; it never deletes `evidence/`, `meta.env` or `pids`. A TUI exits on its own when stdin closes; `run` keeps serving without a terminal and gets SIGTERM. Run it after every failed attempt too. `wzv cleanup --all` covers every run under the root, including other agents' live runs in this checkout: run `wzv cleanup --all --dry-run` first. After reporting results in the PR description, remove your owned run directory with `rm -rf -- "${WZV_ROOT:-target/verify-window-zones}/<run-id>"` once no caller is using it. For `scenario.sh`, also remove its owned `<prefix>-s1` and `<prefix>-failed` directories and `<prefix>.log`; none of these artifacts should be checked in.
 
 ## Helpers
 
 - `.agents/skills/verify-window-zones/scripts/wzv` (`wzv --help`): `start`, `doctor`, `send`, `config`, `exec`, `stop`, `cleanup` as above. Exit 0 success, 1 failed check or runtime error (message on stderr names the missing text or the dead process), 2 usage error.
-- `.agents/skills/verify-window-zones/scripts/scenario.sh` (`scenario.sh --help`): replays the recorded scenario and the failure/cleanup drill below.
+- `.agents/skills/verify-window-zones/scripts/scenario.sh` (`scenario.sh --help`): runs the reproducible scenario and the failure/cleanup drill below.
 
-## Recorded scenario
+## Reproducible scenario
 
-Starting state: fresh empty run HOME (no config), `--backend dry-run`, focused window at x=40 y=40 w=640 h=480 on `display-0`; recorded on macOS 27.0 arm64 at commit `b0f37cd` with a clean tree plus this skill's files. Replay:
+Starting state: fresh empty run HOME (no config), `--backend dry-run`, focused window at x=40 y=40 w=640 h=480 on `display-0`. Run:
 
 ```bash
 scenario.sh --run-id replay-$(date +%s)
@@ -128,38 +128,18 @@ wzv cleanup --dry-run "$RUN"        # would-remove .../scratch; nothing changes
 wzv cleanup "$RUN"                  # removed .../scratch; kept .../evidence
 ```
 
-Recorded result, run `replay-3` (2026-10-08, commit `b0f37cd`): 21/21 steps `PASS`, `RESULT: PASS`, every recorded pid gone afterwards; evidence in `target/verify-window-zones/replay-3-s1/evidence/` and `replay-3-failed/evidence/`, log `target/verify-window-zones/replay-3.log`. Replayed against the readiness implementation as `readiness-20261010-final`: 21/21 passed, zero live-backend program calls and instance locks, owned scratch/processes cleaned; log `target/verify-window-zones/readiness-20261010-final.log`.
-
-Combined local/readiness tree (2026-10-12): updated crossing/no-wrap scenario `merged-readiness-20261012` passed, including the TUI failure and cleanup-ownership drills. Full movement and one-shot recipes passed as `merged-movement-20261012` and `merged-one-shot-20261012`. Each run reported zero live-backend program calls and instance locks; owned processes and scratch were cleaned, with evidence retained under `target/verify-window-zones/<run-id>/evidence/`.
-
 ## Failure drill and cleanup safety
 
-`scenario.sh` also proves, in run `<prefix>-failed` (TUI mode):
+`scenario.sh` checks these expected invariants in run `<prefix>-failed` (TUI mode):
 
-- `cleanup --dry-run` on a live run prints `would-kill` for holder, app and wrapper, and afterwards the app pid is alive, `scratch/` exists and `doctor` still passes.
-- A wrong expectation (`--expect 'Last action: alt+ctrl+up'` after dispatching right) exits 1 with `expected text not seen within 2s: ...`, prints the output it did see, and leaves `[expect FAIL]` in the transcript.
-- `cleanup` after that failure kills only the recorded holder, the app exits, `scratch/` is gone, `app.log`/`exit-code`/transcript remain; a second `cleanup` prints `already-removed` and kills nothing.
-- A run record whose pid now belongs to an unrelated process (start time differs) gets `skip-not-owned`, and that process stays alive.
+- `cleanup --dry-run` on a running owned instance must print `would-kill` for holder, app and wrapper without stopping them; the app pid must remain alive, `scratch/` must still exist and `doctor` must still pass.
+- A wrong expectation (`--expect 'Last action: alt+ctrl+up'` after dispatching right) must exit 1 with `expected text not seen within 2s: ...`, print the output it did see, and leave `[expect FAIL]` in the transcript.
+- `cleanup` after that failure must kill only owned processes; closing the holder lets the TUI app exit. `scratch/` must be gone, while `app.log`/`exit-code`/transcript remain until the caller removes the run; a second `cleanup` must print `already-removed` and kill nothing.
+- Run metadata whose pid now belongs to an unrelated process (start time differs) must get `skip-not-owned`, and that process must stay alive.
 
-`scenario.sh` checks that direct and symlink config/performance-log paths outside the run exit 2 without changing an owned external witness. Additional usage errors were checked by hand: `wzv send RUN` without a line, `wzv exec RUN -- --backend macos status`, `wzv frobnicate`, `scenario.sh --bogus`, and config paths containing `..`.
+`scenario.sh` checks that direct and symlink config/performance-log paths outside the run exit 2 without changing an owned external witness. For manual usage-error checks, expect exit 2 from `wzv send RUN` without a line, `wzv exec RUN -- --backend macos status` with an existing owned run, `wzv frobnicate`, `scenario.sh --bogus`, and `wzv exec` config paths containing `..`.
 
-A scenario step that fails makes `scenario.sh` print `FAIL <step>` and `RESULT: FAIL`, clean up every run it started, and exit 1. Observed with a deliberately wrong expectation in a throwaway copy (run `faildrill-1`): app and holder killed, `scratch/` removed, evidence kept with the `[expect FAIL]` line.
-
-## Coverage
-
-| Path | Status | Where |
-|---|---|---|
-| Starter config: `init`, `--chord`, `--force`, existing-config refusal, invalid chord, `--config` | exercised (dry-run), run `map-starter-config-005616` | `features/starter-config.md` |
-| One-shot `status`/`dispatch`, no carry-over, exit codes, missing config, argument errors, `--help` | exercised (dry-run), combined run `merged-one-shot-20261012` | `features/one-shot-commands.md` |
-| Zones, repeated-half display crossing, center, maximize, restore, next/previous display with wrap, custom zones, `move-to-display` | exercised (dry-run), combined run `merged-movement-20261012`; earlier width-cycling evidence is superseded | `features/move-window.md` |
-| `run` session commands: `status`, `help`, `reload`, `restart`, bare hotkey, unknown hotkey, `exit` | exercised (dry-run), run `map-run-session-005616` | `features/run-session.md` |
-| Live config reload: parse error, validation errors, recovery, added and removed binding | exercised (dry-run), run `map-config-reload-005616` | `features/config-reload.md` |
-| TUI dashboard: frame, dispatch, error line, `refresh`, `reload`, `restart`, config error, quit | exercised (dry-run), run `map-tui-005616` | `features/tui.md` |
-| `wzv` on Linux | exercised on Linux x86_64; final scenario `final` under relative `WZV_ROOT=target/verify-window-zones/merged-final-20261012` | this file |
-| `start` readiness-timeout cleanup branch | unverified: dry-run is always ready in under a second | `wzv` |
-| GNOME Wayland, Linux X11, KDE Plasma Wayland gates | combined GNOME 51 Synthetic session and X11 gates passed with no skips; seated GNOME/KDE remain unverified | `features/live-integrations.md`, `docs/runbooks/testing.md` |
-| macOS native API/raw CLI, listener restart, LaunchAgent lifecycle/ownership, config-error/recovery notifications | exercised on owned AppKit windows and isolated homes; actual injected F8 and problem/recovery banner pixels recorded | `features/live-integrations.md`, `target/verify-window-zones/readiness-macos/` |
-| Windows, Sway/Hyprland, live single-instance CLI (status 75), Linux systemd service | no new live verification in the combined tree; GNOME tray exercised by its Synthetic gate | `features/live-integrations.md` |
+A scenario step that fails must make `scenario.sh` print `FAIL <step>` and `RESULT: FAIL`, clean up every run it started, and exit 1. Its owned processes must stop and `scratch/` must be removed; diagnostic artifacts, including any `[expect FAIL]` line, remain until the caller reports the failure in the PR description and removes them.
 
 ## Isolation
 
@@ -167,9 +147,9 @@ Each run has its own HOME, XDG dirs, TMPDIR, XDG_RUNTIME_DIR and FIFO, and dry-r
 
 ## Loading this skill
 
-- OMP (primary): discovered from `.agents/skills/` in this repo when a session starts (a session that was already running before the skill existed does not see it; start a new one). Read it as `skill://verify-window-zones`, feature files as `skill://verify-window-zones/features/<file>.md`. Observed: a fresh `omp -p` session in this repo read `skill://verify-window-zones` and got `name: verify-window-zones`.
+- OMP (primary): discovered from `.agents/skills/` in this repo when a session starts (a session that was already running before the skill existed does not see it; start a new one). Read it as `skill://verify-window-zones`, feature files as `skill://verify-window-zones/features/<file>.md`.
 - Hermes (secondary): it only discovers this repo's `.agents/skills/` after a human runs `hermes skills trust` for the directory. Agents must not run that themselves; until it is done, load the file explicitly with `skill_view` on `.agents/skills/verify-window-zones/SKILL.md` (and the feature files the same way).
 
 ## Keeping it honest
 
-`features/README.md` is the maintained map. When a feature, command, output line or default changes, update its feature file and rerun its recipe; mark anything not rerun `unverified`. `/maintain-verification-skill` does that upkeep.
+`features/README.md` is the maintained recipe map, not a verification-status ledger. When a feature, command, output line or default changes, update its feature file and rerun its recipe; report results and anything not rerun only in the PR description. `/maintain-verification-skill` does that upkeep.

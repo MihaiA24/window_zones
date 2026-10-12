@@ -177,7 +177,7 @@ global-accelerator entries.
 
 `./scripts/smoke.sh kde-live` runs this checklist mechanically against a real KWin, started on its own `--virtual` framebuffer backend with two outputs and its own Xwayland. It needs the `kwin` package (`kwin_wayland`, `kpackagetool6`, `kwriteconfig6`) and touches nothing in the current session: private session bus, private `HOME` and XDG directories, its own script package and `kwinrc`.
 
-It is not a substitute for this checklist on a seated Plasma session. KWin's nested and virtual backends use a `Session::Type::Noop` session and never own the login seat; the gate's accelerator capture goes through Xwayland XTEST into KWin's EIS input path, which evidences compositor dispatch rather than physical-seat input. Three limitations are recorded as named skips rather than silently passed: seated accelerator capture, Plasma panel exclusion (the fixture runs no `plasmashell`), and negative-coordinate output movement (KWin places the virtual outputs side by side at non-negative origins).
+It is not a substitute for this checklist on a seated Plasma session. KWin's nested and virtual backends use a `Session::Type::Noop` session and never own the login seat; the gate's accelerator capture goes through Xwayland XTEST into KWin's EIS input path, which checks compositor dispatch rather than physical-seat input. Three limitations are recorded as named skips rather than silently passed: seated accelerator capture, Plasma panel exclusion (the fixture runs no `plasmashell`), and negative-coordinate output movement (KWin places the virtual outputs side by side at non-negative origins).
 
 The fixture also requires `dbus-update-activation-environment`. It seeds the
 private bus with its own `WAYLAND_DISPLAY` before KWin starts: Xwayland can
@@ -186,32 +186,15 @@ KWin 6.3.6 [launches Xwayland with `-enable-ei-portal` when supported](https://r
 that path needs a working graphical portal and authorized EIS input delivery.
 Installing KWin alone does not prove the transport.
 
-Current expanded evidence used KWin 6.3.6 and Xwayland 24.1.6 in the owned
-Debian 13 aarch64 container:
+Record the environment, observed results, and limitations only in the PR
+description. Verification logs and screenshots are temporary artifacts and
+must not be checked in. Synthetic results do not replace native-Wayland client
+placement and seated Plasma checks.
 
-| Synthetic run | Assertions | Passed | Failed | Skipped |
-|---|---:|---:|---:|---:|
-| Reload assertions synchronized to new output | 179 | 161 | 15 | 3 |
-| Private portal graphical environment fixed | 180 | 162 | 15 | 3 |
-| Same gate with an owned private PipeWire daemon | 180 | 162 | 15 | 3 |
+For ADR 0009 the gate also starts a second Text Editor and, through `MoveWindow` on the companion bus, moves the first window's captured id after focus changed, expects `WindowGone` once the second window is closed, and expects a quick-tiled (`slotWindowQuickTileLeft`) and a maximized window to be restored before the frame is applied and a fullscreen window to be rejected unchanged. It reads KWin's own `tile`, `maximizeMode`, `fullScreen`, and `frameGeometry` through throwaway scripts and `_NET_WM_STATE` through `xprop`. It then reloads a config adding the incumbent's `Alt+Ctrl+F24` and expects `were refused` naming the owner, the previous five bindings, and `Alt+Ctrl+Left` still moving the window. These checks require KWin 6 scripting with the `tile` property.
 
-The graphical-environment fix made the KDE portal activate successfully instead
-of failing to create `wl_display`. The PipeWire probe did not restore input
-delivery and was not promoted into the harness. Explicit dispatch and window
-identity/state checks passed; all 15 failures depended on injected accelerator
-delivery, including retained-binding delivery after a refused reload. The
-remaining XTEST-to-EIS failure cause is unresolved in this fixture, not a
-verified product defect or a passing shortcut path.
+### KWin API constraints
 
-Evidence under `target/verify-window-zones/`: `readiness-linux-kde-final/`
-(reload synchronization), `readiness-linux-kde-activation/`, and
-`readiness-linux-kde-pipewire/`. The fixture used Xwayland Text Editors;
-native-Wayland client placement and seated Plasma remain unverified.
-
-For ADR 0009 the gate also starts a second Text Editor and, through `MoveWindow` on the companion bus, moves the first window's captured id after focus changed, expects `WindowGone` once the second window is closed, and expects a quick-tiled (`slotWindowQuickTileLeft`) and a maximized window to be restored before the frame is applied and a fullscreen window to be rejected unchanged. It reads KWin's own `tile`, `maximizeMode`, `fullScreen`, and `frameGeometry` through throwaway scripts and `_NET_WM_STATE` through `xprop`. It then reloads a config adding the incumbent's `Alt+Ctrl+F24` and expects `were refused` naming the owner, the previous five bindings, and `Alt+Ctrl+Left` still moving the window. These need KWin 6 scripting with the `tile` property; the current window-state checks exercised them, but retained-binding accelerator delivery remains unverified.
-
-Its first run found two defects, both fixed:
-
-- `workspace.clientArea(KWin.WorkArea, output, desktop)` ignores the output and returns the desktop-wide union, so every display reported the same rectangle and zones were computed against all monitors joined. The per-output area is `KWin.MaximizeArea`.
-- KWin's scripting `registerShortcut` returns success for any callable handler: it hands the sequence to KGlobalAccel and discards the result, so an accelerator another action already owns is accepted and then never fires. The script now preflights every accelerator through KGlobalAccel `action(int)` (the dispatch winner, unlike the unordered `getGlobalShortcutsByKey`) before any registration and the companion re-verifies the winner read-only.
+- `workspace.clientArea(KWin.WorkArea, output, desktop)` ignores the output and returns the desktop-wide union, not a per-output work area. Use `KWin.MaximizeArea` for per-output placement.
+- KWin's scripting `registerShortcut` returns success for any callable handler: it hands the sequence to KGlobalAccel and discards the result, so an accelerator another action already owns can be accepted without firing. The script preflights every accelerator through KGlobalAccel `action(int)` (the dispatch winner, unlike the unordered `getGlobalShortcutsByKey`) before any registration and the companion re-verifies the winner read-only.
 

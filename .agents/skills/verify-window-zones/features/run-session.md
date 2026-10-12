@@ -45,4 +45,4 @@ Preconditions:
 - A typo in a command is dispatched as a hotkey and fails as `no binding configured`; it does not end the session.
 - Closing stdin does not stop `run`; it keeps serving hotkeys. Quit explicitly, or `wzv cleanup` sends SIGTERM.
 - On a live backend only one `run`/`tui` may own the hotkeys; a second one exits with status `75`. Dry-run skips that lock, so this is not provable here.
-- On Linux, when stdout is not a terminal, problem events also raise a desktop notification; `wzv` points the session bus at a dead socket so no notification can leave the run (unverified on Linux).
+- Dry-run skips background notifications, and `wzv` also points the session bus at a dead socket. Check desktop notifications with the owned live procedures in `live-integrations.md`, not this recipe.
