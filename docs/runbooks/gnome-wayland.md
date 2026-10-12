@@ -214,6 +214,11 @@ returns success. Do not replace the user's entire enabled-extension list to
 isolate the test. If another tiling extension interferes, disable only that
 extension with the user's approval and restore it afterwards.
 
+The disconnect/recovery check re-enables the companion, which can append its
+UUID to `enabled-extensions`. The harness restores the exact original order
+when membership is unchanged; it fails without overwriting unrelated user
+changes when membership differs.
+
 Automated `gnome-live` requires writable `/dev/uinput` and fails its preflight
 without it; it has no XTEST or physical-key fallback. Physical key presses can
 provide separate manual evidence, but a direct dispatch is not
@@ -224,20 +229,25 @@ only to the current user, save the original ACL, and restore it even if the
 run fails. Never make `/dev/uinput` world-writable:
 
 ```bash
-(
+bash -c '
   set -e
   sudo modprobe uinput
   acl_backup=$(mktemp)
+  restore_acl() {
+    sudo setfacl -P --restore="$acl_backup" && rm -f "$acl_backup"
+  }
   getfacl -p /dev/uinput > "$acl_backup"
-  trap 'sudo setfacl --restore="$acl_backup" && rm -f "$acl_backup"' EXIT
+  trap restore_acl EXIT
   sudo setfacl -m "u:$(id -un):rw" /dev/uinput
   ./scripts/smoke.sh gnome-live
-)
+'
 ```
 
 This authorized path needs `getfacl`, `setfacl`, and authorized `sudo`; do not
 attempt it unattended when those prerequisites are unavailable. If restoration
 fails, keep the backup and restore the ACL before leaving injector access open.
+Run the block from the repository root. The explicit `bash -c` wrapper also
+works from fish. Physical ACL restoration (`-P`) does not follow symbolic links.
 
 Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item in the PR description:
 

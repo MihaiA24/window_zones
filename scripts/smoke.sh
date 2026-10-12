@@ -186,13 +186,14 @@ wait_for_size_growth() {
 }
 
 start_group() {
-    local log_file=$1
-    shift
+    local pid_variable=$1 log_file=$2
+    shift 2
+    # Assign in this shell: command substitution would orphan the child.
     setsid -- "$@" >"$log_file" 2>&1 &
-    local pid=$!
-    printf '%s\n' "$pid" >>"$PID_FILE"
-    printf '%s\n' "$pid" >>"$GROUP_PID_FILE"
-    printf '%s\n' "$pid"
+    local child_pid=$!
+    printf -v "$pid_variable" '%s' "$child_pid"
+    printf '%s\n' "$child_pid" >>"$PID_FILE"
+    printf '%s\n' "$child_pid" >>"$GROUP_PID_FILE"
 }
 
 start_plain() {
@@ -210,7 +211,7 @@ stop_pid() {
 }
 
 wait_pid() {
-    local pid=$1 timeout_s=${2:-10} rc state
+    local pid=$1 timeout_s=${2:-10} state
     local deadline=$((SECONDS + timeout_s))
     while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
         state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
@@ -221,11 +222,13 @@ wait_pid() {
     if kill -0 "$pid" 2>/dev/null && [[ "$state" != Z* ]]; then
         return 124
     fi
-    set +e
-    wait "$pid"
-    rc=$?
-    set -e
-    return "$rc"
+    # The initial KWin service is an owned descendant of the launcher, not our child.
+    [[ "${3:-child}" == external ]] && return 0
+    if wait "$pid"; then
+        return 0
+    else
+        return "$?"
+    fi
 }
 
 cleanup() {
@@ -1171,11 +1174,11 @@ try {
 EOF
     : >"$monitor_log"
     : >"$helper_log"
-    monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
+    start_group monitor_pid "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         gdbus monitor --session --dest org.window_zones.Gnome \
-        --object-path /org/window_zones/Gnome)
-    helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-        LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper")
+        --object-path /org/window_zones/Gnome
+    start_group helper_pid "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
+        LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper"
     if wait_for_text "$helper_log" 'VALID_OK' 8; then
         assert_text 'GNOME live atomic valid registration' 'VALID_OK' "$(<"$helper_log")"
     else
@@ -1213,9 +1216,21 @@ EOF
 
 restore_gnome_live() {
     [[ "$GNOME_LIVE_ACTIVE" -eq 1 ]] || return 0
-    local enabled_after='' after_info='' tiling_after_info=''
+    local enabled_after='' after_info='' tiling_after_info='' failures_before=$FAILURES
     local window_after_enabled=0 tiling_after_enabled=0
     enabled_after=$(gnome_live_enabled_extensions)
+    # Re-enabling appends the UUID. Restore order without clobbering changed membership.
+    if [[ -n "${GNOME_LIVE_ENABLED_BEFORE:-}" && "$enabled_after" != "$GNOME_LIVE_ENABLED_BEFORE" ]] \
+        && python3 - "$GNOME_LIVE_ENABLED_BEFORE" "$enabled_after" <<'PY'
+import ast
+import sys
+sys.exit(sorted(ast.literal_eval(sys.argv[1])) != sorted(ast.literal_eval(sys.argv[2])))
+PY
+    then
+        DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gsettings set org.gnome.shell \
+            enabled-extensions "$GNOME_LIVE_ENABLED_BEFORE" || true
+        enabled_after=$(gnome_live_enabled_extensions)
+    fi
     after_info=$(gnome_live_extension_info "$GNOME_LIVE_EXT_UUID")
     tiling_after_info=$(gnome_live_extension_info "$GNOME_LIVE_TILING_UUID")
     log "RESTORE enabled-extensions after: $enabled_after"
@@ -1239,6 +1254,7 @@ restore_gnome_live() {
         assert_eq 'GNOME live tilingshell enable state unchanged' \
             "$GNOME_LIVE_TILING_ENABLED_BEFORE" "$tiling_after_enabled"
     fi
+    (( FAILURES == failures_before )) || return 1
     GNOME_LIVE_ACTIVE=0
     return 0
 }
@@ -1378,11 +1394,11 @@ run_gnome_live_adr9_window_checks() {
     a_id=$(gnome_live_focused_id)
     assert_text 'GNOME live captures the test window id' 'captured' "${a_id:+captured}"
     gnome_live_move "$a_id" "$GNOME_LIVE_CENTER_THIRD" >/dev/null
-    b_pid=$(start_group "$GNOME_ROOT/editor-b.log" env \
+    start_group b_pid "$GNOME_ROOT/editor-b.log" env \
         DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone)
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone
     b=$(xwindow_for_pid "$b_pid" 20 || true)
     assert_text 'GNOME live second test window maps' 'mapped' "${b:+mapped}"
     if [[ -z "$b" || -z "$a_id" ]]; then
@@ -1665,7 +1681,7 @@ run_gnome_live() {
     CURRENT_GATE='gnome-live'
     if [[ ! -w /dev/uinput ]]; then
         assert_eq 'GNOME live uinput preflight' writable '/dev/uinput is not writable'
-        log 'BLOCKED GNOME live: uinput is required. With explicit administrator approval, load it with sudo modprobe uinput, save getfacl -p /dev/uinput, grant only this user rw via sudo setfacl -m "u:$(id -un):rw" /dev/uinput, and restore the saved ACL with sudo setfacl --restore on exit (see the GNOME runbook). Never make /dev/uinput world-writable.'
+        log 'BLOCKED GNOME live: uinput is required. With explicit administrator approval, load it with sudo modprobe uinput, save getfacl -p /dev/uinput, grant only this user rw via sudo setfacl -m "u:$(id -un):rw" /dev/uinput, and restore the saved ACL with sudo setfacl -P --restore on exit (see the GNOME runbook). Never make /dev/uinput world-writable.'
         return 1
     fi
     assert_eq 'GNOME live uinput preflight' writable writable
@@ -1835,11 +1851,11 @@ run_gnome_live() {
     write_gnome_live_valid_config
 
     local editor_log="$GNOME_ROOT/editor.log" editor_pid='' editor_deadline
-    editor_pid=$(start_group "$editor_log" env \
+    start_group editor_pid "$editor_log" env \
         DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone)
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone
     EDITOR_PID="$editor_pid"
     log "OBSERVED GNOME live editor pid: $EDITOR_PID"
     editor_deadline=$((SECONDS + 20))
@@ -2279,7 +2295,7 @@ exec kwin_wayland \
     "$KDE_PUBLISH_CLIENT_ENV"
 EOF
     chmod 700 "$KDE_LAUNCHER"
-    KDE_GROUP_PID=$(start_group "$KDE_KWIN_LOG" env \
+    start_group KDE_GROUP_PID "$KDE_KWIN_LOG" env \
         -u DISPLAY -u XAUTHORITY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u KDEHOME \
         BUS_FILE="$KDE_BUS_FILE" KDE_BUS_FILE="$KDE_BUS_FILE" \
         KDE_COMPANION_BIN="$KDE_COMPANION_BIN" KDE_SERVICE_LOG="$KDE_SERVICE_LOG" \
@@ -2295,7 +2311,7 @@ EOF
         KDE_SESSION_VERSION=6 XDG_SESSION_TYPE=wayland \
         QT_LOGGING_RULES='kwin_libeis.debug=true;kwin_scripting.debug=true' \
         QT_FORCE_STDERR_LOGGING=1 \
-        dbus-run-session -- "$KDE_LAUNCHER")
+        dbus-run-session -- "$KDE_LAUNCHER"
     if wait_for_file "$KDE_BUS_FILE" 20; then
         KDE_BUS=$(cat "$KDE_BUS_FILE")
         export DBUS_SESSION_BUS_ADDRESS="$KDE_BUS"
@@ -2601,13 +2617,13 @@ kde_live_adr9_window_checks() {
     IFS='|' read -r present a_id rest <<<"$(kde_live_get_focused)"
     assert_text 'KDE captures the test window id' 'captured' "${a_id:+captured}"
     kde_live_move "$a_id" "$KDE_CENTER_THIRD" >/dev/null
-    b_pid=$(start_group "$KDE_ROOT/editor-b.log" env \
+    start_group b_pid "$KDE_ROOT/editor-b.log" env \
         DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
         XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
         XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 gnome-text-editor --standalone)
+        KDE_SESSION_VERSION=6 gnome-text-editor --standalone
     b=$(xwindow_for_pid "$b_pid" 25 || true)
     assert_text 'KDE second test window maps' 'mapped' "${b:+mapped}"
     if [[ -z "$b" || -z "$a_id" ]]; then
@@ -2780,9 +2796,9 @@ print('INVALID_READY');
 poll(6);
 EOF
     : >"$helper_log"
-    helper_pid=$(start_group "$helper_log" env \
+    start_group helper_pid "$helper_log" env \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" KDE_VALID_HOTKEY="$KDE_SAFE_HOTKEY" \
-        gjs -m "$helper")
+        gjs -m "$helper"
     if wait_for_text "$helper_log" 'VALID_READY' 12; then
         assert_text 'KDE atomic valid registration completes' 'VALID_RESULT true' "$(<"$helper_log")"
     else
@@ -2923,9 +2939,9 @@ register(['alt+ctrl+f24'], 'CONFLICT');
 poll(15);
 EOF
     : >"$helper_log"
-    helper_pid=$(start_group "$helper_log" env \
+    start_group helper_pid "$helper_log" env \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" KDE_VALID_HOTKEY="$KDE_SAFE_HOTKEY" \
-        gjs -m "$helper")
+        gjs -m "$helper"
     wait_for_text "$helper_log" 'VALID_READY' 12 || true
     assert_text 'KDE conflict replacement starts with valid set' \
         'VALID_RESULT [true,"",""]' "$(cat "$helper_log" 2>/dev/null || true)"
@@ -3239,13 +3255,13 @@ PY
 
 
     local editor_log="$KDE_ROOT/editor.log" editor_deadline=0 editor_alive=0 window_found=0
-    KDE_EDITOR_PID=$(start_group "$editor_log" env \
+    start_group KDE_EDITOR_PID "$editor_log" env \
         DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
         XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
         XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 gnome-text-editor --standalone)
+        KDE_SESSION_VERSION=6 gnome-text-editor --standalone
     kill -0 "$KDE_EDITOR_PID" 2>/dev/null && editor_alive=1
     assert_eq 'KDE test editor process starts' 1 "$editor_alive"
     editor_deadline=$((SECONDS + 25))
@@ -3375,8 +3391,8 @@ PY
     # SIGTERM would otherwise be reported as stopped only by timeout, so escalate and confirm the
     # bus name is actually gone.
     stop_pid "$old_service_pid"
-    wait_pid "$old_service_pid" 5 || kill -9 "$old_service_pid" 2>/dev/null || true
-    wait_pid "$old_service_pid" 5 || true
+    wait_pid "$old_service_pid" 5 external || kill -9 "$old_service_pid" 2>/dev/null || true
+    wait_pid "$old_service_pid" 5 external || true
     set +e
     local service_owner_gone=0 stop_deadline=$((SECONDS + 10))
     while (( SECONDS < stop_deadline )); do
@@ -3389,10 +3405,10 @@ PY
     service_stopped=$service_owner_gone
     log "KDE service stop: owner gone=$service_owner_gone pid alive=$(kill -0 "$old_service_pid" 2>/dev/null && printf 1 || printf 0)"
     assert_eq 'KDE Rust service stops independently' 1 "$service_stopped"
-    KDE_SERVICE_PID=$(start_group "$restart_log" env -u KDEHOME DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" \
+    start_group KDE_SERVICE_PID "$restart_log" env -u KDEHOME DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" \
         HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" XDG_DATA_HOME="$KDE_DATA" \
         XDG_CACHE_HOME="$KDE_CACHE" XDG_STATE_HOME="$KDE_STATE" XDG_RUNTIME_DIR="$KDE_RUNTIME" \
-        XDG_DATA_DIRS="$KDE_DATA_DIRS" "$KDE_COMPANION_BIN")
+        XDG_DATA_DIRS="$KDE_DATA_DIRS" "$KDE_COMPANION_BIN"
     if wait_for_text "$restart_log" 'KWin companion service started' 12; then
         assert_text 'KDE Rust service restarts' 'KWin companion service started' "$(<"$restart_log")"
     else
@@ -3682,10 +3698,10 @@ run_x11_adr9_window_checks() {
     XON_DISPLAY="$X11_DISPLAY"
     XON_XAUTHORITY=''
     build_seam_helper X11 || return 0
-    b_pid=$(start_group "$X11_ROOT/editor-b.log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
+    start_group b_pid "$X11_ROOT/editor-b.log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
         XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11 HOME="$X11_HOME" \
         XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" \
-        gnome-text-editor --standalone)
+        gnome-text-editor --standalone
     b=$(xwindow_for_pid "$b_pid" 20 || true)
     assert_text 'X11 second test window maps' 'mapped' "${b:+mapped}"
     if [[ -z "$b" ]]; then
@@ -3790,7 +3806,7 @@ run_x11() {
     X11_DISPLAY=":$display_num"
     record_versions_x11
     local xvfb_log="$X11_ROOT/xvfb.log" xvfb_pid openbox_log="$X11_ROOT/openbox.log" openbox_pid wm_check=''
-    xvfb_pid=$(start_group "$xvfb_log" Xvfb "$X11_DISPLAY" -screen 0 3520x1080x24 -nolisten tcp -ac +extension XTEST)
+    start_group xvfb_pid "$xvfb_log" Xvfb "$X11_DISPLAY" -screen 0 3520x1080x24 -nolisten tcp -ac +extension XTEST
     local deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )) && [[ ! -S "/tmp/.X11-unix/X$display_num" ]]; do sleep 0.1; done
     assert_eq 'X11 Xvfb starts' 0 "$([[ -S "/tmp/.X11-unix/X$display_num" ]] && printf 0 || printf 1)"
@@ -3809,8 +3825,8 @@ run_x11() {
   <keyboard/>
 </openbox_config>
 EOF
-    openbox_pid=$(start_group "$openbox_log" env DISPLAY="$X11_DISPLAY" \
-        openbox --replace --config-file "$X11_ROOT/openbox.xml")
+    start_group openbox_pid "$openbox_log" env DISPLAY="$X11_DISPLAY" \
+        openbox --replace --config-file "$X11_ROOT/openbox.xml"
     deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )); do
         wm_check=$(DISPLAY="$X11_DISPLAY" xprop -root _NET_SUPPORTING_WM_CHECK 2>&1 || true)
@@ -3844,10 +3860,10 @@ EOF
     assert_text 'X11 auto backend resolves x11' 'Using runtime window backend: x11' \
         "$auto_backend_output"
     local editor_log="$X11_ROOT/editor.log" editor_pid
-    editor_pid=$(start_group "$editor_log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
+    start_group editor_pid "$editor_log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
         XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11 HOME="$X11_HOME" \
         XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" \
-        gnome-text-editor --standalone)
+        gnome-text-editor --standalone
     deadline=$((SECONDS + 20))
     while (( SECONDS < deadline )); do
         find_last_window && break
@@ -3970,7 +3986,7 @@ EOF
     local grab_log="$X11_ROOT/competitor-grab.log" grab_pid='' refused_before=0
     local bindings_before=0 registered_before=0 rejected_geometry=''
     if [[ -n "${SEAM_HELPER:-}" ]]; then
-        grab_pid=$(start_group "$grab_log" env DISPLAY="$X11_DISPLAY" "$SEAM_HELPER" grab Alt+Ctrl+F8)
+        start_group grab_pid "$grab_log" env DISPLAY="$X11_DISPLAY" "$SEAM_HELPER" grab Alt+Ctrl+F8
         wait_for_text "$grab_log" 'GRABBED' 10 || true
         assert_text 'X11 competitor holds alt+ctrl+f8' 'GRABBED alt+ctrl+f8' \
             "$(cat "$grab_log" 2>/dev/null || true)"
