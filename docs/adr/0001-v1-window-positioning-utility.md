@@ -51,7 +51,7 @@ This slice includes:
 
 This slice excludes global hotkey registration, focused-window detection, moving real windows, OS-specific Windows/X11/macOS code, tray/menu/UI work, and Wayland support.
 
-Implementation status: the first executable slice is implemented in the platform-neutral Rust core. The verified core includes integer geometry, built-in zone calculation, display movement geometry, TOML config parsing, and unit tests. Platform adapters remain deferred.
+Implementation status: the first executable slice is implemented in the platform-neutral Rust core. It includes integer geometry, built-in zone calculation, display movement geometry, TOML config parsing, and unit tests. Platform adapters remain deferred.
 
 ## Accepted v1 config shape
 
@@ -126,7 +126,7 @@ Accepted executor error shape:
 - Executor errors distinguish normal core states from platform failures: `NoFocusedWindow`, `NoDisplays`, and `FocusedWindowDisplayMissing { display_id }` are core executor errors.
 - Actual adapter/API failures are represented as `WindowSystemError::Platform(String)` and wrapped by the executor without interpretation.
 
-Implementation status: this adapter-contract/executor slice is implemented and verified in the platform-neutral Rust core. The verified core includes `WindowSystem`, `FocusedWindow`, `WindowMove`, `execute_action`, wrapping next/previous display behavior, executor error classification, and fake-adapter unit tests. Real OS adapters remain deferred.
+Implementation status: this adapter-contract/executor slice is implemented in the platform-neutral Rust core. It includes `WindowSystem`, `FocusedWindow`, `WindowMove`, `execute_action`, wrapping next/previous display behavior, executor error classification, and fake-adapter unit tests. Real OS adapters remain deferred.
 
 ## Accepted next slice: config-driven binding dispatcher
 
@@ -147,4 +147,4 @@ The dispatcher takes `&AppConfig` directly and uses exact case-sensitive hotkey 
 
 This slice excludes real global hotkey registration, config file path discovery, config watching/reload, platform-specific hotkey syntax validation, real Windows/X11 APIs, tray/UI work, and Wayland support.
 
-Implementation status: this dispatcher slice is implemented and verified in the platform-neutral Rust core. The verified core includes `dispatch_hotkey`, exact case-sensitive matching against `&AppConfig`, first-match-wins duplicate behavior, dispatch error classification, and fake-adapter unit tests. Real hotkey registration and platform adapters remain deferred.
+Implementation status: this dispatcher slice is implemented in the platform-neutral Rust core. It includes `dispatch_hotkey`, exact case-sensitive matching against `&AppConfig`, first-match-wins duplicate behavior, dispatch error classification, and fake-adapter unit tests. Real hotkey registration and platform adapters remain deferred.
