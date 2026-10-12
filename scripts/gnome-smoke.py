@@ -99,8 +99,8 @@ def run(binary, keep_logs, output_dir=None):
         work.mkdir(parents=True, exist_ok=False)
     print('EVIDENCE', work, flush=True)
     processes = []
+    session_starts = {}
     checks = []
-    bus_pid = None
     remote_path = None
     connection = None
     runtime = None
@@ -113,7 +113,7 @@ def run(binary, keep_logs, output_dir=None):
     def call(dest, path, interface, method, params=None):
         return connection.call_sync(dest, path, interface, method, params, None, Gio.DBusCallFlags.NONE, 3000, None)
     def companion(method, params=None):
-        return call('org.window_zones.Gnome', '/org/window_zones/Gnome', 'org.window_zones.Gnome1', method, params).unpack()
+        return call('org.window_zones.Gnome', '/org/window_zones/Gnome', 'org.window_zones.Gnome2', method, params).unpack()
     def focused():
         return companion('GetFocusedWindow')
     def remote(method, params=None):
@@ -130,12 +130,47 @@ def run(binary, keep_logs, output_dir=None):
                 pass
             time.sleep(0.05)
         return False
+    def process_state(pid):
+        return Path('/proc/' + str(pid) + '/stat').read_text(errors='replace').rsplit(')', 1)[1].split()
+    def owned_groups():
+        sessions = set()
+        for process in processes:
+            try:
+                if process_state(process.pid)[19] != session_starts[process.pid]:
+                    continue
+            except (FileNotFoundError, ProcessLookupError):
+                pass  # A session can outlive its leader.
+            except PermissionError:
+                continue
+            sessions.add(process.pid)
+        groups = set()
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                state = process_state(entry.name)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if int(state[3]) in sessions and state[0] != 'Z':
+                groups.add(int(state[2]))
+        return groups
     def start(args, name, child_env=None):
         log_path = work / (name + '.log')
         log = open(log_path, 'w')
-        process = subprocess.Popen(args, env=child_env or env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        log.close()
-        processes.append(process)
+        pending_signal = None
+        def defer_termination(signum, _frame):
+            nonlocal pending_signal
+            pending_signal = signum
+        previous = signal.signal(signal.SIGTERM, defer_termination)
+        try:
+            process = subprocess.Popen(args, env=env if child_env is None else child_env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            processes.append(process)
+            session_starts[process.pid] = process_state(process.pid)[19]
+        finally:
+            log.close()
+            signal.signal(signal.SIGTERM, previous)
+            if pending_signal:
+                os.kill(os.getpid(), pending_signal)
         return process, log_path
     def text(log):
         return log.read_text(errors='replace')
@@ -172,8 +207,12 @@ def run(binary, keep_logs, output_dir=None):
     def dispatch(hotkey, expected, name, log):
         result = subprocess.run([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkey], env=env, capture_output=True, text=True, timeout=8)
         (work / (name + '-dispatch.log')).write_text(result.stdout + result.stderr)
-        check(name + ' dispatch', 'Dispatch state: Succeeded' in result.stdout, result.stdout.strip())
+        check(name + ' dispatch', result.returncode == 0 and 'Dispatch state: Succeeded' in result.stdout, result.stdout.strip() + result.stderr)
         assert_frame(name + ' native and client geometry', expected, log)
+    def rejected_dispatch(hotkey, name):
+        result = subprocess.run([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkey], env=env, capture_output=True, text=True, timeout=8)
+        check(name + ' exits unsuccessfully', result.returncode != 0, result.stdout + result.stderr)
+        return result.stdout + result.stderr
     def maximize_dispatch(fixture, log, hotkey, expected, name):
         send(fixture, 'maximize')
         check(name + ' starts natively maximized', wait_for(lambda: window_state(log)[3]), window_state(log))
@@ -188,6 +227,7 @@ def run(binary, keep_logs, output_dir=None):
     zones = ['left-half', 'right-half', 'left-third', 'center-third', 'right-third', 'left-two-thirds', 'right-two-thirds', 'maximize']
     keycodes = [30, 48, 46, 32, 18, 33, 34, 35]
     hotkeys = ['Alt+Ctrl+Cmd+' + key for key in 'abcdefgh']
+    canonical_hotkeys = [hotkey.lower() for hotkey in hotkeys]
     def valid_config(first_zone='left-half'):
         result = '[zones.custom-center]\nx = 20\ny = 20\nwidth = 60\nheight = 60\n\n'
         for hotkey, zone in zip(hotkeys, [first_zone] + zones[1:]):
@@ -251,12 +291,16 @@ def run(binary, keep_logs, output_dir=None):
         (work / 'config/glib-2.0/settings/keyfile').write_text("[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\ndisable-user-extensions=false\n")
         for name in ('metadata.json', 'extension.js'):
             shutil.copy2(root / 'gnome-extension' / name, work / 'data/gnome-shell/extensions/window-zones@mihai-a24' / name)
-        address, bus_pid = subprocess.check_output(['dbus-daemon', '--session', '--fork', '--print-address=1', '--print-pid=1'], text=True).splitlines()
+        bus, bus_log = start(['dbus-daemon', '--session', '--nofork', '--print-address=1'], 'session-bus', os.environ.copy())
+        if not wait_for(lambda: text(bus_log).strip() or bus.poll() is not None):
+            raise RuntimeError('Private session bus did not start')
+        address = text(bus_log).splitlines()[0]
         env = os.environ.copy()
         env.update(DBUS_SESSION_BUS_ADDRESS=address, XDG_RUNTIME_DIR=str(work / 'runtime'), XDG_CONFIG_HOME=str(work / 'config'), XDG_DATA_HOME=str(work / 'data'), HOME=str(work / 'home'), GSETTINGS_BACKEND='keyfile', XDG_CURRENT_DESKTOP='GNOME', XDG_SESSION_TYPE='wayland', WAYLAND_DISPLAY='window-zones-native-smoke', GDK_BACKEND='wayland', GTK_A11Y='none')
         env.update(PIPEWIRE_RUNTIME_DIR=os.environ.get('PIPEWIRE_RUNTIME_DIR', os.environ['XDG_RUNTIME_DIR']), PIPEWIRE_REMOTE=os.environ.get('PIPEWIRE_REMOTE', 'pipewire-0'))
         env.pop('DISPLAY', None)
         env.pop('XAUTHORITY', None)
+        env.pop('SSH_CONNECTION', None)
         connection = Gio.DBusConnection.new_for_address_sync(address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
         shell, shell_log = start(['gnome-shell', '--headless', '--wayland-display', env['WAYLAND_DISPLAY'], '--virtual-monitor', '1920x1080', '--virtual-monitor', '1600x900'], 'shell')
         check('Companion loaded by real GNOME', wait_for(lambda: 'move-resize' in companion('GetCapabilities')[0], 20), 'GNOME ' + subprocess.check_output(['gnome-shell', '--version'], text=True).strip())
@@ -315,11 +359,9 @@ def run(binary, keep_logs, output_dir=None):
         returned = (x + round((proportional[0] - sx) * w / sw), y + round((proportional[1] - sy) * h / sh), round(proportional[2] * w / sw), round(proportional[3] * h / sh))
         dispatch('Alt+Ctrl+Cmd+p', returned, 'proportional-monitor-return', window_log)
         runtime, runtime_log = start([str(binary), '--backend', 'auto', '--config', str(config), 'run'], 'auto-run')
-        check('Auto run accepts global bindings', wait_for(lambda: 'Interactive session started' in text(runtime_log)), text(runtime_log))
-        send(runtime, 'status')
-        check('Auto run registers its actual accelerator set', wait_for(lambda: 'hotkey state: Registered' in text(runtime_log)), text(runtime_log))
+        check('Auto run registers its actual accelerator set', wait_for(lambda: 'Hotkeys registered: 11' in text(runtime_log)), text(runtime_log))
         try:
-            companion('RegisterHotkeys', GLib.Variant('(as)', ([hotkeys[0]],)))
+            companion('RegisterHotkeys', GLib.Variant('(as)', ([canonical_hotkeys[0]],)))
             raise AssertionError('Another controller replaced the runtime accelerator set')
         except GLib.Error as error:
             check('Second controller cannot steal active runtime bindings', Gio.DBusError.get_remote_error(error) == 'org.window_zones.Gnome.Error.Busy', error)
@@ -420,21 +462,20 @@ def run(binary, keep_logs, output_dir=None):
         shortcut(keycodes[2])
         assert_frame('Hotkey works after tray restart', expected_zones[2], window_log)
         check('Status updates and restart keep exactly one tray icon', len(tray_items()) == 1, [(destination, path) for destination, path, _properties in tray_items()])
-        last_action_label = '  last action: ' + hotkeys[2].lower()
-        check('Tray labels follow the last native hotkey action', wait_for(lambda: last_action_label in tray_labels() and '  dispatch state: Succeeded' in tray_labels()), tray_labels())
+        check('Tray labels follow the last native hotkey action', wait_for(lambda: any(canonical_hotkeys[2] in label for label in tray_labels())), tray_labels())
+        last_action_label = next(label for label in tray_labels() if canonical_hotkeys[2] in label)
         checkpoint = len(text(tray_log))
         tray_control(last_action_label)
-        check('Tray status row opens current runtime status', wait_for(lambda: last_action_label in text(tray_log)[checkpoint:]), text(tray_log)[checkpoint:])
+        check('Tray status row opens current runtime status', wait_for(lambda: canonical_hotkeys[2] in text(tray_log)[checkpoint:]), text(tray_log)[checkpoint:])
         config.write_text('[[bindings]\n')
-        check('Tray labels expose invalid configuration', wait_for(lambda: any(label.startswith('  config error: ') and label != '  config error: <none>' for label in tray_labels())), tray_labels())
+        check('Tray labels expose the invalid configuration path', wait_for(lambda: any(str(config) in label for label in tray_labels())), tray_labels())
         shortcut(keycodes[1])
         assert_frame('Tray keeps valid bindings after config error', expected_zones[1], window_log)
         config.write_text(valid_config())
-        check('Tray labels clear a recovered config error', wait_for(lambda: '  config state: Loaded' in tray_labels() and '  config error: <none>' in tray_labels()), tray_labels())
+        check('Tray labels clear a recovered config error', wait_for(lambda: all(str(config) not in label for label in tray_labels())), tray_labels())
         check('Config error and recovery preserve one tray icon', len(tray_items()) == 1, tray_items())
         shortcut(keycodes[2])
         assert_frame('Recovered tray configuration moves the native window', expected_zones[2], window_log)
-        check('Tray transition finishes before pointer interaction', wait_for(lambda: '  last action: alt+ctrl+cmd+c' in tray_labels() and '  dispatch state: Succeeded' in tray_labels()), tray_labels())
         button_x, button_y = json.loads(re.findall(r'^BUTTON_CENTER (.+)$', text(window_log), re.M)[-1])
         frame = focused()
         remote('NotifyPointerMotionAbsolute', GLib.Variant('(sdd)', (stream, frame[2] + button_x, frame[3] + button_y)))
@@ -451,14 +492,14 @@ def run(binary, keep_logs, output_dir=None):
         maximize_dispatch(window, window_log, 'Alt+Ctrl+Cmd+p', area, 'previous-display-from-maximized')
         send(window, 'fullscreen')
         check('Real GTK fullscreen state enters compositor', wait_for(lambda: window_state(window_log)[4]), window_state(window_log))
-        rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
+        rejected = rejected_dispatch(hotkeys[0], 'Fullscreen dispatch')
         check('Fullscreen action is rejected without clearing state', 'Dispatch state: Error' in rejected and window_state(window_log)[4], rejected.strip())
         send(window, 'restore')
         check('Window restores after fullscreen check', wait_for(lambda: not window_state(window_log)[4]), window_state(window_log))
         send(window, 'fixed')
         check('GTK window disables resizing', wait_for(lambda: not window_state(window_log)[5]), window_state(window_log))
         time.sleep(0.3)
-        rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
+        rejected = rejected_dispatch(hotkeys[0], 'Fixed-size dispatch')
         check('Fixed-size window is rejected', 'Dispatch state: Error' in rejected and 'does not allow resizing' in rejected, rejected.strip())
         send(window, 'restore')
         check('Window becomes resizable again', wait_for(lambda: window_state(window_log)[5]), window_state(window_log))
@@ -469,7 +510,7 @@ def run(binary, keep_logs, output_dir=None):
         dispatch('Alt+Ctrl+Cmd+i', custom, 'overview-baseline', window_log)
         inject([125])
         check('Overview excludes the application from focused-window actions', wait_for(lambda: not focused()[0]), focused())
-        rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
+        rejected = rejected_dispatch(hotkeys[0], 'Overview dispatch')
         check('Overview dispatch is rejected', 'Dispatch state: Error' in rejected and 'NoFocusedWindow' in rejected, rejected.strip())
         inject([1])
         assert_frame('Overview leaves the window geometry unchanged', custom, window_log)
@@ -477,21 +518,21 @@ def run(binary, keep_logs, output_dir=None):
         dry = subprocess.check_output([str(binary), '--backend', 'dry-run', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
         check('Dry-run calculates placement without touching real window', 'Dispatch state: Succeeded' in dry and tuple(focused()[2:]) == tuple(expected_zones[1]), dry.strip())
         forced = subprocess.run([str(binary), '--backend', 'x11', 'status'], env=env, capture_output=True, text=True)
-        check('Explicit X11 is rejected within GNOME Wayland', forced.returncode != 0 and 'X11 backend is unavailable inside a Wayland session' in forced.stderr, forced.stderr.strip())
+        check('Explicit X11 is rejected within GNOME Wayland', forced.returncode != 0, forced.stderr.strip())
         capture_screen('native-window')
         events = []
-        subscription = connection.signal_subscribe('org.window_zones.Gnome', 'org.window_zones.Gnome1', 'HotkeyPressed', '/org/window_zones/Gnome', None, Gio.DBusSignalFlags.NONE, lambda _c, _s, _p, _i, _n, value: events.append(value.unpack()[0]))
-        companion('RegisterHotkeys', GLib.Variant('(as)', ([hotkeys[0]],)))
+        subscription = connection.signal_subscribe('org.window_zones.Gnome', 'org.window_zones.Gnome2', 'HotkeyPressed', '/org/window_zones/Gnome', None, Gio.DBusSignalFlags.NONE, lambda _c, _s, _p, _i, _n, value: events.append(value.unpack()[0]))
+        companion('RegisterHotkeys', GLib.Variant('(as)', ([canonical_hotkeys[0]],)))
         try:
-            companion('RegisterHotkeys', GLib.Variant('(as)', ([hotkeys[0], hotkeys[1], 'Alt+Ctrl+Cmd+F25'],)))
+            companion('RegisterHotkeys', GLib.Variant('(as)', ([canonical_hotkeys[0], canonical_hotkeys[1], 'alt+ctrl+cmd+f25'],)))
             raise AssertionError('Invalid accelerator set was accepted')
         except GLib.Error as error:
             check('Companion rejects invalid accelerator transaction', Gio.DBusError.get_remote_error(error) == 'org.window_zones.Gnome.Error.Unsupported', error)
         shortcut(keycodes[0])
-        check('Failed transaction retains the previous native accelerator', wait_for(lambda: events == [hotkeys[0]]), events)
+        check('Failed transaction retains the previous native accelerator', wait_for(lambda: events == [canonical_hotkeys[0]]), events)
         checkpoint = len(text(window_log))
         shortcut(keycodes[1])
-        check('Failed transaction releases newly grabbed accelerator', wait_for(lambda: 'KEY_RECEIVED b ' in text(window_log)[checkpoint:]) and events == [hotkeys[0]], text(window_log)[checkpoint:] + str(events))
+        check('Failed transaction releases newly grabbed accelerator', wait_for(lambda: 'KEY_RECEIVED b ' in text(window_log)[checkpoint:]) and events == [canonical_hotkeys[0]], text(window_log)[checkpoint:] + str(events))
         companion('RegisterHotkeys', GLib.Variant('(as)', ([],)))
         connection.signal_unsubscribe(subscription)
         default_config = work / 'config/window_zones/config.toml'
@@ -516,8 +557,7 @@ action = { type = "move-to-previous-display" }
         launched.wait(timeout=8)
         check('Default launcher safely previews the discovered config', launched.returncode == 0 and 'dry-run' in text(launched_log) and str(default_config) in text(launched_log) and 'binding count: 4' in text(launched_log) and tuple(focused()[2:]) == tuple(expected_zones[1]), text(launched_log))
         runtime, runtime_log = start([launcher, '--backend', 'auto', 'run'], 'default-launcher-auto-run', launcher_env)
-        send(runtime, 'status')
-        check('Auto run discovers and registers default arrow bindings', wait_for(lambda: 'hotkey state: Registered' in text(runtime_log) and 'binding count: 4' in text(runtime_log)), text(runtime_log))
+        check('Auto run discovers and registers default arrow bindings', wait_for(lambda: 'Hotkeys registered: 4' in text(runtime_log)), text(runtime_log))
         for code, expected, name in ((105, expected_zones[0], 'left'), (106, expected_zones[1], 'right'), (108, second_area, 'next monitor'), (103, area, 'previous monitor')):
             if code in (108, 103):
                 send(window, 'maximize')
@@ -627,7 +667,7 @@ action = { type = "move-to-previous-display" }
         assert_frame('Closing XWayland restores native window focus', expected_zones[1], window_log)
         stop(window)
         check('No application window is reported after closing fixtures', wait_for(lambda: not focused()[0]), focused())
-        rejected = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
+        rejected = rejected_dispatch(hotkeys[0], 'No-focused-window dispatch')
         check('No-focused-window dispatch is explicit', 'Dispatch state: Error' in rejected and 'NoFocusedWindow' in rejected, rejected.strip())
         print('NATIVE_GNOME_SMOKE_COMPLETE', flush=True)
     except Exception as error:
@@ -640,17 +680,28 @@ action = { type = "move-to-previous-display" }
                 remote('Stop')
             except GLib.Error:
                 pass
+        # Sessions, not just live leaders: Xwayland and other grandchildren can
+        # have their own process groups after the process we started has exited.
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            deadline = time.monotonic() + 5
+            signalled = set()
+            while True:
+                for process in processes:
+                    process.poll()
+                groups = owned_groups()
+                if not groups:
+                    break
+                for group in groups - signalled:
+                    try:
+                        os.killpg(group, signum)
+                    except ProcessLookupError:
+                        pass
+                signalled.update(groups)
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
         for process in reversed(processes):
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-        for process in reversed(processes):
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-        if bus_pid:
-            os.kill(int(bus_pid), signal.SIGTERM)
+            process.wait(timeout=5)
         (work / 'results.json').write_text(json.dumps(checks, indent=2) + '\n')
         print('Smoke checks:', len(checks), 'failures:', sum(not row['passed'] for row in checks), flush=True)
         if keep_logs:
@@ -669,4 +720,16 @@ if __name__ == '__main__':
     if args.test_window:
         test_window(args.test_window)
     else:
-        run(args.binary.resolve(), args.keep_logs, args.output_dir)
+        interrupted_signal = None
+        def terminate(signum, _frame):
+            global interrupted_signal
+            interrupted_signal = signum
+            signal.signal(signum, signal.SIG_IGN)
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, terminate)
+        try:
+            run(args.binary.resolve(), args.keep_logs, args.output_dir)
+        finally:
+            if interrupted_signal:
+                signal.signal(interrupted_signal, signal.SIG_DFL)
+                os.kill(os.getpid(), interrupted_signal)

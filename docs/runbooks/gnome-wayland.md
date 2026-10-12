@@ -41,7 +41,7 @@ gnome-extensions enable window-zones@mihai-a24
 gnome-extensions info window-zones@mihai-a24   # expects State: ACTIVE
 gdbus call --session --dest org.window_zones.Gnome \
   --object-path /org/window_zones/Gnome \
-  --method org.window_zones.Gnome1.GetCapabilities
+  --method org.window_zones.Gnome2.GetCapabilities
 ```
 
 The service should report `focused-window`, `displays`, `move-resize`,
@@ -84,7 +84,45 @@ The companion owns:
 
 - service `org.window_zones.Gnome`;
 - object `/org/window_zones/Gnome`;
-- interface `org.window_zones.Gnome1`.
+- interface `org.window_zones.Gnome2` (strict major; update the App and companion together).
+
+`GetFocusedWindow() -> (btiiuu)` returns presence, the `Meta.Window.get_id()`
+uint64 identity, and global frame coordinates and dimensions. `GetDisplays()`
+returns usable areas, excluding panels and docks. `MoveWindow(tiiuu)` takes the
+captured window identity and a target frame, so changing focus between discovery
+and movement never moves the new focused window. A closed window returns
+`org.window_zones.Gnome.Error.WindowGone`.
+
+Optional `transition-metrics` enables `GetLastTransitionMetrics() -> (dd)`,
+with request/completion milliseconds from the same D-Bus caller's last
+successful move. Metrics are cleared on caller disconnect; unsupported
+timings are absent, not zero.
+
+Moves restore any maximization direction or edge tiling before applying the
+target frame. On Shell 50, `get_maximize_flags()` reports edge tiling as vertical
+maximization, and `unmaximize()` takes **no flags argument** and clears both
+directions and tiling. Fullscreen and non-resizable windows remain explicit
+`InvalidWindowState` rejections; leave fullscreen first. Overview, lock-screen,
+desktop/dock, and other Shell surfaces are excluded. The extension declares the
+`user` and `unlock-dialog` session modes, so locking the screen keeps the
+companion and its registered hotkeys loaded (they only fire in normal mode)
+instead of disconnecting the App on every lock.
+
+Inspect the wire contract without registering hotkeys:
+
+```bash
+gdbus call --session --dest org.window_zones.Gnome \
+  --object-path /org/window_zones/Gnome \
+  --method org.window_zones.Gnome2.GetCapabilities
+gdbus call --session --dest org.window_zones.Gnome \
+  --object-path /org/window_zones/Gnome \
+  --method org.window_zones.Gnome2.GetFocusedWindow
+```
+
+`RegisterHotkeys(as)` accepts only App-canonical strings such as `ctrl+cmd+left`,
+not config spellings such as `Ctrl+Super+Left`. A rejected replacement leaves
+the previous complete set active. Only its active controller may replace it;
+disconnecting that controller releases all grabs.
 
 ## Start the application
 
@@ -117,9 +155,10 @@ file means zero bindings; starting `run` or `tui` does not create defaults.
 
 Use a config containing at least two bindings. GNOME already owns
 `<Control><Alt>Left` and `<Control><Alt>Right` for `switch-to-workspace-left`
-and `switch-to-workspace-right`, and `<Control><Alt>F1`-`<Control><Alt>F12`
-switch virtual terminals, so the companion's `grab_accelerator` refuses them
-with `org.window_zones.Gnome.Error.Unsupported`. List what the desktop already
+and `switch-to-workspace-right`. `<Super>Left` and `<Super>Right` tile windows,
+and `<Control><Alt>F1`-`<Control><Alt>F12` switch virtual terminals, so the
+companion's `grab_accelerator` refuses them with
+`org.window_zones.Gnome.Error.Unsupported`. List what the desktop already
 reserves before choosing bindings:
 
 ```bash
@@ -129,20 +168,20 @@ for schema in org.gnome.desktop.wm.keybindings org.gnome.shell.keybindings \
 done | grep -oE "'<[^']*>[^']*'" | sort -u
 ```
 
-`Cmd` maps to `<Super>`, and `<Super><Control>` plus an arrow is unreserved on a
-default GNOME session:
+`Super` (also `Cmd`) maps to `<Super>`. Use `Ctrl+Super` plus an arrow rather than
+GNOME's workspace or tiling chords, after checking your session's reserved set:
 
 ```toml
 [[bindings]]
-hotkey = "Cmd+Ctrl+Left"
+hotkey = "Ctrl+Super+Left"
 action = { type = "move-to-zone", zone = "left-half" }
 
 [[bindings]]
-hotkey = "Cmd+Ctrl+Right"
+hotkey = "Ctrl+Super+Right"
 action = { type = "move-to-zone", zone = "right-half" }
 
 [[bindings]]
-hotkey = "Cmd+Ctrl+Down"
+hotkey = "Ctrl+Super+Down"
 action = { type = "move-to-next-display" }
 
 [[bindings]]
@@ -169,16 +208,18 @@ gsettings get org.gnome.shell enabled-extensions
 gsettings get org.gnome.shell disabled-extensions
 ```
 
-The companion must be `ACTIVE` and its service reachable before dependent
-checks can pass. Do not replace the user's entire enabled-extension list to
+The companion must be `ACTIVE`, `disable-user-extensions` must be `false`,
+and the `Gnome2` service must be reachable before dependent checks can pass.
+The master switch suppresses user extensions even when `EnableExtension`
+returns success. Do not replace the user's entire enabled-extension list to
 isolate the test. If another tiling extension interferes, disable only that
 extension with the user's approval and restore it afterwards.
 
-Prefer physical key presses when the harness asks for a hotkey. Xwayland
-XTEST events do not prove compositor-level accelerator capture. The seated
-harness uses its narrow virtual-keyboard injector when `/dev/uinput` is already
-writable, otherwise it asks for physical input. Without either path, record
-hotkey delivery as unverified; a direct dispatch is not equivalent evidence.
+Automated `gnome-live` requires writable `/dev/uinput` and fails its preflight
+without it; it has no XTEST or physical-key fallback. Xwayland XTEST events
+did not reach compositor accelerators in the recorded GNOME 50 configuration.
+Physical key presses can provide separate manual evidence, but a direct
+dispatch is not accelerator-delivery evidence.
 
 If an administrator explicitly approves temporary injector access, grant it
 only to the current user, save the original ACL, and restore it even if the
@@ -187,6 +228,7 @@ run fails. Never make `/dev/uinput` world-writable:
 ```bash
 (
   set -e
+  sudo modprobe uinput
   acl_backup=$(mktemp)
   getfacl -p /dev/uinput > "$acl_backup"
   trap 'sudo setfacl --restore="$acl_backup" && rm -f "$acl_backup"' EXIT
@@ -195,16 +237,16 @@ run fails. Never make `/dev/uinput` world-writable:
 )
 ```
 
-This optional path needs `getfacl`, `setfacl`, and authorized `sudo`; do not
+This authorized path needs `getfacl`, `setfacl`, and authorized `sudo`; do not
 attempt it unattended when those prerequisites are unavailable. If restoration
 fails, keep the backup and restore the ACL before leaving injector access open.
 
 Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the repository root, then record the observed result for each item:
 
-1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, `hotkeys`, and `transition-metrics`.
-2. With a normal focused window, move it to left half, right half, a third, two-thirds, maximize, and the next/previous display. Verify frame coordinates, sizes, and usable-area boundaries on two displays, including a display with negative global coordinates.
+1. `status` selects GNOME Wayland and lists `focused-window`, `displays`, `move-resize`, and `hotkeys`; the combined companion also advertises optional `transition-metrics`.
+2. With a normal focused window, move it to every built-in and a custom zone, the next/previous display, and a display in each available explicit direction. Check center (size retained unless it must shrink) and restore in the same runtime session. Verify frame coordinates, sizes, and usable-area boundaries on two displays, including a display with negative global coordinates.
 3. Focus a desktop/dock surface or remove focus and verify the action fails without moving another window.
-4. Maximize or tile a resizable window, then apply a built-in/custom zone or move to the next/previous display. Verify automatic restoration and the destination geometry. Fullscreen and non-resizable windows must still reject placement without changing their state.
+4. Maximize in either direction or edge-tile a resizable window, then apply a built-in/custom zone or move to the next/previous display. Verify restoration before the exact target frame and preservation of full/half destination layout. Fullscreen and non-resizable windows must reject placement without changing their state. Capture one window's id, change focus, and verify `MoveWindow` moves only the captured window; close it and verify `WindowGone`.
 5. Trigger each registered hotkey and verify the configured action runs. Change the config while the session is running and verify the new complete hotkey set replaces the old set atomically.
 6. Introduce malformed config, reload, and verify the last valid bindings remain active. Restore valid config and verify recovery.
 7. Disable the extension. Verify status, reload, and quit remain usable; verify actions and registration report the unavailable companion and do not use X11.
@@ -213,13 +255,35 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 10. Repeat Ctrl+Super+Left/Right at a matching half. Verify crossing to the neighbouring display's nearest half, different-size destinations, and no directional wrap at the outer edge.
 11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Restore desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
 
-For D-Bus-level contract coverage, run:
+`gnome-live` checks item 4 and a refused replacement mechanically on test windows it starts itself: it captures one Text Editor's id, focuses a second, and moves the captured id over `MoveWindow`; closes the second and expects `WindowGone`; maximizes the first through EWMH, then edge-tiles it with a real Super+Left over `/dev/uinput`, and expects each move to clear the state and apply the frame; sets fullscreen and expects `leave fullscreen first` with state and frame unchanged. It then reloads a config adding the reserved `Alt+Ctrl+Left` and expects `were refused`, the previous four bindings, and the previous accelerator still moving the window. Setting EWMH states uses a helper crate the gate builds against the public `window_zones` API, so `cargo` needs the locked crates. The local GNOME 51 driver and earlier seated GNOME 50 records predate these identified-move assertions; they do not establish a combined pass.
+
+Incoming readiness evidence (2026-10-10) left the expanded seated GNOME 50
+gate pending. Its reachable container had GNOME Shell 48.7: after starting a
+real system bus, `gnome` ended with 6 assertions, 2 passed, 4 failed because
+`org.freedesktop.login1` could not activate. `gnome-live` stopped at its
+unwritable `/dev/uinput` preflight (2 assertions, 1 passed, 1 failed), and its
+configured CachyOS SSH target was not reachable on port 22. These are limits
+of that recorded environment, not a passing GNOME 50 configuration or a
+claim that the local GNOME 51 seat is unreachable.
+
+Local 2026-10-11 GNOME 51 animation/profiling evidence comes from a separate
+pre-merge tree. Neither branch's results verify the combined `Gnome2`
+companion. To close the combined gate, run the expanded Synthetic and seated
+checks on the exact GNOME 50 or 51 configuration being claimed, with the
+upgraded companion loaded after a fresh login, `disable-user-extensions=false`,
+and authorized writable `/dev/uinput` for `gnome-live`. Record GNOME/Mutter
+versions, display layout, assertion summary, and retained logs. Contract
+tests and Synthetic results do not replace seated evidence; see the separate
+branch records in [the testing runbook](testing.md#v1-verification-matrix).
+
+For isolated D-Bus client and real companion-dispatcher contract coverage, run:
 
 ```bash
-cargo test --locked gnome_integration
+cargo test --lib gnome_integration
+gjs -m gnome-extension/tests/run.js
 ```
 
-The private fake-service tests cover the stable names and signatures, capability gating, negative coordinates, focused-window absence, exact move payloads, hotkey signals, atomic registration rejection, Busy, incompatible/denied responses, and disconnect/reconnect.
+The private fake-service tests cover names/signatures, capability gating and caching, connection reuse, negative coordinates, focused-window absence, identified move payloads, `WindowGone`, hotkey transport draining, atomic rejection, Busy, incompatible/denied responses, and disconnect/reconnect. The GJS harness invokes the actual `_methodCall` dispatcher with real GLib variants and isolated Shell stubs; it checks reply signatures, focus-change identity, restore-before-move, rejected states, canonical hotkeys, rollback, and owner-vanish cleanup without touching the live desktop.
 
 For real interactive Wayland and XWayland windows on an isolated GNOME 51
 compositor, run:
@@ -236,7 +300,7 @@ security. See [testing prerequisites](testing.md#v1-verification-matrix).
 
 ## Compatibility and lifecycle sources
 
-The GNOME 51 API review used the installed `Meta-51.gir` and the JavaScript
+The local GNOME 51 API review used the installed `Meta-51.gir` and the JavaScript
 resources embedded in `libshell-51.so` (whose `Config.PACKAGE_VERSION` is
 `51.0`). The companion's existing focus, frame, work-area, move/resize, and
 accelerator calls remain available. For cross-monitor moves, the companion
@@ -245,6 +309,11 @@ before `move_resize_frame`. This avoids a late restore acknowledgement
 overwriting the target and supplies the destination's Wayland size bounds.
 Completion waits for settled geometry and animation, and rechecks the final
 frame; request submission alone is not success.
+
+Shell-owned windows are excluded using the cached process ID from
+`Gio.Credentials.get_unix_pid()`. GNOME 51 has no `global.get_pid()` method;
+the contract harness leaves that nonexistent API unstubbed and uses real GIO
+credentials for the process-exclusion regression.
 
 `Window.unmaximize()` takes no arguments in the reviewed Mutter 50/51 APIs;
 on tested GNOME 51 it clears maximization and native side tiling. Resize eligibility uses the intrinsic `resizeable`

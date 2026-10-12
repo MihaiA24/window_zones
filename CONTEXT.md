@@ -18,14 +18,20 @@
 
 - **Capability**: A specific operation a compositor integration can provide to the App, such as focused-window discovery, display enumeration, move/resize, or hotkey registration.
 - **Degraded integration**: A present compositor integration that lacks one or more capabilities; actions relying on missing capabilities fail explicitly while available operations remain usable. _Avoid_: unavailable integration.
+- **Compositor-bound dispatch**: Running `window_zones dispatch <hotkey>` from the compositor's own keybinding configuration when the App's hotkey capability is unavailable there (Sway, Hyprland); the compositor owns capture and the App owns the action. _Avoid_: hotkey fallback, external hotkey.
 
 - **Registered hotkey set**: The complete set of bindings currently accepted by a companion for event delivery; replacement is atomic, and an empty set means no registered hotkeys. _Avoid_: incremental registration.
 - **Hotkey event**: A notification carrying only the canonical binding string when a registered hotkey is activated; the App resolves its action and focused Window. _Avoid_: raw key event.
 
-- **Display identity**: An opaque identifier used within one compositor session to correlate a Window with a Display; it is not persistent across companion restarts or monitor changes. _Avoid_: connector identity, monitor index.
+- **Display identity**: An opaque per-session label a Display carries in status and diagnostics; it never decides which Display a Window is on and is not persistent across companion restarts or monitor changes. _Avoid_: connector identity, monitor index.
 
 
-- **Window state**: A compositor condition such as maximized, tiled, fullscreen, or non-resizable; placement may restore a maximized or tiled window, while a rejected move preserves its state.
+- **Window state**: A compositor condition that can constrain a move, such as maximized, fullscreen, tiled, or non-resizable. A move restores a maximized or tiled Window first and then places it; fullscreen and non-resizable Windows are rejected and keep their state.
+
+- **Window identity**: An opaque, adapter-scoped id of a Window, captured with the Focused window and carried to the move, so a focus change between discovery and move cannot redirect the move to another Window; a Window that closed in between fails as gone. _Avoid_: focused-window move.
+
+- **Window history**: The App's per-Window memory of its own moves within one run: the geometry before the first App move (the restore point for `restore`) and its last placement. A Window the user moves by hand starts over. Repeated half placement is determined by current geometry, not a width-cycle step. _Avoid_: session restore.
+
 - **Session identity**: The resolved desktop-session protocol and compositor represented by normalized session signals; unknown or conflicting signals mean the identity is unresolved. _Avoid_: environment heuristic.
 
 - **Integration diagnostic**: An action-oriented report of companion state and required user remediation, distinguishing absence, incompatibility, denial, unavailability, and operation failure.
@@ -34,7 +40,7 @@
 
 - **Companion availability**: Whether the current desktop session has a reachable, compatible Companion; it may change independently of the App's configuration and runtime state.
 
-- **Hotkey vocabulary**: The App's canonical binding-string form shared with a Companion; the Companion maps it to local accelerator syntax and may reject unsupported entries.
+- **Hotkey vocabulary**: The App's canonical binding-string form, produced only by the App's config normalizer: modifiers in the order `alt`, `ctrl`, `shift`, `cmd`, then one key name, lowercase and `+`-joined; Companions and native listeners accept canonical strings only and reject anything else. _Avoid_: key alias, accelerator string.
 
 - **Companion-unavailable state**: An App runtime state in which the resolved GNOME or KDE Companion cannot be reached or accepted; configuration remains valid while operations fail explicitly and recovery is retried.
 
@@ -42,7 +48,11 @@
 
 - **Usable area**: The global rectangle available for zones after compositor-reserved panels, docks, and similar regions are excluded; it is not the full monitor bounds.
 
-- **Window/display correlation**: The Focused window's Display is the active display containing its frame center; an unmatched center remains explicit instead of being guessed.
+- **Window/display correlation**: The App's executor resolves the Focused window's Display as the Display whose Usable area contains the Window frame's center, else the Display the frame overlaps most, else the nearest Display; adapters report geometry only. _Avoid_: adapter display id.
+
+- **Runtime event**: A user-facing report of a runtime state transition (config loaded/failed/refused, hotkeys registered/recovered/refused/unavailable); emitted once per transition, never per retry, and shown on the terminal, the TUI, or as a desktop notification when no terminal is attached.
+
+- **Starter config**: The complete, commented config `window_zones init` writes, binding every built-in action under one modifier chord chosen to avoid the desktop's own bindings.
 
 - **Window frame**: The full global rectangle used for placement, including compositor-managed decoration space where available; it is distinct from client content geometry.
 
@@ -59,5 +69,7 @@
 - **Synthetic session**: A desktop session created solely for verification, with virtual displays and no physical seat; it exercises the same compositor as a user session but cannot evidence physical display or input hardware behavior. _Avoid_: simulated desktop, mock compositor.
 
 - **Gate status**: The recorded outcome of a Release gate: _pending_ when no Smoke run is on record, _blocking - pass_, _blocking - fail_, or _deferred - unverified_; an integration that does not build is not deferred, it is unimplemented.
+
+- **Ungated integration**: An integration that builds and ships but has no Release gate (Sway, Hyprland, macOS); Smoke evidence may be recorded, but unlike a deferred gate no trigger closes it. _Avoid_: supported, best-effort.
 
 - **Seated session**: A desktop session attached to a login seat with real input devices and a screen; it can evidence physical display and input hardware behavior, unlike a Synthetic session. _Avoid_: real session, physical session.

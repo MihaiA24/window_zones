@@ -2,8 +2,8 @@
 
 const SERVICE_NAME = 'org.window_zones.KWin';
 const OBJECT_PATH = '/org/window_zones/KWin';
-const INTERFACE_NAME = 'org.window_zones.KWin1';
-const PROTOCOL_MAJOR = 1;
+const INTERFACE_NAME = 'org.window_zones.KWin2';
+const PROTOCOL_MAJOR = 2;
 const REQUEST_MOVE = 'move';
 const REQUEST_REGISTER_HOTKEYS = 'register-hotkeys';
 
@@ -14,77 +14,66 @@ const CAPABILITIES = [
     'hotkeys',
 ];
 
+// Qt::KeyboardModifier and Qt::Key values for KGlobalAccel's integer-key query.
 const MODIFIER_NAMES = new Map([
-    ['alt', 'Alt'],
-    ['ctrl', 'Ctrl'],
-    ['shift', 'Shift'],
-    ['cmd', 'Meta'],
+    ['alt', ['Alt', 0x08000000]],
+    ['ctrl', ['Ctrl', 0x04000000]],
+    ['shift', ['Shift', 0x02000000]],
+    ['cmd', ['Meta', 0x10000000]],
 ]);
 
 const KEY_NAMES = new Map([
-    ['esc', 'Esc'],
-    ['escape', 'Esc'],
-    ['pageup', 'PgUp'],
-    ['page_up', 'PgUp'],
-    ['pgup', 'PgUp'],
-    ['pagedown', 'PgDown'],
-    ['page_down', 'PgDown'],
-    ['page_dn', 'PgDown'],
-    ['pgdn', 'PgDown'],
-    ['return', 'Return'],
-    ['enter', 'Enter'],
-    ['space', 'Space'],
-    ['spacebar', 'Space'],
-    ['tab', 'Tab'],
-    ['backspace', 'Backspace'],
-    ['delete', 'Del'],
-    ['insert', 'Ins'],
-    ['home', 'Home'],
-    ['end', 'End'],
-    ['left', 'Left'],
-    ['leftarrow', 'Left'],
-    ['left_arrow', 'Left'],
-    ['right', 'Right'],
-    ['rightarrow', 'Right'],
-    ['right_arrow', 'Right'],
-    ['up', 'Up'],
-    ['uparrow', 'Up'],
-    ['up_arrow', 'Up'],
-    ['down', 'Down'],
-    ['downarrow', 'Down'],
-    ['down_arrow', 'Down'],
-    ['minus', '-'],
-    ['equal', '='],
-    ['comma', ','],
-    ['dot', '.'],
-    ['slash', '/'],
-    ['quote', "'"],
-    ['semicolon', ';'],
-    ['leftbracket', '['],
-    ['left_bracket', '['],
-    ['rightbracket', ']'],
-    ['right_bracket', ']'],
-    ['backslash', '\\'],
-    ['backquote', '`'],
-    ['print', 'Print'],
-    ['printscreen', 'Print'],
-    ['scrolllock', 'ScrollLock'],
-    ['capslock', 'CapsLock'],
-    ['numlock', 'NumLock'],
-    ['pause', 'Pause'],
+    ['escape', ['Esc', 0x01000000]],
+    ['pageup', ['PgUp', 0x01000016]],
+    ['pagedown', ['PgDown', 0x01000017]],
+    ['return', ['Return', 0x01000004]],
+    ['space', ['Space', 0x20]],
+    ['tab', ['Tab', 0x01000001]],
+    ['backspace', ['Backspace', 0x01000003]],
+    ['delete', ['Del', 0x01000007]],
+    ['insert', ['Ins', 0x01000006]],
+    ['home', ['Home', 0x01000010]],
+    ['end', ['End', 0x01000011]],
+    ['left', ['Left', 0x01000012]],
+    ['right', ['Right', 0x01000014]],
+    ['up', ['Up', 0x01000013]],
+    ['down', ['Down', 0x01000015]],
+    ['minus', ['-', 0x2d]],
+    ['equal', ['=', 0x3d]],
+    ['comma', [',', 0x2c]],
+    ['dot', ['.', 0x2e]],
+    ['slash', ['/', 0x2f]],
+    ['quote', ["'", 0x27]],
+    ['semicolon', [';', 0x3b]],
+    ['leftbracket', ['[', 0x5b]],
+    ['rightbracket', [']', 0x5d]],
+    ['backslash', ['\\', 0x5c]],
+    ['backquote', ['`', 0x60]],
+    ['printscreen', ['Print', 0x01000009]],
+    ['scrolllock', ['ScrollLock', 0x01000026]],
+    ['capslock', ['CapsLock', 0x01000024]],
+    ['numlock', ['NumLock', 0x01000025]],
+    ['pause', ['Pause', 0x01000008]],
 ]);
 
 let activeHotkeys = new Set();
-let slotHotkeys = [];
 let registeredShortcuts = new Set();
 let polling = false;
+let pollStartedAt = 0;
+let processingRequest = false;
 let companionRetryTimer = null;
-let trackedWindow = null;
+const trackedWindows = new Map();
 
 function errorMessage(error) {
     if (error && typeof error.message === 'string')
         return error.message;
     return String(error);
+}
+
+function protocolError(kind, message) {
+    const error = new Error(message);
+    error.dbusError = `org.window_zones.KWin.Error.${kind}`;
+    return error;
 }
 
 function invoke(method, args, callback) {
@@ -98,7 +87,7 @@ function invoke(method, args, callback) {
             callback);
         return true;
     } catch (error) {
-        print(`Window Zones KWin D-Bus ${method} failed: ${errorMessage(error)}`);
+        console.warn(`Window Zones KWin D-Bus ${method} failed: ${errorMessage(error)}`);
         return false;
     }
 }
@@ -145,7 +134,6 @@ function displayData() {
             y,
             width,
             height,
-            output,
         });
     });
     if (displays.length === 0)
@@ -174,18 +162,19 @@ function focusedWindow() {
 }
 function trackFocusedWindow(window) {
     if (!window
-        || window === trackedWindow
+        || trackedWindows.has(String(window.internalId))
         || !window.frameGeometryChanged
         || typeof window.frameGeometryChanged.connect !== 'function')
         return;
 
-    trackedWindow = window;
-    window.frameGeometryChanged.connect(() => {
+    const handler = () => {
         if (typeof workspace !== 'undefined'
             && workspace
             && workspace.activeWindow === window)
             publishFocusedWindow();
-    });
+    };
+    trackedWindows.set(String(window.internalId), {window, handler});
+    window.frameGeometryChanged.connect(handler);
 }
 
 function focusedPayload() {
@@ -193,23 +182,9 @@ function focusedPayload() {
     if (!focused)
         return [false, '', 0, 0, 0, 0];
 
-    const displays = displayData();
-    const centerX = focused.x + Math.floor(focused.width / 2);
-    const centerY = focused.y + Math.floor(focused.height / 2);
-    const display = displays.find(item =>
-        focused.window.output
-        && item.output === focused.window.output)
-        || displays.find(item =>
-            centerX >= item.x
-            && centerX < item.x + item.width
-            && centerY >= item.y
-            && centerY < item.y + item.height);
-    const displayIdValue = display
-        ? display.id
-        : `unmatched:${centerX}:${centerY}`;
     return [
         true,
-        displayIdValue,
+        String(focused.window.internalId),
         focused.x,
         focused.y,
         focused.width,
@@ -236,60 +211,70 @@ function publishState() {
         publishDisplays();
         publishFocusedWindow();
     } catch (error) {
-        print(`Window Zones KWin state update failed: ${errorMessage(error)}`);
+        console.warn(`Window Zones KWin state update failed: ${errorMessage(error)}`);
     }
 }
 
-function moveFocusedWindow(x, y, width, height) {
+function moveWindow(windowId, x, y, width, height) {
     if (width <= 0 || height <= 0)
         throw new Error('window target must have positive dimensions');
 
-    const focused = focusedWindow();
-    if (!focused)
-        throw new Error('no focused normal application window');
+    const windows = typeof workspace.windowList === 'function'
+        ? workspace.windowList() : workspace.stackingOrder;
+    const window = Array.prototype.find.call(windows,
+        candidate => !candidate.deleted && String(candidate.internalId) === windowId);
+    if (!window)
+        throw protocolError('WindowGone', windowId);
+    if (window.fullScreen)
+        throw new Error('window is fullscreen; leave fullscreen first');
+    if (window.managed === false || window.normalWindow !== true
+        || window.moveable !== true || window.resizeable !== true)
+        throw new Error('window does not allow moving and resizing');
 
-    const window = focused.window;
-    if (window.fullScreen || window.tile)
-        throw new Error('focused window is fullscreen or tiled; restore it before moving');
-    if (window.moveable !== true || window.resizeable !== true)
-        throw new Error('focused window does not allow moving and resizing');
+    const tile = window.tile;
+    if (tile) {
+        if (typeof tile.unmanage === 'function') {
+            // KWin 6.5: unmanage clears the requested quick/custom tile, including restore geometry.
+            tile.unmanage(window);
+        } else {
+            // Earlier KWin 6: tile=null only detaches the tile. A maximize transition also clears
+            // the non-scriptable quickTileMode; finish in the restored state before placement.
+            window.tile = null;
+            window.setMaximize(true, true);
+        }
+    }
+    window.setMaximize(false, false);
 
     window.frameGeometry = {x, y, width, height};
     publishFocusedWindow();
 }
 
-function canonicalKeySequence(hotkey) {
-    const tokens = hotkey
-        .split('+')
-        .map(token => token.trim().toLowerCase())
-        .filter(Boolean);
+function shortcutForHotkey(hotkey) {
+    const tokens = hotkey.split('+');
+    const key = tokens.pop();
     const modifiers = [];
-    let key = null;
-
-    for (const token of tokens) {
-        const modifier = MODIFIER_NAMES.get(token);
-        if (modifier) {
-            if (!modifiers.includes(modifier))
-                modifiers.push(modifier);
-            continue;
+    let modifierMask = 0;
+    for (const [token, [name, mask]] of MODIFIER_NAMES) {
+        if (tokens[modifiers.length] === token) {
+            modifiers.push(name);
+            modifierMask |= mask;
         }
-        if (key !== null)
-            throw new Error(`hotkey '${hotkey}' contains multiple non-modifier keys`);
-        key = token;
     }
+    if (modifiers.length !== tokens.length)
+        throw protocolError('Unsupported', `unsupported KWin shortcut modifiers in '${hotkey}'`);
 
-    if (key === null)
-        throw new Error(`hotkey '${hotkey}' is missing its key`);
+    let keyData = KEY_NAMES.get(key);
+    if (!keyData && /^f([1-9]|1[0-9]|2[0-4])$/.test(key))
+        keyData = [key.toUpperCase(), 0x0100002f + Number(key.slice(1))];
+    if (!keyData && /^[a-z0-9]$/.test(key))
+        keyData = [key.toUpperCase(), key.toUpperCase().charCodeAt(0)];
+    if (!keyData)
+        throw protocolError('Unsupported', `unsupported KWin shortcut key '${key}' in '${hotkey}'`);
 
-    let keyName = KEY_NAMES.get(key);
-    if (!keyName && /^f([1-9]|1[0-9]|2[0-4])$/.test(key))
-        keyName = key.toUpperCase();
-    if (!keyName && /^[a-z0-9]$/.test(key))
-        keyName = key.toUpperCase();
-    if (!keyName)
-        throw new Error(`unsupported KWin shortcut key '${key}' in '${hotkey}'`);
-
-    return [...modifiers, keyName].join('+');
+    return {
+        sequence: [...modifiers, keyData[0]].join('+'),
+        key: modifierMask | keyData[1],
+    };
 }
 
 function emitHotkey(hotkey) {
@@ -297,39 +282,86 @@ function emitHotkey(hotkey) {
         return;
     invoke('HotkeyPressed', [hotkey], () => {});
 }
-function registerHotkeys(hotkeys) {
-    if (hotkeys.length === slotHotkeys.length
-        && hotkeys.every((hotkey, index) => hotkey === slotHotkeys[index]))
-        return;
-
-    const next = hotkeys.map(hotkey => ({
-        hotkey,
-        sequence: canonicalKeySequence(hotkey),
-    }));
-
-    next.forEach(entry => {
-        if (registeredShortcuts.has(entry.hotkey))
+function registerHotkeys(hotkeys, callback) {
+    // QJSEngine has no object spread.
+    const next = hotkeys.map(hotkey => Object.assign({hotkey}, shortcutForHotkey(hotkey)));
+    // JS-owned QTimer: no deleteLater (not exposed to scripts; the TypeError killed the callback).
+    const timer = new QTimer();
+    let finished = false;
+    const finish = error => {
+        if (finished)
             return;
-        const title = `Window Zones Hotkey ${entry.hotkey}`;
-        const registered = registerShortcut(
-            title,
-            `Window Zones binding ${entry.hotkey}`,
-            entry.sequence,
-            () => emitHotkey(entry.hotkey));
-        if (!registered)
-            throw new Error(`KWin rejected shortcut '${entry.hotkey}'`);
-        registeredShortcuts.add(entry.hotkey);
-    });
+        finished = true;
+        timer.stop();
+        callback(error);
+    };
+    // KWin does not invoke callDBus callbacks on errors. Fail before the App's one-second
+    // request deadline and ignore late replies so a timed-out replacement cannot commit.
+    timer.interval = 750;
+    timer.singleShot = true;
+    timer.timeout.connect(() => finish(protocolError('Unavailable', 'KGlobalAccel shortcut preflight timed out')));
+    timer.start();
 
-    slotHotkeys = next.map(entry => entry.hotkey);
-    activeHotkeys = new Set(slotHotkeys);
+    function preflight(index) {
+        if (finished)
+            return;
+        try {
+            if (index < next.length) {
+                const entry = next[index];
+                // action(int) returns [component, action, ...] for the first registrant,
+                // the actual dispatch winner; getGlobalShortcutsByKey is not ordered.
+                callDBus('org.kde.kglobalaccel', '/kglobalaccel', 'org.kde.KGlobalAccel',
+                    'action', entry.key, winner => {
+                        if (finished)
+                            return;
+                        // QJSEngine hands D-Bus string lists over as sequences, not Arrays.
+                        if (!winner || typeof winner.length !== 'number'
+                            || (winner.length !== 0 && winner.length !== 4)) {
+                            finish(protocolError('Unavailable', 'KGlobalAccel returned an invalid shortcut owner'));
+                        } else if (winner.length !== 0
+                            && (winner[0] !== 'kwin'
+                                || winner[1] !== `Window Zones Hotkey ${entry.hotkey}`)) {
+                            finish(protocolError('Unsupported', `KWin rejected shortcut '${entry.hotkey}': accelerator is already held by '${winner[1]}'; choose a different binding`));
+                        } else {
+                            preflight(index + 1);
+                        }
+                    });
+                return;
+            }
+
+            // No QAction or active-set mutation occurs until every accelerator passes.
+            next.forEach(entry => {
+                if (registeredShortcuts.has(entry.hotkey))
+                    return;
+                const title = `Window Zones Hotkey ${entry.hotkey}`;
+                const registered = registerShortcut(
+                    title,
+                    `Window Zones binding ${entry.hotkey}`,
+                    entry.sequence,
+                    () => emitHotkey(entry.hotkey));
+                if (!registered)
+                    throw protocolError('Unavailable', `KWin rejected shortcut '${entry.hotkey}'`);
+                registeredShortcuts.add(entry.hotkey);
+            });
+            activeHotkeys = new Set(hotkeys);
+            finish();
+        } catch (error) {
+            finish(error);
+        }
+    }
+    preflight(0);
 }
 
-function complete(requestId, ok, message) {
-    invoke('CompleteRequest', [String(requestId), ok, message], () => {});
+function complete(requestId, ok, errorName, message) {
+    invoke('CompleteRequest', [String(requestId), ok, errorName, message], () => {});
 }
 
-function processRequest(requestId, kind, x, y, width, height, hotkeysJson) {
+function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, callback) {
+    const finish = error => {
+        complete(requestId, !error, error ? (error.dbusError || 'org.window_zones.KWin.Error.Operation') : '',
+            error ? errorMessage(error) : '');
+        callback();
+    };
     try {
         const hotkeys = JSON.parse(hotkeysJson);
         if (!Array.isArray(hotkeys)
@@ -337,15 +369,16 @@ function processRequest(requestId, kind, x, y, width, height, hotkeysJson) {
             throw new Error('KWin returned an invalid hotkey request payload');
 
         if (kind === REQUEST_MOVE) {
-            moveFocusedWindow(x, y, width, height);
+            moveWindow(windowId, x, y, width, height);
         } else if (kind === REQUEST_REGISTER_HOTKEYS) {
-            registerHotkeys(hotkeys);
+            registerHotkeys(hotkeys, finish);
+            return;
         } else {
             throw new Error(`unknown KWin request kind '${kind}'`);
         }
-        complete(requestId, true, '');
+        finish();
     } catch (error) {
-        complete(requestId, false, errorMessage(error));
+        finish(error);
     }
 }
 
@@ -353,13 +386,23 @@ function pollRequests() {
     if (polling)
         return;
     polling = true;
+    pollStartedAt = Date.now();
 
     const accepted = invoke('NextRequest', [],
-        (requestId, kind, x, y, width, height, hotkeysJson) => {
-            polling = false;
-            if (requestId !== 0)
-                processRequest(requestId, kind, x, y, width, height, hotkeysJson);
-            pollRequests();
+        (requestId, kind, windowId, x, y, width, height, hotkeysJson) => {
+            if (requestId !== 0) {
+                processingRequest = true;
+                processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, () => {
+                    processingRequest = false;
+                    polling = false;
+                    pollRequests();
+                });
+            } else {
+                // The companion defers an empty reply for up to one second; this is not a
+                // synchronous empty-poll loop and queued moves wake it within one service tick.
+                polling = false;
+                pollRequests();
+            }
         });
     if (!accepted)
         polling = false;
@@ -389,6 +432,9 @@ function connectCompanion(resetState) {
 }
 
 function retryCompanion() {
+    // KWin omits callDBus error callbacks. Recover a lost poll, never duplicate a healthy one.
+    if (processingRequest || (polling && Date.now() - pollStartedAt < 3000))
+        return;
     polling = false;
     connectCompanion(false);
 }
@@ -409,8 +455,11 @@ if (typeof workspace !== 'undefined' && workspace) {
         });
     if (workspace.windowRemoved)
         workspace.windowRemoved.connect(window => {
-            if (trackedWindow === window)
-                trackedWindow = null;
+            const tracked = trackedWindows.get(String(window.internalId));
+            if (tracked) {
+                tracked.window.frameGeometryChanged.disconnect(tracked.handler);
+                trackedWindows.delete(String(window.internalId));
+            }
             publishFocusedWindow();
         });
     trackFocusedWindow(workspace.activeWindow);

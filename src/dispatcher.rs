@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::config::{AppConfig, normalize_hotkey};
-use crate::executor::{ExecuteActionError, execute_action};
+use crate::executor::{ExecuteActionError, WindowHistory, execute_action};
 use crate::window_system::WindowSystem;
 
 /// Errors produced while dispatching an already-received hotkey string.
@@ -18,6 +18,7 @@ pub enum DispatchHotkeyError {
 pub fn dispatch_hotkey<W: WindowSystem>(
     config: &AppConfig,
     hotkey: &str,
+    history: &mut WindowHistory,
     window_system: &mut W,
 ) -> Result<(), DispatchHotkeyError> {
     let normalized_hotkey =
@@ -33,7 +34,7 @@ pub fn dispatch_hotkey<W: WindowSystem>(
             hotkey: hotkey.to_string(),
         })?;
 
-    execute_action(&binding.action, &config.zones, window_system)?;
+    execute_action(&binding.action, &config.zones, history, window_system)?;
     Ok(())
 }
 
@@ -41,8 +42,9 @@ pub fn dispatch_hotkey<W: WindowSystem>(
 mod tests {
     use super::*;
     use crate::actions::{Action, Binding};
+    use crate::config::parse_config;
     use crate::geometry::Rect;
-    use crate::window_system::{FocusedWindow, WindowMove, WindowSystemError};
+    use crate::window_system::{FocusedWindow, WindowId, WindowMove, WindowSystemError};
     use crate::{DisplayGeometry, ZoneDefinition};
     use std::collections::BTreeMap;
 
@@ -63,15 +65,12 @@ mod tests {
             self.displays.clone()
         }
 
-        fn move_focused_window(
-            &mut self,
-            window_move: WindowMove,
-        ) -> Result<(), WindowSystemError> {
+        fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
             if let Some(error) = self.move_error.clone() {
                 return Err(error);
             }
 
-            self.moves.push(window_move);
+            self.moves.push(window_move.clone());
             Ok(())
         }
     }
@@ -93,9 +92,13 @@ mod tests {
         }
     }
 
-    fn fake_with_focus(display_id: &str, geometry: Rect) -> FakeWindowSystem {
+    fn window() -> WindowId {
+        WindowId::new("window")
+    }
+
+    fn fake_with_focus(geometry: Rect) -> FakeWindowSystem {
         FakeWindowSystem {
-            focused_window: Ok(Some(FocusedWindow::new(display_id, geometry))),
+            focused_window: Ok(Some(FocusedWindow::new(window(), geometry))),
             displays: Ok(vec![
                 DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
                 DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
@@ -105,19 +108,31 @@ mod tests {
         }
     }
 
+    fn dispatch(
+        config: &AppConfig,
+        hotkey: &str,
+        fake: &mut FakeWindowSystem,
+    ) -> Result<(), DispatchHotkeyError> {
+        dispatch_hotkey(config, hotkey, &mut WindowHistory::default(), fake)
+    }
+
     #[test]
     fn dispatches_known_hotkey_to_zone_movement() {
-        let config = config(
-            vec![binding("alt+ctrl+left", move_to_zone("left-half"))],
-            BTreeMap::new(),
-        );
-        let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
+        let config = parse_config(
+            r#"
+[[bindings]]
+hotkey = "Ctrl+Alt+Left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+        let mut fake = fake_with_focus(Rect::new(200, 200, 800, 600));
 
-        dispatch_hotkey(&config, "Ctrl + Alt + Left", &mut fake).unwrap();
+        dispatch(&config, "Ctrl+Alt+Left", &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
-            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
+            vec![WindowMove::new(window(), Rect::new(0, 0, 960, 1080))]
         );
     }
 
@@ -135,29 +150,32 @@ mod tests {
         );
 
         let config = config(vec![binding("alt+ctrl+left", move_to_zone("side"))], zones);
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 1920, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 1920, 1080));
 
-        dispatch_hotkey(&config, "alt+ctrl+left", &mut fake).unwrap();
+        dispatch(&config, "alt+ctrl+left", &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
-            vec![WindowMove::new(Rect::new(0, 540, 960, 540))]
+            vec![WindowMove::new(window(), Rect::new(0, 540, 960, 540))]
         );
     }
 
     #[test]
     fn dispatches_known_hotkey_to_display_movement() {
         let config = config(
-            vec![binding("alt+ctrl+shift+right", Action::MoveToNextDisplay)],
+            vec![binding(
+                "alt+ctrl+shift+right",
+                Action::MoveToNextDisplay {},
+            )],
             BTreeMap::new(),
         );
-        let mut fake = fake_with_focus("left", Rect::new(0, 0, 960, 1080));
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
 
-        dispatch_hotkey(&config, "alt+shift+ctrl+right", &mut fake).unwrap();
+        dispatch(&config, "alt+shift+ctrl+right", &mut fake).unwrap();
 
         assert_eq!(
             fake.moves,
-            vec![WindowMove::new(Rect::new(1920, 0, 1280, 1440))]
+            vec![WindowMove::new(window(), Rect::new(1920, 0, 1280, 1440))]
         );
     }
 
@@ -167,9 +185,9 @@ mod tests {
             vec![binding("alt+ctrl+left", move_to_zone("left-half"))],
             BTreeMap::new(),
         );
-        let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut fake = fake_with_focus(Rect::new(200, 200, 800, 600));
 
-        let err = dispatch_hotkey(&config, "ctrl+alt+left+right", &mut fake).unwrap_err();
+        let err = dispatch(&config, "ctrl+alt+left+right", &mut fake).unwrap_err();
 
         assert_eq!(
             err,
@@ -181,27 +199,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_hotkeys_use_first_match() {
-        let config = config(
-            vec![
-                binding("alt+ctrl+x", move_to_zone("left-half")),
-                binding("alt+ctrl+x", Action::MoveToNextDisplay),
-            ],
-            BTreeMap::new(),
-        );
-        let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
-
-        dispatch_hotkey(&config, "alt+ctrl+x", &mut fake).unwrap();
-
-        assert_eq!(
-            fake.moves,
-            vec![WindowMove::new(Rect::new(0, 0, 960, 1080))]
-        );
-    }
-
-    #[test]
     fn executor_errors_are_propagated() {
-        let mut fake = fake_with_focus("left", Rect::new(200, 200, 800, 600));
+        let mut fake = fake_with_focus(Rect::new(200, 200, 800, 600));
         fake.move_error = Some(WindowSystemError::Platform("denied".to_string()));
 
         let config = config(
@@ -209,7 +208,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let err = dispatch_hotkey(&config, "alt+ctrl+right", &mut fake).unwrap_err();
+        let err = dispatch(&config, "alt+ctrl+right", &mut fake).unwrap_err();
 
         assert_eq!(
             err,

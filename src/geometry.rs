@@ -27,12 +27,11 @@ impl Rect {
         self.y.saturating_add_unsigned(self.height)
     }
 
-    pub fn nearly_equals(self, other: Self, tolerance_px: i32) -> bool {
-        let tolerance = i64::from(tolerance_px);
-        (i64::from(self.x) - i64::from(other.x)).abs() <= tolerance
-            && (i64::from(self.y) - i64::from(other.y)).abs() <= tolerance
-            && (i64::from(self.right()) - i64::from(other.right())).abs() <= tolerance
-            && (i64::from(self.bottom()) - i64::from(other.bottom())).abs() <= tolerance
+    pub fn nearly_equals(self, other: Self, tolerance_px: u32) -> bool {
+        self.x.abs_diff(other.x) <= tolerance_px
+            && self.y.abs_diff(other.y) <= tolerance_px
+            && self.right().abs_diff(other.right()) <= tolerance_px
+            && self.bottom().abs_diff(other.bottom()) <= tolerance_px
     }
 }
 
