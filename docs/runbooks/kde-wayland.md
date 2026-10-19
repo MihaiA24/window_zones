@@ -6,7 +6,7 @@ has two parts:
 - `kwin-script/` — a KWin JavaScript script that reads KWin window/output state,
   moves an identified window, and owns global shortcut registration;
 - `window_zones_kwin` — a Rust companion process that exposes the narrow
-  `org.window_zones.KWin2` D-Bus contract on the user session bus.
+  `org.window_zones.KWin3` D-Bus contract on the user session bus.
 
 The KDE path never routes native Wayland windows through X11.
 
@@ -45,12 +45,13 @@ kpackagetool6 --type=KWin/Script --install ./kwin-script
 
 Enable **Window Zones** in **System Settings -> Window Management -> KWin
 Scripts**. If the script was already installed, disable and re-enable it after
-an update so KWin reloads `main.js` and removes old shortcut registrations.
+an update so KWin reloads `main.js`. Binding removal during normal operation
+releases its native accelerator without reloading the script.
 
-Protocol 2 is a clean cutover: upgrade the script package with
+Protocol 3 is a clean cutover: upgrade the script package with
 `kpackagetool6 --type=KWin/Script --upgrade ./kwin-script`, reload the script,
-and restart `window_zones_kwin` after installing the matching binary. An older
-script or companion is incompatible; there is no protocol-1 fallback.
+and restart `window_zones_kwin` after installing the matching binary. Older
+scripts and companions are incompatible; there is no protocol-2 fallback.
 
 Start the companion before launching Window Zones:
 
@@ -85,7 +86,7 @@ Inspect the service and its advertised capabilities from the same user session:
 
 ```bash
 qdbus6 org.window_zones.KWin /org/window_zones/KWin \
-  org.window_zones.KWin2.GetCapabilities
+  org.window_zones.KWin3.GetCapabilities
 busctl --user introspect org.window_zones.KWin /org/window_zones/KWin
 ```
 
@@ -93,7 +94,7 @@ Expected service identity:
 
 - name: `org.window_zones.KWin`;
 - object: `/org/window_zones/KWin`;
-- interface: `org.window_zones.KWin2` (protocol major 2).
+- interface: `org.window_zones.KWin3` (protocol major 3).
 
 If the service is absent, start `window_zones_kwin` and retry. If the script is
 absent or disabled, reload the KWin script and check the KWin journal/log for
@@ -105,7 +106,7 @@ A KDE signal with `DISPLAY` set still selects the native KDE Wayland backend.
 It does not permit an implicit X11 fallback. Missing, incompatible, or denied
 KWin integration is reported as an explicit runtime error with remediation.
 
-### Protocol 2 window requests
+### Protocol 3 window requests
 
 `GetFocusedWindow` returns `(present, window_id, x, y, width, height)`. The
 identity is KWin's `String(window.internalId)`, stable for that Window's lifetime,
@@ -113,6 +114,14 @@ not a Display identity. Coordinates and dimensions describe the global Window
 frame; `GetDisplays` continues to report each output's usable `MaximizeArea`.
 `MoveWindow(window_id, x, y, width, height)` queues a move to that identity even
 if focus changes before the script receives it.
+
+Before reading `GetDisplays`, the App queues `RefreshDisplays` and waits for the
+script to publish fresh `MaximizeArea` rectangles. Panel/reservation changes are
+therefore reflected on the next action, even without a screen-list change.
+`currentDesktopChanged` also publishes the new desktop's usable areas.
+KWin's [WorkspaceWrapper signals](https://github.com/KDE/kwin/blob/Plasma/6.5/src/scripting/workspace_wrapper.h)
+expose desktop and screen changes but no work-area/strut notification; the
+request-time refresh avoids guessing a nonexistent signal.
 
 The script resolves the Window from `workspace.windowList()` or `stackingOrder`.
 It rejects fullscreen with `leave fullscreen first`, restores maximized and
@@ -153,25 +162,34 @@ Unavailable preflight or transport failures are retryable.
    changes only the captured Window; close it and verify `WindowGone`.
 4. With two outputs, including an output with negative global coordinates,
    verify next/previous-display movement uses the correct output work areas.
+   Resize/move a Plasma panel, change its reservation/auto-hide setting, and
+   switch virtual desktop; the next action must use the current usable area.
 5. Verify each configured supported hotkey registers and dispatches its action.
 6. Edit the config, run `reload`, and verify the new binding set is active.
+   Remove a binding and verify another shortcut can acquire its old key, then
+   release that shortcut and re-add the binding without reloading the script.
 7. Run `restart`, then verify hotkeys register again and dispatch still works.
 8. Stop or disable the companion and confirm status/TUI show an in-band
    unavailable diagnostic rather than using X11.
 9. Re-enable/reload the KWin script and restart the companion; verify recovery.
 
-KWin's documented JavaScript API exposes shortcut registration but no reliable
-runtime unregister operation. Window Zones replaces the configured active set
-and sends an empty set when no bindings remain; removed shortcut callbacks
-become inactive and an empty set releases the App's Active controller claim.
-Dropping the App's hotkey connection sends an empty set; an unexpected controller
-disconnect also queues an empty set so its callbacks become inactive.
+After every accelerator passes preflight, the script creates any missing
+QActions and uses the companion's script-only `SetShortcut(hotkey, qt_key)`
+method to assign the desired keys and clear removed ones (`qt_key = 0`).
+The companion calls KGlobalAccel's typed
+[`setForeignShortcutKeys`](https://github.com/KDE/kglobalacceld/blob/master/src/kglobalacceld.cpp)
+with an empty key list for removal: `GlobalShortcut::setKeys` ungrabs the old keys,
+and `yourShortcutsChanged` updates KWin's QAction cache. Re-adding assigns keys
+to the existing QAction; empty sets and controller disconnects use the same
+native release path. The JS callbacks/QActions remain script-owned until script
+unload, but cleared actions hold no native accelerators.
+
 Before touching any QAction the script asks KGlobalAccel `action(int)` who
-would win each requested accelerator; if any is held by another action the
-whole set is rejected with `KWin rejected shortcut '<hotkey>': accelerator is
-already held by '<action>'` and the previous set stays active. Disable/re-enable
-the script after binding removal or upgrades to let KWin clean up stale
-global-accelerator entries.
+would win each requested accelerator; if another action owns any key, the
+whole set is rejected and the previous set stays active. The companion checks
+the whole accepted set in each of six settlement rounds, with five 120 ms gaps
+(600 ms total explicit sleep regardless of binding count). Accelerator state
+is queried, not changed, during this verification.
 
 ## Nested KWin gate
 

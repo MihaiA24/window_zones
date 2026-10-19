@@ -1914,7 +1914,7 @@ kde_live_companion_call() {
     local method=$1
     shift
     busctl --address="$KDE_BUS" call \
-        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin2 "$method" "$@"
+        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin3 "$method" "$@"
 }
 
 kde_live_kwin_call() {
@@ -2725,8 +2725,17 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.KWin',
     '/org/window_zones/KWin',
-    'org.window_zones.KWin2',
+    'org.window_zones.KWin3',
     null);
+const accel = Gio.DBusProxy.new_sync(
+    connection, Gio.DBusProxyFlags.NONE, null,
+    'org.kde.kglobalaccel', '/kglobalaccel', 'org.kde.KGlobalAccel', null);
+function available() {
+    return accel.call_sync(
+        'isGlobalShortcutAvailable',
+        new GLib.Variant('(is)', [0x0d000012, '']),
+        Gio.DBusCallFlags.NONE, 5000, null).deep_unpack()[0];
+}
 
 function request(keys) {
     const reply = proxy.call_sync(
@@ -2794,6 +2803,16 @@ try {
 }
 print('INVALID_READY');
 poll(6);
+waitResult(request([]), 'EMPTY');
+print(`EMPTY_AVAILABLE ${available()}`);
+waitResult(request([valid]), 'READDED');
+print(`READDED_AVAILABLE ${available()}`);
+waitResult(request(['alt+ctrl+f23']), 'REPLACED');
+print(`REPLACED_AVAILABLE ${available()}`);
+waitResult(request([valid]), 'RESTORED');
+print(`RESTORED_AVAILABLE ${available()}`);
+print('LIFECYCLE_READY');
+poll(30);
 EOF
     : >"$helper_log"
     start_group helper_pid "$helper_log" env \
@@ -2845,9 +2864,24 @@ EOF
     wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 8 \
         && previous_active=1
     assert_eq 'KDE atomic registration preserves previous set' 1 "$previous_active"
+    wait_for_text "$helper_log" 'LIFECYCLE_READY' 16 || true
+    local lifecycle_log=''
+    lifecycle_log=$(cat "$helper_log" 2>/dev/null || true)
+    assert_text 'KDE empty set releases native accelerator' 'EMPTY_AVAILABLE true' "$lifecycle_log"
+    assert_text 'KDE removed accelerator can be re-added' 'READDED_AVAILABLE false' "$lifecycle_log"
+    assert_text 'KDE replacement releases removed native accelerator' 'REPLACED_AVAILABLE true' "$lifecycle_log"
+    assert_text 'KDE replacement restores old accelerator without script reload' 'RESTORED_AVAILABLE false' "$lifecycle_log"
     stop_pid "$helper_pid"
     wait_pid "$helper_pid" 5 || true
-    sleep 0.3
+    local available_after_disconnect='' disconnect_deadline=$((SECONDS + 5))
+    while (( SECONDS < disconnect_deadline )); do
+        available_after_disconnect=$(busctl --address="$KDE_BUS" call \
+            org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel \
+            isGlobalShortcutAvailable is 218103826 '' 2>&1 || true)
+        [[ "$available_after_disconnect" == 'b true' ]] && break
+        sleep 0.1
+    done
+    assert_eq 'KDE controller disconnect releases native accelerator' 'b true' "$available_after_disconnect"
     set +e
 }
 
@@ -2891,7 +2925,7 @@ const connection = Gio.DBusConnection.new_for_address_sync(
     null);
 const proxy = Gio.DBusProxy.new_sync(
     connection, Gio.DBusProxyFlags.NONE, null,
-    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin2', null);
+    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin3', null);
 function register(keys, label) {
     const request = proxy.call_sync(
         'RegisterHotkeys',

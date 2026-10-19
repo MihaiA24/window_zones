@@ -38,7 +38,7 @@ This runbook defines V1 Release gates and how to reproduce them. Record results,
 |---|---|---|
 | GNOME Wayland and TUI lifecycle | blocking | Synthetic session and expanded seated run with the upgraded `Gnome2` companion |
 | Linux X11 and TUI lifecycle | blocking | Xvfb/Openbox run, including identified moves, exclusive hotkey rollback and TUI lifecycle |
-| KDE Plasma Wayland | deferred, non-blocking | Seated KWin 6.x run with the protocol-2 script and companion; a nested pass cannot close this gate |
+| KDE Plasma Wayland | deferred, non-blocking | Seated KWin 6.x run with the protocol-3 script and companion; a nested pass cannot close this gate |
 | Windows | deferred, non-blocking | Manual Windows run |
 
 Release gate status is exactly one of `pending`, `blocking - pass`, `blocking - fail`, or `deferred - unverified`. macOS, Sway, and Hyprland are ungated integrations. Linux Smoke runs report `Smoke assertions (<gate>): N; passed: P; failed: F; skipped: S`.
@@ -122,6 +122,33 @@ WZ_MACOS_TEST_PID="$FIXTURE_PID" cargo test --locked --lib \
 This regression deliberately terminates the fixture. Never supply a user's
 application PID. It requires a real macOS GUI and Accessibility permission;
 cross-compilation cannot verify this lifecycle.
+
+The macOS hotkey adapter owns one keyboard event tap per process and reuses it
+across `restart`; both Control keys activate `ctrl` bindings. Configured key
+presses, their repeats, and their matching releases are consumed. Unconfigured
+and unknown keys pass through. When macOS disables an unresponsive tap, the
+adapter reconciles held keys against the session key state and re-enables the
+same tap rather than leaving a disabled listener or starting a duplicate.
+See Apple's [event-tap recovery API](https://developer.apple.com/documentation/coregraphics/cgevent/tapenable(tap:enable:)).
+
+Grant the launching terminal or App Accessibility permission in System
+Settings before running native hotkey checks. If creation or re-enabling fails,
+the App reports hotkeys unavailable; restore permission and use `restart`.
+With all keys released, the native recovery regression can be run with:
+
+```bash
+cargo test --locked --lib \
+  native_disabled_tap_reenables_same_port_and_survives_registration_restart \
+  -- --ignored --test-threads=1
+```
+
+This check creates and disables a real owned tap, delivers both native
+tap-disabled notification types through its callback, checks that the same port
+is enabled again, and exercises native key translation after registration
+restart. It does not cause a real OS timeout or post keys to an application.
+Also check actual left/right Control capture, repeat/release suppression in a
+disposable focused application, and OS-induced timeout recovery before and
+after a runtime `restart`; unit event delivery alone cannot verify those paths.
 
 ### Minimum verification
 

@@ -28,6 +28,9 @@ use window_zones::{
     WaylandBackend, WaylandWindowSystem, X11HotkeySystem, X11WindowSystem,
 };
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod local_session_dispatch;
+
 /// How often queued hotkey presses are read; bounds keypress-to-move latency.
 const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often the config file and hotkey registration are reconciled.
@@ -559,14 +562,9 @@ struct CompositorBoundHotkeySystem;
 
 #[cfg(target_os = "linux")]
 impl HotkeySystem for CompositorBoundHotkeySystem {
-    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        if hotkeys.is_empty() {
-            Ok(())
-        } else {
-            Err(HotkeySystemError::Rejected(
-                "global hotkeys are unavailable on sway/hyprland; bind `window_zones dispatch <hotkey>` in the compositor config".to_string(),
-            ))
-        }
+    fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
+        // The compositor owns key capture; the persistent runtime owns bindings and history.
+        Ok(())
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
@@ -757,6 +755,7 @@ enum RuntimeInstruction {
     Reload,
     Restart,
     Quit,
+    InputClosed,
     Help,
     Dispatch(String),
     Unknown(String),
@@ -794,18 +793,35 @@ fn parse_tui_input(line: &str) -> RuntimeInstruction {
     }
 }
 
-/// Reads stdin lines on a thread; the channel disconnects at end of input.
-fn spawn_stdin_reader(parse: fn(&str) -> RuntimeInstruction) -> mpsc::Receiver<RuntimeInstruction> {
-    let (tx, rx) = mpsc::channel();
+/// One instruction queue serves stdin, tray callbacks, and local compositor dispatch.
+#[derive(Debug)]
+struct RuntimeRequest {
+    instruction: RuntimeInstruction,
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    reply: Option<local_session_dispatch::Reply>,
+}
+
+impl From<RuntimeInstruction> for RuntimeRequest {
+    fn from(instruction: RuntimeInstruction) -> Self {
+        Self {
+            instruction,
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            reply: None,
+        }
+    }
+}
+
+/// EOF is an instruction, since local dispatch may keep the queue connected.
+fn spawn_stdin_reader(parse: fn(&str) -> RuntimeInstruction, tx: mpsc::Sender<RuntimeRequest>) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             let Ok(line) = line else { break };
-            if tx.send(parse(&line)).is_err() {
-                break;
+            if tx.send(parse(&line).into()).is_err() {
+                return;
             }
         }
+        let _ = tx.send(RuntimeInstruction::InputClosed.into());
     });
-    rx
 }
 
 /// What a runtime surface is told to show.
@@ -836,7 +852,7 @@ trait Surface {
 fn run_runtime(
     runtime: &mut Runtime,
     surface: &mut impl Surface,
-    instructions: mpsc::Receiver<RuntimeInstruction>,
+    instructions: mpsc::Receiver<RuntimeRequest>,
     quit_on_input_end: bool,
 ) {
     surface.start(runtime);
@@ -864,10 +880,25 @@ fn run_runtime(
 
         let now = Instant::now();
         let handled_input = instruction.is_some();
-        if let Some(instruction) = instruction {
-            match instruction {
+        if let Some(request) = instruction {
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            if let Some(reply) = &request.reply
+                && now >= reply.deadline
+            {
+                let _ = reply.sender.try_send(local_session_dispatch::Response {
+                    success: false,
+                    output: "Error: dispatch expired before execution; no action was run\n"
+                        .to_string(),
+                });
+                continue;
+            }
+            match request.instruction {
                 RuntimeInstruction::Quit => break,
-                RuntimeInstruction::Empty => {}
+                RuntimeInstruction::InputClosed if quit_on_input_end => {
+                    surface.report(runtime, Report::InputClosed);
+                    break;
+                }
+                RuntimeInstruction::InputClosed | RuntimeInstruction::Empty => {}
                 RuntimeInstruction::Status => surface.report(runtime, Report::Status),
                 RuntimeInstruction::Help => surface.report(runtime, Report::Help),
                 RuntimeInstruction::Unknown(message) => {
@@ -887,7 +918,30 @@ fn run_runtime(
                     }
                 }
                 RuntimeInstruction::Dispatch(hotkey) => {
+                    #[cfg(any(target_os = "linux", all(test, unix)))]
+                    let mut output = request.reply.as_ref().map(|_| {
+                        let mut output = Vec::new();
+                        let _ = writeln!(
+                            output,
+                            "Using runtime window backend: {}",
+                            runtime.window_system.name()
+                        );
+                        for line in runtime_status_lines(&runtime.app) {
+                            let _ = writeln!(output, "{line}");
+                        }
+                        output
+                    });
                     let state = runtime.dispatch(&hotkey);
+                    #[cfg(any(target_os = "linux", all(test, unix)))]
+                    if let Some(reply) = request.reply {
+                        let output = output.as_mut().expect("remote report initialized");
+                        let _ = write_dispatch_state(output, &state, &runtime.window_system);
+                        let _ = reply.sender.try_send(local_session_dispatch::Response {
+                            success: !matches!(state, DispatchState::Error(_)),
+                            output: String::from_utf8(std::mem::take(output))
+                                .expect("formatted report is UTF-8"),
+                        });
+                    }
                     surface.report(runtime, Report::ManualDispatch(state));
                 }
             }
@@ -1220,7 +1274,7 @@ struct TraySurface {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl TraySurface {
-    fn new(runtime: &Runtime, tx: &mpsc::Sender<RuntimeInstruction>) -> Result<Self, String> {
+    fn new(runtime: &Runtime, tx: &mpsc::Sender<RuntimeRequest>) -> Result<Self, String> {
         #[cfg(target_os = "linux")]
         let icon = IconSource::Resource("view-grid-symbolic");
         #[cfg(target_os = "windows")]
@@ -1234,7 +1288,7 @@ impl TraySurface {
             let id = {
                 let tx = tx.clone();
                 tray.inner_mut().add_menu_item_with_id(line, move || {
-                    let _ = tx.send(RuntimeInstruction::Status);
+                    let _ = tx.send(RuntimeInstruction::Status.into());
                 })
             };
             #[cfg(target_os = "windows")]
@@ -1250,7 +1304,7 @@ impl TraySurface {
         ] {
             let tx = tx.clone();
             tray.add_menu_item(label, move || {
-                let _ = tx.send(instruction.clone());
+                let _ = tx.send(instruction.clone().into());
             })
             .map_err(|error| error.to_string())?;
         }
@@ -1621,22 +1675,32 @@ fn print_status(app: &App) {
 }
 
 fn print_dispatch_state(state: &DispatchState, window_system: &RuntimeWindowSystem) {
-    println!("Dispatch state: {state:?}");
+    let _ = write_dispatch_state(&mut io::stdout().lock(), state, window_system);
+}
+
+fn write_dispatch_state(
+    output: &mut impl io::Write,
+    state: &DispatchState,
+    window_system: &RuntimeWindowSystem,
+) -> io::Result<()> {
+    writeln!(output, "Dispatch state: {state:?}")?;
     match state {
-        DispatchState::Error(error) => println!("  error: {error}"),
+        DispatchState::Error(error) => writeln!(output, "  error: {error}")?,
         DispatchState::Succeeded => {
             if let Some(window_move) = window_system.last_move() {
-                println!(
+                writeln!(
+                    output,
                     "  last move: x={} y={} w={} h={}",
                     window_move.target.x,
                     window_move.target.y,
                     window_move.target.width,
                     window_move.target.height
-                );
+                )?;
             }
         }
         DispatchState::Idle => {}
     }
+    Ok(())
 }
 
 fn execute_dispatch(
@@ -1700,10 +1764,38 @@ fn execute_session(
             return ExitCode::FAILURE;
         }
     };
+    let (tx, instructions) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let _dispatch_server = if matches!(backend, RuntimeBackend::Wayland(_)) {
+        let server = (|| {
+            let path = runtime.app.config_path().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot resolve session config path",
+                )
+            })?;
+            let identity =
+                local_session_dispatch::Identity::new(compositor_dispatch_backend(backend), path)?;
+            local_session_dispatch::Server::start(
+                _lock.as_ref().expect("live session holds instance lock"),
+                identity,
+                tx.clone(),
+            )
+        })();
+        match server {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("Cannot start compositor-bound dispatch: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let interactive = io::stdin().is_terminal();
 
     if matches!(command, Command::Tui) {
-        let instructions = spawn_stdin_reader(parse_tui_input);
+        spawn_stdin_reader(parse_tui_input, tx);
         run_runtime(&mut runtime, &mut TuiSurface::new(), instructions, true);
         return ExitCode::SUCCESS;
     }
@@ -1711,7 +1803,6 @@ fn execute_session(
     if show_tray {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            let (tx, instructions) = mpsc::channel();
             let mut surface = match TraySurface::new(&runtime, &tx) {
                 Ok(surface) => surface,
                 Err(error) => {
@@ -1737,7 +1828,7 @@ fn execute_session(
             Notifier::new()
         },
     };
-    let instructions = spawn_stdin_reader(parse_runtime_input);
+    spawn_stdin_reader(parse_runtime_input, tx);
     run_runtime(&mut runtime, &mut surface, instructions, interactive);
     ExitCode::SUCCESS
 }
@@ -1849,6 +1940,7 @@ fn print_help() {
     println!(
         "  dispatch         run the action bound to HOTKEY once and exit (non-zero on failure)"
     );
+    println!("                   Sway/Hyprland dispatch requires an existing run/tui session");
     println!("  run              serve hotkeys until quit; keeps running without a terminal");
     println!("  run --tray       serve hotkeys with a tray status menu");
     println!("  tui              serve hotkeys with the ANSI dashboard");
@@ -1858,6 +1950,7 @@ fn print_help() {
     println!(
         "                   Linux RSS/peak RSS exclude GNOME Shell; unavailable values are null"
     );
+    println!("                   Sway/Hyprland logging belongs to run/tui, not dispatch clients");
 }
 
 fn main() -> ExitCode {
@@ -1901,6 +1994,17 @@ fn main() -> ExitCode {
             args.perf_log_path.as_ref(),
         );
     }
+    #[cfg(target_os = "linux")]
+    if let Command::Dispatch { hotkey } = &args.command
+        && matches!(backend, RuntimeBackend::Wayland(_))
+    {
+        return execute_compositor_dispatch(
+            args.config_path,
+            backend,
+            args.perf_log_path.as_ref(),
+            hotkey,
+        );
+    }
     let app = match build_app(args.config_path.as_ref(), args.perf_log_path.as_ref()) {
         Ok(app) => app,
         Err(error) => {
@@ -1919,6 +2023,53 @@ fn main() -> ExitCode {
         }
         Command::Run | Command::Tui | Command::Init => {
             unreachable!("handled before one-shot App construction")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compositor_dispatch_backend(backend: RuntimeBackend) -> &'static str {
+    match backend {
+        RuntimeBackend::Wayland(ScriptedCompositor::Sway) => "sway",
+        RuntimeBackend::Wayland(ScriptedCompositor::Hyprland) => "hyprland",
+        _ => unreachable!("only compositor-bound backends use local dispatch"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_compositor_dispatch(
+    config_path: Option<PathBuf>,
+    backend: RuntimeBackend,
+    perf_log_path: Option<&PathBuf>,
+    hotkey: &str,
+) -> ExitCode {
+    if perf_log_path.is_some() {
+        eprintln!(
+            "Error: compositor-bound dispatch uses session-owned performance logging; set --perf-log on `window_zones run` or `tui`, not on dispatch clients"
+        );
+        return ExitCode::FAILURE;
+    }
+    let response = (|| {
+        let path = config_path
+            .map_or_else(default_config_path, Ok)
+            .map_err(|error| error.to_string())?;
+        let identity =
+            local_session_dispatch::Identity::new(compositor_dispatch_backend(backend), &path)
+                .map_err(|error| format!("cannot resolve dispatch config path: {error}"))?;
+        local_session_dispatch::dispatch(&instance_lock_path(), identity, hotkey)
+    })();
+    match response {
+        Ok(response) => {
+            print!("{}", response.output);
+            if response.success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -1986,7 +2137,7 @@ mod tests {
             RuntimeInstruction::Dispatch("Ctrl+Alt+Left".to_string()),
             RuntimeInstruction::Quit,
         ] {
-            tx.send(instruction).unwrap();
+            tx.send(instruction.into()).unwrap();
         }
         drop(tx);
         run_runtime(
@@ -2506,13 +2657,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn sway_hyprland_refuse_global_hotkeys_once() {
+    fn sway_hyprland_accept_compositor_owned_hotkeys() {
         let mut hotkeys =
             RuntimeHotkeySystem::new(RuntimeBackend::Wayland(ScriptedCompositor::Hyprland));
         assert_eq!(hotkeys.register_hotkeys(&[]), Ok(()));
-        assert!(matches!(
-            hotkeys.register_hotkeys(&["ctrl+a".to_string()]),
-            Err(HotkeySystemError::Rejected(message)) if message.contains("window_zones dispatch")
-        ));
+        assert_eq!(hotkeys.register_hotkeys(&["ctrl+a".to_string()]), Ok(()));
+        assert_eq!(hotkeys.next_hotkey(), Ok(None));
     }
 }

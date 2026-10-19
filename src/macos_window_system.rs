@@ -455,7 +455,7 @@ mod native {
             let id = &movement.window;
             // Read geometry first to distinguish a closed native object from an
             // app that merely omits optional state attributes.
-            self.frame(window, Some(id))?;
+            let before = self.frame(window, Some(id))?;
             if self.boolean(window, Attribute::Fullscreen, Some(id))? {
                 return Err(WindowSystemError::Platform(
                     "fullscreen window cannot be moved; leave fullscreen first".into(),
@@ -473,49 +473,65 @@ mod native {
                     "window dimensions must be positive".into(),
                 ));
             }
-            for name in [Attribute::Zoomed, Attribute::Minimized] {
-                if self.boolean(window, name, Some(id))? {
-                    if !self.settable(window, name, id)? {
-                        return Err(WindowSystemError::Platform(
-                            "window state cannot be restored".into(),
-                        ));
+            let result = (|| {
+                for name in [Attribute::Zoomed, Attribute::Minimized] {
+                    if self.boolean(window, name, Some(id))? {
+                        if !self.settable(window, name, id)? {
+                            return Err(WindowSystemError::Platform(
+                                "window state cannot be restored".into(),
+                            ));
+                        }
+                        self.set(window, name, unsafe { kCFBooleanFalse }, id)?;
                     }
-                    self.set(window, name, unsafe { kCFBooleanFalse }, id)?;
                 }
-            }
-            let position = Pair {
-                first: f64::from(movement.target.x),
-                second: f64::from(movement.target.y),
-            };
-            let size = Pair {
-                first: f64::from(movement.target.width),
-                second: f64::from(movement.target.height),
-            };
-            // SAFETY: AXValueCreate copies the matching CGPoint/CGSize layouts.
-            let position =
-                Value::owned(unsafe { AXValueCreate(1, (&position as *const Pair).cast()) });
-            let size = Value::owned(unsafe { AXValueCreate(2, (&size as *const Pair).cast()) });
-            // Resize first to release native zoom/tiling. Growth can clamp at
-            // the old origin, so complete that resize only after moving.
-            self.set(window, Attribute::Size, size.raw(), id)?;
-            self.set(window, Attribute::Position, position.raw(), id)?;
-            let mut observed = self.frame(window, Some(id))?;
-            if observed.width != movement.target.width || observed.height != movement.target.height
-            {
+                let position = Pair {
+                    first: f64::from(movement.target.x),
+                    second: f64::from(movement.target.y),
+                };
+                let size = Pair {
+                    first: f64::from(movement.target.width),
+                    second: f64::from(movement.target.height),
+                };
+                // SAFETY: AXValueCreate copies the matching CGPoint/CGSize layouts.
+                let position =
+                    Value::owned(unsafe { AXValueCreate(1, (&position as *const Pair).cast()) });
+                let size = Value::owned(unsafe { AXValueCreate(2, (&size as *const Pair).cast()) });
+                // Resize first to release native zoom/tiling. Growth can clamp at
+                // the old origin, so complete that resize only after moving.
                 self.set(window, Attribute::Size, size.raw(), id)?;
-                observed = self.frame(window, Some(id))?;
-                if observed.x != movement.target.x || observed.y != movement.target.y {
-                    self.set(window, Attribute::Position, position.raw(), id)?;
+                self.set(window, Attribute::Position, position.raw(), id)?;
+                let mut observed = self.frame(window, Some(id))?;
+                if observed.width != movement.target.width
+                    || observed.height != movement.target.height
+                {
+                    self.set(window, Attribute::Size, size.raw(), id)?;
                     observed = self.frame(window, Some(id))?;
+                    if observed.x != movement.target.x || observed.y != movement.target.y {
+                        self.set(window, Attribute::Position, position.raw(), id)?;
+                        observed = self.frame(window, Some(id))?;
+                    }
                 }
-            }
-            if observed != movement.target {
-                return Err(WindowSystemError::Platform(format!(
-                    "window constrained placement: requested {:?}, observed {observed:?}",
-                    movement.target
-                )));
-            }
-            Ok(())
+                if observed != movement.target {
+                    return Err(WindowSystemError::Platform(format!(
+                        "window constrained placement: requested {:?}, observed {observed:?}",
+                        movement.target
+                    )));
+                }
+                Ok(())
+            })();
+            result.map_err(|error| {
+                if matches!(error, WindowSystemError::WindowGone(_)) {
+                    return error;
+                }
+                match self.frame(window, Some(id)) {
+                    Ok(observed) if observed != before => WindowSystemError::PartialMove {
+                        observed,
+                        message: error.to_string(),
+                    },
+                    Err(gone @ WindowSystemError::WindowGone(_)) => gone,
+                    _ => error,
+                }
+            })
         }
     }
 

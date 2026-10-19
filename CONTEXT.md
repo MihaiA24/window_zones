@@ -18,7 +18,7 @@
 
 - **Capability**: A specific operation a compositor integration can provide to the App, such as focused-window discovery, display enumeration, move/resize, or hotkey registration.
 - **Degraded integration**: A present compositor integration that lacks one or more capabilities; actions relying on missing capabilities fail explicitly while available operations remain usable. _Avoid_: unavailable integration.
-- **Compositor-bound dispatch**: Running `window_zones dispatch <hotkey>` from the compositor's own keybinding configuration when the App's hotkey capability is unavailable there (Sway, Hyprland); the compositor owns capture and the App owns the action. _Avoid_: hotkey fallback, external hotkey.
+- **Compositor-bound dispatch**: Running `window_zones dispatch <hotkey>` from the compositor's own keybinding configuration when the App's hotkey capability is unavailable there (Sway, Hyprland); the compositor owns capture and a running App owns the action and Window history. _Avoid_: hotkey fallback, external hotkey.
 
 - **Registered hotkey set**: The complete set of bindings currently accepted by a companion for event delivery; replacement is atomic, and an empty set means no registered hotkeys. _Avoid_: incremental registration.
 - **Hotkey event**: A notification carrying only the canonical binding string when a registered hotkey is activated; the App resolves its action and focused Window. _Avoid_: raw key event.

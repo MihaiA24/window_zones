@@ -19,8 +19,8 @@ use crate::{
 
 pub const KWIN_SERVICE_NAME: &str = "org.window_zones.KWin";
 pub const KWIN_OBJECT_PATH: &str = "/org/window_zones/KWin";
-pub const KWIN_INTERFACE: &str = "org.window_zones.KWin2";
-pub const KWIN_PROTOCOL_MAJOR: u32 = 2;
+pub const KWIN_INTERFACE: &str = "org.window_zones.KWin3";
+pub const KWIN_PROTOCOL_MAJOR: u32 = 3;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 const COMPANION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,6 +31,7 @@ const DISPLAYS_CAPABILITY: &str = "displays";
 const MOVE_RESIZE_CAPABILITY: &str = "move-resize";
 const HOTKEYS_CAPABILITY: &str = "hotkeys";
 const REQUEST_MOVE: &str = "move";
+const REQUEST_REFRESH_DISPLAYS: &str = "refresh-displays";
 const REQUEST_REGISTER_HOTKEYS: &str = "register-hotkeys";
 // KWin hosts KGlobalAccel in-process and registers script actions under the "kwin" component.
 const KGLOBALACCEL_SERVICE: &str = "org.kde.kglobalaccel";
@@ -207,6 +208,8 @@ impl WindowSystem for KwinWindowSystem {
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        self.request_and_wait(DISPLAYS_CAPABILITY, "RefreshDisplays", ())
+            .map_err(KwinIntegrationError::into_window_error)?;
         let result: Result<(Vec<DisplayPayload>,), KwinIntegrationError> =
             self.call_with_capability(DISPLAYS_CAPABILITY, "GetDisplays", ());
 
@@ -484,66 +487,96 @@ fn verify_accelerators_assigned(
         return Ok(());
     }
 
-    for hotkey in hotkeys {
-        let action = format!("Window Zones Hotkey {hotkey}");
-        let action_id = vec![
-            KGLOBALACCEL_COMPONENT.to_string(),
-            action.clone(),
-            String::new(),
-            String::new(),
-        ];
-        // KGlobalAccel answers with requested keys while registration is still in flight.
-        // Its action query selects the dispatch winner by registration serial, unlike the
-        // unordered getGlobalShortcutsByKey list. A later competitor does not steal our binding.
-        let mut competitor = None;
-        for attempt in 0..ACCELERATOR_SETTLE_SAMPLES {
-            if attempt > 0 {
-                thread::sleep(ACCELERATOR_SETTLE_INTERVAL);
-            }
-            let keys = accel
-                .method_call::<(Vec<(Vec<i32>,)>,), _, _, _>(
-                    KGLOBALACCEL_INTERFACE,
-                    "shortcutKeys",
-                    (action_id.clone(),),
-                )
-                .map(|(keys,)| keys)
-                .unwrap_or_default();
-            let key = keys
-                .iter()
-                .flat_map(|(sequence,)| sequence.iter())
-                .copied()
-                .find(|key| *key != 0);
-            let Some(key) = key else {
-                competitor = Some(String::new());
-                break;
-            };
-            let winner = accel
-                .method_call::<(Vec<String>,), _, _, _>(KGLOBALACCEL_INTERFACE, "action", (key,))
-                .map(|(winner,)| winner)
-                .unwrap_or_default();
-            if winner.first().map(String::as_str) != Some(KGLOBALACCEL_COMPONENT)
-                || winner.get(1) != Some(&action)
-            {
-                competitor = Some(winner.get(1).cloned().unwrap_or_default());
-                break;
-            }
-        }
-        if let Some(competitor) = competitor {
-            return Err(KwinIntegrationError::Operation {
-                message: if competitor.is_empty() {
-                    format!(
-                        "KWin accepted '{hotkey}' but KGlobalAccel assigned it no keys; another shortcut already owns that accelerator"
+    let actions: Vec<_> = hotkeys
+        .iter()
+        .map(|hotkey| {
+            (
+                hotkey,
+                vec![
+                    KGLOBALACCEL_COMPONENT.to_string(),
+                    format!("Window Zones Hotkey {hotkey}"),
+                    String::new(),
+                    String::new(),
+                ],
+            )
+        })
+        .collect();
+    verify_accelerator_samples(
+        &actions,
+        |(hotkey, action_id)| {
+            // shortcutKeys can report requested keys before dispatch has settled. action returns
+            // the actual dispatch winner; getGlobalShortcutsByKey has no useful ordering.
+            let competitor = {
+                let keys = accel
+                    .method_call::<(Vec<(Vec<i32>,)>,), _, _, _>(
+                        KGLOBALACCEL_INTERFACE,
+                        "shortcutKeys",
+                        (action_id,),
                     )
+                    .map(|(keys,)| keys)
+                    .unwrap_or_default();
+                let key = keys
+                    .iter()
+                    .flat_map(|(sequence,)| sequence.iter())
+                    .copied()
+                    .find(|key| *key != 0);
+                let Some(key) = key else {
+                    return Err(accelerator_conflict(hotkey, ""));
+                };
+                let winner = accel
+                    .method_call::<(Vec<String>,), _, _, _>(
+                        KGLOBALACCEL_INTERFACE,
+                        "action",
+                        (key,),
+                    )
+                    .map(|(winner,)| winner)
+                    .unwrap_or_default();
+                if winner.first().map(String::as_str) != Some(KGLOBALACCEL_COMPONENT)
+                    || winner.get(1) != action_id.get(1)
+                {
+                    Some(winner.get(1).cloned().unwrap_or_default())
                 } else {
-                    format!(
-                        "KWin accepted '{hotkey}' but the accelerator is also held by '{competitor}', which receives it instead; choose a different binding"
-                    )
-                },
-            });
+                    None
+                }
+            };
+            if let Some(competitor) = competitor {
+                return Err(accelerator_conflict(hotkey, &competitor));
+            }
+            Ok(())
+        },
+        || thread::sleep(ACCELERATOR_SETTLE_INTERVAL),
+    )
+}
+
+fn verify_accelerator_samples<T>(
+    hotkeys: &[T],
+    mut verify: impl FnMut(&T) -> Result<(), KwinIntegrationError>,
+    mut settle: impl FnMut(),
+) -> Result<(), KwinIntegrationError> {
+    for attempt in 0..ACCELERATOR_SETTLE_SAMPLES {
+        if attempt > 0 {
+            settle();
+        }
+        for hotkey in hotkeys {
+            verify(hotkey)?;
         }
     }
 
     Ok(())
+}
+
+fn accelerator_conflict(hotkey: &str, competitor: &str) -> KwinIntegrationError {
+    KwinIntegrationError::Operation {
+        message: if competitor.is_empty() {
+            format!(
+                "KWin accepted '{hotkey}' but KGlobalAccel assigned it no keys; another shortcut already owns that accelerator"
+            )
+        } else {
+            format!(
+                "KWin accepted '{hotkey}' but the accelerator is also held by '{competitor}', which receives it instead; choose a different binding"
+            )
+        },
+    }
 }
 
 fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {
@@ -594,16 +627,22 @@ enum CompanionRequest {
         width: u32,
         height: u32,
     },
+    RefreshDisplays {
+        id: u32,
+    },
     RegisterHotkeys {
         id: u32,
         hotkeys: Vec<String>,
+        controller: Option<String>,
     },
 }
 
 impl CompanionRequest {
     fn id(&self) -> u32 {
         match self {
-            Self::Move { id, .. } | Self::RegisterHotkeys { id, .. } => *id,
+            Self::Move { id, .. }
+            | Self::RefreshDisplays { id }
+            | Self::RegisterHotkeys { id, .. } => *id,
         }
     }
 }
@@ -692,7 +731,8 @@ impl CompanionState {
         self.results.clear();
         self.registered_hotkeys.clear();
         self.events.clear();
-        if !previous_hotkeys.is_empty() {
+        // A reconnecting script may still own keys after the companion lost its state.
+        if !previous_hotkeys.is_empty() || !reset_state {
             self.enqueue_hotkeys(previous_hotkeys);
         }
         Ok(())
@@ -716,7 +756,7 @@ impl CompanionState {
         self.events.clear();
         Err(method_error(
             "org.window_zones.KWin.Error.Unavailable",
-            "KWin script is not connected; enable the Window Zones KWin script",
+            "KWin script is not connected; enable or upgrade the Window Zones KWin script to protocol 3",
         ))
     }
 
@@ -793,8 +833,18 @@ impl CompanionState {
 
     fn enqueue_hotkeys(&mut self, hotkeys: Vec<String>) -> u32 {
         let id = self.next_request_id();
+        self.requests.push_back(CompanionRequest::RegisterHotkeys {
+            id,
+            hotkeys,
+            controller: self.controller_sender.clone(),
+        });
+        id
+    }
+
+    fn enqueue_refresh_displays(&mut self) -> u32 {
+        let id = self.next_request_id();
         self.requests
-            .push_back(CompanionRequest::RegisterHotkeys { id, hotkeys });
+            .push_back(CompanionRequest::RefreshDisplays { id });
         id
     }
 
@@ -839,7 +889,17 @@ impl CompanionState {
                 height,
                 "[]".to_string(),
             ),
-            CompanionRequest::RegisterHotkeys { id, hotkeys } => (
+            CompanionRequest::RefreshDisplays { id } => (
+                id,
+                REQUEST_REFRESH_DISPLAYS.to_string(),
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+                "[]".to_string(),
+            ),
+            CompanionRequest::RegisterHotkeys { id, hotkeys, .. } => (
                 id,
                 REQUEST_REGISTER_HOTKEYS.to_string(),
                 String::new(),
@@ -927,9 +987,15 @@ impl CompanionState {
         }
 
         let request = self.requests.remove(index).expect("request index exists");
-        if ok && let CompanionRequest::RegisterHotkeys { hotkeys, .. } = request {
+        if ok
+            && let CompanionRequest::RegisterHotkeys {
+                hotkeys,
+                controller,
+                ..
+            } = request
+        {
             self.registered_hotkeys = hotkeys;
-            if self.registered_hotkeys.is_empty() {
+            if self.registered_hotkeys.is_empty() && self.controller_sender == controller {
                 self.controller_sender = None;
             }
         }
@@ -1011,6 +1077,10 @@ fn sender_name(message: &dbus::Message) -> Result<String, MethodErr> {
 pub fn run_kwin_companion_service() -> Result<(), String> {
     let connection = LocalConnection::new_session()
         .map_err(|error| format!("connect to the user session bus: {error}"))?;
+    // Keep outbound accelerator calls off the D-Bus server connection, and never hold
+    // CompanionState while KWin processes them.
+    let accelerator_connection = LocalConnection::new_session()
+        .map_err(|error| format!("connect to KGlobalAccel on the user session bus: {error}"))?;
     connection
         .request_name(KWIN_SERVICE_NAME, false, true, false)
         .map_err(|error| format!("own {KWIN_SERVICE_NAME}: {error}"))?;
@@ -1035,6 +1105,8 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
     let capabilities_state = Arc::clone(&state);
     let focused_state = Arc::clone(&state);
     let displays_state = Arc::clone(&state);
+    let refresh_displays_state = Arc::clone(&state);
+    let shortcut_state = Arc::clone(&state);
     let move_state = Arc::clone(&state);
     let register_hotkeys_state = Arc::clone(&state);
     let next_request_state = Arc::clone(&state);
@@ -1103,6 +1175,74 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             state.ensure_ready()?;
                             let reply = method.msg.method_return().append1(state.displays.clone());
                             Ok(vec![reply])
+                        }))
+                        .add_m(factory.method("RefreshDisplays", (), move |method| {
+                            let mut state = refresh_displays_state.lock();
+                            state.ensure_ready()?;
+                            let request_id = state.enqueue_refresh_displays();
+                            Ok(vec![method.msg.method_return().append1(request_id)])
+                        }))
+                        .add_m(factory.method("SetShortcut", (), move |method| {
+                            let (hotkey, key): (String, i32) = method.msg.read2()?;
+                            let sender = sender_name(method.msg)?;
+                            shortcut_state.lock().ensure_script(&sender)?;
+                            if crate::config::normalize_hotkey(&hotkey).as_ref() != Ok(&hotkey) {
+                                return Err(method_error(
+                                    "org.window_zones.KWin.Error.Invalid",
+                                    "SetShortcut requires a canonical hotkey",
+                                ));
+                            }
+                            let action_id = vec![
+                                KGLOBALACCEL_COMPONENT.to_string(),
+                                format!("Window Zones Hotkey {hotkey}"),
+                                String::new(),
+                                String::new(),
+                            ];
+                            // QJSEngine callDBus cannot marshal JS arrays as a(ai).
+                            // setForeignShortcutKeys also updates KWin's QAction cache, so an
+                            // accelerator restart cannot resurrect a removed grab.
+                            let keys: Vec<(Vec<i32>,)> = if key == 0 {
+                                Vec::new()
+                            } else {
+                                // QKeySequence's D-Bus form always contains four key slots.
+                                vec![(vec![key, 0, 0, 0],)]
+                            };
+                            let accel = accelerator_connection.with_proxy(
+                                KGLOBALACCEL_SERVICE,
+                                KGLOBALACCEL_PATH,
+                                CALL_TIMEOUT,
+                            );
+                            accel
+                                .method_call::<(), _, _, _>(
+                                    KGLOBALACCEL_INTERFACE,
+                                    "setForeignShortcutKeys",
+                                    (&action_id, &keys),
+                                )
+                                .map_err(|error| {
+                                    MethodErr::from((
+                                        "org.window_zones.KWin.Error.Unavailable",
+                                        format!(
+                                            "KGlobalAccel could not update '{hotkey}': {error}"
+                                        ),
+                                    ))
+                                })?;
+                            let (assigned,): (Vec<(Vec<i32>,)>,) = accel
+                                .method_call(KGLOBALACCEL_INTERFACE, "shortcutKeys", (action_id,))
+                                .map_err(|error| {
+                                    MethodErr::from((
+                                        "org.window_zones.KWin.Error.Unavailable",
+                                        format!(
+                                            "KGlobalAccel could not verify '{hotkey}': {error}"
+                                        ),
+                                    ))
+                                })?;
+                            if assigned != keys {
+                                return Err(method_error(
+                                    "org.window_zones.KWin.Error.Unavailable",
+                                    "KGlobalAccel did not apply the requested shortcut",
+                                ));
+                            }
+                            Ok(vec![method.msg.method_return()])
                         }))
                         .add_m(factory.method("MoveWindow", (), move |method| {
                             let (window, x, y, width, height): (String, i32, i32, u32, u32) =
@@ -1252,6 +1392,9 @@ mod tests {
             height: u32,
             seen: bool,
         },
+        RefreshDisplays {
+            seen: bool,
+        },
         RegisterHotkeys {
             hotkeys: Vec<String>,
             seen: bool,
@@ -1265,6 +1408,7 @@ mod tests {
         request_error: Option<(&'static str, String)>,
         focused: Option<(String, i32, i32, u32, u32)>,
         displays: Vec<DisplayPayload>,
+        next_displays: Option<Vec<DisplayPayload>>,
         moves: Vec<(String, i32, i32, u32, u32)>,
         registered_hotkeys: Vec<String>,
         pending: HashMap<u32, FakeRequest>,
@@ -1289,6 +1433,7 @@ mod tests {
                     ("monitor-0".to_string(), -1920, 0, 1920, 1080),
                     ("monitor-1".to_string(), 0, -50, 1280, 1024),
                 ],
+                next_displays: None,
                 moves: Vec::new(),
                 registered_hotkeys: Vec::new(),
                 pending: HashMap::new(),
@@ -1367,6 +1512,7 @@ mod tests {
                 let capabilities_state = Arc::clone(&state);
                 let focused_state = Arc::clone(&state);
                 let displays_state = Arc::clone(&state);
+                let refresh_displays_state = Arc::clone(&state);
                 let move_state = Arc::clone(&state);
                 let register_state = Arc::clone(&state);
                 let request_result_state = Arc::clone(&state);
@@ -1445,6 +1591,16 @@ mod tests {
                                                 .append1(state.displays.clone()),
                                         ])
                                     }))
+                                    .add_m(factory.method("RefreshDisplays", (), move |method| {
+                                        let mut state = refresh_displays_state.lock();
+                                        let request_id = state.next_request_id;
+                                        state.next_request_id += 1;
+                                        state.pending.insert(
+                                            request_id,
+                                            FakeRequest::RefreshDisplays { seen: false },
+                                        );
+                                        Ok(vec![method.msg.method_return().append1(request_id)])
+                                    }))
                                     .add_m(factory.method("MoveWindow", (), move |method| {
                                         let (window, x, y, width, height): (
                                             String,
@@ -1503,6 +1659,7 @@ mod tests {
                                         };
                                         let seen = match request {
                                             FakeRequest::Move { seen, .. }
+                                            | FakeRequest::RefreshDisplays { seen }
                                             | FakeRequest::RegisterHotkeys { seen, .. } => {
                                                 let previous = *seen;
                                                 *seen = true;
@@ -1530,6 +1687,13 @@ mod tests {
                                                     ..
                                                 } => {
                                                     state.moves.push((window, x, y, width, height))
+                                                }
+                                                FakeRequest::RefreshDisplays { .. } => {
+                                                    if let Some(displays) =
+                                                        state.next_displays.take()
+                                                    {
+                                                        state.displays = displays;
+                                                    }
                                                 }
                                                 FakeRequest::RegisterHotkeys {
                                                     hotkeys, ..
@@ -1603,6 +1767,39 @@ mod tests {
             let _ = self.daemon.kill();
             let _ = self.daemon.wait();
         }
+    }
+
+    #[test]
+    fn display_requests_refresh_before_reading_the_cached_work_area() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let window_system = KwinWindowSystem::with_bus_address(bus.address.clone());
+        bus.update_state(|state| {
+            state.next_displays = Some(vec![("monitor-0".to_string(), 0, 50, 1200, 850)]);
+        });
+        assert_eq!(
+            window_system.displays().unwrap(),
+            vec![DisplayGeometry::new(
+                "monitor-0",
+                Rect::new(0, 50, 1200, 850)
+            )]
+        );
+        bus.update_state(|state| {
+            assert!(
+                state.next_displays.is_none(),
+                "refresh must complete before reading"
+            );
+            state.request_error = Some((
+                "org.window_zones.KWin.Error.Unavailable",
+                "refresh failed".to_string(),
+            ));
+        });
+        assert!(
+            window_system
+                .displays()
+                .unwrap_err()
+                .to_string()
+                .contains("refresh failed")
+        );
     }
 
     #[test]
@@ -1914,6 +2111,161 @@ for (const hotkey of ['ctrl+alt+a', 'ALT+a', 'alt+ctrl+f25', 'alt++a', 'alt+ente
     }
 
     #[test]
+    fn accelerator_settlement_samples_the_whole_set_before_each_sleep() {
+        let hotkeys: Vec<String> = (1..=18).map(|key| format!("alt+ctrl+f{key}")).collect();
+        let samples = std::cell::RefCell::new(Vec::new());
+        let mut settle_count = 0;
+        verify_accelerator_samples(
+            &hotkeys,
+            |hotkey| {
+                samples.borrow_mut().push(hotkey.to_string());
+                Ok(())
+            },
+            || {
+                settle_count += 1;
+                let samples = samples.borrow();
+                assert_eq!(samples.len() % hotkeys.len(), 0);
+                assert_eq!(&samples[samples.len() - hotkeys.len()..], hotkeys);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            samples.borrow().len(),
+            hotkeys.len() * ACCELERATOR_SETTLE_SAMPLES as usize
+        );
+        assert_eq!(settle_count, ACCELERATOR_SETTLE_SAMPLES - 1);
+
+        let mut count = 0;
+        let mut sleeps = 0;
+        let result = verify_accelerator_samples(
+            &hotkeys,
+            |hotkey| {
+                count += 1;
+                if count == hotkeys.len() + 2 {
+                    Err(accelerator_conflict(hotkey, "incumbent"))
+                } else {
+                    Ok(())
+                }
+            },
+            || sleeps += 1,
+        );
+        assert!(result.unwrap_err().to_string().contains("incumbent"));
+        assert_eq!(sleeps, 1);
+    }
+
+    #[test]
+    fn script_releases_native_keys_readds_and_refreshes_reserved_work_areas() {
+        let output = Command::new("node")
+            .args(["-e", r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+function signal() {
+    const handlers = [];
+    return {connect: callback => handlers.push(callback), emit: () => handlers.forEach(callback => callback())};
+}
+const left = 'alt+ctrl+left', right = 'alt+ctrl+right', extra = 'alt+ctrl+f1';
+const actions = new Map(), nativeKeys = new Map(), writes = [], messages = [];
+const timers = [];
+let lostClearReply = null;
+let workArea = {x: 0, y: 0, width: 1200, height: 860};
+const workspace = {
+    screens: [{name: 'output-1'}], currentDesktop: {}, activeWindow: null,
+    clientArea: () => workArea, currentDesktopChanged: signal(), screensChanged: signal(),
+};
+const context = vm.createContext({
+    workspace, KWin: {MaximizeArea: 2}, console,
+    QTimer: function() { this.timeout = signal(); this.start = () => {}; this.stop = () => {}; timers.push(this); },
+    registerShortcut: (title, text, sequence, callback) => {
+        assert.equal(actions.has(title), false, 'reuse the existing QAction on re-add');
+        actions.set(title, callback);
+        return true;
+    },
+    callDBus: (service, path, iface, method, ...args) => {
+        const callback = args.pop();
+        if (method === 'RegisterCompanion' || method === 'NextRequest')
+            return;
+        if (method === 'action') {
+            const owner = Array.from(nativeKeys).find(([hotkey, key]) => key === args[0]);
+            callback(owner ? ['kwin', `Window Zones Hotkey ${owner[0]}`, '', ''] : []);
+        } else if (method === 'SetShortcut') {
+            assert.ok(actions.has(`Window Zones Hotkey ${args[0]}`));
+            writes.push(args);
+            if (args[1] === 0)
+                nativeKeys.delete(args[0]);
+            else
+                nativeKeys.set(args[0], args[1]);
+            if (args[0] === lostClearReply && args[1] === 0)
+                return;
+            callback();
+        } else {
+            messages.push([method, ...args]);
+            callback();
+        }
+    },
+});
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+function register(keys) {
+    context.keys = keys;
+    vm.runInContext('registerHotkeys(keys, error => { globalThis.failure = error; globalThis.finished = true; })', context);
+    assert.equal(context.finished, true);
+    context.finished = false;
+    return context.failure;
+}
+assert.equal(register([left, right]), undefined);
+assert.deepEqual(Array.from(nativeKeys.keys()), [left, right]);
+lostClearReply = left;
+context.keys = [right, extra];
+vm.runInContext('registerHotkeys(keys, error => { globalThis.failure = error; globalThis.finished = true; })', context);
+assert.equal(context.finished, false);
+timers.at(-1).timeout.emit();
+assert.equal(context.failure.dbusError, 'org.window_zones.KWin.Error.Unavailable');
+assert.equal(nativeKeys.has(left), false, 'the native clear succeeded before its reply was lost');
+lostClearReply = null;
+assert.equal(register([left, right]), undefined);
+assert.deepEqual(Array.from(nativeKeys.keys()).sort(), [left, right].sort(),
+    'retrying the old set must restore a key cleared by a partially failed update');
+assert.equal(register([right, extra]), undefined);
+assert.deepEqual(Array.from(nativeKeys.keys()), [right, extra]);
+assert.ok(writes.some(([hotkey, key]) => hotkey === left && key === 0));
+const before = writes.length;
+assert.throws(() => register([right, 'alt+ctrl+f25']), /unsupported KWin shortcut key/);
+assert.equal(writes.length, before, 'preflight rejection must not mutate grabs');
+assert.deepEqual(Array.from(nativeKeys.keys()), [right, extra]);
+const incumbentKey = vm.runInContext("shortcutForHotkey('alt+ctrl+f2').key", context);
+nativeKeys.set('incumbent', incumbentKey);
+assert.equal(register([right, 'alt+ctrl+f2']).dbusError, 'org.window_zones.KWin.Error.Unsupported');
+assert.equal(writes.length, before, 'native conflict must reject before mutation');
+nativeKeys.delete('incumbent');
+assert.equal(register([]), undefined);
+assert.equal(nativeKeys.size, 0, 'empty set must release native keys, not just callbacks');
+assert.equal(register([left]), undefined);
+assert.equal(nativeKeys.size, 1);
+assert.equal(actions.size, 3);
+actions.get(`Window Zones Hotkey ${left}`)();
+assert.ok(messages.some(message => message[0] === 'HotkeyPressed' && message[1] === left));
+messages.length = 0;
+workArea = {x: 0, y: 50, width: 1200, height: 810};
+vm.runInContext("processRequest(10, 'refresh-displays', '', 0, 0, 0, 0, '[]', () => {})", context);
+assert.deepEqual(JSON.parse(messages[0][1]), [['output-1', 0, 50, 1200, 810]]);
+assert.equal(messages[1][0], 'CompleteRequest');
+assert.equal(messages[1][2], true, 'complete only after the fresh state was published');
+messages.length = 0;
+workArea = {x: 0, y: 0, width: 1200, height: 900};
+workspace.currentDesktopChanged.emit();
+assert.deepEqual(JSON.parse(messages[0][1]), [['output-1', 0, 0, 1200, 900]]);
+"#])
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/kwin-script/contents/code/main.js"))
+            .output()
+            .expect("node must be installed for KWin script contract tests");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn request_payloads_are_claimed_and_complete_atomically() {
         let mut state = CompanionState::default();
         state
@@ -2007,6 +2359,61 @@ for (const hotkey of ['ctrl+alt+a', 'ALT+a', 'alt+ctrl+f25', 'alt++a', 'alt+ente
     }
 
     #[test]
+    fn disconnect_release_does_not_release_the_next_controllers_claim() {
+        let mut state = CompanionState::default();
+        state
+            .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
+            .unwrap();
+        state.authorize_controller("old".to_string()).unwrap();
+        let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+        state.next_request("kwin-script").unwrap();
+        state
+            .complete_request(first, true, String::new(), String::new())
+            .unwrap();
+        state.owner_lost("old");
+        state.authorize_controller("new".to_string()).unwrap();
+        let replacement = state.enqueue_hotkeys(vec!["alt+ctrl+right".to_string()]);
+
+        let release = state.next_request("kwin-script").unwrap();
+        assert_eq!(release.7, "[]");
+        state
+            .complete_request(release.0, true, String::new(), String::new())
+            .unwrap();
+        assert_eq!(state.controller_sender.as_deref(), Some("new"));
+        assert_eq!(state.next_request("kwin-script").unwrap().0, replacement);
+        state
+            .complete_request(replacement, true, String::new(), String::new())
+            .unwrap();
+        assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+right"]);
+        assert!(state.authorize_controller("third".to_string()).is_err());
+    }
+
+    #[test]
+    fn companion_reconnection_releases_keys_left_after_state_loss() {
+        let mut state = CompanionState::default();
+        state
+            .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
+            .unwrap();
+        state.authorize_controller("old".to_string()).unwrap();
+        let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+        state.next_request("kwin-script").unwrap();
+        state
+            .complete_request(first, true, String::new(), String::new())
+            .unwrap();
+        state.last_seen =
+            Some(Instant::now() - COMPANION_HEARTBEAT_TIMEOUT - Duration::from_secs(1));
+        assert!(state.ensure_ready().is_err());
+        state.owner_lost("old");
+
+        state
+            .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), false)
+            .unwrap();
+        let (_, kind, _, _, _, _, _, hotkeys) = state.next_request("kwin-script").unwrap();
+        assert_eq!(kind, REQUEST_REGISTER_HOTKEYS);
+        assert_eq!(hotkeys, "[]");
+    }
+
+    #[test]
     fn script_reset_requeues_registered_hotkeys_once() {
         let mut state = CompanionState::default();
         state
@@ -2080,6 +2487,12 @@ for (const hotkey of ['ctrl+alt+a', 'ALT+a', 'alt+ctrl+f25', 'alt++a', 'alt+ente
         );
 
         state.owner_lost("window-zones-1");
+        let (_, kind, _, _, _, _, _, payload) = state.next_request("kwin-script").unwrap();
+        assert_eq!(kind, REQUEST_REGISTER_HOTKEYS);
+        assert_eq!(
+            payload, "[]",
+            "disconnect must reach the script's native release path"
+        );
         state
             .authorize_controller("window-zones-2".to_string())
             .unwrap();

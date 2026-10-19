@@ -9,12 +9,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use std::thread;
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use rdev::Event;
+#[cfg(target_os = "windows")]
 use rdev::grab;
 #[cfg(target_os = "linux")]
 use rdev::listen;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-use rdev::{Event, EventType, Key};
+use rdev::{EventType, Key};
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// Event generated when a configured global hotkey is activated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,17 +45,17 @@ pub enum HotkeySystemError {
 /// Platform adapter contract for global hotkey registration and dispatch.
 ///
 /// `register_hotkeys` replaces the complete registered set atomically. Dropping
-/// an implementation releases every grab and listener it owns, so a restarted
-/// runtime never leaves a second listener behind.
+/// an implementation releases its registration. A restarted runtime must never
+/// leave a second listener behind.
 pub trait HotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError>;
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError>;
 }
 
-/// Instances share one process-owned rdev listener: rdev's global callback must
-/// never be replaced by a second `listen`/`grab` while a native hook runs. The
-/// singleton passes all input through after its active registration is dropped
+/// Instances share one process-owned native listener. A live listener is never
+/// replaced: rdev owns the Linux/Windows callbacks, and macOS owns its event tap.
+/// The singleton passes input through after its active registration is dropped
 /// (apart from releases whose presses it already consumed). The next instance
 /// reuses it on restart, or starts a fresh one once the native hook stopped.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -189,12 +194,15 @@ impl RdevHotkeySystem {
         let spawn_error_state = Arc::clone(&listener);
         let spawn = thread::Builder::new().name("window-zones-hotkeys".to_string()).spawn(move || {
             let result = std::panic::catch_unwind(move || {
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                #[cfg(target_os = "windows")]
                 let result = grab(move |event: Event| {
                     let consume = listener.lock().map(|mut state| state.handle_event(event.event_type, true))
                         .unwrap_or(false);
                     if consume { None } else { Some(event) }
                 }).map_err(|error| format!("{error:?}"));
+
+                #[cfg(target_os = "macos")]
+                let result = macos::listen(listener);
 
                 #[cfg(target_os = "linux")]
                 let result = listen(move |event: Event| {

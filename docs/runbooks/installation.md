@@ -66,8 +66,8 @@ Install the appropriate companion (Linux) and start the listener automatically:
 ./scripts/install.sh --init-config --autostart
 ```
 
-On KDE, keep `window_zones_kwin` running on the same graphical user's session
-bus, as described below. The App service does not supervise that companion.
+On KDE, the installer also starts and supervises `window_zones_kwin` when
+`--autostart` is selected. Enable the KWin script once in System Settings.
 
 ### Installer options
 
@@ -80,7 +80,7 @@ bus, as described below. The App service does not supervise that companion.
 | `--gnome-extension` | Linux only: install the GNOME Shell companion and attempt to enable it. Refused on macOS. |
 | `--kwin-script` | Linux only: install/upgrade the KWin script and install `window_zones_kwin` alongside the selected binary. Refused on macOS. |
 | `--init-config` | Run the installed App's non-overwriting `init` command. Requires `--binary window_zones`. |
-| `--autostart` | Linux: install the App's systemd user unit, or an XDG desktop entry when user systemd is unreachable. macOS: install and load a per-user LaunchAgent. Requires `--binary window_zones`. |
+| `--autostart` | Linux: install the App's systemd user unit, or XDG login entry when user systemd is unreachable. An installed KWin companion is started and supervised too. macOS: install and load a per-user LaunchAgent. Requires `--binary window_zones`. |
 | `--uninstall` | Remove installations recorded for the chosen prefix; preserve the user config. No build is performed. |
 | `-h, --help` | Show usage. |
 
@@ -133,19 +133,33 @@ with `gsettings set org.gnome.shell disable-user-extensions false`.
 ID is **`window-zones`**. It also builds and installs
 `<prefix>/bin/window_zones_kwin`; upgrade the script and binary together.
 
-The KWin script and Rust companion use protocol major 2 for identified-window
-moves; older protocol-1 files are incompatible.
+The KWin script and Rust companion use protocol major 3 for identified-window
+moves and live display/shortcut updates; older files are incompatible.
 
 Enable **Window Zones** in **System Settings -> Window Management -> KWin
 Scripts**. After upgrading, disable/re-enable the script to reload its code and
-release old shortcut registrations. Start the Rust companion before the App
-and keep it running on the graphical user's session bus:
+release old shortcut registrations.
+
+With `--kwin-script --autostart`, the installer manages both the Rust companion
+and App on the graphical user's session bus. Running `--autostart` later also
+recognizes the companion recorded for the same prefix. With user systemd it
+installs `window-zones-kwin.service` and orders the App after the companion
+acquires `org.window_zones.KWin`. The App stays running while the companion
+recovers, reconnecting when it becomes available again.
+
+Without reachable user systemd, `window_zones_kwin.desktop` starts an installed
+KDE session launcher at login. It starts the companion, waits for its bus name,
+then starts the App and supervises both. This fallback needs `busctl` or
+`dbus-send`. Reinstall restarts an owned active service or launcher onto the
+new binaries; the KWin script itself still needs the reload above.
+
+For an install **without `--autostart`**, start the Rust companion manually
+before the App and keep it running:
 
 ```bash
 "$HOME/.local/bin/window_zones_kwin"
 ```
 
-The App's autostart unit starts only `window_zones run`, not the KWin companion.
 See [KDE Wayland](kde-wayland.md) for startup and runtime checks.
 
 ## Autostart, supervision, and logs
@@ -179,8 +193,8 @@ the new binary) the service with `systemctl --user restart window-zones.service`
 On GNOME, when the companion is not on the session bus yet (it was just
 installed and GNOME Shell loads it at login), the service is only enabled and
 starts at the next login instead of retrying until then. Re-running the
-installer without `--autostart` also restarts an active service so it runs the
-replaced binary.
+installer without `--autostart` also restarts active services only when their
+installed executable paths still belong to the selected prefix.
 
 It removes a previous `window_zones.desktop` fallback to avoid two autostart
 launchers. The unit participates in the graphical session lifecycle: it starts
@@ -196,6 +210,10 @@ systemctl --user disable --now window-zones   # stop and no longer start at logi
 journalctl --user -u window-zones -f
 ```
 
+For KDE, use the same commands with `window-zones-kwin` to manage the companion
+and `journalctl --user -u window-zones-kwin -f` for its logs. Both units stop at
+graphical logout. Stop the App first when deliberately shutting down both.
+
 While the service runs, problems also appear as one desktop notification that is
 updated in place: config errors and refused hotkeys at once, and an unavailable
 companion only after it has been unreachable for 20 seconds, so the login race
@@ -209,17 +227,20 @@ so an already-running instance does not cause a restart/log loop. Other failures
 are retried after two seconds. Stop the other listener before manually starting
 or restarting the service.
 
-If user systemd is unreachable, the installer prints a note and writes
-`${XDG_CONFIG_HOME:-$HOME/.config}/autostart/window_zones.desktop` instead. That
-entry runs the same installed `window_zones run` at desktop login; it has no
-systemd supervision or guaranteed journal capture. The unit is still installed.
-To switch to systemd later, remove the desktop fallback before enabling it:
+If user systemd is unreachable, non-KDE installs use
+`${XDG_CONFIG_HOME:-$HOME/.config}/autostart/window_zones.desktop`. That entry
+runs the installed `window_zones run` at login without supervision or guaranteed
+journal capture. KDE installs instead use `window_zones_kwin.desktop` and the
+owned `<prefix>/share/window-zones/kde-session` launcher described above.
+The launcher retries failures after two seconds, but does not retry an App
+that exits normally or with **75**. It records its process start identity so
+reinstall/uninstall signal only that prefix's owned launcher. Stopping the
+launcher also stops its supervised App and companion before removing its owner
+record.
 
-```bash
-rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/window_zones.desktop"
-systemctl --user daemon-reload
-systemctl --user enable --now window-zones.service
-```
+The systemd units are still installed. To switch from XDG to systemd later,
+re-run the installer with `--autostart` once user systemd is reachable; it stops
+the owned KDE launcher, removes the owned desktop fallback and starts the units.
 
 ### macOS LaunchAgent
 
@@ -294,9 +315,11 @@ Uninstall using the same prefix used for installation:
 
 The installer records its installed binaries and optional features in
 `<prefix>/share/window-zones/install-record`. On Linux, uninstall stops/disables
-the App service when user systemd is reachable, removes its unit and desktop
-entry, disables/removes its GNOME extension, unloads/disables the KWin script when
-the Plasma tools are available and removes its package. On macOS, it boots out
+the App and KWin companion services only when their units still reference this
+prefix, then removes their owned units and desktop entries. It stops the owned
+KDE fallback launcher before removing its binaries. It disables/removes its
+GNOME extension and unloads/disables the KWin script when the Plasma tools are
+available and its package ownership marker still matches this prefix. On macOS, it boots out
 the loaded LaunchAgent and removes its plist only if the plist's executable
 still belongs to the selected prefix; an old prefix cannot uninstall another
 prefix's replacement agent. The log file is kept. It then removes recorded

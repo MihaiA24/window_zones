@@ -2,9 +2,10 @@
 
 const SERVICE_NAME = 'org.window_zones.KWin';
 const OBJECT_PATH = '/org/window_zones/KWin';
-const INTERFACE_NAME = 'org.window_zones.KWin2';
-const PROTOCOL_MAJOR = 2;
+const INTERFACE_NAME = 'org.window_zones.KWin3';
+const PROTOCOL_MAJOR = 3;
 const REQUEST_MOVE = 'move';
+const REQUEST_REFRESH_DISPLAYS = 'refresh-displays';
 const REQUEST_REGISTER_HOTKEYS = 'register-hotkeys';
 
 const CAPABILITIES = [
@@ -195,7 +196,7 @@ function publishFocusedWindow() {
     invoke('UpdateFocusedWindow', [JSON.stringify(focusedPayload())], () => {});
 }
 
-function publishDisplays() {
+function publishDisplays(callback = () => {}) {
     const displays = displayData().map(item => [
         item.id,
         item.x,
@@ -203,7 +204,8 @@ function publishDisplays() {
         item.width,
         item.height,
     ]);
-    invoke('UpdateDisplays', [JSON.stringify(displays)], () => {});
+    if (!invoke('UpdateDisplays', [JSON.stringify(displays)], callback))
+        throw protocolError('Unavailable', 'KWin could not publish current work areas');
 }
 
 function publishState() {
@@ -295,11 +297,11 @@ function registerHotkeys(hotkeys, callback) {
         timer.stop();
         callback(error);
     };
-    // KWin does not invoke callDBus callbacks on errors. Fail before the App's one-second
-    // request deadline and ignore late replies so a timed-out replacement cannot commit.
+    // KWin does not invoke callDBus callbacks on errors. Bound the entire update before the
+    // App's one-second request deadline and ignore late replies after a timeout.
     timer.interval = 750;
     timer.singleShot = true;
-    timer.timeout.connect(() => finish(protocolError('Unavailable', 'KGlobalAccel shortcut preflight timed out')));
+    timer.timeout.connect(() => finish(protocolError('Unavailable', 'KGlobalAccel shortcut update timed out')));
     timer.start();
 
     function preflight(index) {
@@ -343,8 +345,29 @@ function registerHotkeys(hotkeys, callback) {
                     throw protocolError('Unavailable', `KWin rejected shortcut '${entry.hotkey}'`);
                 registeredShortcuts.add(entry.hotkey);
             });
-            activeHotkeys = new Set(hotkeys);
-            finish();
+            const desired = new Set(hotkeys);
+            // Delivery state cannot prove native assignment after a lost update reply.
+            // Reapplying the desired keys lets a retry restore partially cleared grabs.
+            const updates = next;
+            registeredShortcuts.forEach(hotkey => {
+                if (!desired.has(hotkey))
+                    updates.push({hotkey, key: 0});
+            });
+            function configure(index) {
+                if (finished)
+                    return;
+                if (index === updates.length) {
+                    activeHotkeys = desired;
+                    finish();
+                    return;
+                }
+                const entry = updates[index];
+                // Rust supplies the typed a(ai) payload that QJSEngine cannot marshal.
+                // Clearing the native keys also updates KWin's cached QAction shortcuts.
+                if (!invoke('SetShortcut', [entry.hotkey, entry.key], () => configure(index + 1)))
+                    finish(protocolError('Unavailable', 'KGlobalAccel shortcut update failed'));
+            }
+            configure(0);
         } catch (error) {
             finish(error);
         }
@@ -370,6 +393,11 @@ function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJ
 
         if (kind === REQUEST_MOVE) {
             moveWindow(windowId, x, y, width, height);
+        } else if (kind === REQUEST_REFRESH_DISPLAYS) {
+            // WorkspaceWrapper has no work-area/strut change signal. Query at the App's
+            // display-read seam so panel reservations cannot stay stale until a screen change.
+            publishDisplays(() => finish());
+            return;
         } else if (kind === REQUEST_REGISTER_HOTKEYS) {
             registerHotkeys(hotkeys, finish);
             return;
@@ -465,6 +493,8 @@ if (typeof workspace !== 'undefined' && workspace) {
     trackFocusedWindow(workspace.activeWindow);
     if (workspace.screensChanged)
         workspace.screensChanged.connect(() => publishState());
+    if (workspace.currentDesktopChanged)
+        workspace.currentDesktopChanged.connect(() => publishState());
 }
 
 connectCompanion(true);

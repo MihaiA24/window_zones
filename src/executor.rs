@@ -184,13 +184,13 @@ pub fn execute_action<W: WindowSystem>(
                 .record(&focused.id)
                 .map(|record| record.restore)
                 .ok_or(ExecuteActionError::NothingToRestore)?;
-            move_window(window_system, history, &focused.id, restore)?;
+            move_window(window_system, history, &focused, restore)?;
             history.forget(&focused.id);
             return Ok(());
         }
     };
 
-    move_window(window_system, history, &focused.id, target)?;
+    move_window(window_system, history, &focused, target)?;
     history.remember(&focused, target);
     Ok(())
 }
@@ -244,14 +244,18 @@ fn horizontal_neighbour(
 fn move_window<W: WindowSystem>(
     window_system: &mut W,
     history: &mut WindowHistory,
-    window: &WindowId,
+    window: &FocusedWindow,
     target: Rect,
 ) -> Result<(), ExecuteActionError> {
     window_system
-        .move_window(&WindowMove::new(window.clone(), target))
+        .move_window(&WindowMove::new(window.id.clone(), target))
         .map_err(|error| {
-            if matches!(error, WindowSystemError::WindowGone(_)) {
-                history.forget(window);
+            match &error {
+                WindowSystemError::WindowGone(_) => history.forget(&window.id),
+                WindowSystemError::PartialMove { observed, .. } => {
+                    history.remember(window, *observed);
+                }
+                WindowSystemError::Platform(_) => {}
             }
             ExecuteActionError::from(error)
         })
@@ -425,6 +429,11 @@ mod tests {
 
         fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
             if let Some(error) = self.move_error.clone() {
+                if let WindowSystemError::PartialMove { observed, .. } = &error
+                    && let Ok(Some(focused)) = &mut self.focused_window
+                {
+                    focused.geometry = *observed;
+                }
                 return Err(error);
             }
 
@@ -985,6 +994,88 @@ mod tests {
 
         assert_eq!(targets(&fake).last(), Some(&original));
         assert_eq!(second_restore, ExecuteActionError::NothingToRestore);
+    }
+
+    #[test]
+    fn failed_partial_move_keeps_the_original_restore_point() {
+        for already_moved in [false, true] {
+            let original = Rect::new(100, 100, 800, 600);
+            let mut fake = fake_with_focus(original);
+            let mut history = WindowHistory::default();
+            if already_moved {
+                execute_action(
+                    &zone("left-half"),
+                    &BTreeMap::new(),
+                    &mut history,
+                    &mut fake,
+                )
+                .unwrap();
+            }
+            fake.move_error = Some(WindowSystemError::PartialMove {
+                observed: Rect::new(960, 0, 1200, 1080),
+                message: "minimum width constrained placement".into(),
+            });
+            let failed = execute_action(
+                &zone("right-half"),
+                &BTreeMap::new(),
+                &mut history,
+                &mut fake,
+            );
+            assert!(matches!(
+                failed,
+                Err(ExecuteActionError::WindowSystem(
+                    WindowSystemError::PartialMove { .. }
+                ))
+            ));
+            fake.move_error = None;
+            execute_action(
+                &Action::Restore {},
+                &BTreeMap::new(),
+                &mut history,
+                &mut fake,
+            )
+            .unwrap();
+            assert_eq!(fake.focused_window().unwrap().unwrap().geometry, original);
+        }
+    }
+
+    #[test]
+    fn partially_failed_restore_can_be_retried() {
+        let original = Rect::new(100, 100, 800, 600);
+        let mut fake = fake_with_focus(original);
+        let mut history = WindowHistory::default();
+        execute_action(
+            &zone("left-half"),
+            &BTreeMap::new(),
+            &mut history,
+            &mut fake,
+        )
+        .unwrap();
+        fake.move_error = Some(WindowSystemError::PartialMove {
+            observed: Rect::new(100, 100, 900, 700),
+            message: "constrained restore".into(),
+        });
+        let failed = execute_action(
+            &Action::Restore {},
+            &BTreeMap::new(),
+            &mut history,
+            &mut fake,
+        );
+        assert!(matches!(
+            failed,
+            Err(ExecuteActionError::WindowSystem(
+                WindowSystemError::PartialMove { .. }
+            ))
+        ));
+        fake.move_error = None;
+        execute_action(
+            &Action::Restore {},
+            &BTreeMap::new(),
+            &mut history,
+            &mut fake,
+        )
+        .unwrap();
+        assert_eq!(fake.focused_window().unwrap().unwrap().geometry, original);
     }
 
     #[test]

@@ -17,7 +17,7 @@ Options:
       --release         Install a release build (default)
       --gnome-extension Install and enable the GNOME Shell companion
       --kwin-script     Install/upgrade the KWin script and Rust companion
-      --autostart       Start window_zones run at login (systemd/XDG on Linux, LaunchAgent on macOS)
+      --autostart       Start the App and any installed KWin companion at login
       --init-config     Write a starter config without overwriting an existing one
       --uninstall       Remove this prefix's recorded installations; keep config
   -h, --help            Show this help message
@@ -116,6 +116,10 @@ INSTALL_RECORD="$INSTALL_PREFIX/share/window-zones/install-record"
 UNIT_DIR="$CONFIG_HOME/systemd/user"
 UNIT_FILE="$UNIT_DIR/window-zones.service"
 AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones.desktop"
+KWIN_UNIT_FILE="$UNIT_DIR/window-zones-kwin.service"
+KWIN_AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones_kwin.desktop"
+KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
+KDE_SESSION_STATE="$INSTALL_PREFIX/share/window-zones/kde-session-running"
 GNOME_ID='window-zones@mihai-a24'
 GNOME_DIR="$DATA_HOME/gnome-shell/extensions/$GNOME_ID"
 KWIN_ID='window-zones'
@@ -145,6 +149,90 @@ record_install() {
   INSTALLED+=("$1")
 }
 
+recorded() {
+  local item
+  for item in ${INSTALLED[@]+"${INSTALLED[@]}"}; do
+    [[ "$item" != "$1" ]] || return 0
+  done
+  return 1
+}
+
+systemd_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//%/%%}"
+  value="${value//\$/\$\$}"
+  printf '%s' "$value"
+}
+
+desktop_escape() {
+  local value="$1"
+  value="${value//\\/\\\\\\\\}"
+  value="${value//\"/\\\\\"}"
+  value="${value//\$/\\\\\$}"
+  value="${value//\`/\\\\\`}"
+  value="${value//%/%%}"
+  printf '%s' "$value"
+}
+
+unit_owned() {
+  [[ -f "$1" ]] && grep -Fqx -- "ExecStart=\"$(systemd_escape "$2")\"${3:+ $3}" "$1"
+}
+
+desktop_owned() {
+  [[ -f "$1" ]] && grep -Fqx -- "Exec=\"$(desktop_escape "$2")\"${3:+ $3}" "$1"
+}
+
+kde_launcher_owned() {
+  [[ -f "$KDE_LAUNCHER" ]] && grep -Fqx -- "# Window Zones KDE login: $INSTALL_DIR" "$KDE_LAUNCHER"
+}
+
+kde_session_running() {
+  local pid started
+  [[ -f "$KDE_SESSION_STATE/owner" ]] || return 1
+  {
+    IFS= read -r pid || return 1
+    IFS= read -r started || return 1
+  } <"$KDE_SESSION_STATE/owner"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [[ -n "$started" && "$(ps -p "$pid" -o lstart= 2>/dev/null)" == "$started" ]] || return 1
+  KDE_SESSION_PID="$pid"
+}
+
+stop_kde_session() {
+  local attempt
+  if kde_launcher_owned && kde_session_running; then
+    kill -TERM "$KDE_SESSION_PID" 2>/dev/null || return 0
+    for attempt in 1 2 3 4 5; do
+      kde_session_running || return 0
+      sleep 1
+    done
+    echo 'The owned KDE login launcher did not stop; refusing to remove its binaries.' >&2
+    exit 1
+  fi
+}
+
+remove_unit() {
+  local file="$1" binary="$2" args="$3" name="${1##*/}"
+  if unit_owned "$file" "$binary" "$args"; then
+    if user_systemd_available; then
+      systemctl --user disable --now "$name" || warn "Could not stop/disable $name."
+    else
+      warn "User systemd is unreachable; stop any running $name manually."
+    fi
+    if [[ "$UNIT_DIR/graphical-session.target.wants/$name" -ef "$file" ]]; then
+      rm -f -- "$UNIT_DIR/graphical-session.target.wants/$name"
+    fi
+    rm -f -- "$file"
+    if user_systemd_available; then
+      systemctl --user daemon-reload || warn 'Could not reload user systemd.'
+    fi
+  elif [[ -e "$file" ]]; then
+    warn "$name no longer references this prefix; leaving it untouched."
+  fi
+}
+
 user_systemd_available() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
 }
@@ -159,17 +247,24 @@ launch_agent_owned() {
 }
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
+  if recorded kwin-autostart; then
+    stop_kde_session
+  fi
   for item in ${INSTALLED[@]+"${INSTALLED[@]}"}; do
     case "$item" in
       autostart)
-        if user_systemd_available; then
-          systemctl --user disable --now window-zones.service || warn 'Could not stop/disable window-zones.service; stop any running App before removing its binary.'
-        else
-          warn 'User systemd is unreachable; stop any running App manually.'
+        remove_unit "$UNIT_FILE" "$INSTALL_DIR/window_zones" run
+        if desktop_owned "$AUTOSTART_FILE" "$INSTALL_DIR/window_zones" run; then
+          rm -f -- "$AUTOSTART_FILE"
         fi
-        rm -f -- "$UNIT_FILE" "$UNIT_DIR/graphical-session.target.wants/window-zones.service" "$AUTOSTART_FILE"
-        if user_systemd_available; then
-          systemctl --user daemon-reload || warn 'Could not reload user systemd; run systemctl --user daemon-reload when available.'
+        ;;
+      kwin-autostart)
+        remove_unit "$KWIN_UNIT_FILE" "$INSTALL_DIR/window_zones_kwin" ''
+        if desktop_owned "$KWIN_AUTOSTART_FILE" /bin/bash "\"$(desktop_escape "$KDE_LAUNCHER")\""; then
+          rm -f -- "$KWIN_AUTOSTART_FILE"
+        fi
+        if kde_launcher_owned; then
+          rm -f -- "$KDE_LAUNCHER"
         fi
         ;;
       launch-agent)
@@ -191,6 +286,11 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
         rm -rf -- "$GNOME_DIR"
         ;;
       kwin-script)
+        if [[ ! -f "$KWIN_DIR/.window-zones-install-prefix" ]] \
+          || [[ "$(<"$KWIN_DIR/.window-zones-install-prefix")" != "$INSTALL_PREFIX" ]]; then
+          warn 'KWin package ownership does not match this prefix; leaving it enabled and installed.'
+          continue
+        fi
         if command -v kwriteconfig6 >/dev/null 2>&1; then
           kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" false || warn 'Could not disable the KWin script in kwinrc.'
         fi
@@ -290,14 +390,22 @@ if [[ "$KWIN_SCRIPT" -eq 1 ]]; then
   else
     kpackagetool6 --type=KWin/Script --install "$PROJECT_ROOT/kwin-script"
   fi
+  printf '%s\n' "$INSTALL_PREFIX" >"$KWIN_DIR/.window-zones-install-prefix"
   record_install kwin-script
   echo 'KWin script: window-zones (enable Window Zones in System Settings -> Window Management -> KWin Scripts).'
   echo 'After an upgrade, disable/re-enable the script to reload it; upgrade the script and companion together.'
-  printf 'Keep the companion running on your graphical session bus: "%s/window_zones_kwin"\n' "$INSTALL_DIR"
+  if [[ "$AUTOSTART" -eq 0 ]] && ! recorded kwin-autostart; then
+    printf 'Keep the companion running on your graphical session bus: "%s/window_zones_kwin"\n' "$INSTALL_DIR"
+  fi
 fi
 
 if [[ "$INIT_CONFIG" -eq 1 ]]; then
   "$INSTALL_DIR/window_zones" init || warn 'Starter config could not be initialized; run window_zones init and resolve the reported error.'
+fi
+
+KDE_AUTOSTART=0
+if [[ "$OS" == Linux ]] && recorded kwin-script && recorded binary:window_zones_kwin; then
+  KDE_AUTOSTART=1
 fi
 
 if [[ "$AUTOSTART" -eq 1 && "$OS" == Darwin ]]; then
@@ -353,22 +461,26 @@ EOF
   printf 'Logs: tail -f "%s"\n' "$LAUNCH_LOG"
   printf 'Allow %s in System Settings > Privacy & Security > Accessibility (again after each reinstall).\n' "$INSTALL_DIR/window_zones"
 elif [[ "$AUTOSTART" -eq 1 ]]; then
+  if [[ "$KDE_AUTOSTART" -eq 1 && ! -x "$INSTALL_DIR/window_zones_kwin" ]]; then
+    echo 'The recorded KWin companion is missing; reinstall with --kwin-script --autostart.' >&2
+    exit 1
+  fi
+  if [[ "$KDE_AUTOSTART" -eq 1 ]] && ! user_systemd_available \
+    && ! command -v busctl >/dev/null 2>&1 && ! command -v dbus-send >/dev/null 2>&1; then
+    echo 'KDE XDG autostart needs busctl or dbus-send to wait for the companion session bus name.' >&2
+    exit 1
+  fi
   mkdir -p "$UNIT_DIR"
-  # systemd ExecStart quoting: escape quotes/backslashes, specifiers, and environment expansion.
-  EXEC_PATH="$INSTALL_DIR/window_zones"
-  EXEC_PATH="${EXEC_PATH//\\/\\\\}"
-  EXEC_PATH="${EXEC_PATH//\"/\\\"}"
-  EXEC_PATH="${EXEC_PATH//%/%%}"
-  EXEC_PATH="${EXEC_PATH//\$/\$\$}"
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=Window Zones hotkey listener
 PartOf=graphical-session.target
 After=graphical-session.target
+$(if [[ "$KDE_AUTOSTART" -eq 1 ]]; then printf 'Wants=window-zones-kwin.service\nAfter=window-zones-kwin.service\n'; fi)
 
 [Service]
 Type=simple
-ExecStart="$EXEC_PATH" run
+ExecStart="$(systemd_escape "$INSTALL_DIR/window_zones")" run
 Restart=on-failure
 RestartSec=2
 RestartPreventExitStatus=75
@@ -377,10 +489,39 @@ RestartPreventExitStatus=75
 WantedBy=graphical-session.target
 EOF
   record_install autostart
+  if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
+    cat >"$KWIN_UNIT_FILE" <<EOF
+[Unit]
+Description=Window Zones KWin companion
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.window_zones.KWin
+ExecStart="$(systemd_escape "$INSTALL_DIR/window_zones_kwin")"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+    record_install kwin-autostart
+  fi
   if user_systemd_available; then
     systemctl --user daemon-reload
+    if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
+      stop_kde_session
+      systemctl --user enable window-zones-kwin.service
+      systemctl --user restart window-zones-kwin.service
+      if desktop_owned "$KWIN_AUTOSTART_FILE" /bin/bash "\"$(desktop_escape "$KDE_LAUNCHER")\""; then
+        rm -f -- "$KWIN_AUTOSTART_FILE"
+      fi
+    fi
     systemctl --user enable window-zones.service
-    rm -f -- "$AUTOSTART_FILE"
+    if desktop_owned "$AUTOSTART_FILE" "$INSTALL_DIR/window_zones" run; then
+      rm -f -- "$AUTOSTART_FILE"
+    fi
     if [[ ":${XDG_CURRENT_DESKTOP:-}:" == *:GNOME:* ]] \
       && ! busctl --user status org.window_zones.Gnome >/dev/null 2>&1; then
       # Starting now would only retry until GNOME Shell loads the companion at login.
@@ -393,24 +534,109 @@ EOF
     echo 'Logs: journalctl --user -u window-zones -f'
   else
     mkdir -p "$(dirname -- "$AUTOSTART_FILE")"
-    # Desktop Exec quoting is not shell quoting; escape literal field codes too.
-    EXEC_PATH="$INSTALL_DIR/window_zones"
-    EXEC_PATH="${EXEC_PATH//\\/\\\\\\\\}"
-    EXEC_PATH="${EXEC_PATH//\"/\\\\\"}"
-    EXEC_PATH="${EXEC_PATH//\$/\\\\\$}"
-    EXEC_PATH="${EXEC_PATH//\`/\\\\\`}"
-    EXEC_PATH="${EXEC_PATH//%/%%}"
-    cat >"$AUTOSTART_FILE" <<EOF
+    if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
+      {
+        printf '#!/usr/bin/env bash\n# Window Zones KDE login: %s\n' "$INSTALL_DIR"
+        printf 'INSTALL_DIR=%q\nSESSION_STATE=%q\n' "$INSTALL_DIR" "$KDE_SESSION_STATE"
+        cat <<'EOF'
+set -u
+umask 077
+if ! mkdir "$SESSION_STATE" 2>/dev/null; then
+  old_pid='' old_start=''
+  if [[ -f "$SESSION_STATE/owner" ]]; then
+    { IFS= read -r old_pid; IFS= read -r old_start; } <"$SESSION_STATE/owner"
+  fi
+  case "$old_pid" in ''|*[!0-9]*) exit 75 ;; esac
+  if [[ -n "$old_start" && "$(ps -p "$old_pid" -o lstart= 2>/dev/null)" == "$old_start" ]]; then
+    exit 75
+  fi
+  rm -f -- "$SESSION_STATE/owner"
+  rmdir "$SESSION_STATE" && mkdir "$SESSION_STATE" || exit 75
+fi
+children=()
+stop_children() {
+  if [[ -n "${children[*]-}" ]]; then
+    kill -TERM "${children[@]}" 2>/dev/null || true
+    wait "${children[@]}" 2>/dev/null || true
+    children=()
+  fi
+}
+cleanup() {
+  stop_children
+  rm -f -- "$SESSION_STATE/owner"
+  rmdir "$SESSION_STATE"
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+trap 'cleanup; trap - EXIT; exec "$0"' USR1
+printf '%s\n%s\n' "$$" "$(ps -p "$$" -o lstart=)" >"$SESSION_STATE/owner"
+supervise() {
+  child=''
+  trap 'if [[ -n "$child" ]]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; exit 0' TERM INT
+  trap '' HUP USR1
+  while :; do
+    "$@" &
+    child=$!
+    result=0
+    wait "$child" || result=$?
+    child=''
+    if [[ "$1" == "$INSTALL_DIR/window_zones" && ( "$result" -eq 0 || "$result" -eq 75 ) ]]; then
+      exit "$result"
+    fi
+    sleep 2 &
+    child=$!
+    wait "$child" || true
+    child=''
+  done
+}
+supervise "$INSTALL_DIR/window_zones_kwin" &
+children+=("$!")
+companion_ready() {
+  if command -v busctl >/dev/null 2>&1; then
+    busctl --user status org.window_zones.KWin >/dev/null 2>&1
+  else
+    dbus-send --session --type=method_call --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner string:org.window_zones.KWin >/dev/null 2>&1
+  fi
+}
+until companion_ready; do
+  sleep 1 &
+  children+=("$!")
+  wait "$!" || true
+  unset 'children[1]'
+done
+supervise "$INSTALL_DIR/window_zones" run &
+children+=("$!")
+wait "${children[@]}"
+EOF
+      } >"$KDE_LAUNCHER"
+      chmod 755 "$KDE_LAUNCHER"
+      cat >"$KWIN_AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Window Zones KDE session
+Exec="/bin/bash" "$(desktop_escape "$KDE_LAUNCHER")"
+Terminal=false
+EOF
+      if desktop_owned "$AUTOSTART_FILE" "$INSTALL_DIR/window_zones" run; then
+        rm -f -- "$AUTOSTART_FILE"
+      fi
+      if kde_session_running; then
+        kill -USR1 "$KDE_SESSION_PID"
+      fi
+      printf 'User systemd is unreachable; KDE companion and App use XDG login supervision: %s\n' "$KWIN_AUTOSTART_FILE"
+    else
+      cat >"$AUTOSTART_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Window Zones
-Exec="$EXEC_PATH" run
+Exec="$(desktop_escape "$INSTALL_DIR/window_zones")" run
 X-GNOME-Autostart-enabled=true
 Terminal=false
 EOF
-    printf 'User systemd is unreachable; using XDG autostart: %s\n' "$AUTOSTART_FILE"
-    printf 'Unit also installed at %s; to switch later, remove the desktop file and run:\n' "$UNIT_FILE"
-    echo 'systemctl --user daemon-reload && systemctl --user enable --now window-zones.service'
+      printf 'User systemd is unreachable; using XDG autostart: %s\n' "$AUTOSTART_FILE"
+    fi
+    echo 'To switch to systemd later, re-run the installer with --autostart.'
   fi
 fi
 
@@ -424,10 +650,23 @@ if [[ "$AUTOSTART" -eq 0 && "$BINARY_NAME" == window_zones && "$OS" == Darwin ]]
   fi
 fi
 
-if [[ "$AUTOSTART" -eq 0 && "$BINARY_NAME" == window_zones ]] && user_systemd_available \
-  && systemctl --user is-active --quiet window-zones.service; then
-  systemctl --user restart window-zones.service
-  echo 'Restarted window-zones.service onto the new binary.'
+if [[ "$AUTOSTART" -eq 0 && "$OS" == Linux ]]; then
+  if [[ "$KWIN_SCRIPT" -eq 1 || "$BINARY_NAME" == window_zones_kwin ]] \
+    && recorded kwin-autostart && unit_owned "$KWIN_UNIT_FILE" "$INSTALL_DIR/window_zones_kwin" '' \
+    && user_systemd_available && systemctl --user is-active --quiet window-zones-kwin.service; then
+    systemctl --user restart window-zones-kwin.service
+    echo 'Restarted window-zones-kwin.service onto the new binary.'
+  fi
+  if [[ "$BINARY_NAME" == window_zones ]] && recorded autostart \
+    && unit_owned "$UNIT_FILE" "$INSTALL_DIR/window_zones" run \
+    && user_systemd_available && systemctl --user is-active --quiet window-zones.service; then
+    systemctl --user restart window-zones.service
+    echo 'Restarted window-zones.service onto the new binary.'
+  fi
+  if recorded kwin-autostart && kde_launcher_owned && kde_session_running; then
+    kill -USR1 "$KDE_SESSION_PID"
+    echo 'Restarted the owned KDE login launcher onto the new binaries.'
+  fi
 fi
 
 printf 'Installation complete (profile: %s, prefix: %s).\n' "$BUILD_PROFILE" "$INSTALL_PREFIX"

@@ -67,6 +67,10 @@ pub struct TransitionMetrics {
 pub enum WindowSystemError {
     #[error("platform window-system error: {0}")]
     Platform(String),
+    /// A failed placement changed the identified window; retain its actual
+    /// frame so Restore does not mistake the partial move for a manual move.
+    #[error("{message}")]
+    PartialMove { observed: Rect, message: String },
     #[error("window {0} no longer exists")]
     WindowGone(WindowId),
 }
@@ -79,7 +83,8 @@ pub enum WindowSystemError {
 /// for the app to move. `move_window` moves the window named by
 /// `WindowMove::window` whether or not it still has focus, restoring a
 /// maximized or tiled state first, and fails with `WindowGone` when the window
-/// has closed.
+/// has closed. If a failed placement changed the window's frame, report
+/// `PartialMove` with that identified window's observed geometry.
 pub trait WindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError>;
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError>;

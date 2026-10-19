@@ -9,18 +9,18 @@ On a real desktop the runtime moves windows and captures keys through the GNOME 
 - `kde-wayland` the same checks against a nested KWin 6.x (deferred gate).
 - `windows` the manual Windows smoke run (deferred gate).
 - `macos` retained native Accessibility window identity, usable-area placement, and grabbing-hook restart recovery (ungated).
-- `sway-hyprland` compositor keybindings calling `window_zones dispatch` (ungated).
+- `sway-hyprland` compositor keybindings forwarding `window_zones dispatch` into one persistent `run`/`tui` session (ungated).
 - `tray` `run --tray` status menu (Linux and Windows).
 - `notifications` desktop notifications from the service when stdout is not a terminal.
 - `single-instance` a second live `run`/`tui` exits with status `75`.
-- `service` `./scripts/install.sh --autostart`: Linux `window-zones` systemd user service or macOS `org.window_zones.run` LaunchAgent.
+- `service` `./scripts/install.sh --autostart`: Linux `window-zones` plus any recorded `window-zones-kwin` companion, supervised KDE XDG fallback, or macOS `org.window_zones.run` LaunchAgent.
 
 ## How to get to it (user POV)
 
 - Log in to the desktop and press a bound hotkey while `window_zones run`, `window_zones tui`, or the service runs.
 - Run `window_zones --backend auto run` (or `x11`, `wayland`, `windows`, `macos`) in a desktop session.
 - Run `window_zones --tray run` on Linux or Windows.
-- Bind a Sway or Hyprland key to `window_zones dispatch <hotkey>`.
+- Start `window_zones run` or `tui` inside Sway/Hyprland, then bind compositor keys to `window_zones dispatch <hotkey>` with the same backend/config.
 
 ## Driving it with wzv
 
@@ -36,9 +36,12 @@ Preconditions:
 - **Windows gate.** Follow `docs/runbooks/windows-smoke.md` on Windows.
 - **macOS backend.** Grant Accessibility/input capture to the responsible process. With an owned HOME/TMPDIR and config, run `target/debug/window_zones --backend macos --config "$CONFIG" run`; keep only a disposable window frontmost, trigger its configured key, and check the independent frame plus runtime `status`. Distinguish physical-key capture from CGEvent injection and native API checks from the raw CLI or `scripts/run.sh` entry point.
 - **macOS expansion regression.** In a dedicated fixture process, put a normal resizable window low on the primary display, keep it frontmost, and run `WZ_MACOS_TEST_PID="$FIXTURE_PID" cargo test --locked --lib expansion_finishes_at_target_origin -- --ignored --test-threads=1`. It refuses a different window owner and asserts exact full-height half placement; compare independent AppKit readback. For native zoom/menu-tiling checks, wait for the external animation to settle, then move and sample the resulting frame after the move. See the reusable [macOS native smoke procedure](../../../../docs/runbooks/testing.md#macos-native-smoke-ungated).
+- **Installer lifecycle regression.** Run `bash scripts/test-install.sh`. It drives the real installer under isolated HOME/XDG/prefixes with fixture-only build, D-Bus and desktop/service tools; require both PASS lines for companion-before-App startup, recorded-companion reuse, special-prefix quoting, reinstall/recovery and ownership-safe uninstall. It never calls the desktop's real service manager. This does not prove systemd or KDE native integration.
+- **KDE login service.** In an owned KDE login/session bus and isolated HOME/XDG/prefix, install with `--kwin-script --autostart --init-config`, enable only the owned KWin script and log back in. Require both services and the real hotkeys to work without a manual companion process. Kill only the fixture companion, require its recovery and the App's hotkeys to resume, reinstall and require the running companion's executable to be the new installed binary. Repeat with a fixture PATH where user systemd is unreachable and launch only the owned `window_zones_kwin.desktop`; require the KDE login launcher to supervise both children. Uninstall, require both owned children/artifacts gone and config preserved. Do not stop a borrowed desktop service or mutate a real user's KWin script settings.
 - **macOS service.** On an otherwise unused GUI label, run `/bin/bash scripts/install.sh --debug --prefix "$PREFIX" --autostart` with an isolated installer HOME and a bootstrap wrapper that injects that HOME/TMPDIR/XDG environment into the owned plist before real `launchctl bootstrap`. Require a running PID, the chosen executable and config state; reinstall, replace prefixes, uninstall the stale prefix, then uninstall the replacement. Require the stale uninstall to preserve the replacement PID/program and the final uninstall to remove the agent while keeping config/logs. See the installation runbook for normal user commands.
 - **macOS notifications.** Run the owned live runtime with stdout redirected to a log. Reload invalid config, inspect `Window Zones needs attention` in Notification Center, restore valid config and inspect matching `Window Zones` recovery. Capture only the owned notice; check banner pixels, Notification Center text and quoted text without changing notification preferences.
 - **Single instance.** With no borrowed service, start two owned live `run` processes with the same isolated HOME/TMPDIR and explicit live backend; the second must exit `75`.
+- **Sway/Hyprland dispatch.** In an owned compositor session with an isolated, owned `0700` `XDG_RUNTIME_DIR`, start `window_zones --config "$CONFIG" --perf-log "$LOG" run` (or `tui`) and keep a disposable window focused. Bind the compositor's keys as in the [running runbook](../../../../docs/runbooks/running.md#sway-and-hyprland). Record its original geometry using `swaymsg`/`hyprctl`; launch separate CLI dispatches for Left, Right, then Backspace and require Restore to recover that original frame. Require each response to retain `Using runtime window backend`, `Runtime status`, and `Dispatch state`, with success exit `0`. Reload a config with a changed binding and require the new binding to work without a hotkey-refusal error. Require exit `1` for an unbound key, failed Restore, a different config path, the other compositor identity, and client `--perf-log`; only actual actions appear in the session-owned log/PID. Inspect the dispatch socket mode `0600` and its directory mode `0700`; quit the owned session, require its socket gone, then require a new dispatch to fail with `start window_zones run` guidance (without moving the window). Run `cargo test --locked --bin window_zones local_session_dispatch` for bounded malformed requests, stale-socket recovery, symlink/regular-file refusal, replacement-safe cleanup, and pending-request shutdown. Transport tests use the real runtime with dry-run geometry; they do not prove native movement or real key capture.
 
 ## Gotchas
 

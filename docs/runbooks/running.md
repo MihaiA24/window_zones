@@ -86,6 +86,11 @@ per attempted action, including failures. Each row has a timestamp, PID,
 action/result/error, and memory scope. Choose a fresh path for an isolated
 measurement; runtime `restart` preserves the open log.
 
+On Sway/Hyprland, set `--perf-log` on the persistent `run`/`tui` session.
+Compositor-bound dispatches are logged by that session (its PID and memory),
+not by the short-lived CLI clients. Passing `--perf-log` to those clients is
+an error; other backends retain one-shot dispatch logging.
+
 | Field | Measurement |
 |---|---|
 | `dispatch_ms` | Rust action execution, including adapter calls and completion waits; excludes hotkey queue/polling latency, metrics retrieval, memory sampling, and log I/O |
@@ -134,14 +139,37 @@ Config and `dispatch` hotkeys are canonicalized once by the App: modifiers `alt`
 
 ## Sway and Hyprland
 
-Neither compositor exposes a global hotkey capability to the App, so `run` reports the hotkey set as refused there. Bind the compositor's own keys to compositor-bound dispatch (each `dispatch` is a separate process, so `restore` history does not carry over; repeated-half crossing is geometry-based and still works):
+The compositor owns key capture; one persistent App owns configuration, actions,
+and restore history. Start it inside the compositor session before using bindings:
+
+```bash
+window_zones run
+# Or use `window_zones tui` for the dashboard.
+```
+
+Keep the same compositor bindings, including Restore:
 
 ```text
 # sway
 bindsym $mod+Left exec window_zones dispatch ctrl+alt+left
+bindsym $mod+BackSpace exec window_zones dispatch ctrl+alt+backspace
 # hyprland
 bind = CTRL ALT, left, exec, window_zones dispatch ctrl+alt+left
+bind = CTRL ALT, backspace, exec, window_zones dispatch ctrl+alt+backspace
 ```
+
+Each CLI client forwards its action to the running session over a local Unix
+socket, so a later Restore returns to the geometry before the first App move.
+Config reloads stay active without asking the compositor to capture keys.
+There is no one-shot fallback: without a runtime, dispatch exits nonzero and
+asks you to start `window_zones run`. Use the same resolved compositor and
+`--config` path on the runtime and its clients; mismatches are refused.
+The runtime uses its current accepted config, including reloads.
+
+The socket has mode `0600` inside an owned `0700` directory next to the instance
+lock (`$XDG_RUNTIME_DIR/window_zones.dispatch/dispatch.sock` on a normal Linux
+login). Quit removes the owned socket; after a crash the next lock-owning session
+can remove its stale socket, but refuses foreign files and symlinks.
 
 Window and display state come from `swaymsg`/`hyprctl`; both integrations are ungated (no Smoke run on record).
 
