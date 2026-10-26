@@ -140,6 +140,10 @@ An idle call has a deferred reply for up to one second, not an immediate empty
 poll loop. Queued work wakes it on the companion's 25 ms service tick, without
 blocking other D-Bus requests. A three-second script watchdog retries a lost
 poll; the native [KWin 6 script engine exposes `QTimer`](https://github.com/KDE/kwin/blob/Plasma/6.5/src/scripting/scripting.cpp).
+Display refresh also has a bounded completion: an omitted `UpdateDisplays`
+reply fails the request as unavailable instead of retaining the processing
+slot forever. Late display replies and obsolete poll callbacks cannot complete
+work in a recovered connection.
 Geometry updates connect once per Window and disconnect when it is removed.
 
 `CompleteRequest(request_id_string, ok, error_name, message)` preserves the
@@ -149,6 +153,10 @@ failure class. `GetRequestResult(request_id_string)` returns
 and maps to the App's `WindowGone`; shortcut conflicts and non-canonical keys
 use `Unsupported` and map to `Rejected` without replacing the previous set.
 Unavailable preflight or transport failures are retryable.
+
+`RegisterHotkeys` claims the active controller; a completed empty registration
+releases it. `GetNextHotkey` never claims ownership: an unowned poll returns no
+event, and a different active controller is rejected without consuming events.
 
 ## Manual smoke checklist
 

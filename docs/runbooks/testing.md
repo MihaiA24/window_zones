@@ -15,13 +15,15 @@ What this verifies:
 - `node --check gnome-extension/extension.js`
 - `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
 - `node --check kwin-script/contents/code/main.js`
+- `node kwin-script/tests/run.js` (missing display-callback recovery and stale-reply isolation)
 - Python syntax for `scripts/gnome-smoke.py` (system Python, without generating cache files)
 - `qmllint kwin-script/contents/code/main.js` (QJSEngine syntax, which `node` does not enforce; only if `qmllint` is installed)
 
 The repository test script covers formatting, unit/integration/doc tests in one
 Cargo test invocation, and clippy when installed. The GNOME and KDE adapter
 contract tests use fake compositor services on private `dbus-daemon` instances;
-they do not require a running compositor session.
+KWin controller ownership is also checked through the real Rust dispatcher.
+Neither requires a running compositor session.
 
 The compositor scripts can be syntax-checked with:
 
@@ -54,17 +56,24 @@ The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit i
 
 The isolated GNOME 51 gate uses `/usr/bin/python3` with PyGObject and GTK 4,
 `gst-launch-1.0` with the PipeWire, video-conversion, and PNG plugins, and a
-running user PipeWire daemon. It copies the installed GNOME-compatible
-AppIndicator extension into its private XDG tree for real tray checks.
+running user PipeWire daemon and session manager (for example WirePlumber).
+It copies the installed GNOME-compatible AppIndicator extension into its private
+XDG tree for real tray checks.
 On CachyOS/Arch the smoke dependencies are:
 
 ```bash
-sudo pacman -S --needed python-gobject gtk4 gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire
+sudo pacman -S --needed python-gobject gtk4 gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire wireplumber
 ```
 
 Mutter's RemoteDesktop API supplies compositor-native keyboard and mouse
 input; its linked ScreenCast stream supplies actual rendered screenshots.
 This gate does not require `/dev/uinput` or alter seated extension settings.
+The owned Shell uses `--force-animations` so software rendering does not silently
+bypass the enabled-animation path; disabled animations and reduced motion are
+checked separately. Overview uses Shell's public `OverviewActive` property with
+an observed-state wait, followed by captured-window identity and frame checks.
+The virtual pointer is created before leaving startup Overview because creating
+that device can reopen it.
 
 The X11 adapter owns exclusive `XGrabKey` accelerators (including CapsLock/NumLock variants); `xdotool` XTEST injection reaches these grabs without delivering the accelerator to the focused application. It does not require XRecord. The owned Openbox fixture uses an empty keyboard map so distro defaults do not preempt the test chords; a separate competing client proves real grab refusal.
 

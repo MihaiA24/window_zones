@@ -110,8 +110,17 @@ async function call(name, args = [], sender = ':1.42', expectedError = null) {
     equal(reply.errorName, expectedError, `${name} error: ${reply.message}`);
     return reply.message;
 }
+
+function delay(milliseconds) {
+    return new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, milliseconds, () => {
+        resolve();
+        return GLib.SOURCE_REMOVE;
+    }));
+}
 const invalid = 'org.window_zones.Gnome.Error.InvalidWindowState';
 const unsupported = 'org.window_zones.Gnome.Error.Unsupported';
+const partial = 'org.window_zones.Gnome.Error.PartialMove';
+const gone = 'org.window_zones.Gnome.Error.WindowGone';
 const window = makeWindow(4294967301);
 const other = makeWindow(4294967302);
 display.windows = [window, other];
@@ -202,6 +211,83 @@ window.actor = null;
 connection.vanish(':1.42');
 await call('GetLastTransitionMetrics', [], ':1.42', invalid);
 
+const failureWindow = makeWindow(4294967303);
+display.windows.push(failureWindow);
+display.focus = other;
+const resize = failureWindow.move_resize_frame;
+failureWindow.move_resize_frame = function (_userOp, x, y, width, height) {
+    this.frame = {x, y, width: Math.max(500, width), height};
+};
+let failure = JSON.parse(await call('MoveWindow', [failureWindow.id, 100, 200, 300, 400], ':1.42', partial));
+equal(failure.window_id, String(failureWindow.id), 'partial move retains the requested identity despite other focus');
+equal(failure.observed, [100, 200, 500, 400], 'constrained placement reports the actual frame');
+equal(failure.message.includes('did not reach requested'), true, 'partial move retains the original failure');
+await call('GetLastTransitionMetrics', [], ':1.42', invalid);
+await call('MoveWindow', [failureWindow.id, 100, 200, 300, 400], ':1.42', invalid);
+
+const superseded = call('MoveWindow', [failureWindow.id, 200, 300, 300, 400], ':1.42', partial);
+failureWindow.move_resize_frame = resize;
+await call('MoveWindow', [failureWindow.id, 300, 400, 600, 700], ':1.99');
+failure = JSON.parse(await superseded);
+equal(failure.observed, [200, 300, 500, 400], 'superseded request reads its frame before the replacement mutates it');
+equal(failure.message, 'transition superseded by another request', 'supersession preserves its failure reason');
+const unmaximize = failureWindow.unmaximize;
+failureWindow.maximizeFlags = 3;
+failureWindow.unmaximize = function () {
+    this.frame.x = 350;
+    throw new Error('restore interrupted');
+};
+failure = JSON.parse(await call('MoveWindow', [failureWindow.id, 400, 500, 600, 700], ':1.42', partial));
+equal(failure.observed, [350, 400, 600, 700], 'failed state restoration reports changed geometry even before placement');
+equal(failure.message, 'restore interrupted', 'state restoration preserves its failure reason');
+failureWindow.unmaximize = unmaximize;
+failureWindow.maximizeFlags = 0;
+
+failureWindow.actor = new TestActor();
+const interrupted = call('MoveWindow', [failureWindow.id, 400, 500, 600, 700], ':1.42', partial);
+await delay(40);
+global.window_group.children.at(-1).remove_all_transitions();
+failure = JSON.parse(await interrupted);
+equal(failure.observed, [400, 500, 600, 700], 'interrupted animation preserves the moved frame');
+equal(failure.message, 'animation interrupted', 'interrupted animation remains a failure');
+equal(failureWindow.actor.frozen, false, 'interrupted animation thaws its actor');
+failureWindow.actor = null;
+
+const readFrame = failureWindow.get_frame_rect;
+failureWindow.move_resize_frame = function (_userOp, x, y, width, height) {
+    this.frame = {x, y, width, height};
+    this.get_frame_rect = () => { throw new Error('frame readback failed'); };
+    throw new Error('placement interrupted');
+};
+await call('MoveWindow', [failureWindow.id, 10, 20, 600, 700], ':1.42', 'org.freedesktop.DBus.Error.Failed');
+failureWindow.get_frame_rect = readFrame;
+for (const badFrame of [
+    {x: 10, y: 20, width: 0, height: 700},
+    {x: 10, y: 20, width: -1, height: 700},
+    {x: 10.5, y: 20, width: 600, height: 700},
+    {x: 2 ** 31, y: 20, width: 600, height: 700},
+    {x: 10, y: 20, width: 2 ** 32, height: 700},
+    {x: NaN, y: 20, width: 600, height: 700},
+]) {
+    failureWindow.frame = {x: 10, y: 20, width: 600, height: 700};
+    failureWindow.move_resize_frame = function () {
+        this.frame = badFrame;
+        throw new Error('placement interrupted');
+    };
+    await call('MoveWindow', [failureWindow.id, 30, 40, 600, 700], ':1.42', 'org.freedesktop.DBus.Error.Failed');
+}
+failureWindow.frame = {x: 10, y: 20, width: 600, height: 700};
+failureWindow.actor = new TestActor();
+failureWindow.move_resize_frame = function (_userOp, x, y, width, height) {
+    this.frame = {x, y, width: width + 100, height};
+};
+const closed = call('MoveWindow', [failureWindow.id, 30, 40, 600, 700], ':1.42', gone);
+display.windows = display.windows.filter(candidate => candidate !== failureWindow);
+failureWindow.actor.destroy();
+await closed;
+failureWindow.actor = null;
+failureWindow.move_resize_frame = resize;
+display.windows.push(failureWindow);
 
 await call('RegisterHotkeys', [['alt+ctrl+left', 'cmd+1', 'shift+f24']]);
 const originalGrabs = [...display.grabbed];
@@ -243,7 +329,11 @@ await call('RegisterHotkeys', [['ctrl+cmd+left']], ':1.99');
 await call('RegisterHotkeys', [[]], ':1.99');
 equal(display.grabbed.size, 0, 'empty set releases controller ownership and grabs');
 await call('RegisterHotkeys', [['ctrl+cmd+left']]);
+const disabled = call('MoveWindow', [failureWindow.id, 50, 60, 600, 700], ':1.42', partial);
 service.destroy();
+failure = JSON.parse(await disabled);
+equal(failure.observed, [50, 60, 600, 700], 'companion teardown preserves the changed frame');
+equal(failure.message, 'companion disabled during transition', 'teardown retains its failure reason');
 equal(display.grabbed.size, 0, 'destroy releases every grab');
 equal(display.handler, null, 'destroy disconnects accelerator listener');
 print(`GNOME companion contract: ${checks} checks passed`);

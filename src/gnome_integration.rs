@@ -222,6 +222,14 @@ impl WindowSystem for GnomeWindowSystem {
                 ))
             })?;
         let target = window_move.target;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PartialMovePayload {
+            window_id: String,
+            observed: (i32, i32, u32, u32),
+            message: String,
+        }
+        let mut partial_move = None;
         let result: Result<(), GnomeIntegrationError> = self.with_connection(|cached| {
             cached.has_transition = false;
             require_capability(
@@ -238,16 +246,33 @@ impl WindowSystem for GnomeWindowSystem {
                     "MoveWindow",
                     (id, target.x, target.y, target.width, target.height),
                 )
-                .map_err(classify_dbus_error)?;
+                .map_err(|error| {
+                    if error.name() == Some("org.window_zones.Gnome.Error.PartialMove")
+                        && let Some(payload) = error.message().and_then(|message| {
+                            serde_json::from_str::<PartialMovePayload>(message).ok()
+                        })
+                        && payload.window_id == id.to_string()
+                        && payload.observed.2 > 0
+                        && payload.observed.3 > 0
+                    {
+                        let (x, y, width, height) = payload.observed;
+                        partial_move = Some((Rect::new(x, y, width, height), payload.message));
+                    }
+                    classify_dbus_error(error)
+                })?;
             cached.has_transition = true;
             Ok(())
         });
 
-        result.map_err(|error| match error {
-            GnomeIntegrationError::WindowGone { .. } => {
+        result.map_err(|error| match (error, partial_move) {
+            (GnomeIntegrationError::WindowGone { .. }, _) => {
                 WindowSystemError::WindowGone(window_move.window.clone())
             }
-            _ => WindowSystemError::Platform(error.to_string()),
+            (_, Some((observed, message))) => WindowSystemError::PartialMove {
+                observed,
+                message: GnomeIntegrationError::Operation { message }.to_string(),
+            },
+            (error, None) => WindowSystemError::Platform(error.to_string()),
         })
     }
 
@@ -547,13 +572,14 @@ mod tests {
     struct FakeServiceState {
         capabilities: Vec<String>,
         capabilities_error: Option<(&'static str, String)>,
-        capabilities_delay: Option<Duration>,
+        reply_capabilities: bool,
         capabilities_calls: usize,
         window_senders: Vec<String>,
         focused: Option<(u64, i32, i32, u32, u32)>,
         displays: Vec<(String, i32, i32, u32, u32)>,
         moves: Vec<(u64, i32, i32, u32, u32)>,
         move_error: Option<(&'static str, String)>,
+        move_observed: Option<(i32, i32, u32, u32)>,
         transition_metrics: Option<(String, f64, f64)>,
         registered_hotkeys: Vec<String>,
         register_error: Option<(&'static str, String)>,
@@ -570,7 +596,7 @@ mod tests {
                     HOTKEYS_CAPABILITY.to_string(),
                 ],
                 capabilities_error: None,
-                capabilities_delay: None,
+                reply_capabilities: true,
                 capabilities_calls: 0,
                 window_senders: Vec::new(),
                 focused: Some((4294967301, -300, -20, 801, 602)),
@@ -580,6 +606,7 @@ mod tests {
                 ],
                 moves: Vec::new(),
                 move_error: None,
+                move_observed: None,
                 transition_metrics: None,
                 registered_hotkeys: Vec::new(),
                 register_error: None,
@@ -674,11 +701,10 @@ mod tests {
                                 factory
                                     .interface(GNOME_INTERFACE, ())
                                     .add_m(factory.method("GetCapabilities", (), move |method| {
-                                        let delay = capabilities_state.lock().capabilities_delay;
-                                        if let Some(delay) = delay {
-                                            thread::sleep(delay);
-                                        }
                                         let mut state = capabilities_state.lock();
+                                        if !state.reply_capabilities {
+                                            return Ok(Vec::new());
+                                        }
                                         state.capabilities_calls += 1;
                                         state
                                             .window_senders
@@ -727,10 +753,25 @@ mod tests {
                                         state
                                             .window_senders
                                             .push(method.msg.sender().unwrap().to_string());
+                                        if let Some((x, y, width, height)) = state.move_observed
+                                            && state
+                                                .focused
+                                                .as_ref()
+                                                .is_some_and(|window| window.0 == payload.0)
+                                        {
+                                            state.focused = Some((payload.0, x, y, width, height));
+                                        }
                                         if let Some((name, message)) = state.move_error.clone() {
                                             return Err((name, message).into());
                                         }
                                         state.moves.push(payload);
+                                        if state
+                                            .focused
+                                            .as_ref()
+                                            .is_some_and(|window| window.0 == payload.0)
+                                        {
+                                            state.focused = Some(payload);
+                                        }
                                         state.transition_metrics = Some((
                                             method.msg.sender().unwrap().to_string(),
                                             3.0,
@@ -1083,13 +1124,14 @@ mod tests {
         let bus = FakeBus::new(FakeServiceState::complete());
         let window_system = GnomeWindowSystem::with_bus_address(bus.address.clone());
         bus.update_state(|state| {
-            state.capabilities_delay = Some(CALL_TIMEOUT + Duration::from_millis(100));
+            state.reply_capabilities = false;
         });
 
-        assert!(matches!(
-            window_system.capabilities(),
-            Err(GnomeIntegrationError::Unavailable { .. })
-        ));
+        let result = window_system.capabilities();
+        assert!(
+            matches!(result, Err(GnomeIntegrationError::Unavailable { .. })),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1213,6 +1255,228 @@ mod tests {
                     .all(|sender| sender == &state.window_senders[0])
             );
         });
+    }
+
+    fn move_test_app() -> crate::App {
+        let path = std::env::temp_dir().join(format!(
+            "window-zones-gnome-moves-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[[bindings]]
+hotkey = "ctrl+cmd+left"
+action = { type = "move-to-zone", zone = "left-half" }
+[[bindings]]
+hotkey = "ctrl+cmd+r"
+action = { type = "restore" }
+"#,
+        )
+        .unwrap();
+        let app = crate::App::start_at(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(app.config_state(), crate::ConfigState::Loaded));
+        app
+    }
+
+    #[test]
+    fn app_preserves_restore_after_partial_placement_and_partial_restore() {
+        use crate::{DispatchHotkeyError, DispatchState, ExecuteActionError};
+
+        for initial_failure in [true, false] {
+            let bus = FakeBus::new(FakeServiceState::complete());
+            let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+            let mut app = move_test_app();
+            let original = system.focused_window().unwrap().unwrap();
+            let constrained = Rect::new(0, -50, 900, 1024);
+            if initial_failure {
+                bus.update_state(|state| {
+                    state.move_observed = Some((constrained.x, constrained.y, constrained.width, constrained.height));
+                    state.move_error = Some((
+                        "org.window_zones.Gnome.Error.PartialMove",
+                        serde_json::json!({
+                            "window_id": original.id.as_str(),
+                            "observed": [constrained.x, constrained.y, constrained.width as i64, constrained.height as i64],
+                            "message": "minimum width constrained placement",
+                        }).to_string(),
+                    ));
+                });
+            }
+            let dispatch = app.dispatch_hotkey("ctrl+cmd+left", &mut system);
+            if initial_failure {
+                assert!(matches!(
+                    dispatch,
+                    DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                        ExecuteActionError::WindowSystem(WindowSystemError::PartialMove { observed, .. })
+                    )) if *observed == constrained
+                ));
+            } else {
+                assert_eq!(dispatch, &DispatchState::Succeeded);
+            }
+
+            let partial_restore = Rect::new(-250, -10, 850, 650);
+            bus.update_state(|state| {
+                state.move_observed = Some((partial_restore.x, partial_restore.y, partial_restore.width, partial_restore.height));
+                state.move_error = Some((
+                    "org.window_zones.Gnome.Error.PartialMove",
+                    serde_json::json!({
+                        "window_id": original.id.as_str(),
+                        "observed": [partial_restore.x, partial_restore.y, partial_restore.width as i64, partial_restore.height as i64],
+                        "message": "restore interrupted",
+                    }).to_string(),
+                ));
+            });
+            assert!(matches!(
+                app.dispatch_hotkey("ctrl+cmd+r", &mut system),
+                DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                    ExecuteActionError::WindowSystem(WindowSystemError::PartialMove { observed, .. })
+                )) if *observed == partial_restore
+            ));
+            bus.update_state(|state| {
+                state.move_error = None;
+                state.move_observed = None;
+            });
+            assert_eq!(
+                app.dispatch_hotkey("ctrl+cmd+r", &mut system),
+                &DispatchState::Succeeded
+            );
+            assert_eq!(system.focused_window().unwrap().unwrap(), original);
+            assert!(matches!(
+                app.dispatch_hotkey("ctrl+cmd+r", &mut system),
+                DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                    ExecuteActionError::NothingToRestore
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn app_does_not_record_refusal_and_discards_closed_window_history() {
+        use crate::{DispatchHotkeyError, DispatchState, ExecuteActionError};
+
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        let mut app = move_test_app();
+        let original = system.focused_window().unwrap().unwrap();
+        bus.update_state(|state| {
+            state.move_error = Some((
+                "org.window_zones.Gnome.Error.InvalidWindowState",
+                "window refused placement without changing frame".into(),
+            ));
+        });
+        assert!(matches!(
+            app.dispatch_hotkey("ctrl+cmd+left", &mut system),
+            DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                ExecuteActionError::WindowSystem(WindowSystemError::Platform(_))
+            ))
+        ));
+        assert_eq!(system.focused_window().unwrap().unwrap(), original);
+        assert!(matches!(
+            app.dispatch_hotkey("ctrl+cmd+r", &mut system),
+            DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                ExecuteActionError::NothingToRestore
+            ))
+        ));
+        bus.update_state(|state| state.move_error = None);
+        assert_eq!(
+            app.dispatch_hotkey("ctrl+cmd+left", &mut system),
+            &DispatchState::Succeeded
+        );
+        bus.update_state(|state| {
+            state.move_error = Some((
+                "org.window_zones.Gnome.Error.WindowGone",
+                "window closed during restore".into(),
+            ));
+        });
+        assert!(matches!(
+            app.dispatch_hotkey("ctrl+cmd+r", &mut system),
+            DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                ExecuteActionError::WindowSystem(WindowSystemError::WindowGone(id))
+            )) if id == &original.id
+        ));
+        bus.update_state(|state| state.move_error = None);
+        assert!(matches!(
+            app.dispatch_hotkey("ctrl+cmd+r", &mut system),
+            DispatchState::Error(DispatchHotkeyError::ExecuteAction(
+                ExecuteActionError::NothingToRestore
+            ))
+        ));
+    }
+
+    #[test]
+    fn partial_move_payload_is_validated_on_the_private_bus() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        let requested = WindowMove::new(WindowId::new("4294967301"), Rect::new(10, 20, 600, 700));
+        let valid = serde_json::json!({
+            "window_id": "4294967301",
+            "observed": [-100, -20, 900, 700],
+            "message": "placement interrupted",
+        });
+        bus.update_state(|state| {
+            state.focused = Some((99, 1, 2, 3, 4));
+            state.move_error = Some((
+                "org.window_zones.Gnome.Error.PartialMove",
+                valid.to_string(),
+            ));
+        });
+        let error = system.move_window(&requested).unwrap_err();
+        assert!(matches!(
+            &error,
+            WindowSystemError::PartialMove { observed, .. } if *observed == Rect::new(-100, -20, 900, 700)
+        ));
+        assert!(error.to_string().contains("placement interrupted"));
+        assert!(system.transition_metrics().unwrap().is_none());
+
+        let mut malformed = vec!["not JSON".to_string(), "{}".to_string()];
+        for (field, value) in [
+            ("window_id", serde_json::json!("99")),
+            ("window_id", serde_json::json!(4294967301_u64)),
+            ("observed", serde_json::json!([-100, -20, 0, 700])),
+            ("observed", serde_json::json!([-100, -20, -1, 700])),
+            (
+                "observed",
+                serde_json::json!([-100, -20, 4294967296_u64, 700]),
+            ),
+            (
+                "observed",
+                serde_json::json!([2147483648_i64, -20, 900, 700]),
+            ),
+            ("observed", serde_json::json!([-100.5, -20, 900, 700])),
+            ("observed", serde_json::json!([-100, -20, 900])),
+            ("observed", serde_json::json!([-100, -20, 900, 700, 1])),
+            ("message", serde_json::Value::Null),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut payload = valid.clone();
+            payload[field] = value;
+            malformed.push(payload.to_string());
+        }
+        for payload in malformed {
+            bus.update_state(|state| {
+                state.move_error =
+                    Some(("org.window_zones.Gnome.Error.PartialMove", payload.clone()));
+            });
+            assert!(
+                matches!(
+                    system.move_window(&requested),
+                    Err(WindowSystemError::Platform(_))
+                ),
+                "malformed or foreign-window payload must not invent geometry: {payload}"
+            );
+        }
+        bus.update_state(|state| {
+            state.move_error = Some(("org.window_zones.Gnome.Error.WindowGone", valid.to_string()));
+        });
+        assert_eq!(
+            system.move_window(&requested),
+            Err(WindowSystemError::WindowGone(requested.window))
+        );
     }
 
     #[test]

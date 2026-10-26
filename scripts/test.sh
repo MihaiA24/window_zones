@@ -12,6 +12,7 @@ if command -v gjs >/dev/null 2>&1; then
   gjs -m "$PROJECT_ROOT/gnome-extension/tests/run.js"
 fi
 node --check "$PROJECT_ROOT/kwin-script/contents/code/main.js"
+node "$PROJECT_ROOT/kwin-script/tests/run.js"
 /usr/bin/python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/gnome-smoke.py").read_text())'
 # node accepts syntax QJSEngine rejects (object spread); qmllint is Qt's own parser.
 if command -v qmllint >/dev/null 2>&1; then

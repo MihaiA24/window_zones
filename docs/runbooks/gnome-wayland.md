@@ -92,6 +92,14 @@ captured window identity and a target frame, so changing focus between discovery
 and movement never moves the new focused window. A closed window returns
 `org.window_zones.Gnome.Error.WindowGone`.
 
+If a failed request changes that Window's frame, the companion returns
+`org.window_zones.Gnome.Error.PartialMove` with JSON fields `window_id`
+(decimal string), `observed` (`[x,y,width,height]`), and `message`. The App
+validates the identity and positive frame dimensions before retaining the
+original Restore point, including after a partially failed Restore. Readback
+uses the captured Window, never the new focused Window. Unchanged or unreadable
+frames remain ordinary failures; a closed Window still returns `WindowGone`.
+
 Optional `transition-metrics` enables `GetLastTransitionMetrics() -> (dd)`,
 with request/completion milliseconds from the same D-Bus caller's last
 successful move. Metrics are cleared on caller disconnect; unsupported
@@ -262,6 +270,7 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 9. Restart the application and repeat one zone move and one display move.
 10. Repeat Ctrl+Super+Left/Right at a matching half. Verify crossing to the neighbouring display's nearest half, different-size destinations, and no directional wrap at the outer edge.
 11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Restore desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
+12. On a disposable client with controllable minimum size, force a zone placement to apply only partially and confirm Restore still reaches its pre-placement frame. Also snap a small window to a larger zone, set a minimum width below that placement but above its original width, and Restore: after removing the constraint, retrying Restore must reach the original frame rather than the partially restored one.
 
 `gnome-live` checks item 4 and a refused replacement mechanically on test windows it starts itself: it captures one Text Editor's id, focuses a second, and moves the captured id over `MoveWindow`; closes the second and expects `WindowGone`; maximizes the first through EWMH, then edge-tiles it with a real Super+Left over `/dev/uinput`, and expects each move to clear the state and apply the frame; sets fullscreen and expects `leave fullscreen first` with state and frame unchanged. It then reloads a config adding the reserved `Alt+Ctrl+Left` and expects `were refused`, the previous four bindings, and the previous accelerator still moving the window. Setting EWMH states uses a helper crate the gate builds against the public `window_zones` API, so `cargo` needs the locked crates.
 
@@ -281,7 +290,7 @@ cargo test --lib gnome_integration
 gjs -m gnome-extension/tests/run.js
 ```
 
-The private fake-service tests cover names/signatures, capability gating and caching, connection reuse, negative coordinates, focused-window absence, identified move payloads, `WindowGone`, hotkey transport draining, atomic rejection, Busy, incompatible/denied responses, and disconnect/reconnect. The GJS harness invokes the actual `_methodCall` dispatcher with real GLib variants and isolated Shell stubs; it checks reply signatures, focus-change identity, restore-before-move, rejected states, canonical hotkeys, rollback, and owner-vanish cleanup without touching the live desktop.
+The private fake-service tests cover names/signatures, capability gating and caching, connection reuse, negative coordinates, focused-window absence, identified move payloads, partial-placement and partial-Restore history, malformed/foreign-window partial errors, `WindowGone`, hotkey transport draining, atomic rejection, Busy, incompatible/denied responses, and disconnect/reconnect. The GJS harness invokes the actual `_methodCall` dispatcher with real GLib variants and isolated Shell stubs; it checks reply signatures, focus-change identity, restore-before-move, failed/unchanged/unreadable frame reporting, rejected states, canonical hotkeys, rollback, and owner-vanish cleanup without touching the live desktop.
 
 For real interactive Wayland and XWayland windows on an isolated GNOME 51
 compositor, run:

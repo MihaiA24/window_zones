@@ -122,6 +122,13 @@ function dbusError(name, message) {
     return error;
 }
 
+function validFrame(frame) {
+    return frame && [frame.x, frame.y].every(value =>
+        Number.isInteger(value) && value >= -2147483648 && value <= 2147483647)
+        && [frame.width, frame.height].every(value =>
+            Number.isInteger(value) && value > 0 && value <= 4294967295);
+}
+
 function canonicalAccelerator(hotkey) {
     if (/\s/.test(hotkey) || !/^(alt\+)?(ctrl\+)?(shift\+)?(cmd\+)?[^+]+$/.test(hotkey))
         throw new Error(`non-canonical hotkey '${hotkey}'`);
@@ -326,6 +333,9 @@ export class WindowZonesService {
         if (actor)
             global.window_manager.emit('kill-window-effects', actor);
         const oldFrame = window.get_frame_rect();
+        const initialFrame = {
+            x: oldFrame.x, y: oldFrame.y, width: oldFrame.width, height: oldFrame.height,
+        };
         const settings = St.Settings.get();
         let clone = null;
         if (actor && settings.enable_animations
@@ -379,11 +389,31 @@ export class WindowZonesService {
                     }
                     clone?.destroy();
                     this._moves.delete(window);
-                    if (!error) {
-                        const finalFrame = window.get_frame_rect();
-                        if (Math.abs(finalFrame.x - x) > 2 || Math.abs(finalFrame.y - y) > 2
-                            || Math.abs(finalFrame.width - width) > 2 || Math.abs(finalFrame.height - height) > 2)
-                            error = dbusError('org.window_zones.Gnome.Error.InvalidWindowState', 'window changed geometry during transition');
+                    let finalFrame = null;
+                    try {
+                        if (error?.name !== 'org.window_zones.Gnome.Error.WindowGone') {
+                            if (!global.display.list_all_windows().includes(window)) {
+                                error = dbusError('org.window_zones.Gnome.Error.WindowGone', `window ${id} closed during transition`);
+                            } else {
+                                finalFrame = window.get_frame_rect();
+                            }
+                        }
+                    } catch (readError) {
+                        error ??= readError;
+                    }
+                    if (!error && (!validFrame(finalFrame)
+                        || Math.abs(finalFrame.x - x) > 2 || Math.abs(finalFrame.y - y) > 2
+                        || Math.abs(finalFrame.width - width) > 2 || Math.abs(finalFrame.height - height) > 2))
+                        error = dbusError('org.window_zones.Gnome.Error.InvalidWindowState', 'window changed geometry during transition');
+                    if (error && error.name !== 'org.window_zones.Gnome.Error.WindowGone'
+                        && validFrame(initialFrame) && validFrame(finalFrame)
+                        && (finalFrame.x !== initialFrame.x || finalFrame.y !== initialFrame.y
+                            || finalFrame.width !== initialFrame.width || finalFrame.height !== initialFrame.height)) {
+                        error = dbusError('org.window_zones.Gnome.Error.PartialMove', JSON.stringify({
+                            window_id: String(id),
+                            observed: [finalFrame.x, finalFrame.y, finalFrame.width, finalFrame.height],
+                            message: error.message ?? String(error),
+                        }));
                     }
                     if (error) {
                         reject(error);

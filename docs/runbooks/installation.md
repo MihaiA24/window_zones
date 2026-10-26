@@ -108,8 +108,12 @@ installer then adds `window-zones@mihai-a24` to
 
 **GNOME on Wayland needs a log out/in before a newly installed extension loads.**
 An upgrade also needs the companion to be reloaded; follow the
-[GNOME lifecycle runbook](gnome-wayland.md). Uninstall disables the extension and
-removes it from `enabled-extensions`.
+[GNOME lifecycle runbook](gnome-wayland.md). The installer records the owning
+prefix in the companion's `.window-zones-install-prefix` marker. Uninstall
+disables the extension, removes its enabled-list entry and deletes its files
+only while that marker matches the selected prefix. Missing or different
+ownership leaves the companion and activation unchanged; reinstall with
+`--gnome-extension` from the intended prefix before removing it.
 
 Upgrade the binary and companion together: the combined contract uses
 `org.window_zones.Gnome2`, with identified-window moves and optional
@@ -317,9 +321,10 @@ The installer records its installed binaries and optional features in
 `<prefix>/share/window-zones/install-record`. On Linux, uninstall stops/disables
 the App and KWin companion services only when their units still reference this
 prefix, then removes their owned units and desktop entries. It stops the owned
-KDE fallback launcher before removing its binaries. It disables/removes its
-GNOME extension and unloads/disables the KWin script when the Plasma tools are
-available and its package ownership marker still matches this prefix. On macOS, it boots out
+KDE fallback launcher before removing its binaries. GNOME extension cleanup and
+KWin script cleanup each require their package's ownership marker to match this
+prefix; an old prefix cannot disable or delete a replacement companion. KWin
+activation cleanup also requires the Plasma tools. On macOS, it boots out
 the loaded LaunchAgent and removes its plist only if the plist's executable
 still belongs to the selected prefix; an old prefix cannot uninstall another
 prefix's replacement agent. The log file is kept. It then removes recorded

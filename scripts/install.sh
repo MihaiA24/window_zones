@@ -278,6 +278,11 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
         fi
         ;;
       gnome-extension)
+        if [[ ! -f "$GNOME_DIR/.window-zones-install-prefix" ]] \
+          || [[ "$(<"$GNOME_DIR/.window-zones-install-prefix")" != "$INSTALL_PREFIX" ]]; then
+          warn 'GNOME companion ownership does not match this prefix; leaving it enabled and installed. Reinstall with --gnome-extension from the intended prefix before uninstalling.'
+          continue
+        fi
         if command -v gnome-extensions >/dev/null 2>&1; then
           gnome-extensions disable "$GNOME_ID" 2>/dev/null || true
         fi
@@ -370,6 +375,7 @@ done
 if [[ "$GNOME_EXTENSION" -eq 1 ]]; then
   mkdir -p "$GNOME_DIR"
   install -m 644 -- "$PROJECT_ROOT/gnome-extension/metadata.json" "$PROJECT_ROOT/gnome-extension/extension.js" "$GNOME_DIR/"
+  printf '%s\n' "$INSTALL_PREFIX" >"$GNOME_DIR/.window-zones-install-prefix"
   record_install gnome-extension
   if command -v gnome-extensions >/dev/null 2>&1 && gnome-extensions enable "$GNOME_ID" 2>/dev/null; then
     echo 'GNOME companion enabled.'

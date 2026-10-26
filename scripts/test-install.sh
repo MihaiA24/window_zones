@@ -56,7 +56,7 @@ while True:
 # All desktop/service commands are fixture executables, including on a real KDE host.
 # The small manager executes generated units rather than testing installer source text.
 fixture_tool = r'''
-import configparser, json, os, shlex, shutil, signal, subprocess, sys, time
+import ast, configparser, json, os, shlex, shutil, signal, subprocess, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -160,6 +160,26 @@ elif name in ('busctl', 'dbus-send'):
     sys.exit(0 if ready.exists() else 1)
 elif name in ('kwriteconfig6', 'qdbus6'):
     log('kwin-setting')
+elif name == 'gnome-extensions':
+    log('gnome-extension')
+    if args not in (['enable', 'window-zones@mihai-a24'], ['disable', 'window-zones@mihai-a24']):
+        raise RuntimeError('unexpected GNOME extension command: ' + repr(args))
+    # A newly installed extension is unknown to the running Shell until next login.
+    sys.exit(1)
+elif name == 'gsettings':
+    log('gnome-setting')
+    if args[1:3] != ['org.gnome.shell', 'enabled-extensions']:
+        raise RuntimeError('unexpected GNOME setting: ' + repr(args))
+    file = base / 'gnome-enabled.json'
+    enabled = json.loads(file.read_text()) if file.exists() else ['unrelated@example']
+    if args == ['get', 'org.gnome.shell', 'enabled-extensions']:
+        print(repr(enabled))
+    elif len(args) == 4 and args[0] == 'set':
+        enabled = ast.literal_eval(args[3])
+        assert isinstance(enabled, list) and all(isinstance(item, str) for item in enabled)
+        file.write_text(json.dumps(enabled))
+    else:
+        raise RuntimeError('unexpected gsettings command: ' + repr(args))
 else:
     raise RuntimeError('unexpected desktop command: ' + name)
 '''
@@ -229,6 +249,66 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         return [part.replace('\\$', '$').replace('\\`', '`').replace('%%', '%') for part in shlex.split(value)]
 
     try:
+        env['XDG_CURRENT_DESKTOP'] = 'GNOME'
+        gnome_id = 'window-zones@mihai-a24'
+        gnome_dir = Path(env['XDG_DATA_HOME']) / 'gnome-shell/extensions' / gnome_id
+        gnome_marker = gnome_dir / '.window-zones-install-prefix'
+        gnome_settings = base / 'gnome-enabled.json'
+        unrelated = gnome_dir.parent / 'unrelated@example/metadata.json'
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text('unrelated extension witness\n')
+        gnome_replacement = base / r'''GNOME replacement $cash 25% "quoted" 'single' \back`tick'''
+
+        def gnome_files():
+            return {str(file.relative_to(gnome_dir)): file.read_bytes()
+                    for file in gnome_dir.rglob('*') if file.is_file()}
+
+        install(prefix, '--gnome-extension', '--init-config')
+        install(gnome_replacement, '--gnome-extension')
+        replacement_files = gnome_files()
+        replacement_settings = gnome_settings.read_bytes()
+        offset = len(events())
+        result = install(prefix, '--uninstall')
+        assert gnome_files() == replacement_files, 'stale prefix removed replacement GNOME files'
+        assert gnome_settings.read_bytes() == replacement_settings, 'stale prefix changed replacement GNOME activation'
+        assert not any(item['kind'] in ('gnome-extension', 'gnome-setting') for item in events()[offset:]), 'stale prefix called GNOME tools'
+        assert 'leaving it enabled and installed' in result.stderr
+        assert '--gnome-extension' in result.stderr, 'ownership warning must explain how to reclaim the companion'
+        assert gnome_marker.read_text() == str(gnome_replacement) + '\n'
+        assert json.loads(gnome_settings.read_text()) == ['unrelated@example', gnome_id]
+        assert not (prefix / 'bin/window_zones').exists()
+
+        (gnome_dir / 'extension.js').write_text('old companion revision\n')
+        install(gnome_replacement, '--gnome-extension', '--init-config')
+        assert gnome_files() == replacement_files, 'same-prefix reinstall did not replace the companion'
+        record = (gnome_replacement / 'share/window-zones/install-record').read_text().splitlines()
+        assert record.count('gnome-extension') == 1
+        install(gnome_replacement, '--uninstall')
+        assert not gnome_dir.exists(), 'owning prefix did not remove its GNOME companion'
+        assert not (gnome_replacement / 'bin/window_zones').exists()
+        assert json.loads(gnome_settings.read_text()) == ['unrelated@example']
+        assert unrelated.read_text() == 'unrelated extension witness\n'
+        assert witness.read_text() == 'user config witness\n'
+
+        for owner in (None, str(gnome_replacement)):
+            install(prefix, '--gnome-extension')
+            if owner is None:
+                gnome_marker.unlink()
+            else:
+                gnome_marker.write_text(owner + '\n')
+            unowned_files = gnome_files()
+            unowned_settings = gnome_settings.read_bytes()
+            offset = len(events())
+            result = install(prefix, '--uninstall')
+            assert gnome_files() == unowned_files, 'unowned GNOME files were removed'
+            assert gnome_settings.read_bytes() == unowned_settings, 'unowned GNOME activation was changed'
+            assert not any(item['kind'] in ('gnome-extension', 'gnome-setting') for item in events()[offset:]), 'unowned uninstall called GNOME tools'
+            assert 'leaving it enabled and installed' in result.stderr and '--gnome-extension' in result.stderr
+            assert unrelated.read_text() == 'unrelated extension witness\n'
+            assert witness.read_text() == 'user config witness\n'
+        print('PASS GNOME prefix replacement, owned reinstall/uninstall, unowned preservation, config preservation')
+        env['XDG_CURRENT_DESKTOP'] = 'KDE'
+
         install(prefix, '--kwin-script', '--autostart', '--init-config')
         wait_for(lambda: starts('window_zones'), 'systemd App did not start')
         assert not any(item['kind'] == 'early-app' for item in events()), 'App started before companion readiness'

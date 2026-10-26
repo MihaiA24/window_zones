@@ -773,16 +773,19 @@ impl CompanionState {
     }
 
     fn authorize_controller(&mut self, sender: String) -> Result<(), MethodErr> {
+        self.is_controller(&sender)?;
+        self.controller_sender = Some(sender);
+        Ok(())
+    }
+
+    fn is_controller(&self, sender: &str) -> Result<bool, MethodErr> {
         match self.controller_sender.as_deref() {
             Some(owner) if owner != sender => Err(method_error(
                 "org.window_zones.KWin.Error.Busy",
                 "another Window Zones process owns the KWin controller",
             )),
-            Some(_) => Ok(()),
-            None => {
-                self.controller_sender = Some(sender);
-                Ok(())
-            }
+            Some(_) => Ok(true),
+            None => Ok(false),
         }
     }
 
@@ -1344,9 +1347,13 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             let sender = sender_name(method.msg)?;
                             let mut state = next_hotkey_state.lock();
                             state.ensure_ready()?;
-                            state.authorize_controller(sender)?;
+                            let event = if state.is_controller(&sender)? {
+                                state.events.pop_front()
+                            } else {
+                                None
+                            };
                             let mut reply = method.msg.method_return();
-                            match state.events.pop_front() {
+                            match event {
                                 Some(hotkey) => reply.append_all((true, hotkey)),
                                 None => reply.append_all((false, String::new())),
                             }
@@ -1923,6 +1930,151 @@ mod tests {
         });
         drop(system);
         bus.update_state(|state| assert!(state.registered_hotkeys.is_empty()));
+    }
+
+    #[test]
+    fn real_service_hotkey_polling_never_claims_controller() {
+        const CHILD_ENV: &str = "WINDOW_ZONES_KWIN_SERVICE_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_kwin_companion_service().unwrap();
+            return;
+        }
+
+        struct Process(Child);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut daemon = Process(
+            Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for KDE contract tests"),
+        );
+        let mut address = String::new();
+        BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim();
+        assert!(!address.is_empty());
+        let mut service = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "kwin_integration::tests::real_service_hotkey_polling_never_claims_controller",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("DBUS_SESSION_BUS_ADDRESS", address)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let script = Connection::new_address(address).unwrap();
+        let bus = script.with_proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            Duration::from_secs(1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (owned,): (bool,) = bus
+                .method_call("org.freedesktop.DBus", "NameHasOwner", (KWIN_SERVICE_NAME,))
+                .unwrap();
+            if owned {
+                break;
+            }
+            assert!(
+                service.0.try_wait().unwrap().is_none(),
+                "real KWin companion exited before owning its bus name"
+            );
+            assert!(Instant::now() < deadline, "real KWin service never started");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let proxy = script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+        proxy
+            .method_call::<(), _, _, _>(
+                KWIN_INTERFACE,
+                "RegisterCompanion",
+                (KWIN_PROTOCOL_MAJOR.to_string(), true),
+            )
+            .unwrap();
+        let old = Connection::new_address(address).unwrap();
+        let new = Connection::new_address(address).unwrap();
+        let register = |connection: &Connection, hotkeys: &[&str]| {
+            let (id,): (u32,) = connection
+                .with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT)
+                .method_call(
+                    KWIN_INTERFACE,
+                    "RegisterHotkeys",
+                    (serde_json::to_string(hotkeys).unwrap(),),
+                )?;
+            Ok::<_, dbus::Error>(id)
+        };
+        let complete_registration = |id: u32, hotkeys: &[&str]| {
+            let request: NextRequestPayload = proxy
+                .method_call(KWIN_INTERFACE, "NextRequest", ())
+                .unwrap();
+            assert_eq!(request.0, id);
+            assert_eq!(request.1, REQUEST_REGISTER_HOTKEYS);
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&request.7).unwrap(),
+                hotkeys
+            );
+            proxy
+                .method_call::<(), _, _, _>(
+                    KWIN_INTERFACE,
+                    "CompleteRequest",
+                    (id.to_string(), true, String::new(), String::new()),
+                )
+                .unwrap();
+        };
+        let poll = |connection: &Connection| {
+            connection
+                .with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT)
+                .method_call::<(bool, String), _, _, _>(KWIN_INTERFACE, "GetNextHotkey", ())
+        };
+
+        complete_registration(
+            register(&old, &["alt+ctrl+left"]).unwrap(),
+            &["alt+ctrl+left"],
+        );
+        assert_eq!(
+            register(&new, &["alt+ctrl+right"]).unwrap_err().name(),
+            Some("org.window_zones.KWin.Error.Busy")
+        );
+        complete_registration(register(&old, &[]).unwrap(), &[]);
+        for _ in 0..2 {
+            assert_eq!(poll(&old).unwrap(), (false, String::new()));
+            assert_eq!(poll(&new).unwrap(), (false, String::new()));
+        }
+        for hotkey in ["ctrl+alt+left", "ALT+left", "alt+enter"] {
+            assert_eq!(
+                register(&old, &[hotkey]).unwrap_err().name(),
+                Some("org.window_zones.KWin.Error.Unsupported")
+            );
+        }
+        complete_registration(
+            register(&new, &["alt+ctrl+right"]).unwrap(),
+            &["alt+ctrl+right"],
+        );
+        proxy
+            .method_call::<(), _, _, _>(
+                KWIN_INTERFACE,
+                "HotkeyPressed",
+                ("alt+ctrl+right".to_string(),),
+            )
+            .unwrap();
+        assert_eq!(
+            poll(&old).unwrap_err().name(),
+            Some("org.window_zones.KWin.Error.Busy")
+        );
+        assert_eq!(poll(&new).unwrap(), (true, "alt+ctrl+right".to_string()));
+        assert_eq!(poll(&new).unwrap(), (false, String::new()));
     }
 
     #[test]

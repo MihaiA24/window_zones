@@ -116,6 +116,14 @@ def run(binary, keep_logs, output_dir=None):
         return call('org.window_zones.Gnome', '/org/window_zones/Gnome', 'org.window_zones.Gnome2', method, params).unpack()
     def focused():
         return companion('GetFocusedWindow')
+    def set_overview(active):
+        # Observe Shell state rather than assuming Overview transitions fit a key-event delay.
+        destination, path = 'org.gnome.Shell', '/org/gnome/Shell'
+        call(destination, path, 'org.freedesktop.DBus.Properties', 'Set',
+             GLib.Variant('(ssv)', ('org.gnome.Shell', 'OverviewActive', GLib.Variant('b', active))))
+        check('Overview ' + ('opens' if active else 'closes'),
+              wait_for(lambda: call(destination, path, 'org.freedesktop.DBus.Properties', 'Get',
+                                    GLib.Variant('(ss)', ('org.gnome.Shell', 'OverviewActive'))).unpack()[0] == active))
     def remote(method, params=None):
         return call('org.gnome.Mutter.RemoteDesktop', remote_path, 'org.gnome.Mutter.RemoteDesktop.Session', method, params)
     def wait_for(predicate, timeout=8):
@@ -302,10 +310,13 @@ def run(binary, keep_logs, output_dir=None):
         env.pop('XAUTHORITY', None)
         env.pop('SSH_CONNECTION', None)
         connection = Gio.DBusConnection.new_for_address_sync(address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
-        shell, shell_log = start(['gnome-shell', '--headless', '--wayland-display', env['WAYLAND_DISPLAY'], '--virtual-monitor', '1920x1080', '--virtual-monitor', '1600x900'], 'shell')
+        shell, shell_log = start(['gnome-shell', '--headless', '--force-animations', '--wayland-display', env['WAYLAND_DISPLAY'], '--virtual-monitor', '1920x1080', '--virtual-monitor', '1600x900'], 'shell')
         check('Companion loaded by real GNOME', wait_for(lambda: 'move-resize' in companion('GetCapabilities')[0], 20), 'GNOME ' + subprocess.check_output(['gnome-shell', '--version'], text=True).strip())
+        check('GNOME finishes startup before input', wait_for(lambda: 'GNOME Shell started' in text(shell_log)), text(shell_log))
+        check('Two real compositor displays and reserved panel area',
+              wait_for(lambda: len(available := companion('GetDisplays')[0]) == 2 and available[0][2] > 0),
+              companion('GetDisplays')[0])
         displays = companion('GetDisplays')[0]
-        check('Two real compositor displays and reserved panel area', len(displays) == 2 and displays[0][2] > 0, displays)
         area = displays[0][1:]
         second_area = displays[1][1:]
         expected_zones = targets(area)
@@ -320,10 +331,9 @@ def run(binary, keep_logs, output_dir=None):
         video, video_log = start(['gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]), '!', 'videoconvert', '!', 'fakesink', 'sync=false'], 'live-compositor-video')
         window, window_log = start([sys.executable, str(Path(__file__).resolve()), '--test-window', 'native Wayland'], 'native-window')
         check('Native Wayland GTK window mapped', wait_for(lambda: window_state(window_log) and window_state(window_log)[:2] == [720, 480]), text(window_log))
-        check('GNOME finishes startup before input', wait_for(lambda: 'GNOME Shell started' in text(shell_log)), text(shell_log))
-        inject([1])
-        inject([56, 15])
         remote('NotifyPointerMotionRelative', GLib.Variant('(dd)', (500.0, 400.0)))
+        set_overview(False)
+        inject([56, 15])
         check('Native virtual keyboard establishes application focus', wait_for(lambda: focused()[0]), focused())
         capture_screen('focus-before-input')
         focus_entry(window_log)
@@ -508,11 +518,16 @@ def run(binary, keep_logs, output_dir=None):
         tile_dispatch(window_log, 105, expected_zones[0], 'Alt+Ctrl+Cmd+n', targets(second_area)[0], 'next-display-from-tiled')
         tile_dispatch(window_log, 106, targets(second_area)[1], 'Alt+Ctrl+Cmd+p', expected_zones[1], 'previous-display-from-tiled')
         dispatch('Alt+Ctrl+Cmd+i', custom, 'overview-baseline', window_log)
-        inject([125])
+        overview_window_id = focused()[1]
+        set_overview(True)
         check('Overview excludes the application from focused-window actions', wait_for(lambda: not focused()[0]), focused())
         rejected = rejected_dispatch(hotkeys[0], 'Overview dispatch')
         check('Overview dispatch is rejected', 'Dispatch state: Error' in rejected and 'NoFocusedWindow' in rejected, rejected.strip())
-        inject([1])
+        set_overview(False)
+        inject([56, 15])
+        check('Overview exit returns actions to the captured application',
+              wait_for(lambda: focused()[:2] == (True, overview_window_id) and window_state(window_log)[2]),
+              focused())
         assert_frame('Overview leaves the window geometry unchanged', custom, window_log)
         dispatch(hotkeys[1], expected_zones[1], 'dry-run-baseline', window_log)
         dry = subprocess.check_output([str(binary), '--backend', 'dry-run', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)

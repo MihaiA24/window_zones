@@ -61,6 +61,7 @@ let activeHotkeys = new Set();
 let registeredShortcuts = new Set();
 let polling = false;
 let pollStartedAt = 0;
+let pollGeneration = 0;
 let processingRequest = false;
 let companionRetryTimer = null;
 const trackedWindows = new Map();
@@ -380,7 +381,14 @@ function complete(requestId, ok, errorName, message) {
 }
 
 function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, callback) {
+    let finished = false;
+    let timer = null;
     const finish = error => {
+        if (finished)
+            return;
+        finished = true;
+        if (timer)
+            timer.stop();
         complete(requestId, !error, error ? (error.dbusError || 'org.window_zones.KWin.Error.Operation') : '',
             error ? errorMessage(error) : '');
         callback();
@@ -396,6 +404,12 @@ function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJ
         } else if (kind === REQUEST_REFRESH_DISPLAYS) {
             // WorkspaceWrapper has no work-area/strut change signal. Query at the App's
             // display-read seam so panel reservations cannot stay stale until a screen change.
+            // Like shortcut updates, display publication must survive an omitted D-Bus callback.
+            timer = new QTimer();
+            timer.interval = 750;
+            timer.singleShot = true;
+            timer.timeout.connect(() => finish(protocolError('Unavailable', 'KWin work-area update timed out')));
+            timer.start();
             publishDisplays(() => finish());
             return;
         } else if (kind === REQUEST_REGISTER_HOTKEYS) {
@@ -415,9 +429,12 @@ function pollRequests() {
         return;
     polling = true;
     pollStartedAt = Date.now();
+    const generation = ++pollGeneration;
 
     const accepted = invoke('NextRequest', [],
         (requestId, kind, windowId, x, y, width, height, hotkeysJson) => {
+            if (generation !== pollGeneration)
+                return;
             if (requestId !== 0) {
                 processingRequest = true;
                 processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, () => {
@@ -463,6 +480,7 @@ function retryCompanion() {
     // KWin omits callDBus error callbacks. Recover a lost poll, never duplicate a healthy one.
     if (processingRequest || (polling && Date.now() - pollStartedAt < 3000))
         return;
+    ++pollGeneration;
     polling = false;
     connectCompanion(false);
 }

@@ -25,6 +25,7 @@ export class TestActor {
     thaw() { this.frozen = false; }
     set_scale(x, y) { this.scale_x = x; this.scale_y = y; }
     ease(properties) {
+        this.onStopped = properties.onStopped;
         this.transition = GLib.timeout_add(GLib.PRIORITY_DEFAULT, properties.duration, () => {
             this.transition = 0;
             Object.assign(this, properties);
@@ -36,6 +37,7 @@ export class TestActor {
         if (this.transition !== 0) {
             GLib.source_remove(this.transition);
             this.transition = 0;
+            this.onStopped?.(false);
         }
     }
     destroy() {
