@@ -577,12 +577,6 @@ impl CompanionRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RequestResult {
-    complete: bool,
-    message: String,
-}
-
 #[derive(Debug)]
 struct CompanionState {
     script_ready: bool,
@@ -593,7 +587,7 @@ struct CompanionState {
     displays: Vec<DisplayPayload>,
     requests: VecDeque<CompanionRequest>,
     claimed_requests: HashSet<u32>,
-    results: HashMap<u32, RequestResult>,
+    results: HashMap<u32, String>,
     next_request_id: u32,
     registered_hotkeys: Vec<String>,
     events: VecDeque<String>,
@@ -819,19 +813,14 @@ impl CompanionState {
         if ok && let CompanionRequest::RegisterHotkeys { hotkeys, .. } = request {
             self.registered_hotkeys = hotkeys;
         }
-        self.results.insert(
-            id,
-            RequestResult {
-                complete: true,
-                message: if ok { String::new() } else { message },
-            },
-        );
+        self.results
+            .insert(id, if ok { String::new() } else { message });
         Ok(())
     }
 
     fn request_result(&mut self, id: u32) -> (bool, String) {
-        if let Some(result) = self.results.remove(&id) {
-            return (result.complete, result.message);
+        if let Some(message) = self.results.remove(&id) {
+            return (true, message);
         }
         if self.requests.iter().any(|request| request.id() == id) {
             return (false, String::new());

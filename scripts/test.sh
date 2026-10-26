@@ -8,6 +8,7 @@ cd "$PROJECT_ROOT"
 bash -n "$PROJECT_ROOT"/scripts/*.sh
 node --check "$PROJECT_ROOT/gnome-extension/extension.js"
 node --check "$PROJECT_ROOT/kwin-script/contents/code/main.js"
+python3 "$PROJECT_ROOT/.agents/skills/verify-window-zones/test_verify.py"
 
 cargo fmt --all -- --check
 cargo test --locked

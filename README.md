@@ -51,6 +51,7 @@ Use these helper scripts for common workflows:
 - `./scripts/run.sh` — run the binary with safe defaults for quick checks.
 - `./scripts/test.sh` — run formatting, test, and lint checks.
 - `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs; `gnome-live` runs the seated GNOME session checks.
+- [`.agents/skills/verify-window-zones/SKILL.md`](.agents/skills/verify-window-zones/SKILL.md) — checkout-owned verification CLI, maintained feature journeys, build freshness checks, and retained evidence.
 
 - `docs/runbooks/installation.md`
 - `docs/runbooks/running.md`

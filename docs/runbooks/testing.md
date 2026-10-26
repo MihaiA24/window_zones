@@ -15,6 +15,7 @@ What this verifies:
 - `bash -n scripts/*.sh` (shell syntax, including the 2000-line Smoke harness)
 - `node --check gnome-extension/extension.js`
 - `node --check kwin-script/contents/code/main.js`
+- `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, dry-run, freshness, evidence retention, JSON mismatches, median/spread, and application-only clock scope)
 
 The repository test script covers formatting, unit/integration tests, doc tests,
 and clippy when installed. The GNOME and KDE adapter contract tests use fake
@@ -27,6 +28,16 @@ The compositor scripts can be syntax-checked with:
 node --check gnome-extension/extension.js
 node --check kwin-script/contents/code/main.js
 ```
+
+## Agent-driven verification
+
+For checkout-owned launches, drives, fixed-oracle checks, performance measurement and evidence,
+follow the [verification skill](../../.agents/skills/verify-window-zones/SKILL.md) and [feature map](../../.agents/skills/verify-window-zones/features/README.md).
+
+For direct smoke-runner integrations, `WINDOW_ZONES_BINARY` pins the app binary,
+`WINDOW_ZONES_SMOKE_ROOT` selects a new absolute scratch directory, and
+`WINDOW_ZONES_SMOKE_DISPLAY` selects a free X11 display number. An occupied
+display is rejected rather than attached to; retain proof with `--keep-logs`.
 
 ## V1 verification matrix
 

@@ -29,13 +29,12 @@ impl WindowsWindowSystem {
     fn collect_displays() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         let mut displays = Vec::<DisplayGeometry>::new();
 
-        let mut callback_state = MonitorEnumState::new();
         let result = unsafe {
             EnumDisplayMonitors(
                 HDC::default(),
                 None,
                 Some(monitor_enum_callback),
-                LPARAM(&mut callback_state as *mut _ as isize),
+                LPARAM(&mut displays as *mut _ as isize),
             )
         };
 
@@ -43,12 +42,6 @@ impl WindowsWindowSystem {
             return Err(WindowSystemError::Platform(
                 "EnumDisplayMonitors failed".to_string(),
             ));
-        }
-
-        displays.append(&mut callback_state.displays);
-
-        if displays.is_empty() {
-            return Ok(Vec::new());
         }
 
         Ok(displays)
@@ -154,27 +147,13 @@ impl WindowSystem for WindowsWindowSystem {
 }
 
 #[cfg(target_os = "windows")]
-struct MonitorEnumState {
-    displays: Vec<DisplayGeometry>,
-}
-
-#[cfg(target_os = "windows")]
-impl MonitorEnumState {
-    fn new() -> Self {
-        Self {
-            displays: Vec::new(),
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 extern "system" fn monitor_enum_callback(
     h_monitor: HMONITOR,
     _hdc: HDC,
     _rect: *mut RECT,
     lparam: LPARAM,
 ) -> windows::Win32::Foundation::BOOL {
-    let state = unsafe { &mut *(lparam.0 as *mut MonitorEnumState) };
+    let displays = unsafe { &mut *(lparam.0 as *mut Vec<DisplayGeometry>) };
     let mut info = MONITORINFOEXW {
         monitorInfo: MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
@@ -198,7 +177,7 @@ extern "system" fn monitor_enum_callback(
         let width = u32::try_from(area.right - area.left).ok();
         let height = u32::try_from(area.bottom - area.top).ok();
         if let (Some(width), Some(height)) = (width, height) {
-            state.displays.push(DisplayGeometry::new(
+            displays.push(DisplayGeometry::new(
                 id,
                 Rect::new(area.left, area.top, width, height),
             ));

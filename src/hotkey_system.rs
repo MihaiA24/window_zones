@@ -197,7 +197,7 @@ fn normalized_hotkey(raw: &str) -> Result<String, HotkeySystemError> {
                         "invalid hotkey {raw}: expected exactly one non-modifier key"
                     )));
                 }
-                if key_token_to_code(&canonical).is_none() {
+                if !is_supported_key(&canonical) {
                     return Err(HotkeySystemError::Platform(format!(
                         "unsupported hotkey key `{canonical}` in `{raw}`"
                     )));
@@ -247,112 +247,53 @@ fn canonical_token(raw: &str) -> Result<String, HotkeySystemError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-fn key_token_to_code(token: &str) -> Option<Key> {
-    if let Some(c) = token.chars().next() {
-        if token.len() == 1 {
-            return match c {
-                'a'..='z' => Some(match c {
-                    'a' => Key::KeyA,
-                    'b' => Key::KeyB,
-                    'c' => Key::KeyC,
-                    'd' => Key::KeyD,
-                    'e' => Key::KeyE,
-                    'f' => Key::KeyF,
-                    'g' => Key::KeyG,
-                    'h' => Key::KeyH,
-                    'i' => Key::KeyI,
-                    'j' => Key::KeyJ,
-                    'k' => Key::KeyK,
-                    'l' => Key::KeyL,
-                    'm' => Key::KeyM,
-                    'n' => Key::KeyN,
-                    'o' => Key::KeyO,
-                    'p' => Key::KeyP,
-                    'q' => Key::KeyQ,
-                    'r' => Key::KeyR,
-                    's' => Key::KeyS,
-                    't' => Key::KeyT,
-                    'u' => Key::KeyU,
-                    'v' => Key::KeyV,
-                    'w' => Key::KeyW,
-                    'x' => Key::KeyX,
-                    'y' => Key::KeyY,
-                    'z' => Key::KeyZ,
-                    _ => return None,
-                }),
-                '0'..='9' => Some(match c {
-                    '0' => Key::Num0,
-                    '1' => Key::Num1,
-                    '2' => Key::Num2,
-                    '3' => Key::Num3,
-                    '4' => Key::Num4,
-                    '5' => Key::Num5,
-                    '6' => Key::Num6,
-                    '7' => Key::Num7,
-                    '8' => Key::Num8,
-                    '9' => Key::Num9,
-                    _ => return None,
-                }),
-                _ => None,
-            };
-        }
-
-        if let Some(stripped) = token.strip_prefix('f') {
-            let Ok(number) = stripped.parse::<u8>() else {
-                return None;
-            };
-            return match number {
-                1 => Some(Key::F1),
-                2 => Some(Key::F2),
-                3 => Some(Key::F3),
-                4 => Some(Key::F4),
-                5 => Some(Key::F5),
-                6 => Some(Key::F6),
-                7 => Some(Key::F7),
-                8 => Some(Key::F8),
-                9 => Some(Key::F9),
-                10 => Some(Key::F10),
-                11 => Some(Key::F11),
-                12 => Some(Key::F12),
-                _ => None,
-            };
-        }
+fn is_supported_key(token: &str) -> bool {
+    if matches!(token.as_bytes(), [b'a'..=b'z' | b'0'..=b'9']) {
+        return true;
+    }
+    if let Some(number) = token.strip_prefix('f') {
+        return number
+            .parse::<u8>()
+            .is_ok_and(|number| (1..=12).contains(&number));
     }
 
-    Some(match token {
-        "space" => Key::Space,
-        "tab" => Key::Tab,
-        "backspace" => Key::Backspace,
-        "escape" => Key::Escape,
-        "insert" => Key::Insert,
-        "home" => Key::Home,
-        "end" => Key::End,
-        "pageup" => Key::PageUp,
-        "pagedown" => Key::PageDown,
-        "delete" => Key::Delete,
-        "left" => Key::LeftArrow,
-        "right" => Key::RightArrow,
-        "up" => Key::UpArrow,
-        "down" => Key::DownArrow,
-        "minus" => Key::Minus,
-        "equal" => Key::Equal,
-        "comma" => Key::Comma,
-        "dot" => Key::Dot,
-        "slash" => Key::Slash,
-        "quote" => Key::Quote,
-        "semicolon" => Key::SemiColon,
-        "leftbracket" | "left_bracket" => Key::LeftBracket,
-        "rightbracket" | "right_bracket" => Key::RightBracket,
-        "backslash" => Key::BackSlash,
-        "backquote" => Key::BackQuote,
-        "return" => Key::Return,
-        "print" | "printscreen" => Key::PrintScreen,
-        "scrolllock" => Key::ScrollLock,
-        "pause" => Key::Pause,
-        "capslock" => Key::CapsLock,
-        "numlock" => Key::NumLock,
-        _ => return None,
-    })
+    matches!(
+        token,
+        "space"
+            | "tab"
+            | "backspace"
+            | "escape"
+            | "insert"
+            | "home"
+            | "end"
+            | "pageup"
+            | "pagedown"
+            | "delete"
+            | "left"
+            | "right"
+            | "up"
+            | "down"
+            | "minus"
+            | "equal"
+            | "comma"
+            | "dot"
+            | "slash"
+            | "quote"
+            | "semicolon"
+            | "leftbracket"
+            | "left_bracket"
+            | "rightbracket"
+            | "right_bracket"
+            | "backslash"
+            | "backquote"
+            | "return"
+            | "print"
+            | "printscreen"
+            | "scrolllock"
+            | "pause"
+            | "capslock"
+            | "numlock"
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -459,5 +400,42 @@ mod tests {
     #[test]
     fn rejects_unsupported_keys() {
         assert!(normalized_hotkey("ctrl+unknown").is_err());
+    }
+
+    #[test]
+    fn preserves_supported_key_boundaries_and_aliases() {
+        for (raw, expected) in [
+            ("A", "a"),
+            ("Z", "z"),
+            ("0", "0"),
+            ("9", "9"),
+            ("F1", "f1"),
+            ("F12", "f12"),
+            ("F01", "f01"),
+            ("F00012", "f00012"),
+            ("Esc", "escape"),
+            ("Page_Up", "pageup"),
+            ("Left_Arrow", "left"),
+            ("Left_Bracket", "left_bracket"),
+            ("RightBracket", "rightbracket"),
+            ("PrintScreen", "printscreen"),
+        ] {
+            assert_eq!(normalized_hotkey(raw).unwrap(), expected, "{raw}");
+        }
+        for raw in [
+            "F0",
+            "F13",
+            "F256",
+            "F0013",
+            "é",
+            "ß",
+            "９",
+            "ab",
+            "print_screen",
+            "caps_lock",
+            "del",
+        ] {
+            assert!(normalized_hotkey(raw).is_err(), "{raw}");
+        }
     }
 }
