@@ -6,6 +6,7 @@ Maintained source for user-facing verification journeys. Read the index, then th
 
 - From the repo root set `V=.agents/skills/verify-window-zones/verify`; run `"$V" launch` and `"$V" doctor`.
 - Require this checkout's profile, `build: current`, and a free or owned derived display. No TCP server/auth/database exists. A stale or foreign instance is not driveable evidence.
+- Verifier freshness includes the thin `verify` launcher and every Python module under `wz_verify/`. After changing that package, cleanup and launch again; the existing safety regression checks module edits/additions/removals and independent workspace cleanup.
 - The isolated TOML has Left → left-half, Up → center-third, Right → left-two-thirds, Down → next display, Shift+Right → previous display; each uses Alt+Ctrl.
 - Restore `"$V" drive config valid` before a baseline journey. Each CLI/PTY drive starts a new process; mutations persist in the profile's file, not runtime memory.
 - Dry-run's fixed display is 1920×1080 at (0,0), with a second 1280×1024 display at (1920,0); it does not move OS windows. Native smoke uses its own fixtures and observations.
@@ -19,7 +20,7 @@ Maintained source for user-facing verification journeys. Read the index, then th
 - `--backend-flag backend|alias` and `--discovery` select real flag/config entry variants. Verifier `--dry-run` only prints a plan; it is not app evidence.
 - Mutate only the isolated TOML via `drive config`; files and build stamps are recorded alongside action/result transcripts.
 - For native paths use `drive smoke x11|gnome|kde-live`. Seated GNOME/Windows/macOS and a real tray host are separate required environments when affected, not covered by synthetic gates.
-- Use the skill's `Checks` section for fixed-oracle `check behaviors`, native `check e2e`, and alternating `check performance --baseline-ref REF`. Their JSON differences and report paths are the result; raw timings without confirmed dispatch are not measurements.
+- Use the skill's `Checks` section first: `check behaviors` owns the CLI flag/config matrix; `check sessions` owns the 24-session reload/watcher/cancel matrix; `check e2e` already includes X11 smoke. Do not reimplement these loops or repeat their underlying drives. `check performance --baseline-ref REF` is separate measurement, not a deterministic timing golden.
 
 ## Proof and skip reporting
 

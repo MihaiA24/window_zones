@@ -22,6 +22,7 @@ Preconditions:
 
 - Baseline profile/current build and valid seed. Only the private config may be edited.
 
+- **Maintained matrix first.** `"$V" check sessions` runs both modes, both reload/watch journeys and cancel through all backend-flag/config-entry combinations, checks in-process action reset and unchanged final config content, then compares a fresh-process dispatch against the fixed oracle. Use the individual recipes below only for uncovered paths or diagnosis.
 - **Explicit-path TUI.** `"$V" drive session --mode tui --journey reload` loads five bindings, dispatches Left, edits to one right-half binding, waits for the displayed replacement, writes invalid TOML, waits for an Error while retaining right-half, dispatches the retained binding, then observes empty, missing, recovery and restart.
 - **CLI loop.** `"$V" drive session --mode run --journey reload` drives the same sequence with `config state`/`binding count` observations and successful retained dispatch.
 - **Watcher entry.** `"$V" drive session --mode run --journey watcher` and `"$V" drive session --mode tui --journey watcher` edit each file state and poll the resulting status without an explicit reload during those transitions.
@@ -34,6 +35,7 @@ Preconditions:
 ## Gotchas
 
 - The app debounces config changes; the helper polls for specific resulting state instead of sleeping once and trusting a stale Loaded label.
+- Reload uses the same mtime/length signature detection and debounce as watcher polling; it is not a forced reread. Same-length edits that preserve mtime are not detected. The fixtures deliberately change signatures.
 - Invalid reload retains the last good bindings; invalid cold startup has no last-good state and starts empty. Do not weaken one expectation to match the other.
 - `restart` reconstructs the app and clears last-dispatch history. Persistence means reading the file again, not retaining an invalid runtime-only fallback forever.
 - The reload journey exercises explicit reload; the watcher journey independently waits for file-change transitions without sending reload. Keep their evidence distinct.

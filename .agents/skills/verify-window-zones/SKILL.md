@@ -30,7 +30,7 @@ Teardown: `"$V" cleanup --dry-run`, then `"$V" cleanup`. An existing profile req
 
 `"$V" doctor` is read-only. Require exit 0, the expected checkout/profile/config, `build: current`, and no foreign display owner. `active_process: null` between short-lived drives is normal. During a drive it reports the recorded PID/start identity. Never borrow a live instance or copy another checkout's owner/build metadata.
 
-Freshness compares content hashes of Rust/Cargo inputs, compositor code, scripts, the verifier, fixed-clock C source and default expected-result JSON, the Rust toolchain/build environment, and both binary hashes. A stale build is **not evidence**. Run cleanup, launch and the affected journeys again after source changes. Doctor does not rebuild to hide staleness. Each drive/check validates freshness before and after; a mid-run change invalidates the proof.
+Freshness compares content hashes of Rust/Cargo inputs, compositor code, scripts, the `verify` launcher and every `wz_verify/**/*.py` module, fixed-clock C source and default expected-result JSON, the Rust toolchain/build environment, and both binary hashes. Adding, changing or removing an implementation module invalidates old proof; bytecode caches are not inputs. A stale build is **not evidence**. Run cleanup, launch and the affected journeys again after source changes. Doctor does not rebuild to hide staleness. Each drive/check validates freshness before and after; a mid-run change invalidates the proof.
 
 ## Drive
 
@@ -56,15 +56,20 @@ Freshness compares content hashes of Rust/Cargo inputs, compositor code, scripts
 
 ```sh
 "$V" check behaviors
+"$V" check sessions
 "$V" check e2e
 "$V" check performance --baseline-ref HEAD --runs 5 --max-regression-percent 25
 ```
 
 Checks print JSON with `status`, structured `difference` paths and `evidence_path`; exit 0 means pass, nonzero means mismatch or an unmet precondition. Full reports live in the launched run's `checks/<scenario-id>/report.json`, alongside raw outputs; pre-launch/ownership errors go under `target/verification/<checkout-key>/check-errors/`. `--dry-run` prints a JSON plan without side effects. `--expected-file` accepts a reviewed fixed oracle and records its SHA-256; never generate/bless an oracle from the output under test.
 
+Prefer these maintained checks over agent-written loops or drive scripts. Run `behaviors` for CLI/config/geometry changes, `sessions` for interactive/config/lifecycle changes, and `e2e` for native X11 movement/hotkeys; a whole-map pass needs all three plus the other applicable native gates. Run serially. Do not duplicate `e2e` with `drive smoke x11`. Use individual `drive` commands only for a changed path the fixed checks do not cover or to diagnose a failed case. Never retry until green, bless actual output, or replace a failed native assertion with a dry-run pass.
+
 Fixtures are literal TOML/hotkeys/geometry, seed 0, UTC and epoch `1704067200`. A C compiler builds `fixed_clock.c` into scratch; wall time is frozen only in `window_zones` and the separately compiled `clock-probe`. Shells, desktop services and other tools retain real wall time, verified by the safety regression. Monotonic clocks stay real for debounce, readiness deadlines and measurement; freezing harness clocks would stall native waits. Verifier fixture mtimes are fixed; the native gate retains kernel mtime transitions for its watcher. Artifact timestamps/PIDs/display IDs are evidence metadata, not golden results.
 
 `behaviors` compares all eight built-ins, custom geometry, both display directions, unbound dispatch and empty/missing/invalid config: 15 cases × both backend flag forms × explicit/discovered config. It uses `scripts/run.sh`, not internal setters. `e2e` reuses the real X11 smoke runner and compares independent geometry, real accelerator, reload retention/recovery, captures, quit, a new process reading persisted config, and a separate cancel-before-edit TUI path. It remains synthetic X11 evidence, not seated/tray/other-platform coverage.
+
+`sessions` runs a fixed 24-session matrix: CLI/TUI × both backend flag forms × explicit/discovered config × reload/watcher/cancel. All four quit forms occur in both modes. It reuses the PTY journeys, health-checks before each session, asserts restart clears action history, checks completed TUI dispatch responses for errors, compares config content before/after, and verifies persisted configuration through a new process against the existing dispatch oracle. Reports name each variant; PTY transcripts and input/result events remain the evidence. Terminal local echo is disabled; output assertions consume the post-result prompt, not just a matching input or a previous prompt.
 
 `performance` resolves a local baseline ref to its exact commit, archives it without checkout/ref changes, and builds its binary separately using the same debug Cargo profile and toolchain. Missing cached baseline dependencies fail offline. After one confirmed warmup per side, at least five measured runs **per side alternate baseline/candidate**. Every sample must actually load five bindings and produce the expected successful left-half dispatch. The JSON reports raw samples, work confirmation, median/min/max and spread = max−min; the console omits raw samples but links the full report. The default gate permits a 25% median regression, configurable explicitly. Compilation, warmups and result comparison are excluded; runner/process/capture/ownership overhead is included. Do not run tests or other benchmarks concurrently. This measures debug CLI startup+dispatch, not native hotkey/compositor latency.
 
@@ -93,5 +98,7 @@ Cleanup validates checkout/PID start identity and private-runtime markers, termi
 ## Helpers
 
 `verify` and `test_verify.py` are executable. Use `"$V" --help`, `"$V" drive --help`, and each subcommand's `--help`; destructive operations accept `--dry-run`. Run the safety regression directly with `python3 .agents/skills/verify-window-zones/test_verify.py` or through the existing `scripts/test.sh` (`drive tests` preserves its output).
+
+`verify` is only the executable entry point. Its `wz_verify/` package contains `runtime.py` (workspace, ownership, freshness, evidence and process lifecycle), `journeys.py` (PTY/config/native driving), `checks.py` (observations, scenarios and reports), and `cli.py` (argument parsing and dispatch). Pass one `runtime.Workspace` explicitly to journeys/checks; independent workspaces carry their own paths instead of mutable module globals. Dependencies flow from CLI to checks/journeys to runtime. The safety regression imports these modules normally and checks workspace isolation and freshness after module additions, edits and removals. Keep the package with the launcher; command syntax, evidence locations and approved `expected.json` are unchanged.
 
 OMP discovers this directory under project-local `.agents/skills/`. Hermes requires human-run trust; until then use `skill_view` on `.agents/skills/verify-window-zones/SKILL.md` explicitly, without modifying global settings. Maintain this map with `/maintain-verification-skill` when app paths change.

@@ -1,0 +1,1 @@
+"""Window Zones verification internals."""
