@@ -2,9 +2,10 @@
 
 const SERVICE_NAME = 'org.window_zones.KWin';
 const OBJECT_PATH = '/org/window_zones/KWin';
-const INTERFACE_NAME = 'org.window_zones.KWin1';
-const PROTOCOL_MAJOR = 1;
+const INTERFACE_NAME = 'org.window_zones.KWin3';
+const PROTOCOL_MAJOR = 3;
 const REQUEST_MOVE = 'move';
+const REQUEST_REFRESH_DISPLAYS = 'refresh-displays';
 const REQUEST_REGISTER_HOTKEYS = 'register-hotkeys';
 
 const CAPABILITIES = [
@@ -59,14 +60,22 @@ const KEY_NAMES = new Map([
 let activeHotkeys = new Set();
 let registeredShortcuts = new Set();
 let polling = false;
+let pollStartedAt = 0;
+let pollGeneration = 0;
 let processingRequest = false;
 let companionRetryTimer = null;
-let trackedWindow = null;
+const trackedWindows = new Map();
 
 function errorMessage(error) {
     if (error && typeof error.message === 'string')
         return error.message;
     return String(error);
+}
+
+function protocolError(kind, message) {
+    const error = new Error(message);
+    error.dbusError = `org.window_zones.KWin.Error.${kind}`;
+    return error;
 }
 
 function invoke(method, args, callback) {
@@ -80,7 +89,7 @@ function invoke(method, args, callback) {
             callback);
         return true;
     } catch (error) {
-        print(`Window Zones KWin D-Bus ${method} failed: ${errorMessage(error)}`);
+        console.warn(`Window Zones KWin D-Bus ${method} failed: ${errorMessage(error)}`);
         return false;
     }
 }
@@ -155,18 +164,19 @@ function focusedWindow() {
 }
 function trackFocusedWindow(window) {
     if (!window
-        || window === trackedWindow
+        || trackedWindows.has(String(window.internalId))
         || !window.frameGeometryChanged
         || typeof window.frameGeometryChanged.connect !== 'function')
         return;
 
-    trackedWindow = window;
-    window.frameGeometryChanged.connect(() => {
+    const handler = () => {
         if (typeof workspace !== 'undefined'
             && workspace
             && workspace.activeWindow === window)
             publishFocusedWindow();
-    });
+    };
+    trackedWindows.set(String(window.internalId), {window, handler});
+    window.frameGeometryChanged.connect(handler);
 }
 
 function focusedPayload() {
@@ -176,7 +186,7 @@ function focusedPayload() {
 
     return [
         true,
-        '',
+        String(focused.window.internalId),
         focused.x,
         focused.y,
         focused.width,
@@ -187,7 +197,7 @@ function publishFocusedWindow() {
     invoke('UpdateFocusedWindow', [JSON.stringify(focusedPayload())], () => {});
 }
 
-function publishDisplays() {
+function publishDisplays(callback = () => {}) {
     const displays = displayData().map(item => [
         item.id,
         item.x,
@@ -195,7 +205,8 @@ function publishDisplays() {
         item.width,
         item.height,
     ]);
-    invoke('UpdateDisplays', [JSON.stringify(displays)], () => {});
+    if (!invoke('UpdateDisplays', [JSON.stringify(displays)], callback))
+        throw protocolError('Unavailable', 'KWin could not publish current work areas');
 }
 
 function publishState() {
@@ -203,23 +214,39 @@ function publishState() {
         publishDisplays();
         publishFocusedWindow();
     } catch (error) {
-        print(`Window Zones KWin state update failed: ${errorMessage(error)}`);
+        console.warn(`Window Zones KWin state update failed: ${errorMessage(error)}`);
     }
 }
 
-function moveFocusedWindow(x, y, width, height) {
+function moveWindow(windowId, x, y, width, height) {
     if (width <= 0 || height <= 0)
         throw new Error('window target must have positive dimensions');
 
-    const focused = focusedWindow();
-    if (!focused)
-        throw new Error('no focused normal application window');
+    const windows = typeof workspace.windowList === 'function'
+        ? workspace.windowList() : workspace.stackingOrder;
+    const window = Array.prototype.find.call(windows,
+        candidate => !candidate.deleted && String(candidate.internalId) === windowId);
+    if (!window)
+        throw protocolError('WindowGone', windowId);
+    if (window.fullScreen)
+        throw new Error('window is fullscreen; leave fullscreen first');
+    if (window.managed === false || window.normalWindow !== true
+        || window.moveable !== true || window.resizeable !== true)
+        throw new Error('window does not allow moving and resizing');
 
-    const window = focused.window;
-    if (window.fullScreen || window.tile)
-        throw new Error('focused window is fullscreen or tiled; restore it before moving');
-    if (window.moveable !== true || window.resizeable !== true)
-        throw new Error('focused window does not allow moving and resizing');
+    const tile = window.tile;
+    if (tile) {
+        if (typeof tile.unmanage === 'function') {
+            // KWin 6.5: unmanage clears the requested quick/custom tile, including restore geometry.
+            tile.unmanage(window);
+        } else {
+            // Earlier KWin 6: tile=null only detaches the tile. A maximize transition also clears
+            // the non-scriptable quickTileMode; finish in the restored state before placement.
+            window.tile = null;
+            window.setMaximize(true, true);
+        }
+    }
+    window.setMaximize(false, false);
 
     window.frameGeometry = {x, y, width, height};
     publishFocusedWindow();
@@ -237,7 +264,7 @@ function shortcutForHotkey(hotkey) {
         }
     }
     if (modifiers.length !== tokens.length)
-        throw new Error(`unsupported KWin shortcut modifiers in '${hotkey}'`);
+        throw protocolError('Unsupported', `unsupported KWin shortcut modifiers in '${hotkey}'`);
 
     let keyData = KEY_NAMES.get(key);
     if (!keyData && /^f([1-9]|1[0-9]|2[0-4])$/.test(key))
@@ -245,7 +272,7 @@ function shortcutForHotkey(hotkey) {
     if (!keyData && /^[a-z0-9]$/.test(key))
         keyData = [key.toUpperCase(), key.toUpperCase().charCodeAt(0)];
     if (!keyData)
-        throw new Error(`unsupported KWin shortcut key '${key}' in '${hotkey}'`);
+        throw protocolError('Unsupported', `unsupported KWin shortcut key '${key}' in '${hotkey}'`);
 
     return {
         sequence: [...modifiers, keyData[0]].join('+'),
@@ -271,11 +298,11 @@ function registerHotkeys(hotkeys, callback) {
         timer.stop();
         callback(error);
     };
-    // KWin does not invoke callDBus callbacks on errors. Fail before the App's one-second
-    // request deadline and ignore late replies so a timed-out replacement cannot commit.
+    // KWin does not invoke callDBus callbacks on errors. Bound the entire update before the
+    // App's one-second request deadline and ignore late replies after a timeout.
     timer.interval = 750;
     timer.singleShot = true;
-    timer.timeout.connect(() => finish(new Error('KGlobalAccel shortcut preflight timed out')));
+    timer.timeout.connect(() => finish(protocolError('Unavailable', 'KGlobalAccel shortcut update timed out')));
     timer.start();
 
     function preflight(index) {
@@ -293,11 +320,11 @@ function registerHotkeys(hotkeys, callback) {
                         // QJSEngine hands D-Bus string lists over as sequences, not Arrays.
                         if (!winner || typeof winner.length !== 'number'
                             || (winner.length !== 0 && winner.length !== 4)) {
-                            finish(new Error('KGlobalAccel returned an invalid shortcut owner'));
+                            finish(protocolError('Unavailable', 'KGlobalAccel returned an invalid shortcut owner'));
                         } else if (winner.length !== 0
                             && (winner[0] !== 'kwin'
                                 || winner[1] !== `Window Zones Hotkey ${entry.hotkey}`)) {
-                            finish(new Error(`KWin rejected shortcut '${entry.hotkey}': accelerator is already held by '${winner[1]}'; choose a different binding`));
+                            finish(protocolError('Unsupported', `KWin rejected shortcut '${entry.hotkey}': accelerator is already held by '${winner[1]}'; choose a different binding`));
                         } else {
                             preflight(index + 1);
                         }
@@ -316,11 +343,32 @@ function registerHotkeys(hotkeys, callback) {
                     entry.sequence,
                     () => emitHotkey(entry.hotkey));
                 if (!registered)
-                    throw new Error(`KWin rejected shortcut '${entry.hotkey}'`);
+                    throw protocolError('Unavailable', `KWin rejected shortcut '${entry.hotkey}'`);
                 registeredShortcuts.add(entry.hotkey);
             });
-            activeHotkeys = new Set(hotkeys);
-            finish();
+            const desired = new Set(hotkeys);
+            // Delivery state cannot prove native assignment after a lost update reply.
+            // Reapplying the desired keys lets a retry restore partially cleared grabs.
+            const updates = next;
+            registeredShortcuts.forEach(hotkey => {
+                if (!desired.has(hotkey))
+                    updates.push({hotkey, key: 0});
+            });
+            function configure(index) {
+                if (finished)
+                    return;
+                if (index === updates.length) {
+                    activeHotkeys = desired;
+                    finish();
+                    return;
+                }
+                const entry = updates[index];
+                // Rust supplies the typed a(ai) payload that QJSEngine cannot marshal.
+                // Clearing the native keys also updates KWin's cached QAction shortcuts.
+                if (!invoke('SetShortcut', [entry.hotkey, entry.key], () => configure(index + 1)))
+                    finish(protocolError('Unavailable', 'KGlobalAccel shortcut update failed'));
+            }
+            configure(0);
         } catch (error) {
             finish(error);
         }
@@ -328,13 +376,21 @@ function registerHotkeys(hotkeys, callback) {
     preflight(0);
 }
 
-function complete(requestId, ok, message) {
-    invoke('CompleteRequest', [String(requestId), ok, message], () => {});
+function complete(requestId, ok, errorName, message) {
+    invoke('CompleteRequest', [String(requestId), ok, errorName, message], () => {});
 }
 
-function processRequest(requestId, kind, x, y, width, height, hotkeysJson, callback) {
+function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, callback) {
+    let finished = false;
+    let timer = null;
     const finish = error => {
-        complete(requestId, !error, error ? errorMessage(error) : '');
+        if (finished)
+            return;
+        finished = true;
+        if (timer)
+            timer.stop();
+        complete(requestId, !error, error ? (error.dbusError || 'org.window_zones.KWin.Error.Operation') : '',
+            error ? errorMessage(error) : '');
         callback();
     };
     try {
@@ -344,7 +400,18 @@ function processRequest(requestId, kind, x, y, width, height, hotkeysJson, callb
             throw new Error('KWin returned an invalid hotkey request payload');
 
         if (kind === REQUEST_MOVE) {
-            moveFocusedWindow(x, y, width, height);
+            moveWindow(windowId, x, y, width, height);
+        } else if (kind === REQUEST_REFRESH_DISPLAYS) {
+            // WorkspaceWrapper has no work-area/strut change signal. Query at the App's
+            // display-read seam so panel reservations cannot stay stale until a screen change.
+            // Like shortcut updates, display publication must survive an omitted D-Bus callback.
+            timer = new QTimer();
+            timer.interval = 750;
+            timer.singleShot = true;
+            timer.timeout.connect(() => finish(protocolError('Unavailable', 'KWin work-area update timed out')));
+            timer.start();
+            publishDisplays(() => finish());
+            return;
         } else if (kind === REQUEST_REGISTER_HOTKEYS) {
             registerHotkeys(hotkeys, finish);
             return;
@@ -361,17 +428,23 @@ function pollRequests() {
     if (polling)
         return;
     polling = true;
+    pollStartedAt = Date.now();
+    const generation = ++pollGeneration;
 
     const accepted = invoke('NextRequest', [],
-        (requestId, kind, x, y, width, height, hotkeysJson) => {
+        (requestId, kind, windowId, x, y, width, height, hotkeysJson) => {
+            if (generation !== pollGeneration)
+                return;
             if (requestId !== 0) {
                 processingRequest = true;
-                processRequest(requestId, kind, x, y, width, height, hotkeysJson, () => {
+                processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, () => {
                     processingRequest = false;
                     polling = false;
                     pollRequests();
                 });
             } else {
+                // The companion defers an empty reply for up to one second; this is not a
+                // synchronous empty-poll loop and queued moves wake it within one service tick.
                 polling = false;
                 pollRequests();
             }
@@ -404,8 +477,10 @@ function connectCompanion(resetState) {
 }
 
 function retryCompanion() {
-    if (processingRequest)
+    // KWin omits callDBus error callbacks. Recover a lost poll, never duplicate a healthy one.
+    if (processingRequest || (polling && Date.now() - pollStartedAt < 3000))
         return;
+    ++pollGeneration;
     polling = false;
     connectCompanion(false);
 }
@@ -426,13 +501,18 @@ if (typeof workspace !== 'undefined' && workspace) {
         });
     if (workspace.windowRemoved)
         workspace.windowRemoved.connect(window => {
-            if (trackedWindow === window)
-                trackedWindow = null;
+            const tracked = trackedWindows.get(String(window.internalId));
+            if (tracked) {
+                tracked.window.frameGeometryChanged.disconnect(tracked.handler);
+                trackedWindows.delete(String(window.internalId));
+            }
             publishFocusedWindow();
         });
     trackFocusedWindow(workspace.activeWindow);
     if (workspace.screensChanged)
         workspace.screensChanged.connect(() => publishState());
+    if (workspace.currentDesktopChanged)
+        workspace.currentDesktopChanged.connect(() => publishState());
 }
 
 connectCompanion(true);

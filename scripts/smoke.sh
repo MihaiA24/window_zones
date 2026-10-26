@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 BIN_PATH="$PROJECT_ROOT/target/debug/window_zones"
+# Keep the build toolchain available after gates isolate the application's HOME.
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 
 KEEP_LOGS=0
 COMMAND=""
@@ -41,15 +43,12 @@ PID_FILE="$TMP_DIR/pids"
 GROUP_PID_FILE="$TMP_DIR/group-pids"
 : >"$PID_FILE"
 : >"$GROUP_PID_FILE"
-PIDS=()
-GROUP_PIDS=()
 FAILURES=0
 ASSERTIONS=0
 SKIPPED=0
 CURRENT_GATE=""
 LAST_SHOT=""
 GNOME_LIVE_ACTIVE=0
-GNOME_LIVE_NEEDS_RESTORE=0
 GNOME_LIVE_RESTORE_FAILURE=0
 log() {
     printf '%s\n' "$*" | tee -a "$ASSERT_LOG"
@@ -187,13 +186,14 @@ wait_for_size_growth() {
 }
 
 start_group() {
-    local log_file=$1
-    shift
+    local pid_variable=$1 log_file=$2
+    shift 2
+    # Assign in this shell: command substitution would orphan the child.
     setsid -- "$@" >"$log_file" 2>&1 &
-    local pid=$!
-    printf '%s\n' "$pid" >>"$PID_FILE"
-    printf '%s\n' "$pid" >>"$GROUP_PID_FILE"
-    printf '%s\n' "$pid"
+    local child_pid=$!
+    printf -v "$pid_variable" '%s' "$child_pid"
+    printf '%s\n' "$child_pid" >>"$PID_FILE"
+    printf '%s\n' "$child_pid" >>"$GROUP_PID_FILE"
 }
 
 start_plain() {
@@ -211,7 +211,7 @@ stop_pid() {
 }
 
 wait_pid() {
-    local pid=$1 timeout_s=${2:-10} rc state
+    local pid=$1 timeout_s=${2:-10} state
     local deadline=$((SECONDS + timeout_s))
     while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
         state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
@@ -222,11 +222,13 @@ wait_pid() {
     if kill -0 "$pid" 2>/dev/null && [[ "$state" != Z* ]]; then
         return 124
     fi
-    set +e
-    wait "$pid"
-    rc=$?
-    set -e
-    return "$rc"
+    # The initial KWin service is an owned descendant of the launcher, not our child.
+    [[ "${3:-child}" == external ]] && return 0
+    if wait "$pid"; then
+        return 0
+    else
+        return "$?"
+    fi
 }
 
 cleanup() {
@@ -312,7 +314,7 @@ hotkey = "Alt+Ctrl+Down"
 action = { type = "move-to-next-display" }
 EOF
 }
-write_x11_valid_config() {
+write_five_binding_config() {
     write_valid_config
     cat >>"$CONFIG_PATH" <<'EOF'
 
@@ -347,7 +349,7 @@ parse_gnome_focused() {
     python - "$raw" <<'PY'
 import re, sys
 s = sys.argv[1]
-m = re.search(r"\((true|false),\s*'([^']*)',\s*(-?\d+),\s*(-?\d+),\s*(?:uint32\s+)?(\d+),\s*(?:uint32\s+)?(\d+)\)", s)
+m = re.search(r"\((true|false),\s*(?:uint64\s+)?(\d+),\s*(-?\d+),\s*(-?\d+),\s*(?:uint32\s+)?(\d+),\s*(?:uint32\s+)?(\d+)\)", s)
 if m:
     print('|'.join(m.groups()))
 PY
@@ -425,8 +427,7 @@ x11_inject_hotkey() {
 }
 
 x11_hotkey_diagnostics() {
-    local run_log=$1 app_tail='' app_display='' registered='' registration_log="$TMP_DIR/x11-hotkey-registration.log"
-    local registration_rc=0 line
+    local run_log=$1 app_tail='' app_display='' line
     log 'X11 real-hotkey diagnostics:'
     app_display=$(tr '\0' '\n' <"/proc/$APP_PID/environ" 2>/dev/null | sed -n '/^DISPLAY=/p' | sed -n '1p' || true)
     log "  App environment: ${app_display:-DISPLAY unavailable}"
@@ -435,25 +436,15 @@ x11_hotkey_diagnostics() {
     while IFS= read -r line; do
         log "    $line"
     done <<<"$app_tail"
-    if [[ "$app_tail" == *'global hotkey listener is unavailable'* ]]; then
-        log '  next_hotkey error: global hotkey listener is unavailable'
+    if [[ "$app_tail" == *'Hotkey registration refused:'* ]]; then
+        log '  XGrabKey registration was refused; check for another program owning a configured accelerator'
+    elif [[ "$app_tail" == *'Hotkey registration failed:'* ]]; then
+        log '  XGrabKey listener is unavailable; check the App DISPLAY and X server access'
     else
-        log '  next_hotkey error: none observed in App output'
+        log '  No XGrabKey registration error observed in App output'
     fi
-
-    printf 'status\nquit\n' | timeout 5 env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 \
-        XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" \
-        "$BIN_PATH" --backend x11 --config "$CONFIG_PATH" tui >"$registration_log" 2>&1 || registration_rc=$?
-    registered=$(sed -n '/^Bindings:/,/^Last action:/p' "$registration_log" 2>/dev/null \
-        | sed '/^Last action:/d' || true)
-    log '  App parsed registered hotkey set:'
-    if [[ -n "$registered" ]]; then
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && log "    $line"
-        done <<<"$registered"
-    else
-        log "    unavailable (diagnostic TUI exit $registration_rc)"
-    fi
+    # A second App would contend for the instance lock and exclusive grabs, so
+    # inspect the owning App's status/log rather than launching a diagnostic TUI.
 }
 
 wait_x11_geometry() {
@@ -506,6 +497,78 @@ x11_assert_geometry() {
         log "Harness limitation $name screenshot: no usable screenshot tool"
     fi
 }
+
+xon() {
+    # Run an X client on the gate's display: $XON_DISPLAY plus $XON_XAUTHORITY when it has one.
+    if [[ -n "${XON_XAUTHORITY:-}" ]]; then
+        DISPLAY="$XON_DISPLAY" XAUTHORITY="$XON_XAUTHORITY" "$@"
+    else
+        DISPLAY="$XON_DISPLAY" "$@"
+    fi
+}
+
+xwindow_for_pid() {
+    # pid [timeout]: print the visible editor window that process mapped.
+    local pid=$1 timeout_s=${2:-20} id='' owner=''
+    local deadline=$((SECONDS + timeout_s))
+    while (( SECONDS < deadline )); do
+        while read -r id; do
+            [[ -n "$id" ]] || continue
+            owner=$(xon xdotool getwindowpid "$id" 2>/dev/null || true)
+            if [[ "$owner" == "$pid" ]]; then
+                printf '%s' "$id"
+                return 0
+            fi
+        done < <(xon xdotool search --onlyvisible --name 'Text Editor' 2>/dev/null || true)
+        sleep 0.2
+    done
+    return 1
+}
+
+wait_xwindow_gone() {
+    # window [timeout]: the X window is destroyed and the window manager stopped listing it.
+    local id=$1 timeout_s=${2:-10} clients='' hex
+    local deadline=$((SECONDS + timeout_s))
+    hex=$(printf '0x%x' "$id")
+    while (( SECONDS < deadline )); do
+        clients=$(xon xprop -root _NET_CLIENT_LIST 2>/dev/null || true)
+        if ! xon xdotool getwindowname "$id" >/dev/null 2>&1 \
+            && [[ ! "$clients" =~ (^|[^0-9a-fx])$hex([^0-9a-f]|$) ]]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+assert_wm_state() {
+    # name window needle want: want 1 = _NET_WM_STATE lists needle, 0 = it does not.
+    local name=$1 window=$2 needle=$3 want=$4
+    local deadline=$((SECONDS + 5)) state='' has=0
+    while :; do
+        state=$(xon xprop -id "$window" _NET_WM_STATE 2>&1 || true)
+        [[ "$state" == *"$needle"* ]] && has=1 || has=0
+        [[ "$has" == "$want" ]] && break
+        (( SECONDS < deadline )) || break
+        sleep 0.1
+    done
+    log "OBSERVED $name: $state"
+    assert_eq "$name" "$want" "$has"
+}
+
+wait_observed() {
+    # observer expected [timeout]: poll an observer function until it prints expected; print the last value.
+    local observer=$1 expected=$2 timeout_s=${3:-8} observed=''
+    local deadline=$((SECONDS + timeout_s))
+    while :; do
+        observed=$("$observer")
+        [[ "$observed" == "$expected" ]] && break
+        (( SECONDS < deadline )) || break
+        sleep 0.2
+    done
+    printf '%s' "$observed"
+}
+
 start_fifo_app() {
     local mode=$1 backend=$2 log_file=$3
     local fifo="$TMP_DIR/${CURRENT_GATE}-${mode}.fifo"
@@ -521,7 +584,6 @@ start_fifo_app() {
     APP_PID=$!
     printf '%s\n' "$APP_PID" >>"$PID_FILE"
     exec {APP_FD}>"$fifo"
-    APP_FIFO="$fifo"
 }
 
 send_app() {
@@ -546,26 +608,10 @@ stop_app_cleanly() {
     assert_rc_zero "$1" "$rc" "app log $2"
 }
 
-find_gnome_xwayland() {
-    GNOME_XDISPLAY=''
-    GNOME_XAUTHORITY=''
-    local line
-    while IFS= read -r line; do
-        if [[ "$line" =~ /Xwayland[[:space:]]+:([0-9]+).*-[aA]uth[[:space:]]([^[:space:]]+) ]]; then
-            if [[ "${BASH_REMATCH[2]}" == "$GNOME_ROOT"/* ]]; then
-                GNOME_XDISPLAY=":${BASH_REMATCH[1]}"
-                GNOME_XAUTHORITY="${BASH_REMATCH[2]}"
-                return 0
-            fi
-        fi
-    done < <(ps -eo args=)
-    return 1
-}
-
 gnome_call() {
     DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus call --session \
         --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome \
-        --method "org.window_zones.Gnome1.$1" "${@:2}"
+        --method "org.window_zones.Gnome2.$1" "${@:2}"
 }
 
 gnome_shell_call() {
@@ -606,26 +652,13 @@ gnome_live_wait_companion() {
     return 1
 }
 
-gnome_live_wait_companion_gone() {
-    local timeout_s=${1:-10}
-    local deadline=$((SECONDS + timeout_s))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        if [[ "$service_list" != *'org.window_zones.Gnome'* ]]; then
-            return 0
-        fi
-        sleep 0.2
-    done
-    return 1
-}
-
-gnome_live_geometry() {
-    local geometry key value x='' y='' width='' height=''
+gtk_x11_geometry() {
+    local display=$1 xauthority=$2 geometry key value x='' y='' width='' height=''
     if [[ -z "${WINDOW_ID:-}" ]]; then
         printf 'unavailable'
         return 0
     fi
-    geometry=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
+    geometry=$(DISPLAY="$display" XAUTHORITY="$xauthority" \
         xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null || true)
     while IFS='=' read -r key value; do
         case "$key" in
@@ -639,7 +672,7 @@ gnome_live_geometry() {
     # every side than the frame the compositor places. Inset it so the observer and the Companion
     # describe the same rectangle.
     local extents left=0 right=0 top=0 bottom=0
-    extents=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
+    extents=$(DISPLAY="$display" XAUTHORITY="$xauthority" \
         xprop -id "$WINDOW_ID" _GTK_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p')
     if [[ "$extents" =~ ^([0-9]+),\ ([0-9]+),\ ([0-9]+),\ ([0-9]+)$ ]]; then
         left=${BASH_REMATCH[1]}
@@ -656,15 +689,21 @@ gnome_live_geometry() {
     fi
 }
 
+gnome_live_geometry() {
+    gtk_x11_geometry "$GNOME_XDISPLAY" "$GNOME_XAUTHORITY"
+}
+
 gnome_live_zone_targets() {
-    # Derive the current display from the frame center, not the legacy wire display id.
-    local focused present display x y w h id center_x center_y
-    local area='' next_area='' found=-1 total=0 index=0
+    # Derive the current display from the frame center; the wire id identifies the window.
+    local focused present window_id x y w h id center_x center_y
+    local area='' next_area='' display_lines found=-1 total=0 index=0
     focused=$(get_gnome_focused)
-    IFS='|' read -r present display x y w h <<<"$focused"
+    IFS='|' read -r present window_id x y w h <<<"$focused"
     [[ "$present" == 'true' ]] || return 0
     center_x=$((x + w / 2))
     center_y=$((y + h / 2))
+    # Match the executor's stable spatial ordering, including enumeration order on ties.
+    display_lines=$(printf '%s\n' "$GNOME_LIVE_DISPLAY_LINES" | LC_ALL=C sort -s -t '|' -k2,2n -k3,3n)
     while IFS='|' read -r id x y w h; do
         [[ -n "$id" ]] && (( w > 0 && h > 0 )) || continue
         if (( found < 0 && center_x >= x && center_x < x + w \
@@ -674,7 +713,7 @@ gnome_live_zone_targets() {
             GNOME_LIVE_DISPLAY_ID="$id"
         fi
         total=$((total + 1))
-    done <<<"$GNOME_LIVE_DISPLAY_LINES"
+    done <<<"$display_lines"
     (( found >= 0 )) || return 0
     while IFS='|' read -r id x y w h; do
         [[ -n "$id" ]] && (( w > 0 && h > 0 )) || continue
@@ -682,7 +721,7 @@ gnome_live_zone_targets() {
             next_area="$x|$y|$w|$h"
         fi
         index=$((index + 1))
-    done <<<"$GNOME_LIVE_DISPLAY_LINES"
+    done <<<"$display_lines"
     IFS='|' read -r GNOME_LIVE_X GNOME_LIVE_Y GNOME_LIVE_W GNOME_LIVE_H <<<"$area"
     GNOME_LIVE_LEFT_HALF="$GNOME_LIVE_X,$GNOME_LIVE_Y,$((GNOME_LIVE_W / 2)),$GNOME_LIVE_H"
     GNOME_LIVE_CENTER_THIRD="$((GNOME_LIVE_X + GNOME_LIVE_W / 3)),$GNOME_LIVE_Y,$((GNOME_LIVE_W - 2 * (GNOME_LIVE_W / 3))),$GNOME_LIVE_H"
@@ -817,7 +856,7 @@ gnome_live_capture() {
 gnome_live_focus_baseline() {
     local timeout_s=${1:-10}
     local deadline=$((SECONDS + timeout_s))
-    local focused='' observed='' active='' present='' display='' x='' y='' width='' height=''
+    local focused='' observed='' active='' present='' window_id='' x='' y='' width='' height=''
     GNOME_LIVE_FOCUS_X11=''
     GNOME_LIVE_FOCUS_COMPANION=''
     GNOME_LIVE_FOCUS_ACTIVE=''
@@ -825,7 +864,7 @@ gnome_live_focus_baseline() {
         observed=$(gnome_live_geometry)
         focused=$(get_gnome_focused)
         active=$(gnome_live_active_window)
-        IFS='|' read -r present display x y width height <<<"$focused"
+        IFS='|' read -r present window_id x y width height <<<"$focused"
         if [[ "$observed" != 'unavailable' && "$present" == 'true' \
             && "$x,$y,$width,$height" == "$observed" && "$active" == "$WINDOW_ID" ]]; then
             GNOME_LIVE_FOCUS_X11="$observed"
@@ -844,8 +883,8 @@ gnome_live_focus_baseline() {
 gnome_live_assert_focus() {
     local focused=$GNOME_LIVE_FOCUS_COMPANION observed=$GNOME_LIVE_FOCUS_X11
     local active=$GNOME_LIVE_FOCUS_ACTIVE
-    local present='' display='' x='' y='' width='' height='' focused_geometry=''
-    IFS='|' read -r present display x y width height <<<"$focused"
+    local present='' window_id='' x='' y='' width='' height='' focused_geometry=''
+    IFS='|' read -r present window_id x y width height <<<"$focused"
     focused_geometry="$x,$y,$width,$height"
     log "OBSERVED GNOME live focus: companion='$focused' xdotool='$observed' active='$active' window='$WINDOW_ID'"
     assert_eq 'GNOME live focused-window present' 'true' "$present"
@@ -858,12 +897,12 @@ gnome_live_assert_geometry() {
     local name=$1 expected=$2
     local deadline=$((SECONDS + 10))
     local observed_x11='' observed_companion='' focused=''
-    local present='' display='' x='' y='' width='' height=''
+    local present='' window_id='' x='' y='' width='' height=''
     gnome_live_activate_window || true
     while (( SECONDS < deadline )); do
         observed_x11=$(gnome_live_geometry)
         focused=$(get_gnome_focused)
-        IFS='|' read -r present display x y width height <<<"$focused"
+        IFS='|' read -r present window_id x y width height <<<"$focused"
         observed_companion="$focused"
         if [[ "$observed_x11" == "$expected" \
             && "$present" == 'true' \
@@ -925,85 +964,12 @@ run_gnome_live_dispatch() {
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
 }
 
-snapshot_gnome() {
-    local label=$1
-    local path="$TMP_DIR/${CURRENT_GATE}-${label}.png" result=''
-    LAST_SHOT=''
-    if result=$(gnome_shell_call /org/gnome/Shell/Screenshot org.gnome.Shell.Screenshot.Screenshot false false "$path" 2>&1) \
-        && [[ "$result" == "(true,"* ]] && [[ -s "$path" ]]; then
-        LAST_SHOT="$path"
-    elif find_gnome_xwayland \
-        && timeout 5 import -display "$GNOME_XDISPLAY" -window root "$path" >/dev/null 2>&1 \
-        && [[ -s "$path" ]]; then
-        LAST_SHOT="$path"
-    elif find_gnome_xwayland && command -v ffmpeg >/dev/null 2>&1 \
-        && timeout 5 env DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-            ffmpeg -loglevel error -f x11grab -video_size 3520x1080 -i "$GNOME_XDISPLAY.0" -frames:v 1 "$path" >/dev/null 2>&1 \
-        && [[ -s "$path" ]]; then
-        LAST_SHOT="$path"
-    fi
-    if [[ -n "$LAST_SHOT" ]]; then
-        log "SCREENSHOT $label: $LAST_SHOT"
-    else
-        log "SCREENSHOT $label: unavailable (GNOME Shell Screenshot/import/ffmpeg failed)"
-    fi
-}
-
 get_gnome_focused() {
     local raw
     raw=$(gnome_call GetFocusedWindow 2>&1 || true)
     parse_gnome_focused "$raw"
 }
 
-wait_gnome_focused() {
-    local expected=$1 timeout_s=${2:-8} observed
-    local deadline=$((SECONDS + timeout_s))
-    while (( SECONDS < deadline )); do
-        observed=$(get_gnome_focused | cut -d'|' -f1,3-)
-        if [[ "$observed" == "$expected" ]]; then
-            printf '%s' "$observed"
-            return 0
-        fi
-        sleep 0.1
-    done
-    printf '%s' "$(get_gnome_focused | cut -d'|' -f1,3-)"
-    return 1
-}
-
-gnome_assert_geometry() {
-    local name=$1 expected=$2 observed
-    observed=$(wait_gnome_focused "$expected" 8 || true)
-    snapshot_gnome "$name"
-    if [[ -n "$LAST_SHOT" ]]; then
-        ASSERTIONS=$((ASSERTIONS + 1))
-        if [[ "$observed" == "$expected" ]]; then
-            log "PASS $name: expected '$expected' observed '$observed' (screenshot $LAST_SHOT)"
-        else
-            FAILURES=$((FAILURES + 1))
-            log "FAIL $name: expected '$expected' observed '$observed' (screenshot $LAST_SHOT)"
-        fi
-    else
-        assert_eq "$name" "$expected" "$observed"
-        log "Harness limitation $name screenshot: no usable screenshot tool"
-    fi
-}
-
-run_gnome_dispatch() {
-    local label=$1 hotkey=$2 rc=0
-    local out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log"
-    if env XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-        XDG_RUNTIME_DIR="$GNOME_RUNTIME" XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-        DCONF_PROFILE="$GNOME_DCONF_PROFILE" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-        XDG_CURRENT_DESKTOP=GNOME GNOME_DESKTOP_SESSION_ID=smoke \
-        "$BIN_PATH" --backend wayland --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
-    cat "$out" >>"$ASSERT_LOG"
-    assert_eq "$label dispatch exit" 0 "$rc"
-    assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
-}
 
 run_x11_dispatch() {
     local label=$1 hotkey=$2 expected=${3:-} rc=0 attempts=0
@@ -1034,130 +1000,8 @@ run_x11_dispatch() {
 }
 
 
-run_gnome_atomic_registration() {
-    local helper="$GNOME_ROOT/register.js" monitor_log="$GNOME_ROOT/hotkey-monitor.log" helper_log="$GNOME_ROOT/register.log"
-    cat >"$helper" <<'EOF'
-import Gio from 'gi://Gio';
-import GLib from 'gi://GLib';
-const address = GLib.getenv('DBUS_SESSION_BUS_ADDRESS');
-const connection = Gio.DBusConnection.new_for_address_sync(
-    address,
-    Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
-    Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
-    null,
-    null);
-const proxy = Gio.DBusProxy.new_sync(
-    connection,
-    Gio.DBusProxyFlags.NONE,
-    null,
-    'org.window_zones.Gnome',
-    '/org/window_zones/Gnome',
-    'org.window_zones.Gnome1',
-    null);
-proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [['alt+ctrl+left']]), Gio.DBusCallFlags.NONE, 5000, null);
-print('VALID_OK');
-try {
-    proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [['alt+ctrl+left', 'alt+ctrl+F25']]), Gio.DBusCallFlags.NONE, 5000, null);
-    print('INVALID_ACCEPTED');
-} catch (error) {
-    print(`INVALID_REJECTED ${Gio.DBusError.get_remote_error(error)}`);
-}
-GLib.usleep(15000000);
-EOF
-    : >"$monitor_log"
-    local monitor_pid helper_pid rc=0
-    monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor --session \
-        --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome)
-    helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gjs -m "$helper")
-    if ! wait_for_text "$helper_log" 'VALID_OK' 8; then
-        assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(cat "$helper_log" 2>/dev/null || true)"
-        return 0
-    fi
-    assert_text 'GNOME RegisterHotkeys valid set' 'VALID_OK' "$(<"$helper_log")"
-    if wait_for_text "$helper_log" 'INVALID_REJECTED' 8; then
-        assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(<"$helper_log")"
-    else
-        assert_text 'GNOME RegisterHotkeys rejects invalid set' 'INVALID_REJECTED' "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
-    if find_gnome_xwayland; then
-        : >"$monitor_log"
-        env DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-            xdotool key --clearmodifiers alt+ctrl+Left >/dev/null 2>&1 || true
-        if wait_for_text "$monitor_log" 'HotkeyPressed' 5; then
-            assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(<"$monitor_log")"
-        else
-            assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' "$(cat "$monitor_log" 2>/dev/null || true)"
-            log 'Harness limitation GNOME hotkey injection: headless Shell has no physical input seat'
-        fi
-    else
-        assert_text 'GNOME atomic registration keeps previous set' 'alt+ctrl+left' 'Xwayland display/auth not found'
-        log 'Harness limitation GNOME hotkey injection: no Xwayland observer'
-    fi
-    stop_pid "$helper_pid"
-    stop_pid "$monitor_pid"
-}
-
-run_gnome_hotkey_and_disconnect() {
-    local run_log="$GNOME_ROOT/run.log" monitor_log="$GNOME_ROOT/app-hotkey-monitor.log" before rc=0
-    start_fifo_app run wayland "$run_log"
-    if wait_for_text "$run_log" 'Interactive session started' 15; then
-        assert_text 'GNOME run starts' 'Interactive session started' "$(<"$run_log")"
-    else
-        assert_text 'GNOME run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
-    assert_text 'GNOME hotkeys initially register' 'Hotkey registration initially' "$(cat "$run_log" 2>/dev/null || true)"
-    : >"$monitor_log"
-    local monitor_pid=''
-    if monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gdbus monitor \
-        --session --dest org.window_zones.Gnome --object-path /org/window_zones/Gnome); then
-        if find_gnome_xwayland; then
-            env DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-                xdotool key --clearmodifiers alt+ctrl+Left >/dev/null 2>&1 || true
-            if wait_for_text "$monitor_log" 'HotkeyPressed' 5; then
-                assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' "$(<"$monitor_log")"
-                send_app status
-                sleep 0.5
-                assert_text 'GNOME signal resolves configured action' 'last action: alt+ctrl+left' "$(<"$run_log")"
-            else
-                assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' "$(cat "$monitor_log" 2>/dev/null || true)"
-                log 'Harness limitation GNOME hotkey injection: headless Shell has no physical input seat'
-            fi
-        else
-            assert_text 'GNOME companion hotkey signal' 'alt+ctrl+left' 'Xwayland display/auth not found'
-            log 'Harness limitation GNOME hotkey injection: no Xwayland observer'
-        fi
-    fi
-    stop_pid "$monitor_pid"
-
-    local disable_out enable_out service_list
-    disable_out=$(gnome_shell_call /org/gnome/Shell org.gnome.Shell.Extensions.DisableExtension window-zones@mihai-a24 2>&1 || true)
-    local deadline=$((SECONDS + 10))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        [[ "$service_list" != *'org.window_zones.Gnome'* ]] && break
-        sleep 0.2
-    done
-    assert_text 'GNOME companion disable call' 'true' "$disable_out"
-    assert_text 'GNOME disconnect surfaces explicit unavailable state' 'GNOME companion is unavailable' "$(cat "$run_log" 2>/dev/null || true)"
-
-    enable_out=$(gnome_shell_call /org/gnome/Shell org.gnome.Shell.Extensions.EnableExtension window-zones@mihai-a24 2>&1 || true)
-    deadline=$((SECONDS + 15))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        [[ "$service_list" == *'org.window_zones.Gnome'* ]] && break
-        sleep 0.2
-    done
-    assert_text 'GNOME companion restore call' 'true' "$enable_out"
-    if wait_for_text "$run_log" 'Hotkey registration now recovered' 12; then
-        assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(<"$run_log")"
-    else
-        assert_text 'GNOME companion recovery without restart' 'Hotkey registration now recovered' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
-    stop_app_cleanly 'GNOME run quits cleanly' "$run_log"
-}
-run_tui_lifecycle() {
-    local backend=$1 label=$2
-    local tui_log="$TMP_DIR/${CURRENT_GATE}-${label}-tui.log" before after rc=0
+tui_begin() {
+    local backend=$1 label=$2 tui_log=$3 command marker before
     start_fifo_app tui "$backend" "$tui_log"
     if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
         assert_text "$label TUI starts" 'Window Zones TUI' "$(<"$tui_log")"
@@ -1165,29 +1009,37 @@ run_tui_lifecycle() {
         assert_text "$label TUI starts" 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app reload
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text "$label TUI reload" 'Config:' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI reload" 'Config:' ''
-    fi
+    for command in reload restart status; do
+        case "$command" in
+            reload) marker='Config:' ;;
+            restart) marker='Hotkey state:' ;;
+            status) marker='Commands: reload' ;;
+        esac
+        before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
+        send_app "$command"
+        if wait_for_size_growth "$tui_log" "$before" 8; then
+            assert_text "$label TUI $command" "$marker" "$(<"$tui_log")"
+        else
+            assert_text "$label TUI $command" "$marker" ''
+        fi
+    done
+}
 
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app restart
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text "$label TUI restart" 'Hotkey state:' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI restart" 'Hotkey state:' ''
+tui_end() {
+    local label=$1 tui_log=$2 rc=0
+    send_app quit
+    close_app_input
+    if [[ -n "${APP_PID:-}" ]]; then
+        wait_pid "$APP_PID" 12 || rc=$?
+        APP_PID=''
     fi
+    assert_rc_zero "$label TUI quit" "$rc" "tui log $tui_log"
+}
 
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app status
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text "$label TUI status" 'Commands: reload' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI status" 'Commands: reload' ''
-    fi
+run_tui_lifecycle() {
+    local backend=$1 label=$2
+    local tui_log="$TMP_DIR/${CURRENT_GATE}-${label}-tui.log"
+    tui_begin "$backend" "$label" "$tui_log"
 
     send_app 'dispatch alt+ctrl+left'
     if wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8; then
@@ -1196,13 +1048,7 @@ run_tui_lifecycle() {
         assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
     fi
 
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero "$label TUI quit" "$rc" "tui log $tui_log"
+    tui_end "$label" "$tui_log"
 }
 
 gnome_live_choose_hotkeys() {
@@ -1302,7 +1148,7 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.Gnome',
     '/org/window_zones/Gnome',
-    'org.window_zones.Gnome1',
+    'org.window_zones.Gnome2',
     null);
 try {
     proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [[valid]]),
@@ -1328,11 +1174,11 @@ try {
 EOF
     : >"$monitor_log"
     : >"$helper_log"
-    monitor_pid=$(start_group "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
+    start_group monitor_pid "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         gdbus monitor --session --dest org.window_zones.Gnome \
-        --object-path /org/window_zones/Gnome)
-    helper_pid=$(start_group "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-        LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper")
+        --object-path /org/window_zones/Gnome
+    start_group helper_pid "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
+        LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper"
     if wait_for_text "$helper_log" 'VALID_OK' 8; then
         assert_text 'GNOME live atomic valid registration' 'VALID_OK' "$(<"$helper_log")"
     else
@@ -1370,9 +1216,21 @@ EOF
 
 restore_gnome_live() {
     [[ "$GNOME_LIVE_ACTIVE" -eq 1 ]] || return 0
-    local enabled_after='' after_info='' tiling_after_info=''
+    local enabled_after='' after_info='' tiling_after_info='' failures_before=$FAILURES
     local window_after_enabled=0 tiling_after_enabled=0
     enabled_after=$(gnome_live_enabled_extensions)
+    # Re-enabling appends the UUID. Restore order without clobbering changed membership.
+    if [[ -n "${GNOME_LIVE_ENABLED_BEFORE:-}" && "$enabled_after" != "$GNOME_LIVE_ENABLED_BEFORE" ]] \
+        && python3 - "$GNOME_LIVE_ENABLED_BEFORE" "$enabled_after" <<'PY'
+import ast
+import sys
+sys.exit(sorted(ast.literal_eval(sys.argv[1])) != sorted(ast.literal_eval(sys.argv[2])))
+PY
+    then
+        DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" gsettings set org.gnome.shell \
+            enabled-extensions "$GNOME_LIVE_ENABLED_BEFORE" || true
+        enabled_after=$(gnome_live_enabled_extensions)
+    fi
     after_info=$(gnome_live_extension_info "$GNOME_LIVE_EXT_UUID")
     tiling_after_info=$(gnome_live_extension_info "$GNOME_LIVE_TILING_UUID")
     log "RESTORE enabled-extensions after: $enabled_after"
@@ -1396,6 +1254,7 @@ restore_gnome_live() {
         assert_eq 'GNOME live tilingshell enable state unchanged' \
             "$GNOME_LIVE_TILING_ENABLED_BEFORE" "$tiling_after_enabled"
     fi
+    (( FAILURES == failures_before )) || return 1
     GNOME_LIVE_ACTIVE=0
     return 0
 }
@@ -1419,6 +1278,32 @@ gnome_live_skip_after_companion() {
         'left-two-thirds dispatch state'
         'GNOME live left-two-thirds xdotool geometry'
         'GNOME live left-two-thirds companion geometry'
+        'GNOME live seam helper builds against the public API'
+        'GNOME live captures the test window id'
+        'GNOME live second test window maps'
+        'GNOME live focus moves to the second window'
+        'GNOME live Companion reports a different focused id'
+        'GNOME live captured id move after focus change succeeds'
+        'GNOME live captured id moves the original window'
+        'GNOME live captured id move leaves the focused window frame'
+        'GNOME live captured id move leaves focus on the second window'
+        'GNOME live closed target reports WindowGone'
+        'GNOME live closed target leaves the other window unchanged'
+        'GNOME live maximized precondition vertical'
+        'GNOME live maximized precondition horizontal'
+        'GNOME live maximized window move succeeds'
+        'GNOME live maximized window is restored before the frame'
+        'GNOME live maximized window gets the target frame'
+        'GNOME live Super+Left edge-tiles the test window'
+        'GNOME live edge-tiled precondition'
+        'GNOME live edge-tiled window move succeeds'
+        'GNOME live edge-tiled window is restored before the frame'
+        'GNOME live edge-tiled window gets the target frame'
+        'GNOME live fullscreen precondition'
+        'GNOME live fullscreen window move is rejected'
+        'GNOME live fullscreen rejection keeps fullscreen'
+        'GNOME live fullscreen rejection keeps the frame'
+        'GNOME live test window leaves fullscreen'
         'GNOME live conflicting binding is refused'
         'GNOME live conflicting binding error name'
         'GNOME live conflicting binding names accelerator'
@@ -1447,6 +1332,10 @@ gnome_live_skip_after_companion() {
         'GNOME live invalid reload preserves previous bindings'
         'GNOME live invalid reload keeps hotkeys registered'
         'GNOME live invalid config keeps previous binding active'
+        'GNOME live rejected replacement reports a refused reload'
+        'GNOME live rejected replacement keeps the previous bindings'
+        'GNOME live rejected replacement keeps hotkeys registered'
+        'GNOME live rejected replacement keeps the previous grab working'
         'GNOME live valid config recovers'
         'GNOME live valid config restores bindings'
         'GNOME live App quits cleanly'
@@ -1474,6 +1363,129 @@ gnome_live_finish() {
         log 'FAIL GNOME live restoration did not complete; retaining strict EXIT trap'
     fi
 }
+
+gnome_live_move() {
+    # window x,y,w,h: call the Companion's MoveWindow directly; print `ok` or the D-Bus error.
+    # `--` keeps gdbus from reading a negative coordinate as an option.
+    local out=''
+    if out=$(gnome_call MoveWindow -- "$1" ${2//,/ } 2>&1); then
+        printf 'ok'
+    else
+        printf '%s' "$out"
+    fi
+}
+
+gnome_live_focused_id() {
+    local present='' id='' rest=''
+    IFS='|' read -r present id rest <<<"$(get_gnome_focused)"
+    [[ "$present" == 'true' ]] && printf '%s' "$id"
+}
+
+run_gnome_live_adr9_window_checks() {
+    # ADR 0009 on the seated compositor, observed through Xwayland's xdotool/xprop. Only the gate's
+    # own editor windows are touched: a captured id outlives a focus change and reports closure;
+    # maximized, edge-tiled (Super+Left, GNOME's default tiling binding) and fullscreen windows.
+    local a="$WINDOW_ID" b='' b_pid='' a_id='' b_id='' out='' before='' b_before='' observed=''
+    XON_DISPLAY="$GNOME_XDISPLAY"
+    XON_XAUTHORITY="$GNOME_XAUTHORITY"
+    write_uinput_injector
+    build_seam_helper 'GNOME live'
+    gnome_live_activate_window || true
+    a_id=$(gnome_live_focused_id)
+    assert_text 'GNOME live captures the test window id' 'captured' "${a_id:+captured}"
+    gnome_live_move "$a_id" "$GNOME_LIVE_CENTER_THIRD" >/dev/null
+    start_group b_pid "$GNOME_ROOT/editor-b.log" env \
+        DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
+        XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
+        XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" \
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone
+    b=$(xwindow_for_pid "$b_pid" 20 || true)
+    assert_text 'GNOME live second test window maps' 'mapped' "${b:+mapped}"
+    if [[ -z "$b" || -z "$a_id" ]]; then
+        stop_pid "$b_pid"
+        return 0
+    fi
+    xon xdotool windowactivate --sync "$b" >/dev/null 2>&1 || true
+    sleep 0.5
+    b_id=$(gnome_live_focused_id)
+    assert_eq 'GNOME live focus moves to the second window' "$b" "$(gnome_live_active_window)"
+    assert_eq 'GNOME live Companion reports a different focused id' 1 \
+        "$([[ -n "$b_id" && "$b_id" != "$a_id" ]] && printf 1 || printf 0)"
+    WINDOW_ID="$b"
+    sleep 0.5
+    b_before=$(gnome_live_geometry)
+    WINDOW_ID="$a"
+    out=$(gnome_live_move "$a_id" "$GNOME_LIVE_LEFT_HALF")
+    assert_eq 'GNOME live captured id move after focus change succeeds' ok "$out"
+    assert_eq 'GNOME live captured id moves the original window' "$GNOME_LIVE_LEFT_HALF" \
+        "$(wait_observed gnome_live_geometry "$GNOME_LIVE_LEFT_HALF")"
+    WINDOW_ID="$b"
+    assert_eq 'GNOME live captured id move leaves the focused window frame' "$b_before" \
+        "$(gnome_live_geometry)"
+    WINDOW_ID="$a"
+    assert_eq 'GNOME live captured id move leaves focus on the second window' "$b" \
+        "$(gnome_live_active_window)"
+    gnome_live_capture captured-id-move
+
+    stop_pid "$b_pid"
+    wait_pid "$b_pid" 5 || true
+    set +e
+    wait_xwindow_gone "$b" 10 || true
+    before=$(gnome_live_geometry)
+    out=$(gnome_live_move "$b_id" "$GNOME_LIVE_CENTER_THIRD")
+    assert_text 'GNOME live closed target reports WindowGone' \
+        'org.window_zones.Gnome.Error.WindowGone' "$out"
+    sleep 1
+    assert_eq 'GNOME live closed target leaves the other window unchanged' "$before" \
+        "$(gnome_live_geometry)"
+
+    gnome_live_activate_window || true
+    if [[ -n "$SEAM_HELPER" ]]; then
+        seam state "$a" add _NET_WM_STATE_MAXIMIZED_VERT _NET_WM_STATE_MAXIMIZED_HORZ >/dev/null
+    fi
+    assert_wm_state 'GNOME live maximized precondition vertical' "$a" _NET_WM_STATE_MAXIMIZED_VERT 1
+    assert_wm_state 'GNOME live maximized precondition horizontal' "$a" _NET_WM_STATE_MAXIMIZED_HORZ 1
+    out=$(gnome_live_move "$a_id" "$GNOME_LIVE_CENTER_THIRD")
+    assert_eq 'GNOME live maximized window move succeeds' ok "$out"
+    assert_wm_state 'GNOME live maximized window is restored before the frame' "$a" \
+        _NET_WM_STATE_MAXIMIZED 0
+    assert_eq 'GNOME live maximized window gets the target frame' "$GNOME_LIVE_CENTER_THIRD" \
+        "$(wait_observed gnome_live_geometry "$GNOME_LIVE_CENTER_THIRD")"
+
+    gnome_live_activate_window || true
+    out=$(python3 "$UINPUT_INJECTOR" super+left 2>&1) || log "GNOME live uinput super+left: $out"
+    assert_eq 'GNOME live Super+Left edge-tiles the test window' "$GNOME_LIVE_LEFT_HALF" \
+        "$(wait_observed gnome_live_geometry "$GNOME_LIVE_LEFT_HALF")"
+    assert_wm_state 'GNOME live edge-tiled precondition' "$a" _NET_WM_STATE_MAXIMIZED_VERT 1
+    out=$(gnome_live_move "$a_id" "$GNOME_LIVE_TWO_THIRDS")
+    assert_eq 'GNOME live edge-tiled window move succeeds' ok "$out"
+    assert_wm_state 'GNOME live edge-tiled window is restored before the frame' "$a" \
+        _NET_WM_STATE_MAXIMIZED 0
+    assert_eq 'GNOME live edge-tiled window gets the target frame' "$GNOME_LIVE_TWO_THIRDS" \
+        "$(wait_observed gnome_live_geometry "$GNOME_LIVE_TWO_THIRDS")"
+
+    if [[ -n "$SEAM_HELPER" ]]; then
+        seam state "$a" add _NET_WM_STATE_FULLSCREEN >/dev/null
+    fi
+    assert_wm_state 'GNOME live fullscreen precondition' "$a" _NET_WM_STATE_FULLSCREEN 1
+    sleep 1
+    before=$(gnome_live_geometry)
+    out=$(gnome_live_move "$a_id" "$GNOME_LIVE_CENTER_THIRD")
+    assert_text 'GNOME live fullscreen window move is rejected' \
+        'window is fullscreen; leave fullscreen first' "$out"
+    assert_wm_state 'GNOME live fullscreen rejection keeps fullscreen' "$a" _NET_WM_STATE_FULLSCREEN 1
+    sleep 1
+    assert_eq 'GNOME live fullscreen rejection keeps the frame' "$before" "$(gnome_live_geometry)"
+    gnome_live_capture fullscreen-rejected
+    if [[ -n "$SEAM_HELPER" ]]; then
+        seam state "$a" remove _NET_WM_STATE_FULLSCREEN >/dev/null
+    fi
+    assert_wm_state 'GNOME live test window leaves fullscreen' "$a" _NET_WM_STATE_FULLSCREEN 0
+    gnome_live_move "$a_id" "$GNOME_LIVE_TWO_THIRDS" >/dev/null
+    wait_observed gnome_live_geometry "$GNOME_LIVE_TWO_THIRDS" >/dev/null
+    gnome_live_activate_window || true
+}
+
 run_gnome_live_app_checks() {
     local run_log="$GNOME_ROOT/live-run.log"
     local registered=0 real_geometry=''
@@ -1598,6 +1610,40 @@ run_gnome_live_app_checks() {
         "$GNOME_LIVE_LEFT_HALF" "$real_geometry"
     gnome_live_capture invalid-config-binding
 
+    # ADR 0009: a replacement the compositor refuses keeps the old config and its grabs. GNOME
+    # reserves Alt+Ctrl+Left (the conflicting-binding check above proves it is refused).
+    local refused_before
+    refused_before=$(count_text "$run_log" 'were refused')
+    write_gnome_live_valid_config
+    cat >>"$CONFIG_PATH" <<'EOF'
+
+[[bindings]]
+hotkey = "Alt+Ctrl+Left"
+action = { type = "move-to-zone", zone = "center-third" }
+EOF
+    sleep 0.4
+    send_app reload
+    sleep 0.3
+    send_app reload
+    wait_for_new_text "$run_log" 'were refused' "$refused_before" 10 || true
+    assert_eq 'GNOME live rejected replacement reports a refused reload' 1 \
+        "$(( $(count_text "$run_log" 'were refused') > refused_before ? 1 : 0 ))"
+    bindings_before=$(count_text "$run_log" 'binding count: 4')
+    hotkeys_before=$(count_text "$run_log" 'hotkey state: Registered')
+    send_app status
+    wait_for_new_text "$run_log" 'binding count: 4' "$bindings_before" 10 || true
+    assert_eq 'GNOME live rejected replacement keeps the previous bindings' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 4') > bindings_before ? 1 : 0 ))"
+    assert_eq 'GNOME live rejected replacement keeps hotkeys registered' 1 \
+        "$(( $(count_text "$run_log" 'hotkey state: Registered') > hotkeys_before ? 1 : 0 ))"
+    gnome_live_activate_window || true
+    gnome_live_move "$(gnome_live_focused_id)" "$GNOME_LIVE_CENTER_THIRD" >/dev/null
+    wait_observed gnome_live_geometry "$GNOME_LIVE_CENTER_THIRD" >/dev/null
+    gnome_live_inject_hotkey || true
+    assert_eq 'GNOME live rejected replacement keeps the previous grab working' \
+        "$GNOME_LIVE_LEFT_HALF" "$(wait_observed gnome_live_geometry "$GNOME_LIVE_LEFT_HALF" 10)"
+    gnome_live_capture rejected-replacement-binding
+
     write_gnome_live_valid_config
     sleep 0.4
     send_app reload
@@ -1618,39 +1664,9 @@ run_gnome_live_app_checks() {
 }
 
 run_gnome_live_tui_lifecycle() {
-    local tui_log="$GNOME_ROOT/live-tui.log" before rc=0
+    local tui_log="$GNOME_ROOT/live-tui.log"
     write_gnome_live_valid_config
-    start_fifo_app tui wayland "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text 'GNOME live TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI starts' 'Window Zones TUI' \
-            "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
-
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app reload
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'GNOME live TUI reload' 'Config:' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI reload' 'Config:' ''
-    fi
-
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app restart
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'GNOME live TUI restart' 'Hotkey state:' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI restart' 'Hotkey state:' ''
-    fi
-
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app status
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'GNOME live TUI status' 'Commands: reload' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI status' 'Commands: reload' ''
-    fi
+    tui_begin wayland 'GNOME live' "$tui_log"
 
     gnome_live_activate_window || true
     send_app "dispatch $GNOME_SAFE_LEFT_HOTKEY"
@@ -1658,20 +1674,14 @@ run_gnome_live_tui_lifecycle() {
         "$(sorted_hotkey "$GNOME_SAFE_LEFT_HOTKEY")" \
         "$(sorted_hotkey "$(wait_for_reported_action "$tui_log" 'Last action: ' 10)")"
 
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero 'GNOME live TUI quit' "$rc" "tui log $tui_log"
+    tui_end 'GNOME live' "$tui_log"
 }
 
 run_gnome_live() {
     CURRENT_GATE='gnome-live'
     if [[ ! -w /dev/uinput ]]; then
         assert_eq 'GNOME live uinput preflight' writable '/dev/uinput is not writable'
-        log 'BLOCKED GNOME live: run sudo modprobe uinput, then sudo chmod 0666 /dev/uinput or install a udev rule granting access; uinput is required for this gate'
+        log 'BLOCKED GNOME live: uinput is required. With explicit administrator approval, load it with sudo modprobe uinput, save getfacl -p /dev/uinput, grant only this user rw via sudo setfacl -m "u:$(id -un):rw" /dev/uinput, and restore the saved ACL with sudo setfacl -P --restore on exit (see the GNOME runbook). Never make /dev/uinput world-writable.'
         return 1
     fi
     assert_eq 'GNOME live uinput preflight' writable writable
@@ -1690,11 +1700,8 @@ run_gnome_live() {
     WAYLAND_DISPLAY='wayland-0'
     GNOME_XDISPLAY=':0'
     GNOME_XAUTHORITY=''
-    GNOME_LIVE_EXT_PRESENT=0
     GNOME_LIVE_WINDOW_ENABLED_BEFORE=0
     GNOME_LIVE_TILING_ENABLED_BEFORE=0
-    GNOME_LIVE_SNAPSHOT_READY=0
-    GNOME_LIVE_NEEDS_RESTORE=0
     GNOME_LIVE_ACTIVE=1
     GNOME_LIVE_RESTORE_FAILURE=0
     APP_PID=''
@@ -1729,16 +1736,13 @@ run_gnome_live() {
         snapshot_ok=0
     fi
     if [[ -d "$GNOME_LIVE_EXT_DIR" ]]; then
-        GNOME_LIVE_EXT_PRESENT=1
         if ! cp -a -- "$GNOME_LIVE_EXT_DIR" "$GNOME_LIVE_BACKUP_DIR"; then
             snapshot_ok=0
         fi
     else
         log "SNAPSHOT installed extension directory: absent ($GNOME_LIVE_EXT_DIR)"
     fi
-    if [[ "$snapshot_ok" -eq 1 ]]; then
-        GNOME_LIVE_SNAPSHOT_READY=1
-    else
+    if [[ "$snapshot_ok" -ne 1 ]]; then
         assert_eq 'GNOME live snapshot complete' 1 0
     fi
 
@@ -1761,7 +1765,7 @@ run_gnome_live() {
     if [[ "$companion_ready" -ne 1 ]]; then
         log 'BLOCKED GNOME live: companion is not active on the live session bus; log out and back in, then rerun gnome-live'
         gnome_live_skip_after_companion \
-            'org.window_zones.Gnome absent or extension remained INACTIVE on GNOME Shell 50.4'
+            'org.window_zones.Gnome absent or extension not ACTIVE; install the current companion and log out and back in'
         gnome_live_finish
         set -e
         return 0
@@ -1846,19 +1850,12 @@ run_gnome_live() {
     GNOME_LIVE_DISPLAY_TOTAL="$display_count"
     write_gnome_live_valid_config
 
-    local editor_launcher="$GNOME_ROOT/launch-editor.sh"
     local editor_log="$GNOME_ROOT/editor.log" editor_pid='' editor_deadline
-    cat >"$editor_launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec gnome-text-editor --standalone
-EOF
-    chmod +x "$editor_launcher"
-    editor_pid=$(start_group "$editor_log" env \
+    start_group editor_pid "$editor_log" env \
         DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland "$editor_launcher")
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone
     EDITOR_PID="$editor_pid"
     log "OBSERVED GNOME live editor pid: $EDITOR_PID"
     editor_deadline=$((SECONDS + 20))
@@ -1903,12 +1900,12 @@ EOF
             "not exercised: live session reports $display_count display"
     fi
 
+    run_gnome_live_adr9_window_checks
     run_gnome_live_conflicting_binding
     run_gnome_live_atomic_registration
     run_gnome_live_app_checks
     run_gnome_live_tui_lifecycle
     stop_pid "$EDITOR_PID"
-    GNOME_LIVE_EDITOR_STOPPED=1
     gnome_live_finish
     set -e
 }
@@ -1917,7 +1914,7 @@ kde_live_companion_call() {
     local method=$1
     shift
     busctl --address="$KDE_BUS" call \
-        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin1 "$method" "$@"
+        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin3 "$method" "$@"
 }
 
 kde_live_kwin_call() {
@@ -2219,7 +2216,7 @@ kde_live_preflight() {
     fi
     assert_eq 'KDE kwin_wayland installed' 1 1
     local -a required=(kpackagetool6 kwriteconfig6 busctl gjs xdotool xprop \
-        dbus-run-session python setsid gnome-text-editor)
+        dbus-run-session dbus-update-activation-environment python setsid gnome-text-editor)
     for tool in "${required[@]}"; do
         if which "$tool" >/dev/null 2>&1; then
             assert_eq "KDE preflight $tool installed" 1 1
@@ -2252,30 +2249,6 @@ kde_live_preflight() {
     return 0
 }
 
-kde_live_write_valid_config() {
-    cat >"$CONFIG_PATH" <<'EOF'
-[[bindings]]
-hotkey = "Alt+Ctrl+Left"
-action = { type = "move-to-zone", zone = "left-half" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Up"
-action = { type = "move-to-zone", zone = "center-third" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Right"
-action = { type = "move-to-zone", zone = "left-two-thirds" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Down"
-action = { type = "move-to-next-display" }
-
-[[bindings]]
-hotkey = "Alt+Ctrl+Shift+Right"
-action = { type = "move-to-previous-display" }
-EOF
-}
-
 kde_live_write_changed_config() {
     cat >"$CONFIG_PATH" <<'EOF'
 [[bindings]]
@@ -2301,6 +2274,8 @@ kde_live_start_fixture() {
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$DBUS_SESSION_BUS_ADDRESS" >"$KDE_BUS_FILE"
+# Xwayland can activate the EIS portal before the first client starts.
+dbus-update-activation-environment "WAYLAND_DISPLAY=$KDE_SOCKET"
 "$KDE_COMPANION_BIN" >"$KDE_SERVICE_LOG" 2>&1 &
 printf '%s\n' "$!" >"$KDE_SERVICE_PID_FILE"
 printf '%s\n' "$$" >"$KDE_KWIN_PID_FILE"
@@ -2320,7 +2295,7 @@ exec kwin_wayland \
     "$KDE_PUBLISH_CLIENT_ENV"
 EOF
     chmod 700 "$KDE_LAUNCHER"
-    KDE_GROUP_PID=$(start_group "$KDE_KWIN_LOG" env \
+    start_group KDE_GROUP_PID "$KDE_KWIN_LOG" env \
         -u DISPLAY -u XAUTHORITY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u KDEHOME \
         BUS_FILE="$KDE_BUS_FILE" KDE_BUS_FILE="$KDE_BUS_FILE" \
         KDE_COMPANION_BIN="$KDE_COMPANION_BIN" KDE_SERVICE_LOG="$KDE_SERVICE_LOG" \
@@ -2336,7 +2311,7 @@ EOF
         KDE_SESSION_VERSION=6 XDG_SESSION_TYPE=wayland \
         QT_LOGGING_RULES='kwin_libeis.debug=true;kwin_scripting.debug=true' \
         QT_FORCE_STDERR_LOGGING=1 \
-        dbus-run-session -- "$KDE_LAUNCHER")
+        dbus-run-session -- "$KDE_LAUNCHER"
     if wait_for_file "$KDE_BUS_FILE" 20; then
         KDE_BUS=$(cat "$KDE_BUS_FILE")
         export DBUS_SESSION_BUS_ADDRESS="$KDE_BUS"
@@ -2413,48 +2388,18 @@ kde_live_find_window() {
 }
 
 kde_live_x11_geometry() {
-    local geometry='' key='' value='' x='' y='' width='' height=''
-    if [[ -z "${WINDOW_ID:-}" ]]; then
-        printf 'unavailable'
-        return 0
-    fi
-    geometry=$(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null || true)
-    while IFS='=' read -r key value; do
-        case "$key" in
-            X) x=$value ;;
-            Y) y=$value ;;
-            WIDTH) width=$value ;;
-            HEIGHT) height=$value ;;
-        esac
-    done <<<"$geometry"
-    local extents='' left=0 right=0 top=0 bottom=0
-    extents=$(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        xprop -id "$WINDOW_ID" _GTK_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p')
-    if [[ "$extents" =~ ^([0-9]+),\ ([0-9]+),\ ([0-9]+),\ ([0-9]+)$ ]]; then
-        left=${BASH_REMATCH[1]}
-        right=${BASH_REMATCH[2]}
-        top=${BASH_REMATCH[3]}
-        bottom=${BASH_REMATCH[4]}
-    fi
-    if [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ \
-        && "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
-        printf '%s,%s,%s,%s' "$((x + left))" "$((y + top))" \
-            "$((width - left - right))" "$((height - top - bottom))"
-    else
-        printf 'unavailable'
-    fi
+    gtk_x11_geometry "$KDE_XDISPLAY" "$KDE_XAUTHORITY"
 }
 
 kde_live_wait_focus() {
     local timeout_s=${1:-15}
     local deadline=$((SECONDS + timeout_s))
-    local observed='' focused='' active='' present='' display='' x='' y='' width='' height=''
+    local observed='' focused='' active='' present='' window_id='' x='' y='' width='' height=''
     while (( SECONDS < deadline )); do
         observed=$(kde_live_x11_geometry)
         focused=$(kde_live_get_focused)
         active=$(kde_live_x11_active_window)
-        IFS='|' read -r present display x y width height <<<"$focused"
+        IFS='|' read -r present window_id x y width height <<<"$focused"
         if [[ "$observed" != unavailable && "$present" == true \
             && "$active" == "$WINDOW_ID" && "$observed" == "$x,$y,$width,$height" ]]; then
             KDE_FOCUS_X11="$observed"
@@ -2472,10 +2417,11 @@ kde_live_wait_focus() {
 
 kde_live_assert_focus() {
     local focused="$KDE_FOCUS_COMPANION" observed="$KDE_FOCUS_X11" active="$KDE_FOCUS_ACTIVE"
-    local present='' display='' x='' y='' width='' height=''
-    IFS='|' read -r present display x y width height <<<"$focused"
+    local present='' window_id='' x='' y='' width='' height=''
+    IFS='|' read -r present window_id x y width height <<<"$focused"
     log "OBSERVED KDE focus: companion='$focused' xdotool='$observed' active='$active' window='${WINDOW_ID:-unavailable}'"
     assert_eq 'KDE GetFocusedWindow reports test window' true "$present"
+    assert_eq 'KDE focused window has stable identity' 1 "$([[ -n "$window_id" ]] && printf 1 || printf 0)"
     assert_eq 'KDE focus geometry agrees with xdotool' "$observed" "$x,$y,$width,$height"
     assert_eq 'KDE focus active nested X11 window' "$WINDOW_ID" "$active"
     local display_match=0 id='' output_x output_y output_width output_height
@@ -2612,6 +2558,151 @@ kde_live_inject_key() {
         xdotool key --clearmodifiers "$sequence"
 }
 
+kde_live_move() {
+    # window x,y,w,h: queue the Companion's MoveWindow directly and wait for the script's result;
+    # print `ok` or the completed error.
+    local reply='' request='' result='' deadline=$((SECONDS + 10))
+    reply=$(kde_live_companion_call MoveWindow siiuu "$1" ${2//,/ } 2>&1 || true)
+    request=$(printf '%s\n' "$reply" | sed -n 's/^u //p')
+    if [[ -z "$request" ]]; then
+        printf '%s' "$reply"
+        return 0
+    fi
+    while (( SECONDS < deadline )); do
+        result=$(kde_live_companion_call GetRequestResult s "$request" 2>&1 || true)
+        [[ "$result" == 'bss true'* ]] && break
+        sleep 0.1
+    done
+    if [[ "$result" == 'bss true "" ""' ]]; then
+        printf 'ok'
+    else
+        printf '%s' "$result"
+    fi
+}
+
+kde_live_window_state() {
+    # tag window js: run js against the KWin window `w` with that internalId in a throwaway
+    # script, then print KWin's own view: tile=<bool> max=<mode> fs=<bool> geo=x,y,w,h.
+    local tag=$1 id=$2 body=$3 js="$KDE_ROOT/adr9-$1.js" plugin="window-zones-adr9-$1"
+    cat >"$js" <<EOF
+'use strict';
+const w = Array.prototype.find.call(workspace.windowList(),
+    candidate => !candidate.deleted && String(candidate.internalId) === '$id');
+if (w) {
+    $body
+    const g = w.frameGeometry;
+    console.warn('KDE_STATE $tag tile=' + !!w.tile + ' max=' + w.maximizeMode
+        + ' fs=' + w.fullScreen + ' geo=' + [g.x, g.y, g.width, g.height].map(Math.round).join(','));
+} else {
+    console.warn('KDE_STATE $tag missing');
+}
+EOF
+    kde_live_load_script "$js" "$plugin"
+    kde_live_run_script "$KDE_LAST_SCRIPT_ID"
+    wait_for_text "$KDE_KWIN_LOG" "KDE_STATE $tag " 10 || true
+    kde_live_unload_script "$plugin"
+    sed -n "s/.*KDE_STATE $tag //p" "$KDE_KWIN_LOG" | sed -n '$p'
+}
+
+kde_live_adr9_window_checks() {
+    # ADR 0009 in nested KWin, observed through Xwayland's xdotool/xprop and KWin's own window
+    # state read by a separate script: a captured id outlives a focus change and reports closure;
+    # quick-tiled, maximized and fullscreen windows.
+    local a="$WINDOW_ID" b='' b_pid='' a_id='' b_id='' out='' before='' b_before='' state=''
+    local present='' rest=''
+    XON_DISPLAY="$KDE_XDISPLAY"
+    XON_XAUTHORITY="$KDE_XAUTHORITY"
+    kde_live_refresh_targets
+    kde_live_activate_window || true
+    IFS='|' read -r present a_id rest <<<"$(kde_live_get_focused)"
+    assert_text 'KDE captures the test window id' 'captured' "${a_id:+captured}"
+    kde_live_move "$a_id" "$KDE_CENTER_THIRD" >/dev/null
+    start_group b_pid "$KDE_ROOT/editor-b.log" env \
+        DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
+        XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
+        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
+        XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
+        XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
+        KDE_SESSION_VERSION=6 gnome-text-editor --standalone
+    b=$(xwindow_for_pid "$b_pid" 25 || true)
+    assert_text 'KDE second test window maps' 'mapped' "${b:+mapped}"
+    if [[ -z "$b" || -z "$a_id" ]]; then
+        stop_pid "$b_pid"
+        return 0
+    fi
+    xon xdotool windowactivate --sync "$b" >/dev/null 2>&1 || true
+    sleep 0.5
+    IFS='|' read -r present b_id rest <<<"$(kde_live_get_focused)"
+    assert_eq 'KDE focus moves to the second window' "$b" \
+        "$(xon xdotool getactivewindow 2>/dev/null || printf unavailable)"
+    assert_eq 'KDE Companion reports a different focused id' 1 \
+        "$([[ -n "$b_id" && "$b_id" != "$a_id" ]] && printf 1 || printf 0)"
+    WINDOW_ID="$b"
+    b_before=$(kde_live_x11_geometry)
+    WINDOW_ID="$a"
+    out=$(kde_live_move "$a_id" "$KDE_LEFT_HALF")
+    assert_eq 'KDE captured id move after focus change succeeds' ok "$out"
+    assert_eq 'KDE captured id moves the original window' "$KDE_LEFT_HALF" \
+        "$(wait_observed kde_live_x11_geometry "$KDE_LEFT_HALF")"
+    WINDOW_ID="$b"
+    assert_eq 'KDE captured id move leaves the focused window frame' "$b_before" \
+        "$(kde_live_x11_geometry)"
+    WINDOW_ID="$a"
+    assert_eq 'KDE captured id move leaves focus on the second window' "$b" \
+        "$(xon xdotool getactivewindow 2>/dev/null || printf unavailable)"
+
+    stop_pid "$b_pid"
+    wait_pid "$b_pid" 5 || true
+    set +e
+    wait_xwindow_gone "$b" 10 || true
+    before=$(kde_live_x11_geometry)
+    out=$(kde_live_move "$b_id" "$KDE_CENTER_THIRD")
+    assert_text 'KDE closed target reports WindowGone' 'WindowGone' "$out"
+    sleep 1
+    assert_eq 'KDE closed target leaves the other window unchanged' "$before" \
+        "$(kde_live_x11_geometry)"
+
+    state=$(kde_live_window_state tile "$a_id" \
+        'workspace.activeWindow = w; workspace.slotWindowQuickTileLeft();')
+    assert_text 'KDE quick-tiled precondition' 'tile=true' "$state"
+    out=$(kde_live_move "$a_id" "$KDE_TWO_THIRDS")
+    assert_eq 'KDE quick-tiled window move succeeds' ok "$out"
+    assert_text 'KDE quick-tiled window is restored before the frame' \
+        "tile=false max=0 fs=false geo=$KDE_TWO_THIRDS" "$(kde_live_window_state tiled-after "$a_id" '')"
+    assert_eq 'KDE quick-tiled window gets the target frame' "$KDE_TWO_THIRDS" \
+        "$(wait_observed kde_live_x11_geometry "$KDE_TWO_THIRDS")"
+
+    state=$(kde_live_window_state max "$a_id" 'w.setMaximize(true, true);')
+    assert_text 'KDE maximized precondition' 'max=3' "$state"
+    assert_wm_state 'KDE maximized precondition Xwayland state' "$a" _NET_WM_STATE_MAXIMIZED_HORZ 1
+    out=$(kde_live_move "$a_id" "$KDE_CENTER_THIRD")
+    assert_eq 'KDE maximized window move succeeds' ok "$out"
+    assert_text 'KDE maximized window is restored before the frame' \
+        "tile=false max=0 fs=false geo=$KDE_CENTER_THIRD" "$(kde_live_window_state max-after "$a_id" '')"
+    assert_wm_state 'KDE maximized window leaves Xwayland maximized state' "$a" _NET_WM_STATE_MAXIMIZED 0
+    assert_eq 'KDE maximized window gets the target frame' "$KDE_CENTER_THIRD" \
+        "$(wait_observed kde_live_x11_geometry "$KDE_CENTER_THIRD")"
+
+    state=$(kde_live_window_state fs "$a_id" 'w.fullScreen = true;')
+    assert_text 'KDE fullscreen precondition' 'fs=true' "$state"
+    assert_wm_state 'KDE fullscreen precondition Xwayland state' "$a" _NET_WM_STATE_FULLSCREEN 1
+    sleep 1
+    before=$(kde_live_x11_geometry)
+    out=$(kde_live_move "$a_id" "$KDE_LEFT_HALF")
+    assert_text 'KDE fullscreen window move is rejected' \
+        'window is fullscreen; leave fullscreen first' "$out"
+    assert_text 'KDE fullscreen rejection keeps fullscreen' 'fs=true' \
+        "$(kde_live_window_state fs-after "$a_id" '')"
+    assert_wm_state 'KDE fullscreen rejection keeps Xwayland state' "$a" _NET_WM_STATE_FULLSCREEN 1
+    sleep 1
+    assert_eq 'KDE fullscreen rejection keeps the frame' "$before" "$(kde_live_x11_geometry)"
+    state=$(kde_live_window_state fs-exit "$a_id" 'w.fullScreen = false;')
+    assert_text 'KDE test window leaves fullscreen' 'fs=false' "$state"
+    kde_live_move "$a_id" "$KDE_TWO_THIRDS" >/dev/null
+    wait_observed kde_live_x11_geometry "$KDE_TWO_THIRDS" >/dev/null
+    kde_live_activate_window || true
+}
+
 kde_live_atomic_registration() {
     local helper="$KDE_ROOT/atomic-register.js"
     local helper_log="$KDE_ROOT/atomic-register.log"
@@ -2634,8 +2725,17 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.KWin',
     '/org/window_zones/KWin',
-    'org.window_zones.KWin1',
+    'org.window_zones.KWin3',
     null);
+const accel = Gio.DBusProxy.new_sync(
+    connection, Gio.DBusProxyFlags.NONE, null,
+    'org.kde.kglobalaccel', '/kglobalaccel', 'org.kde.KGlobalAccel', null);
+function available() {
+    return accel.call_sync(
+        'isGlobalShortcutAvailable',
+        new GLib.Variant('(is)', [0x0d000012, '']),
+        Gio.DBusCallFlags.NONE, 5000, null).deep_unpack()[0];
+}
 
 function request(keys) {
     const reply = proxy.call_sync(
@@ -2658,7 +2758,7 @@ function requestResult(id) {
 }
 
 function waitResult(id, label) {
-    let result = [false, ''];
+    let result = [false, '', ''];
     for (let attempt = 0; attempt < 100; attempt++) {
         try {
             result = requestResult(id);
@@ -2668,7 +2768,7 @@ function waitResult(id, label) {
         }
         GLib.usleep(100000);
     }
-    print(`${label}_RESULT ${result[0]} ${result[1]}`);
+    print(`${label}_RESULT ${result[0]} ${result[1]} ${result[2]}`);
     return result;
 }
 
@@ -2694,15 +2794,30 @@ const validId = request([valid]);
 waitResult(validId, 'VALID');
 print('VALID_READY');
 poll(6);
-const invalidId = request([valid, 'alt+ctrl+f25']);
-waitResult(invalidId, 'INVALID');
+try {
+    const invalidId = request([valid, 'alt+ctrl+f25']);
+    waitResult(invalidId, 'INVALID');
+} catch (error) {
+    // Canonical-vocabulary rejection can happen before the script request is queued.
+    print(`INVALID_RESULT true ${error.message}`);
+}
 print('INVALID_READY');
 poll(6);
+waitResult(request([]), 'EMPTY');
+print(`EMPTY_AVAILABLE ${available()}`);
+waitResult(request([valid]), 'READDED');
+print(`READDED_AVAILABLE ${available()}`);
+waitResult(request(['alt+ctrl+f23']), 'REPLACED');
+print(`REPLACED_AVAILABLE ${available()}`);
+waitResult(request([valid]), 'RESTORED');
+print(`RESTORED_AVAILABLE ${available()}`);
+print('LIFECYCLE_READY');
+poll(30);
 EOF
     : >"$helper_log"
-    helper_pid=$(start_group "$helper_log" env \
+    start_group helper_pid "$helper_log" env \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" KDE_VALID_HOTKEY="$KDE_SAFE_HOTKEY" \
-        gjs -m "$helper")
+        gjs -m "$helper"
     if wait_for_text "$helper_log" 'VALID_READY' 12; then
         assert_text 'KDE atomic valid registration completes' 'VALID_RESULT true' "$(<"$helper_log")"
     else
@@ -2749,9 +2864,24 @@ EOF
     wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 8 \
         && previous_active=1
     assert_eq 'KDE atomic registration preserves previous set' 1 "$previous_active"
+    wait_for_text "$helper_log" 'LIFECYCLE_READY' 16 || true
+    local lifecycle_log=''
+    lifecycle_log=$(cat "$helper_log" 2>/dev/null || true)
+    assert_text 'KDE empty set releases native accelerator' 'EMPTY_AVAILABLE true' "$lifecycle_log"
+    assert_text 'KDE removed accelerator can be re-added' 'READDED_AVAILABLE false' "$lifecycle_log"
+    assert_text 'KDE replacement releases removed native accelerator' 'REPLACED_AVAILABLE true' "$lifecycle_log"
+    assert_text 'KDE replacement restores old accelerator without script reload' 'RESTORED_AVAILABLE false' "$lifecycle_log"
     stop_pid "$helper_pid"
     wait_pid "$helper_pid" 5 || true
-    sleep 0.3
+    local available_after_disconnect='' disconnect_deadline=$((SECONDS + 5))
+    while (( SECONDS < disconnect_deadline )); do
+        available_after_disconnect=$(busctl --address="$KDE_BUS" call \
+            org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel \
+            isGlobalShortcutAvailable is 218103826 '' 2>&1 || true)
+        [[ "$available_after_disconnect" == 'b true' ]] && break
+        sleep 0.1
+    done
+    assert_eq 'KDE controller disconnect releases native accelerator' 'b true' "$available_after_disconnect"
     set +e
 }
 
@@ -2795,7 +2925,7 @@ const connection = Gio.DBusConnection.new_for_address_sync(
     null);
 const proxy = Gio.DBusProxy.new_sync(
     connection, Gio.DBusProxyFlags.NONE, null,
-    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin1', null);
+    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin3', null);
 function register(keys, label) {
     const request = proxy.call_sync(
         'RegisterHotkeys',
@@ -2803,7 +2933,7 @@ function register(keys, label) {
         Gio.DBusCallFlags.NONE,
         5000,
         null).deep_unpack()[0];
-    let result = [false, ''];
+    let result = [false, '', ''];
     for (let attempt = 0; attempt < 100; attempt++) {
         result = proxy.call_sync(
             'GetRequestResult',
@@ -2843,12 +2973,12 @@ register(['alt+ctrl+f24'], 'CONFLICT');
 poll(15);
 EOF
     : >"$helper_log"
-    helper_pid=$(start_group "$helper_log" env \
+    start_group helper_pid "$helper_log" env \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" KDE_VALID_HOTKEY="$KDE_SAFE_HOTKEY" \
-        gjs -m "$helper")
+        gjs -m "$helper"
     wait_for_text "$helper_log" 'VALID_READY' 12 || true
     assert_text 'KDE conflict replacement starts with valid set' \
-        'VALID_RESULT [true,""]' "$(cat "$helper_log" 2>/dev/null || true)"
+        'VALID_RESULT [true,"",""]' "$(cat "$helper_log" 2>/dev/null || true)"
     valid_events_before=$(count_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY")
     kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
     wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 5 \
@@ -2900,47 +3030,21 @@ hotkey = "alt+ctrl+f24"
 action = { type = "move-to-zone", zone = "left-half" }
 EOF
     start_fifo_app run auto "$conflict_config_log"
-    wait_for_text "$conflict_config_log" 'Hotkey registration initially failed' 20 || true
+    wait_for_text "$conflict_config_log" 'Hotkey registration refused' 20 || true
     assert_text 'KDE App refuses a conflicting accelerator' \
-        'Hotkey registration initially failed' "$(cat "$conflict_config_log" 2>/dev/null || true)"
+        'Hotkey registration refused' "$(cat "$conflict_config_log" 2>/dev/null || true)"
     assert_text 'KDE App names the accelerator owner' \
         'Window Zones conflict incumbent' "$(cat "$conflict_config_log" 2>/dev/null || true)"
     stop_app_cleanly 'KDE App with a conflicting accelerator quits cleanly' "$conflict_config_log"
-    kde_live_write_valid_config
+    write_five_binding_config
     set +e
     kde_live_unload_script window-zones-conflict
 }
 
 kde_live_tui_lifecycle() {
-    local tui_log="$KDE_ROOT/tui.log" before='' rc=0
-    kde_live_write_valid_config
-    start_fifo_app tui auto "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text 'KDE TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI starts' 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app reload
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'KDE TUI reload' 'Config:' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI reload' 'Config:' ''
-    fi
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app restart
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'KDE TUI restart' 'Hotkey state:' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI restart' 'Hotkey state:' ''
-    fi
-    before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-    send_app status
-    if wait_for_size_growth "$tui_log" "$before" 8; then
-        assert_text 'KDE TUI status' 'Commands: reload' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI status' 'Commands: reload' ''
-    fi
+    local tui_log="$KDE_ROOT/tui.log"
+    write_five_binding_config
+    tui_begin auto KDE "$tui_log"
     kde_live_activate_window || true
     send_app 'dispatch alt+ctrl+left'
     wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 10 || true
@@ -2948,13 +3052,7 @@ kde_live_tui_lifecycle() {
         "$(cat "$tui_log" 2>/dev/null || true)"
     kde_live_refresh_targets
     kde_live_assert_zone 'KDE TUI dispatch geometry' left-half A
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero 'KDE TUI quit' "$rc" "tui log $tui_log"
+    tui_end KDE "$tui_log"
     set +e
 }
 
@@ -3129,7 +3227,7 @@ run_kde_live() {
         '/Window Zones KWin.*failed/p;/Window Zones KWin.*error/p;/KDE_CONFLICT_ERROR/p' \
         "$KDE_KWIN_LOG" 2>/dev/null || true)
     log "KDE nested KWin script diagnostics: ${kwin_diagnostics:-none}"
-    kde_live_write_valid_config
+    write_five_binding_config
     local auto_backend_output=''
     auto_backend_output=$(env -u GNOME_DESKTOP_SESSION_ID -u SWAYSOCK \
         -u HYPRLAND_INSTANCE_SIGNATURE DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
@@ -3191,13 +3289,13 @@ PY
 
 
     local editor_log="$KDE_ROOT/editor.log" editor_deadline=0 editor_alive=0 window_found=0
-    KDE_EDITOR_PID=$(start_group "$editor_log" env \
+    start_group KDE_EDITOR_PID "$editor_log" env \
         DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
         XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
         XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 gnome-text-editor --standalone)
+        KDE_SESSION_VERSION=6 gnome-text-editor --standalone
     kill -0 "$KDE_EDITOR_PID" 2>/dev/null && editor_alive=1
     assert_eq 'KDE test editor process starts' 1 "$editor_alive"
     editor_deadline=$((SECONDS + 25))
@@ -3242,9 +3340,10 @@ PY
 
     kde_live_atomic_registration
     kde_live_conflict_registration
+    kde_live_adr9_window_checks
     log 'KDE native Wayland placement not exercised; test client used Xwayland'
 
-    kde_live_write_valid_config
+    write_five_binding_config
     kde_live_prepare_environment
     local run_log="$KDE_ROOT/run.log" app_bus=''
     start_fifo_app run auto "$run_log"
@@ -3326,8 +3425,8 @@ PY
     # SIGTERM would otherwise be reported as stopped only by timeout, so escalate and confirm the
     # bus name is actually gone.
     stop_pid "$old_service_pid"
-    wait_pid "$old_service_pid" 5 || kill -9 "$old_service_pid" 2>/dev/null || true
-    wait_pid "$old_service_pid" 5 || true
+    wait_pid "$old_service_pid" 5 external || kill -9 "$old_service_pid" 2>/dev/null || true
+    wait_pid "$old_service_pid" 5 external || true
     set +e
     local service_owner_gone=0 stop_deadline=$((SECONDS + 10))
     while (( SECONDS < stop_deadline )); do
@@ -3340,10 +3439,10 @@ PY
     service_stopped=$service_owner_gone
     log "KDE service stop: owner gone=$service_owner_gone pid alive=$(kill -0 "$old_service_pid" 2>/dev/null && printf 1 || printf 0)"
     assert_eq 'KDE Rust service stops independently' 1 "$service_stopped"
-    KDE_SERVICE_PID=$(start_group "$restart_log" env -u KDEHOME DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" \
+    start_group KDE_SERVICE_PID "$restart_log" env -u KDEHOME DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" \
         HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" XDG_DATA_HOME="$KDE_DATA" \
         XDG_CACHE_HOME="$KDE_CACHE" XDG_STATE_HOME="$KDE_STATE" XDG_RUNTIME_DIR="$KDE_RUNTIME" \
-        XDG_DATA_DIRS="$KDE_DATA_DIRS" "$KDE_COMPANION_BIN")
+        XDG_DATA_DIRS="$KDE_DATA_DIRS" "$KDE_COMPANION_BIN"
     if wait_for_text "$restart_log" 'KWin companion service started' 12; then
         assert_text 'KDE Rust service restarts' 'KWin companion service started' "$(<"$restart_log")"
     else
@@ -3394,34 +3493,75 @@ PY
         "$(cat "$run_log" 2>/dev/null || true)"
     kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
     kde_live_assert_zone 'KDE invalid config retains active binding' left-half A
+
+    # ADR 0009: a replacement KWin refuses keeps the old config and its grabs. The conflict
+    # incumbent holds Alt+Ctrl+F24, so a config adding it must be refused as a whole.
+    local conflict_before=0 refused_before=0 bindings_before=0 hotkeys_before=0
+    conflict_before=$(count_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_READY')
+    kde_live_load_script "$KDE_CONFLICT_JS" window-zones-conflict
+    kde_live_run_script "$KDE_LAST_SCRIPT_ID"
+    wait_for_new_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_READY' "$conflict_before" 10 || true
+    assert_eq 'KDE rejected replacement incumbent holds the accelerator' 1 \
+        "$(( $(count_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_READY') > conflict_before ? 1 : 0 ))"
+    refused_before=$(count_text "$run_log" 'were refused')
+    write_five_binding_config
+    cat >>"$CONFIG_PATH" <<'EOF'
+
+[[bindings]]
+hotkey = "Alt+Ctrl+F24"
+action = { type = "move-to-zone", zone = "center-third" }
+EOF
+    sleep 0.4
+    send_app reload
+    sleep 0.3
+    send_app reload
+    wait_for_new_text "$run_log" 'were refused' "$refused_before" 12 || true
+    assert_eq 'KDE rejected replacement reports a refused reload' 1 \
+        "$(( $(count_text "$run_log" 'were refused') > refused_before ? 1 : 0 ))"
+    assert_text 'KDE rejected replacement names the accelerator owner' \
+        'Window Zones conflict incumbent' "$(sed -n '/were refused/p' "$run_log")"
+    bindings_before=$(count_text "$run_log" 'binding count: 5')
+    hotkeys_before=$(count_text "$run_log" 'hotkey state: Registered')
+    send_app status
+    wait_for_new_text "$run_log" 'binding count: 5' "$bindings_before" 10 || true
+    assert_eq 'KDE rejected replacement keeps the previous bindings' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 5') > bindings_before ? 1 : 0 ))"
+    assert_eq 'KDE rejected replacement keeps hotkeys registered' 1 \
+        "$(( $(count_text "$run_log" 'hotkey state: Registered') > hotkeys_before ? 1 : 0 ))"
+    send_app 'dispatch alt+ctrl+up'
+    kde_live_assert_zone 'KDE rejected replacement baseline center-third' center-third A
+    kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
+    kde_live_assert_zone 'KDE rejected replacement keeps the previous grab working' left-half A
+    kde_live_unload_script window-zones-conflict
+    local loaded_before
+    loaded_before=$(count_text "$run_log" 'Config state: Loaded')
+    bindings_before=$(count_text "$run_log" 'binding count: 1')
     kde_live_write_changed_config
     sleep 0.4
     send_app reload
     sleep 0.3
     send_app reload
-    if wait_for_text "$run_log" 'Config state: Loaded' 12; then
-        assert_text 'KDE valid changed config recovers' 'Config state: Loaded' "$(<"$run_log")"
-    else
-        assert_text 'KDE valid changed config recovers' 'Config state: Loaded' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_new_text "$run_log" 'Config state: Loaded' "$loaded_before" 30 || true
+    assert_eq 'KDE valid changed config recovers' 1 \
+        "$(( $(count_text "$run_log" 'Config state: Loaded') > loaded_before ? 1 : 0 ))"
     send_app status
-    assert_text 'KDE valid changed config updates binding count' 'binding count: 1' \
-        "$(cat "$run_log" 2>/dev/null || true)"
-    kde_live_write_valid_config
+    wait_for_new_text "$run_log" 'binding count: 1' "$bindings_before" 30 || true
+    assert_eq 'KDE valid changed config updates binding count' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 1') > bindings_before ? 1 : 0 ))"
+    loaded_before=$(count_text "$run_log" 'Config state: Loaded')
+    bindings_before=$(count_text "$run_log" 'binding count: 5')
+    write_five_binding_config
     sleep 0.4
     send_app reload
     sleep 0.3
     send_app reload
-    if wait_for_text "$run_log" 'Config state: Loaded' 12; then
-        assert_text 'KDE valid config restores bindings' 'Config state: Loaded' "$(<"$run_log")"
-    else
-        assert_text 'KDE valid config restores bindings' 'Config state: Loaded' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_new_text "$run_log" 'Config state: Loaded' "$loaded_before" 30 || true
+    assert_eq 'KDE valid config restores bindings' 1 \
+        "$(( $(count_text "$run_log" 'Config state: Loaded') > loaded_before ? 1 : 0 ))"
     send_app status
-    assert_text 'KDE valid config restores binding count' 'binding count: 5' \
-        "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'binding count: 5' "$bindings_before" 30 || true
+    assert_eq 'KDE valid config restores binding count' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 5') > bindings_before ? 1 : 0 ))"
     set +e
     stop_app_cleanly 'KDE App quits cleanly' "$run_log"
     set +e
@@ -3439,181 +3579,244 @@ PY
 run_gnome() {
     CURRENT_GATE='gnome'
     GNOME_ROOT="$TMP_DIR/gnome"
-    GNOME_CONFIG="$GNOME_ROOT/config"
-    GNOME_DATA="$GNOME_ROOT/data"
-    GNOME_RUNTIME="$GNOME_ROOT/runtime"
-    GNOME_HOME="$GNOME_ROOT/home"
-    GNOME_DCONF_PROFILE="$GNOME_ROOT/dconf-profile"
-    CONFIG_PATH="$GNOME_ROOT/config.toml"
-    WAYLAND_DISPLAY="wayland-window-zones-smoke-$$"
-    export XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-        XDG_RUNTIME_DIR="$GNOME_RUNTIME" HOME="$GNOME_HOME" \
-        XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY
-    mkdir -p "$GNOME_CONFIG/dconf" "$GNOME_DATA" "$GNOME_RUNTIME" "$GNOME_HOME" "$GNOME_ROOT/keyfiles"
-    chmod 700 "$GNOME_RUNTIME" "$GNOME_HOME"
-    printf 'user-db:smoke\n' >"$GNOME_DCONF_PROFILE"
-    printf "[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24']\n" >"$GNOME_ROOT/keyfiles/shell"
-    dconf compile "$GNOME_CONFIG/dconf/smoke" "$GNOME_ROOT/keyfiles"
-    mkdir -p "$GNOME_DATA/gnome-shell/extensions/window-zones@mihai-a24"
-    install -m 0644 "$PROJECT_ROOT/gnome-extension/metadata.json" \
-        "$GNOME_DATA/gnome-shell/extensions/window-zones@mihai-a24/metadata.json"
-    install -m 0644 "$PROJECT_ROOT/gnome-extension/extension.js" \
-        "$GNOME_DATA/gnome-shell/extensions/window-zones@mihai-a24/extension.js"
-    record_versions_gnome
-    assert_eq 'GNOME isolated enabled extensions' "['window-zones@mihai-a24']" \
-        "$(DCONF_PROFILE="$GNOME_DCONF_PROFILE" XDG_CONFIG_HOME="$GNOME_CONFIG" dconf read /org/gnome/shell/enabled-extensions)"
-    local launcher="$GNOME_ROOT/launch-shell.sh" shell_log="$GNOME_ROOT/gnome-shell.log"
-    cat >"$launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$DBUS_SESSION_BUS_ADDRESS" >"$BUS_FILE"
-exec gnome-shell --headless --wayland-display "$WAYLAND_DISPLAY" \
-    --virtual-monitor 1920x1080 --virtual-monitor 1600x900
-EOF
-    chmod +x "$launcher"
-    BUS_FILE="$GNOME_ROOT/bus-address"
-    local shell_pid
-    # With SSH_CONNECTION set (any value) gnome-shell --headless 50 never serves
-    # org.gnome.Shell.Extensions; bisected on CachyOS, so the gate runs over SSH.
-    shell_pid=$(start_group "$shell_log" env -u SSH_CONNECTION \
-        BUS_FILE="$BUS_FILE" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-        XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-        XDG_RUNTIME_DIR="$GNOME_RUNTIME" DCONF_PROFILE="$GNOME_DCONF_PROFILE" \
-        HOME="$GNOME_HOME" XDG_DATA_DIRS=/usr/local/share:/usr/share \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland GNOME_DESKTOP_SESSION_ID=smoke \
-        dbus-run-session -- "$launcher")
-    if wait_for_file "$BUS_FILE" 20; then
-        GNOME_BUS=$(<"$BUS_FILE")
-        export DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS"
-        if ! env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-            XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
-            XDG_RUNTIME_DIR="$GNOME_RUNTIME" DCONF_PROFILE="$GNOME_DCONF_PROFILE" \
-            HOME="$GNOME_HOME" gnome-extensions enable window-zones@mihai-a24 \
-            >>"$shell_log" 2>&1; then
-            log 'Harness limitation GNOME extension CLI could not enable window-zones@mihai-a24'
+    local output="$TMP_DIR/gnome-native.log" rc=0 checks=0 failures=0
+    /usr/bin/python3 "$SCRIPT_DIR/gnome-smoke.py" --binary "$BIN_PATH" \
+        --output-dir "$GNOME_ROOT" --keep-logs >"$output" 2>&1 || rc=$?
+    log "$(<"$output")"
+    if [[ -f "$GNOME_ROOT/results.json" ]]; then
+        read -r checks failures < <(/usr/bin/python3 -c \
+            'import json, sys; rows = json.load(open(sys.argv[1])); print(len(rows), sum(not row["passed"] for row in rows))' \
+            "$GNOME_ROOT/results.json")
+        ASSERTIONS=$((ASSERTIONS + checks))
+        FAILURES=$((FAILURES + failures))
+        if [[ "$rc" -ne 0 && "$failures" -eq 0 ]]; then
+            assert_rc_zero 'GNOME native runner exit' "$rc" "$output"
         fi
     else
-        assert_text 'GNOME session bus address' 'unix:' "$(cat "$shell_log" 2>/dev/null || true)"
+        assert_rc_zero 'GNOME native evidence manifest' 1 "$output"
+    fi
+
+}
+
+build_seam_helper() {
+    # Gate-time helper over the public crate API, generated and built per run and never shipped:
+    # `dispatch` always acts on the focused window, so captured-id moves drive the X11 seam
+    # directly; `state` sends the EWMH request a pager would to put a test window into
+    # maximized or fullscreen state; `grab` holds an accelerator as another X client.
+    local dir="$TMP_DIR/seam-helper" target_dir="$PROJECT_ROOT/target/smoke-seam-helper"
+    local output='' rc=0
+    SEAM_HELPER=''
+    mkdir -p "$dir/src"
+    cat >"$dir/Cargo.toml" <<EOF
+[package]
+name = "window_zones_smoke_seam"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+window_zones = { path = "$PROJECT_ROOT" }
+x11rb = "0.13"
+
+[workspace]
+EOF
+    # Start from the repository lockfile so the helper builds against the audited dependency set.
+    cp "$PROJECT_ROOT/Cargo.lock" "$dir/Cargo.lock"
+    cat >"$dir/src/main.rs" <<'EOF'
+use std::{env, process, thread, time::Duration};
+
+use window_zones::config::normalize_hotkey;
+use window_zones::{
+    HotkeySystem, Rect, WindowId, WindowMove, WindowSystem, WindowSystemError, X11HotkeySystem,
+    X11WindowSystem,
+};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["focused"] => match X11WindowSystem::new().focused_window() {
+            Ok(Some(window)) => println!("{}", window.id),
+            Ok(None) => println!("none"),
+            Err(error) => println!("error: {error}"),
+        },
+        ["move", id, x, y, width, height] => {
+            let target = Rect {
+                x: x.parse().expect("x"),
+                y: y.parse().expect("y"),
+                width: width.parse().expect("width"),
+                height: height.parse().expect("height"),
+            };
+            match X11WindowSystem::new().move_window(&WindowMove::new(WindowId::new(*id), target)) {
+                Ok(()) => println!("ok"),
+                Err(WindowSystemError::WindowGone(_)) => println!("gone"),
+                Err(error) => println!("error: {error}"),
+            }
+        }
+        ["state", window, action @ ("add" | "remove"), first, rest @ ..] if rest.len() <= 1 => {
+            let (conn, screen) = x11rb::connect(None).expect("connect to DISPLAY");
+            let root = conn.setup().roots[screen].root;
+            let atom = |name: &str| {
+                conn.intern_atom(false, name.as_bytes())
+                    .expect("intern atom")
+                    .reply()
+                    .expect("intern atom reply")
+                    .atom
+            };
+            let data = [
+                u32::from(*action == "add"),
+                atom(*first),
+                rest.first().map_or(0, |name| atom(*name)),
+                2,
+                0,
+            ];
+            let window: u32 = window.parse().expect("window");
+            let event = ClientMessageEvent::new(32, window, atom("_NET_WM_STATE"), data);
+            conn.send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .expect("send _NET_WM_STATE")
+            .check()
+            .expect("_NET_WM_STATE request");
+            println!("sent");
+        }
+        ["grab", hotkey] => {
+            let hotkey = normalize_hotkey(hotkey).expect("hotkey");
+            let mut hotkeys = X11HotkeySystem::new();
+            if let Err(error) = hotkeys.register_hotkeys(&[hotkey.clone()]) {
+                println!("error: {error}");
+                process::exit(1);
+            }
+            println!("GRABBED {hotkey}");
+            loop {
+                let _ = hotkeys.next_hotkey();
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+        _ => {
+            eprintln!("usage: focused | move ID X Y WIDTH HEIGHT | state WINDOW add|remove ATOM [ATOM] | grab HOTKEY");
+            process::exit(2);
+        }
+    }
+}
+EOF
+    if output=$(CARGO_TARGET_DIR="$target_dir" cargo build --manifest-path "$dir/Cargo.toml" 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf '%s\n' "$output" >>"$ASSERT_LOG"
+    assert_rc_zero "$1 seam helper builds against the public API" "$rc" "cargo build $dir"
+    if [[ "$rc" -eq 0 ]]; then
+        SEAM_HELPER="$target_dir/debug/window_zones_smoke_seam"
+    fi
+    return "$rc"
+}
+
+seam() {
+    # Runs on the gate's X display; output is one line naming the outcome.
+    xon "$SEAM_HELPER" "$@" 2>&1 || true
+}
+
+run_x11_adr9_window_checks() {
+    # ADR 0009 on a real window manager, observed through xdotool and xprop: a captured id outlives
+    # a focus change and reports closure; maximized, vertically maximized (Openbox has no edge
+    # tiling, and vertical maximize is the tiled state the X11 adapter sees) and fullscreen
+    # windows are handled before any frame is applied.
+    local a="$WINDOW_ID" b='' b_pid='' a_id='' b_id='' out='' b_geometry='' before=''
+    XON_DISPLAY="$X11_DISPLAY"
+    XON_XAUTHORITY=''
+    build_seam_helper X11 || return 0
+    start_group b_pid "$X11_ROOT/editor-b.log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
+        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11 HOME="$X11_HOME" \
+        XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" \
+        gnome-text-editor --standalone
+    b=$(xwindow_for_pid "$b_pid" 20 || true)
+    assert_text 'X11 second test window maps' 'mapped' "${b:+mapped}"
+    if [[ -z "$b" ]]; then
+        stop_pid "$b_pid"
         return 0
     fi
-    local service_list='' deadline=$((SECONDS + 30))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        if [[ "$service_list" == *'org.window_zones.Gnome'* ]]; then
-            break
-        fi
-        sleep 0.2
-    done
-    if [[ "$service_list" != *'org.window_zones.Gnome'* ]]; then
-        log "GNOME extension enable: $(gnome_shell_call /org/gnome/Shell \
-            org.gnome.Shell.Extensions.EnableExtension "'window-zones@mihai-a24'" 2>&1 || true)"
-        log "GNOME extension info: $(gnome_shell_call /org/gnome/Shell \
-            org.gnome.Shell.Extensions.GetExtensionInfo "'window-zones@mihai-a24'" 2>&1 || true)"
-        log "GNOME extension errors: $(gnome_shell_call /org/gnome/Shell \
-            org.gnome.Shell.Extensions.GetExtensionErrors "'window-zones@mihai-a24'" 2>&1 || true)"
-    fi
-    assert_text 'GNOME companion owns D-Bus name' 'org.window_zones.Gnome' "$service_list"
 
-    local capabilities displays_raw display_lines first_display second_display
-    capabilities=$(gnome_call GetCapabilities 2>&1 || true)
-    assert_eq 'GNOME capability set' "(['focused-window', 'displays', 'move-resize', 'hotkeys'],)" "$capabilities"
-    displays_raw=$(gnome_call GetDisplays 2>&1 || true)
-    display_lines=$(parse_gnome_displays "$displays_raw" || true)
-    first_display=$(printf '%s\n' "$display_lines" | sed -n '1p')
-    second_display=$(printf '%s\n' "$display_lines" | sed -n '2p')
-    assert_text 'GNOME first virtual display' '|' "$first_display"
-    assert_text 'GNOME second virtual display' '|' "$second_display"
-    if [[ -z "$first_display" || -z "$second_display" ]]; then
-        return 0
-    fi
-    IFS='|' read -r GNOME_DISPLAY_ID GNOME_X GNOME_Y GNOME_W GNOME_H <<<"$first_display"
-    IFS='|' read -r GNOME_DISPLAY2_ID GNOME_X2 GNOME_Y2 GNOME_W2 GNOME_H2 <<<"$second_display"
-    GNOME_HALF="$GNOME_X,$GNOME_Y,$((GNOME_W / 2)),$GNOME_H"
-    GNOME_CENTER="$((GNOME_X + GNOME_W / 3)),$GNOME_Y,$((GNOME_W - 2 * (GNOME_W / 3))),$GNOME_H"
-    GNOME_TWO_THIRDS="$GNOME_X,$GNOME_Y,$((GNOME_W - GNOME_W / 3)),$GNOME_H"
-    GNOME_SECOND_HALF="$GNOME_X2,$GNOME_Y2,$((GNOME_W2 / 2)),$GNOME_H2"
-
-    local editor_launcher="$GNOME_ROOT/launch-editor.sh" editor_log="$GNOME_ROOT/editor.log" editor_pid
-    cat >"$editor_launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec gnome-text-editor --standalone
-EOF
-    chmod +x "$editor_launcher"
-    editor_pid=$(start_group "$editor_log" env \
-        WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_RUNTIME_DIR="$GNOME_RUNTIME" \
-        DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" XDG_CONFIG_HOME="$GNOME_CONFIG" \
-        XDG_DATA_HOME="$GNOME_DATA" HOME="$GNOME_HOME" GDK_BACKEND=wayland \
-        XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland "$editor_launcher")
-    if wait_for_text "$editor_log" 'Text Editor' 15; then
-        assert_text 'GNOME test window launched' 'Text Editor' "$(<"$editor_log")"
-    else
-        # GTK may be quiet on a successful Wayland map; retain the process probe as evidence.
-        if kill -0 "$editor_pid" 2>/dev/null; then
-            assert_text 'GNOME test window launched' 'running editor pid' "running editor pid $editor_pid"
-        else
-            assert_text 'GNOME test window launched' 'Text Editor' "$(cat "$editor_log" 2>/dev/null || true)"
-        fi
-    fi
-    # A headless Shell has no seat: GetFocusedWindow stays false and grab_accelerator rejects every
-    # accelerator (ADR 0007). Record the seat-dependent checks as skipped instead of failing them;
-    # gnome-live carries them.
-    local focused
-    focused=$(wait_gnome_focused 'true|' 5 || true)
-    if [[ "$focused" == 'true|'* ]]; then
-        assert_text 'GNOME GetFocusedWindow reports test window' 'true|' "$focused"
-
-        run_gnome_dispatch half alt+ctrl+left
-        gnome_assert_geometry 'gnome-left-half' "true|$GNOME_X|$GNOME_Y|$((GNOME_W / 2))|$GNOME_H"
-        run_gnome_dispatch center-third alt+ctrl+up
-        gnome_assert_geometry 'gnome-center-third' "true|$((GNOME_X + GNOME_W / 3))|$GNOME_Y|$((GNOME_W - 2 * (GNOME_W / 3)))|$GNOME_H"
-        run_gnome_dispatch two-thirds alt+ctrl+right
-        gnome_assert_geometry 'gnome-left-two-thirds' "true|$GNOME_X|$GNOME_Y|$((GNOME_W - GNOME_W / 3))|$GNOME_H"
-        run_gnome_dispatch next-display alt+ctrl+down
-        gnome_assert_geometry 'gnome-next-display' "true|$GNOME_X2|$GNOME_Y2|$GNOME_W2|$GNOME_H2"
-
-        run_gnome_atomic_registration
-        write_valid_config
-        run_gnome_hotkey_and_disconnect
-    else
-        local seatless_reason='not exercised: seatless Synthetic session reports no focused window and rejects every accelerator; covered by gnome-live'
-        skip_assert 'GNOME GetFocusedWindow reports test window' "$seatless_reason"
-        skip_assert 'GNOME zone placement' "$seatless_reason"
-        skip_assert 'GNOME cross-display move' "$seatless_reason"
-        skip_assert 'GNOME atomic hotkey registration' "$seatless_reason"
-        skip_assert 'GNOME companion hotkey signal' "$seatless_reason"
-        skip_assert 'GNOME companion disconnect and recovery' "$seatless_reason"
-        write_valid_config
-    fi
-
-    # Config reload must retain the last valid bindings while exposing a parse error.
-    local run_log="$GNOME_ROOT/reload-run.log" reload_rc=0
-    start_fifo_app run wayland "$run_log"
-    wait_for_text "$run_log" 'Interactive session started' 15 || true
-    sleep 0.3
-    write_invalid_config
-    send_app reload
+    xdotool windowactivate --sync "$a" >/dev/null 2>&1 || true
     sleep 0.5
-    send_app reload
-    if wait_for_text "$run_log" 'Config reload error' 8; then
-        assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(<"$run_log")"
-    else
-        assert_text 'GNOME invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
-    send_app status
-    sleep 0.3
-    assert_text 'GNOME invalid reload preserves previous bindings' 'binding count: 4' "$(<"$run_log")"
-    write_valid_config
-    sleep 0.3
-    send_app reload
+    a_id=$(seam focused)
+    assert_eq 'X11 seam captures the focused window id' "$a" "$a_id"
+    xdotool windowactivate --sync "$b" >/dev/null 2>&1 || true
     sleep 0.5
-    send_app reload
-    assert_text 'GNOME config recovers after valid rewrite' 'Config state: Loaded' "$(<"$run_log")"
-    stop_app_cleanly 'GNOME reload run quits cleanly' "$run_log"
+    b_id=$(seam focused)
+    assert_eq 'X11 focus moves to the second window' "$b" "$b_id"
+    WINDOW_ID="$b"
+    x11_geometry_stable 5 || true
+    b_geometry=$(x11_geometry)
+    WINDOW_ID="$a"
+    out=$(seam move "$a_id" 1920 0 800 1080)
+    assert_eq 'X11 captured id move after focus change succeeds' ok "$out"
+    x11_assert_geometry 'x11-captured-id-moves-original-window' '1920,0,800,1080'
+    WINDOW_ID="$b"
+    assert_eq 'X11 captured id move leaves the focused window frame' "$b_geometry" "$(x11_geometry)"
+    WINDOW_ID="$a"
+    assert_eq 'X11 captured id move leaves focus on the second window' "$b" \
+        "$(xdotool getactivewindow 2>/dev/null || printf unavailable)"
 
-    run_tui_lifecycle wayland 'gnome'
-    stop_pid "$editor_pid"
-    stop_pid "$shell_pid"
+    stop_pid "$b_pid"
+    wait_pid "$b_pid" 5 || true
+    wait_xwindow_gone "$b" 10 || true
+    before=$(x11_geometry)
+    out=$(seam move "$b_id" 0 0 960 1080)
+    assert_eq 'X11 closed target reports WindowGone' gone "$out"
+    sleep 1
+    assert_eq 'X11 closed target leaves the other window unchanged' "$before" "$(x11_geometry)"
+
+    seam state "$a" add _NET_WM_STATE_MAXIMIZED_VERT _NET_WM_STATE_MAXIMIZED_HORZ >/dev/null
+    assert_wm_state 'X11 maximized precondition vertical' "$a" _NET_WM_STATE_MAXIMIZED_VERT 1
+    assert_wm_state 'X11 maximized precondition horizontal' "$a" _NET_WM_STATE_MAXIMIZED_HORZ 1
+    out=$(seam move "$a_id" 640 0 640 1080)
+    assert_eq 'X11 maximized window move succeeds' ok "$out"
+    assert_wm_state 'X11 maximized window is restored before the frame' "$a" _NET_WM_STATE_MAXIMIZED 0
+    x11_assert_geometry 'x11-maximized-window-gets-target-frame' '640,0,640,1080'
+
+    seam state "$a" add _NET_WM_STATE_MAXIMIZED_VERT >/dev/null
+    assert_wm_state 'X11 vertically maximized precondition' "$a" _NET_WM_STATE_MAXIMIZED_VERT 1
+    out=$(seam move "$a_id" 0 0 960 1080)
+    assert_eq 'X11 vertically maximized window move succeeds' ok "$out"
+    assert_wm_state 'X11 vertically maximized window is restored before the frame' "$a" \
+        _NET_WM_STATE_MAXIMIZED 0
+    x11_assert_geometry 'x11-vertically-maximized-window-gets-target-frame' '0,0,960,1080'
+
+    seam state "$a" add _NET_WM_STATE_FULLSCREEN >/dev/null
+    assert_wm_state 'X11 fullscreen precondition' "$a" _NET_WM_STATE_FULLSCREEN 1
+    x11_geometry_stable 5 || true
+    before=$(x11_geometry)
+    out=$(seam move "$a_id" 640 0 640 1080)
+    assert_text 'X11 fullscreen window move is rejected' 'leave fullscreen first' "$out"
+    assert_wm_state 'X11 fullscreen rejection keeps fullscreen' "$a" _NET_WM_STATE_FULLSCREEN 1
+    sleep 1
+    assert_eq 'X11 fullscreen rejection keeps the frame' "$before" "$(x11_geometry)"
+    seam state "$a" remove _NET_WM_STATE_FULLSCREEN >/dev/null
+    assert_wm_state 'X11 test window leaves fullscreen' "$a" _NET_WM_STATE_FULLSCREEN 0
+    x11_geometry_stable 5 || true
+    xdotool windowactivate --sync "$a" >/dev/null 2>&1 || true
+
+    # Transactional grabs at the adapter seam: the ignored real-server test against this
+    # isolated display. The App-level replacement is checked in the run session below.
+    local test_output='' test_rc=0
+    if test_output=$(WZ_X11_TEST_DISPLAY="$X11_DISPLAY" cargo test --locked \
+        --manifest-path "$PROJECT_ROOT/Cargo.toml" --lib \
+        x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored 2>&1); then
+        test_rc=0
+    else
+        test_rc=$?
+    fi
+    printf '%s\n' "$test_output" >>"$ASSERT_LOG"
+    assert_rc_zero 'X11 real-server grabs are exclusive, atomic and released' "$test_rc" \
+        'cargo test --lib x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored'
+    assert_text 'X11 real-server grab test ran' '1 passed' "$test_output"
 }
 
 run_x11() {
@@ -3622,8 +3825,12 @@ run_x11() {
     X11_CONFIG="$X11_ROOT/config"
     X11_DATA="$X11_ROOT/data"
     X11_HOME="$X11_ROOT/home"
+    X11_RUNTIME="$X11_ROOT/runtime"
     CONFIG_PATH="$X11_ROOT/config.toml"
-    mkdir -p "$X11_CONFIG" "$X11_DATA" "$X11_HOME" "$X11_ROOT"
+    SEAM_HELPER=''
+    mkdir -p "$X11_CONFIG" "$X11_DATA" "$X11_HOME" "$X11_RUNTIME" "$X11_ROOT"
+    chmod 700 "$X11_RUNTIME"
+    export XDG_RUNTIME_DIR="$X11_RUNTIME"
     local display_num
     for display_num in $(seq 90 199); do
         if [[ ! -S "/tmp/.X11-unix/X$display_num" ]]; then
@@ -3633,7 +3840,7 @@ run_x11() {
     X11_DISPLAY=":$display_num"
     record_versions_x11
     local xvfb_log="$X11_ROOT/xvfb.log" xvfb_pid openbox_log="$X11_ROOT/openbox.log" openbox_pid wm_check=''
-    xvfb_pid=$(start_group "$xvfb_log" Xvfb "$X11_DISPLAY" -screen 0 3520x1080x24 -nolisten tcp -ac +extension RECORD +extension XTEST)
+    start_group xvfb_pid "$xvfb_log" Xvfb "$X11_DISPLAY" -screen 0 3520x1080x24 -nolisten tcp -ac +extension XTEST
     local deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )) && [[ ! -S "/tmp/.X11-unix/X$display_num" ]]; do sleep 0.1; done
     assert_eq 'X11 Xvfb starts' 0 "$([[ -S "/tmp/.X11-unix/X$display_num" ]] && printf 0 || printf 1)"
@@ -3644,9 +3851,16 @@ run_x11() {
     else
         extension_text='xdpyinfo unavailable'
     fi
-    assert_text 'X11 RECORD extension' 'RECORD' "$extension_text"
     assert_text 'X11 XTEST extension' 'XTEST' "$extension_text"
-    openbox_pid=$(start_group "$openbox_log" env DISPLAY="$X11_DISPLAY" openbox --replace)
+    # Distro defaults may grab Ctrl+Alt+arrows; only the explicit competitor
+    # below should own a configured chord on this isolated test desktop.
+    cat >"$X11_ROOT/openbox.xml" <<'EOF'
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <keyboard/>
+</openbox_config>
+EOF
+    start_group openbox_pid "$openbox_log" env DISPLAY="$X11_DISPLAY" \
+        openbox --replace --config-file "$X11_ROOT/openbox.xml"
     deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )); do
         wm_check=$(DISPLAY="$X11_DISPLAY" xprop -root _NET_SUPPORTING_WM_CHECK 2>&1 || true)
@@ -3672,7 +3886,7 @@ run_x11() {
     export XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME"
     export XDG_SESSION_TYPE=x11
     unset WAYLAND_DISPLAY
-    write_x11_valid_config
+    write_five_binding_config
     local auto_backend_output=''
     auto_backend_output=$(env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 \
         XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" \
@@ -3680,10 +3894,10 @@ run_x11() {
     assert_text 'X11 auto backend resolves x11' 'Using runtime window backend: x11' \
         "$auto_backend_output"
     local editor_log="$X11_ROOT/editor.log" editor_pid
-    editor_pid=$(start_group "$editor_log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
+    start_group editor_pid "$editor_log" env DISPLAY="$X11_DISPLAY" GDK_BACKEND=x11 \
         XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11 HOME="$X11_HOME" \
         XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" \
-        gnome-text-editor --standalone)
+        gnome-text-editor --standalone
     deadline=$((SECONDS + 20))
     while (( SECONDS < deadline )); do
         find_last_window && break
@@ -3733,11 +3947,12 @@ run_x11() {
     x11_assert_geometry 'x11-previous-display-wraps-to-second-monitor' '1920,0,800,1080'
     run_x11_dispatch next-display-wrap alt+ctrl+down '0,0,960,1080'
     x11_assert_geometry 'x11-next-display-wraps-from-second-monitor' '0,0,960,1080'
+    run_x11_adr9_window_checks
 
     run_x11_dispatch center-before-hotkey alt+ctrl+up '640,0,640,1080'
     x11_assert_geometry 'x11-center-before-hotkey' '640,0,640,1080'
 
-    # Real XRecord/XTEST hotkey capture through the running App.
+    # Exclusive XGrabKey accelerator capture, injected through XTEST.
     local run_log="$X11_ROOT/run.log"
     start_fifo_app run x11 "$run_log"
     if wait_for_text "$run_log" 'Interactive session started' 15; then
@@ -3794,12 +4009,65 @@ run_x11() {
     send_app status
     sleep 0.3
     assert_text 'X11 invalid reload preserves previous bindings' 'binding count: 5' "$(<"$run_log")"
-    write_x11_valid_config
+    write_five_binding_config
     sleep 0.3
     send_app reload
     sleep 0.5
     send_app reload
     assert_text 'X11 config recovers after valid rewrite' 'Config state: Loaded' "$(<"$run_log")"
+
+    # ADR 0009: a replacement set the X server refuses keeps the old config and its grabs.
+    local grab_log="$X11_ROOT/competitor-grab.log" grab_pid='' refused_before=0
+    local bindings_before=0 registered_before=0 rejected_geometry=''
+    if [[ -n "${SEAM_HELPER:-}" ]]; then
+        start_group grab_pid "$grab_log" env DISPLAY="$X11_DISPLAY" "$SEAM_HELPER" grab Alt+Ctrl+F8
+        wait_for_text "$grab_log" 'GRABBED' 10 || true
+        assert_text 'X11 competitor holds alt+ctrl+f8' 'GRABBED alt+ctrl+f8' \
+            "$(cat "$grab_log" 2>/dev/null || true)"
+        refused_before=$(count_text "$run_log" 'were refused')
+        write_five_binding_config
+        cat >>"$CONFIG_PATH" <<'EOF'
+
+[[bindings]]
+hotkey = "Alt+Ctrl+F8"
+action = { type = "move-to-zone", zone = "center-third" }
+EOF
+        sleep 0.3
+        send_app reload
+        sleep 0.5
+        send_app reload
+        wait_for_new_text "$run_log" 'were refused' "$refused_before" 10 || true
+        assert_eq 'X11 rejected replacement reports a refused reload' 1 \
+            "$(( $(count_text "$run_log" 'were refused') > refused_before ? 1 : 0 ))"
+        assert_text 'X11 rejected replacement names the held accelerator' \
+            'alt+ctrl+f8 is already grabbed by another program' "$(cat "$run_log" 2>/dev/null || true)"
+        bindings_before=$(count_text "$run_log" 'binding count: 5')
+        registered_before=$(count_text "$run_log" 'hotkey state: Registered')
+        send_app status
+        wait_for_new_text "$run_log" 'binding count: 5' "$bindings_before" 8 || true
+        assert_eq 'X11 rejected replacement keeps the previous bindings' 1 \
+            "$(( $(count_text "$run_log" 'binding count: 5') > bindings_before ? 1 : 0 ))"
+        assert_eq 'X11 rejected replacement keeps hotkeys registered' 1 \
+            "$(( $(count_text "$run_log" 'hotkey state: Registered') > registered_before ? 1 : 0 ))"
+        seam move "$WINDOW_ID" 640 0 640 1080 >/dev/null
+        wait_x11_geometry '640,0,640,1080' 8 >/dev/null || true
+        xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
+        hotkey_deadline=$((SECONDS + 8))
+        while (( SECONDS < hotkey_deadline )); do
+            x11_inject_hotkey Left || true
+            sleep 0.2
+            rejected_geometry=$(x11_geometry)
+            [[ "$rejected_geometry" == '0,0,960,1080' ]] && break
+        done
+        assert_eq 'X11 rejected replacement keeps the previous grab working' '0,0,960,1080' \
+            "$rejected_geometry"
+        stop_pid "$grab_pid"
+        wait_pid "$grab_pid" 5 || true
+        write_five_binding_config
+    else
+        skip_assert 'X11 rejected replacement keeps the previous grab working' \
+            'seam helper did not build; see X11 seam helper build assertion'
+    fi
     stop_app_cleanly 'X11 run quits cleanly' "$run_log"
 
     run_tui_lifecycle x11 'x11'

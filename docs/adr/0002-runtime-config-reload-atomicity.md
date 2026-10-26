@@ -4,7 +4,7 @@ Date: 2026-07-14
 
 ## Status
 
-Accepted
+Accepted; amended by ADR 0009: the reload entry points are now `App::tick`/`App::reload`, and a reloaded config is applied only if the hotkey system also accepts its complete hotkey set.
 
 ## Context
 
