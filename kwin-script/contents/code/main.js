@@ -8,14 +8,6 @@ const REQUEST_MOVE = 'move';
 const REQUEST_REFRESH_DISPLAYS = 'refresh-displays';
 const REQUEST_REGISTER_HOTKEYS = 'register-hotkeys';
 
-const CAPABILITIES = [
-    'focused-window',
-    'displays',
-    'move-resize',
-    'hotkeys',
-];
-
-// Qt::KeyboardModifier and Qt::Key values for KGlobalAccel's integer-key query.
 const MODIFIER_NAMES = new Map([
     ['alt', ['Alt', 0x08000000]],
     ['ctrl', ['Ctrl', 0x04000000]],

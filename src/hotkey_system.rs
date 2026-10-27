@@ -786,4 +786,40 @@ mod tests {
             Err(HotkeySystemError::Rejected(_))
         ));
     }
+
+    #[test]
+    fn preserves_supported_key_boundaries_and_aliases() {
+        for (raw, expected) in [
+            ("A", "a"),
+            ("Z", "z"),
+            ("0", "0"),
+            ("9", "9"),
+            ("F1", "f1"),
+            ("F12", "f12"),
+            ("Esc", "escape"),
+            ("Page_Up", "pageup"),
+            ("Left_Arrow", "left"),
+            ("RightBracket", "rightbracket"),
+            ("PrintScreen", "printscreen"),
+        ] {
+            assert_eq!(
+                crate::config::normalize_hotkey(raw).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
+        for raw in [
+            "F0",
+            "F256",
+            "F0013",
+            "é",
+            "ß",
+            "９",
+            "ab",
+            "print_screen",
+            "caps_lock",
+        ] {
+            assert!(crate::config::normalize_hotkey(raw).is_err(), "{raw}");
+        }
+    }
 }

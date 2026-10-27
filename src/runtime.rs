@@ -1313,25 +1313,346 @@ action = { type = "move-to-zone", zone = "left-half" }
     }
 
     #[test]
-    fn first_tick_registers_the_configured_hotkeys() {
-        let config = TestConfig::new("register_hotkeys");
+    fn read_failure_keeps_path_and_os_diagnostic() {
+        let config = TestConfig::new("main_read_error");
+        let app = App::start_at(&config.directory);
+
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Read { path, .. }) => {
+                assert_eq!(path, &config.directory);
+            }
+            state => panic!("expected read error, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_config_from_path_replaces_bindings_on_success() {
+        let config = TestConfig::new("main_reload_success");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: left_half(),
+            }]
+        );
+
+        config.write(
+            "[[bindings]]\nhotkey = \"Shift+Alt+Right\"\naction = { type = \"move-to-next-display\" }\n",
+        );
+        app.reload(&mut hotkeys, Instant::now());
+
+        assert!(matches!(app.config_state(), ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+shift+right".to_string(),
+                action: Action::MoveToNextDisplay {},
+            }]
+        );
+    }
+
+    #[test]
+    fn reload_config_keeps_last_valid_bindings_after_parse_error() {
+        let config = TestConfig::new("main_reload_parse_error");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        config.write("bindings = [");
+        app.reload(&mut hotkeys, Instant::now());
+
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Parse { path, .. }) => {
+                assert_eq!(path, &config.path);
+            }
+            state => panic!("expected parse error, got {state:?}"),
+        }
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: left_half(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reload_config_keeps_last_valid_bindings_after_validation_error() {
+        let config = TestConfig::new("main_reload_validation_error");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
         config.write(&format!(
-            "{}{}",
-            zone_binding("Ctrl+Alt+Left", "left-half"),
-            zone_binding("Ctrl+Alt+Right", "right-half")
+            "{}\n[[bindings]]\nhotkey = \"Alt+Ctrl+Left\"\naction = {{ type = \"move-to-next-display\" }}\n",
+            zone_binding("Ctrl+Alt+Left", "right-half")
         ));
+        app.reload(&mut hotkeys, Instant::now());
+
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Validation { path, source }) => {
+                assert_eq!(path, &config.path);
+                assert_eq!(
+                    source.to_string(),
+                    "duplicate binding for hotkey alt+ctrl+left"
+                );
+            }
+            state => panic!("expected validation error, got {state:?}"),
+        }
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: left_half(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reload_config_updates_bindings_for_subsequent_dispatches() {
+        let config = TestConfig::new("main_reload_dispatches");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        let mut windows = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Succeeded
+        );
+        assert_eq!(windows.targets(), vec![Rect::new(0, 0, 960, 1080)]);
+
+        config.write(&zone_binding("Ctrl+Alt+Right", "right-half"));
+        app.reload(&mut hotkeys, Instant::now());
+        assert!(matches!(app.config_state(), ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+right".to_string(),
+                action: Action::MoveToZone {
+                    zone: "right-half".to_string(),
+                },
+            }]
+        );
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Right", &mut windows),
+            &DispatchState::Succeeded
+        );
+        assert_eq!(
+            windows.targets(),
+            vec![Rect::new(0, 0, 960, 1080), Rect::new(960, 0, 960, 1080)]
+        );
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Ctrl+Alt+Left".to_string(),
+            })
+        );
+        assert_eq!(windows.moves.len(), 2);
+    }
+
+    #[test]
+    fn reload_parse_error_keeps_last_known_bindings_and_dispatches_them() {
+        let config = TestConfig::new("main_reload_parse_error_dispatched");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        let mut windows = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+        config.write("bindings = [");
+        app.reload(&mut hotkeys, Instant::now());
+
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Parse { path, source }) => {
+                assert_eq!(path, &config.path);
+                assert!(source.to_string().contains("invalid TOML config"));
+            }
+            state => panic!("expected parse error, got {state:?}"),
+        }
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Succeeded
+        );
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Right", &mut windows),
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Ctrl+Alt+Right".to_string(),
+            })
+        );
+        assert_eq!(windows.targets(), vec![Rect::new(0, 0, 960, 1080)]);
+    }
+
+    #[test]
+    fn poll_config_changes_reloads_and_updates_bindings() {
+        let config = TestConfig::new("main_polling_reload_success");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
         let mut app = App::start_at(&config.path);
         let mut hotkey_system = FakeHotkeySystem::default();
+        let mut windows = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+        let now = Instant::now();
+        app.tick(&mut hotkey_system, now);
+
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Succeeded
+        );
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: left_half(),
+            }]
+        );
+        config.write(
+            "[[bindings]]\nhotkey = \"Shift+Alt+Right\"\naction = { type = \"move-to-next-display\" }\n",
+        );
+        app.tick(&mut hotkey_system, now);
+        assert!(matches!(app.config_state(), ConfigState::Loaded));
+        assert_eq!(hotkeys(&app), ["alt+ctrl+left"]);
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Succeeded
+        );
+
+        app.tick(&mut hotkey_system, now + CONFIG_RELOAD_DEBOUNCE);
+        assert!(matches!(app.config_state(), ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+shift+right".to_string(),
+                action: Action::MoveToNextDisplay {},
+            }]
+        );
+        assert_eq!(
+            app.dispatch_hotkey("Shift+Alt+Right", &mut windows),
+            &DispatchState::Succeeded
+        );
+    }
+
+    #[test]
+    fn poll_config_changes_debounces_rapid_successive_writes() {
+        let config = TestConfig::new("main_polling_debounce");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkey_system = FakeHotkeySystem::default();
+        let now = Instant::now();
+        app.tick(&mut hotkey_system, now);
+
+        config.write(&zone_binding("Ctrl+Alt+Right", "right-half"));
+        app.tick(&mut hotkey_system, now);
+        config.write(
+            "[[bindings]]\nhotkey = \"Shift+Alt+Right\"\naction = { type = \"move-to-next-display\" }\n",
+        );
+        app.tick(&mut hotkey_system, now);
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: left_half(),
+            }]
+        );
+
+        app.tick(&mut hotkey_system, now + CONFIG_RELOAD_DEBOUNCE);
+        assert!(matches!(app.config_state(), ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+shift+right".to_string(),
+                action: Action::MoveToNextDisplay {},
+            }]
+        );
+    }
+
+    #[test]
+    fn poll_config_changes_survives_read_errors_without_terminating_runtime() {
+        let config = TestConfig::new("main_polling_read_error");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        let mut windows = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+        let now = Instant::now();
+        app.tick(&mut hotkeys, now);
+
+        fs::remove_file(&config.path).unwrap();
+        fs::create_dir(&config.path).unwrap();
+        settle(&mut app, &mut hotkeys, now);
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Read { path, .. }) => {
+                assert_eq!(path, &config.path);
+            }
+            state => panic!("expected read error, got {state:?}"),
+        }
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Succeeded
+        );
+
+        fs::remove_dir_all(&config.path).unwrap();
+        config.write(&zone_binding("Ctrl+Alt+Right", "right-half"));
+        settle(&mut app, &mut hotkeys, now + Duration::from_secs(1));
+        assert!(matches!(app.config_state(), ConfigState::Loaded));
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+right".to_string(),
+                action: Action::MoveToZone {
+                    zone: "right-half".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_reload_does_not_corrupt_hotkey_registration_or_dispatch() {
+        let config = TestConfig::new("main_reload_malformed_does_not_corrupt_runtime");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        let now = Instant::now();
+        hotkeys.press("Ctrl+Alt+Left");
+        app.tick(&mut hotkeys, now);
+        assert_eq!(hotkeys.registered, ["alt+ctrl+left"]);
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
+
+        config.write("bindings = [");
+        app.reload(&mut hotkeys, now);
+        match app.config_state() {
+            ConfigState::Error(ConfigLoadError::Parse { path, .. }) => {
+                assert_eq!(path, &config.path);
+            }
+            state => panic!("expected parse error, got {state:?}"),
+        }
+
+        let mut windows = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+        assert_eq!(
+            app.dispatch_next_hotkey(&mut hotkeys, &mut windows)
+                .unwrap(),
+            Some(&DispatchState::Succeeded)
+        );
+        assert_eq!(windows.targets(), vec![Rect::new(0, 0, 960, 1080)]);
+        app.tick(&mut hotkeys, now);
+        assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
+        assert_eq!(hotkeys.registered, ["alt+ctrl+left"]);
+    }
+
+    #[test]
+    fn registers_hotkeys_with_hotkey_adapter() {
+        let config = TestConfig::new("main_register_hotkeys");
+        config.write(&format!(
+            "{}\n[[bindings]]\nhotkey = \"Ctrl+Alt+Shift+Right\"\naction = {{ type = \"move-to-next-display\" }}\n",
+            zone_binding("Ctrl+Alt+Left", "left-half")
+        ));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
 
         assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Unregistered);
-        let events = app.tick(&mut hotkey_system, Instant::now());
-
+        let events = app.tick(&mut hotkeys, Instant::now());
         assert_eq!(events, vec![RuntimeEvent::HotkeysRegistered { count: 2 }]);
         assert_eq!(app.hotkey_state(), &HotkeyRegistrationState::Registered);
         assert!(app.hotkeys_registered());
         assert_eq!(
-            hotkey_system.registered,
-            ["alt+ctrl+left", "alt+ctrl+right"]
+            hotkeys.registered,
+            ["alt+ctrl+left", "alt+ctrl+shift+right"]
         );
     }
 

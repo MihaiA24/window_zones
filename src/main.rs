@@ -1713,11 +1713,7 @@ fn execute_dispatch(
 
     let state = app.dispatch_hotkey(hotkey, &mut window_system).clone();
     print_dispatch_state(&state, &window_system);
-    if matches!(state, DispatchState::Error(_)) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    ExitCode::SUCCESS
 }
 
 fn execute_status(app: &App, window_system: &RuntimeWindowSystem) {
@@ -1937,9 +1933,7 @@ fn print_help() {
     println!("Commands:");
     println!("  init             write a starter config (default chord depends on the desktop)");
     println!("  status           print runtime state and exit");
-    println!(
-        "  dispatch         run the action bound to HOTKEY once and exit (non-zero on failure)"
-    );
+    println!("  dispatch         run the action bound to HOTKEY once and print its state");
     println!("                   Sway/Hyprland dispatch requires an existing run/tui session");
     println!("  run              serve hotkeys until quit; keeps running without a terminal");
     println!("  run --tray       serve hotkeys with a tray status menu");

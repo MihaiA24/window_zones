@@ -127,7 +127,7 @@ The App prints runtime events once per change, never per retry:
 
 With non-terminal stdout, Linux and macOS notify about background problems; `--backend dry-run` never does. Config errors and refused hotkeys notify at once; unavailable hotkeys notify only after 20 seconds without recovery. Linux updates the notification in place and clears it on matching recovery. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html). Actual problem and recovery banners and Notification Center content were observed in the incoming readiness work, attributed to Script Editor; enable notifications for that sender if needed.
 
-`dispatch` exits `1` when the dispatch state is an error (no binding, no focused window, adapter failure); the state is still printed.
+One-shot `dispatch` prints its state and exits `0`, including dispatch errors (no binding, no focused window, adapter failure). Inspect `Dispatch state` and diagnostics rather than treating exit status as proof of movement. Sway/Hyprland dispatch clients still exit nonzero when their session-owned request fails.
 
 ## Backend resolution
 

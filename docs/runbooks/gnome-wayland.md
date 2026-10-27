@@ -1,6 +1,6 @@
 # GNOME Wayland Runbook
 
-The GNOME integration targets GNOME Shell 50 and 51 and uses the in-repository Shell extension as the compositor companion. Both versions are admitted by `metadata.json`; Shell version validation must remain enabled. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session. Admission and API compatibility are not a substitute for a passing smoke run. Record exact configurations, observed results, and limitations only in the PR description; verification artifacts are temporary and must not be checked in.
+The GNOME integration targets GNOME Shell 50 and 51 and uses the in-repository Shell extension as the compositor companion. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session.
 
 ## Target version
 
@@ -9,6 +9,11 @@ Record the exact point release before a manual run:
 ```bash
 gnome-shell --version
 ```
+
+GNOME Shell 51.1 has passed the private Synthetic companion/capability/display,
+config reload and CLI/TUI journeys with extension-version validation enabled.
+Seated Shell 51 placement and accelerator capture remain unverified; the
+existing seated reference remains Shell 50.4.
 
 ## Install and enable the companion
 
@@ -278,9 +283,10 @@ To verify the combined `Gnome2` companion, run the expanded Synthetic and seated
 checks on the exact GNOME 50 or 51 configuration being claimed, with the
 upgraded companion loaded after a fresh login, `disable-user-extensions=false`,
 and authorized writable `/dev/uinput` for `gnome-live`. Record GNOME/Mutter
-versions, display layout, assertion summary, and limitations in the PR
-description only. Logs are temporary verification artifacts, not repository
-content. Contract tests and Synthetic results do not replace seated evidence;
+versions, display layout, assertion summary, limitations, and retained evidence
+paths in the PR description. Preserve proof with `--keep-logs`; verifier cleanup
+retains its evidence. Do not check artifacts in. Contract tests and Synthetic
+results do not replace seated evidence;
 see [testing prerequisites](testing.md#v1-verification-matrix).
 
 For isolated D-Bus client and real companion-dispatcher contract coverage, run:

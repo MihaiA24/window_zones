@@ -296,7 +296,7 @@ def run(binary, keep_logs, output_dir=None):
         indicator_dir = next((base / 'gnome-shell/extensions' / indicator_uuid for base in (Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))), Path('/usr/share')) if (base / 'gnome-shell/extensions' / indicator_uuid).is_dir()), None)
         check('Installed AppIndicator supports real GNOME tray testing', indicator_dir is not None, indicator_dir)
         shutil.copytree(indicator_dir, work / 'data/gnome-shell/extensions' / indicator_uuid, symlinks=True)
-        (work / 'config/glib-2.0/settings/keyfile').write_text("[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\ndisable-user-extensions=false\n")
+        (work / 'config/glib-2.0/settings/keyfile').write_text("[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\ndisable-user-extensions=false\ndisable-extension-version-validation=false\n")
         for name in ('metadata.json', 'extension.js'):
             shutil.copy2(root / 'gnome-extension' / name, work / 'data/gnome-shell/extensions/window-zones@mihai-a24' / name)
         bus, bus_log = start(['dbus-daemon', '--session', '--nofork', '--print-address=1'], 'session-bus', os.environ.copy())

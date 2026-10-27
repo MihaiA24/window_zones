@@ -1,54 +1,39 @@
-# window_zones verification map
+# Window Zones verification map
 
-This directory is the maintained source for verifying the user-facing behavior of window_zones. Read the index before driving the app, then use the matching feature file as the recipe. Dry-run recipes drive owned instances through `wzv` (see `../SKILL.md`); `live-integrations.md` uses explicit live backends, platform gates, and disposable fixtures outside `wzv`.
+Maintained source for user-facing verification journeys. Read the index, then the affected feature files. `docs/runbooks/testing.md` remains the release-gate status record; this map does not promote synthetic evidence to a seated release pass.
 
 ## Baseline preconditions
 
-- Work from the repository root with `cargo build --locked --bin window_zones` passing; `wzv start` runs that build.
-- Put the helpers on `PATH`: `export PATH="$PWD/.agents/skills/verify-window-zones/scripts:$PATH"`.
-- Name the run and its directory: `RUN=<feature>-$(date +%s)` and `R="${WZV_ROOT:-target/verify-window-zones}/$RUN"`.
-- Each dry-run recipe starts its own run with `wzv start --run-id "$RUN"` and requires `wzv doctor "$RUN"` to print `doctor=ok`; live integrations have separate prerequisites.
-- The dry-run desktop is fixed: focused window `dry-run-window` at x=40 y=40 w=640 h=480 on `display-0` (0,0 1920x1080); `display-1` sits at 1920,0 with 1280x1024.
-- `wzv start` writes the starter config (18 `Ctrl+Alt` bindings) unless the recipe passes `--no-init`.
-- Never drive an instance this run did not start, the user's installed `window_zones`, or the `window-zones` systemd user service.
+- From the repo root set `V=.agents/skills/verify-window-zones/verify`; run `"$V" launch` and `"$V" doctor`.
+- Require this checkout's profile, `build: current`, and a free or owned derived display. No TCP server/auth/database exists. A stale or foreign instance is not driveable evidence.
+- Verifier freshness includes the thin `verify` launcher and every Python module under `wz_verify/`. After changing that package, cleanup and launch again; the existing safety regression checks module edits/additions/removals and independent workspace cleanup.
+- The isolated TOML has Left → left-half, Up → center-third, Right → left-two-thirds, Down → next display, Shift+Right → previous display; each uses Alt+Ctrl.
+- Restore `"$V" drive config valid` before a baseline journey. Each CLI/PTY drive starts a new process; mutations persist in the profile's file, not runtime memory.
+- Dry-run's fixed display is 1920×1080 at (0,0), with a second 1280×1024 display at (1920,0); it does not move OS windows. Native smoke uses its own fixtures and observations.
+- Native prerequisites come from `docs/runbooks/testing.md`. Missing compositor, display, focus, seat, tray host or capture support is a failed precondition for that journey, not permission to replace it with dry-run.
 
 ## Driving conventions
 
-- Start every recipe from the baseline and run its commands in order; later steps depend on earlier window state.
-- Treat every command as literal. Keep quoting unchanged; session lines are single-quoted.
-- Type session lines with `wzv send`, save config files with `wzv config`, and run one-shot CLI commands with `wzv exec ... -- ARGS`. Never pass `--backend`; `wzv` always uses `dry-run`.
-- `--expect` holds the exact text the app prints. A recipe command that exits 0 has passed its check; `wzv exec --expect-exit 1` passes when the app exits 1.
-- Hotkeys are case-insensitive on input; the app reports them in canonical `alt+ctrl+shift+cmd+key` order.
-- Write fixture files under `"$R/scratch/"`; cleanup removes them.
-- Finish with `wzv stop "$RUN"` and `wzv cleanup "$RUN"`. Cleanup removes scratch files but keeps `"$R/evidence/"`, `meta.env` and `pids`; after reporting results in the PR description, remove your owned run directory with `rm -rf -- "$R"` once no caller is using it.
+- Use `verify` subcommands, the repo launcher and existing smoke/test runners; do not write one-off drive scripts or install a second framework.
+- Match post-action text and exact geometry with deadlines. PTY commands use literal prompts/labels; native gates have independent geometry observers. Legacy pacing pauses in the existing smoke script are not assertions.
+- Use `drive cli -- …` for one-shot commands; `drive session --mode run|tui` for line input. Repeat paired `--command` and `--expect` for custom input. `--quit quit|q|exit|eof` owns shutdown.
+- `--backend-flag backend|alias` and `--discovery` select real flag/config entry variants. Verifier `--dry-run` only prints a plan; it is not app evidence.
+- Mutate only the isolated TOML via `drive config`; files and build stamps are recorded alongside action/result transcripts.
+- For native paths use `drive smoke x11|gnome|kde-live`. Seated GNOME/Windows/macOS and a real tray host are separate required environments when affected, not covered by synthetic gates.
+- Use the skill's `Checks` section first: `check behaviors` owns the CLI flag/config matrix; `check sessions` owns the 24-session reload/watcher/cancel matrix; `check e2e` already includes X11 smoke. Do not reimplement these loops or repeat their underlying drives. `check performance --baseline-ref REF` is separate measurement, not a deterministic timing golden.
 
 ## Proof and skip reporting
 
-- Inspect the run's temporary `evidence/` directory: `transcript.log` (each typed line, its output, one-shot commands with `exit_code=`, `[expect ok]`/`[expect FAIL]`), `app.log`, `config-NN.toml`, `side-effects.txt`, `sentinel.log`, `exit-code`. These artifacts are not checked in or retained as repository documentation.
-- Capture the user action and the resulting state: the `last move:` geometry, `Config state:`, `Dispatch state:`, or the TUI `Last action:`/`Last error:`/`Last event:` lines.
-- `wzv stop` must report `exit_code=0`, `live_backend_tool_calls=0`, and `instance_locks=0`; report `home_files` with the files you expected.
-- Report the feature file, run id, commands, observed results and limitations only in the PR description; do not require a retained evidence path.
-- Dry-run proves runtime behavior, not real window movement or real key capture. Never report a live backend as verified through dry-run.
-- Report an unreachable path in the PR description with the attempted command and the unmet precondition (see `live-integrations.md`).
-- Do not report a skipped entry point as verified through a different one: a one-shot `dispatch` does not prove the session path, and the reverse.
-
-## Feature entry contract
-
-Each feature file starts with an H1 title and one paragraph describing the user-visible behavior. It then uses exactly four H2 sections in this order.
-
-1. `Sub-features` lists short IDs with one line for each behavior.
-2. `How to get to it (user POV)` lists every user entry point.
-3. `Driving it with wzv` starts with `Preconditions:` and uses labeled bullets that pair each user action with an exact command and observable result.
-4. `Gotchas` lists traps that can waste or invalidate a verification run.
-
-Keep implementation details out of the map. Name only user paths, stable handles, required state, commands, and expected invariants. Verification status, including anything not run against the current build, belongs only in the PR description.
+- Apply the skill's exhaustive entry-point × mode × enabled-flag × outcome matrix. Success, cancel, error, empty and persistence must each be covered or explicitly inapplicable with a reason.
+- Bind every proof to feature ID, entry point, actual backend, flag/config variant, current build and artifacts. `actions.jsonl` records exact commands/options and results; annotate the handoff with feature IDs.
+- Include both input and result; confirm durable config from a new process and OS movement from an independent observer/screenshot. Exit 0 alone does not prove dispatch/config success.
+- Report attempted command and missing precondition for an unreachable journey. A different entry point's pass cannot close it. Existing SKIPs and failed screenshots are not successes.
+- Cleanup removes scratch state/owned processes, never evidence. Run `logs --path-only` after cleanup and inspect the named files.
 
 ## Features
 
-- [Starter config](./starter-config.md) covers `init` with the default chord, a chosen chord, `--force`, refusal to overwrite, an invalid chord, and `--config` paths.
-- [One-shot commands](./one-shot-commands.md) covers `status`, `dispatch HOTKEY`, exit codes, missing config, and argument errors.
-- [Move the window](./move-window.md) covers every starter zone, repeated-half display crossing without wrap, center, maximize, restore, next and previous display with wrap, custom zones, and `move-to-display`.
-- [Run session](./run-session.md) covers the `run` stdin commands: `status`, `help`, `dispatch`, bare hotkeys, unknown hotkeys, `reload`, `restart`, and `exit`.
-- [Live config reload](./config-reload.md) covers saving broken, invalid, fixed, and extended configs while the App runs.
-- [TUI dashboard](./tui.md) covers the dashboard frame, dispatch, error and event lines, `refresh`, `reload`, `restart`, config errors, and quit.
-- [Live integrations](./live-integrations.md) covers GNOME, X11, KDE, macOS, Windows, Sway/Hyprland, tray, notifications, single-instance and services. See `docs/runbooks/testing.md` for platform procedures, gate policy and limits.
+- [Status and backend selection](status-backends.md): one-shot status, dashboard/status refresh, missing/error config, auto/explicit routing and dry-run alias.
+- [Window placement and display movement](placement.md): eight built-in zones, custom zones, next/previous display, dispatch and real accelerators, error/empty boundaries.
+- [Configuration and atomic reload](configuration.md): discovery/explicit paths, valid replacement, invalid retention, empty/missing configs, restart and disk persistence.
+- [Global hotkeys and dispatch](hotkeys.md): physical accelerators, one-shot and interactive dispatch, aliases, registration failure/recovery and no-binding errors.
+- [Runtime controls](runtime-controls.md): CLI/TUI lifecycle, help/refresh, quit aliases/EOF and optional tray menu entry points.

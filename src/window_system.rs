@@ -95,3 +95,58 @@ pub trait WindowSystem {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FakeWindowSystem {
+    pub(crate) focused_window: Result<Option<FocusedWindow>, WindowSystemError>,
+    pub(crate) displays: Result<Vec<DisplayGeometry>, WindowSystemError>,
+    pub(crate) moves: Vec<WindowMove>,
+    pub(crate) move_error: Option<WindowSystemError>,
+}
+
+#[cfg(test)]
+impl FakeWindowSystem {
+    pub(crate) fn with_focus(geometry: Rect) -> Self {
+        Self {
+            focused_window: Ok(Some(FocusedWindow::new(WindowId::new("window"), geometry))),
+            displays: Ok(vec![
+                DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
+                DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
+            ]),
+            moves: Vec::new(),
+            move_error: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl WindowSystem for FakeWindowSystem {
+    fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
+        self.focused_window.clone()
+    }
+
+    fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        self.displays.clone()
+    }
+
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
+        if let Some(error) = self.move_error.clone() {
+            if let WindowSystemError::PartialMove { observed, .. } = &error
+                && let Ok(Some(focused)) = &mut self.focused_window
+                && focused.id == window_move.window
+            {
+                focused.geometry = *observed;
+            }
+            return Err(error);
+        }
+
+        self.moves.push(window_move.clone());
+        if let Ok(Some(focused)) = &mut self.focused_window
+            && focused.id == window_move.window
+        {
+            focused.geometry = window_move.target;
+        }
+        Ok(())
+    }
+}

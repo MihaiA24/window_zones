@@ -18,6 +18,11 @@ node "$PROJECT_ROOT/kwin-script/tests/run.js"
 if command -v qmllint >/dev/null 2>&1; then
   qmllint "$PROJECT_ROOT/kwin-script/contents/code/main.js"
 fi
+if [[ "$(uname -s)" == Linux ]]; then
+  python3 "$PROJECT_ROOT/.agents/skills/verify-window-zones/test_verify.py"
+else
+  echo "Skipping Linux-only verifier safety checks on $(uname -s)."
+fi
 
 cargo fmt --all -- --check
 cargo test --locked

@@ -48,7 +48,7 @@ The platform-neutral core and runtime paths currently include:
 - Blocking Release gates: GNOME Wayland (`./scripts/smoke.sh gnome` in a Synthetic session plus `./scripts/smoke.sh gnome-live` on the seated session) and Linux X11 (`./scripts/smoke.sh x11`), each including the TUI lifecycle Smoke run.
 - KDE Plasma Wayland (`./scripts/smoke.sh kde-live` on a nested KWin) and Windows (`docs/runbooks/windows-smoke.md`) are implemented but deferred and non-blocking until a seated KWin 6.x Smoke run and the manual Windows run pass.
 - macOS, Sway, and Hyprland are ungated integrations. Sway and Hyprland use compositor-bound dispatch (`window_zones dispatch <hotkey>` from the compositor keybinding config) into a running `run`/`tui` session, retaining Restore history without global hotkey capture.
-- `docs/runbooks/testing.md` contains gate requirements and reproduction commands. Record observed results, exact configurations, dates, and unverified limits only in the PR description; do not retain verification records or artifacts in the repository.
+- `docs/runbooks/testing.md` contains gate requirements and reproduction commands. Report observed results, exact configurations, dates, unverified limits, and retained evidence paths in the PR description. Verifier cleanup preserves evidence under ignored `target/verification/`; do not check verification artifacts into the repository.
 
 ## Configuration discovery
 
@@ -66,8 +66,9 @@ Use these helper scripts for common workflows:
 
 - `./scripts/install.sh` — build and install the binary; optional `--gnome-extension`, `--kwin-script`, `--init-config`, `--autostart` (Linux systemd user service or macOS LaunchAgent), `--uninstall`.
 - `./scripts/run.sh` — run the binary with safe defaults for quick checks.
-- `./scripts/test.sh` — run formatting, test, lint, and companion contract/syntax checks.
-- `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs; GNOME uses real interactive GTK windows and compositor-provided virtual input. `gnome-live` checks the seated GNOME session.
+- `./scripts/test.sh` — run formatting, test, and lint checks.
+- `./scripts/smoke.sh` — run GNOME Wayland or Linux X11 Synthetic session Smoke runs; `gnome-live` runs the seated GNOME session checks.
+- [`.agents/skills/verify-window-zones/SKILL.md`](.agents/skills/verify-window-zones/SKILL.md) — checkout-owned verification CLI, maintained feature journeys, build freshness checks, and retained evidence.
 
 - `docs/runbooks/installation.md`
 - `docs/runbooks/running.md`

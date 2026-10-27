@@ -311,13 +311,18 @@ impl WindowSystem for X11WindowSystem {
             .x(window_move.target.x)
             .y(window_move.target.y)
             .width(width)
-            .height(height);
+            .height(height)
+            .border_width(0);
+
+        // Wait for the server before dropping this short-lived connection.
         conn.configure_window(window, &values)
             .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to configure window: {error}"))
+                WindowSystemError::Platform(format!("failed to configure focused window: {error}"))
             })?
             .check()
-            .map_err(|error| window_reply_error(window, "configure window", error))?;
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("X11 rejected window configuration: {error}"))
+            })?;
         Ok(())
     }
 }

@@ -1,0 +1,67 @@
+{
+  "clock": {
+    "realtime_seconds": 1704067200,
+    "realtime_nanoseconds": 0,
+    "time_seconds": 1704067200,
+    "gettimeofday_seconds": 1704067200,
+    "gettimeofday_microseconds": 0,
+    "monotonic_advances": true
+  },
+  "dispatch": {
+    "exit_code": 0,
+    "backend": "dry-run",
+    "config_path": "$CONFIG",
+    "config_state": "Loaded",
+    "bindings": 5,
+    "dispatch": "Succeeded",
+    "error": null,
+    "geometry": [0, 0, 960, 1080]
+  },
+  "behaviors": {
+    "left-half": {"geometry": [0, 0, 960, 1080]},
+    "right-half": {"geometry": [960, 0, 960, 1080]},
+    "left-third": {"geometry": [0, 0, 640, 1080]},
+    "center-third": {"geometry": [640, 0, 640, 1080]},
+    "right-third": {"geometry": [1280, 0, 640, 1080]},
+    "left-two-thirds": {"geometry": [0, 0, 1280, 1080]},
+    "right-two-thirds": {"geometry": [640, 0, 1280, 1080]},
+    "maximize": {"geometry": [0, 0, 1920, 1080]},
+    "custom": {"bindings": 1, "geometry": [192, 108, 960, 540]},
+    "next-display": {"geometry": [1947, 38, 427, 455]},
+    "previous-display": {"geometry": [1947, 38, 427, 455]},
+    "unbound": {"dispatch": "Error", "error": "NoBindingForHotkey", "geometry": null},
+    "empty": {"bindings": 0, "dispatch": "Error", "error": "NoBindingForHotkey", "geometry": null},
+    "missing": {"config_state": "Missing", "bindings": 0, "dispatch": "Error", "error": "NoBindingForHotkey", "geometry": null},
+    "invalid": {"config_state": "Error", "bindings": 0, "dispatch": "Error", "error": "NoBindingForHotkey", "geometry": null}
+  },
+  "e2e": {
+    "failures": 0,
+    "geometry": {
+      "x11-left-half": [0, 0, 960, 1080],
+      "x11-center-third": [640, 0, 640, 1080],
+      "x11-left-two-thirds": [0, 0, 1280, 1080],
+      "x11-next-display": [1920, 0, 1067, 1080],
+      "x11-previous-display": [1920, 0, 1067, 1080],
+      "X11 real hotkey moves window": [0, 0, 960, 1080]
+    },
+    "captured_png": ["x11-x11-center-third.png", "x11-x11-left-half.png", "x11-x11-left-two-thirds.png", "x11-x11-next-display.png", "x11-x11-previous-display.png", "x11-x11-real-hotkey.png"],
+    "native_backend": "x11",
+    "hotkey_action": "alt+ctrl+left",
+    "retained_binding_count": 5,
+    "config_recovered": true,
+    "tui_action": "alt+ctrl+left",
+    "run_closed": true,
+    "tui_closed": true,
+    "cancel_config_unchanged": true,
+    "persisted_dispatch": {
+      "exit_code": 0,
+      "backend": "dry-run",
+      "config_path": "$CONFIG",
+      "config_state": "Loaded",
+      "bindings": 5,
+      "dispatch": "Succeeded",
+      "error": null,
+      "geometry": [0, 0, 960, 1080]
+    }
+  }
+}

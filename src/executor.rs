@@ -407,61 +407,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::geometry::Rect;
-    use crate::window_system::FocusedWindow;
+    use crate::window_system::FakeWindowSystem;
     use crate::{DisplayGeometry, ZoneDefinition};
 
-    #[derive(Debug)]
-    struct FakeWindowSystem {
-        focused_window: Result<Option<FocusedWindow>, WindowSystemError>,
-        displays: Result<Vec<DisplayGeometry>, WindowSystemError>,
-        moves: Vec<WindowMove>,
-        move_error: Option<WindowSystemError>,
-    }
-
-    impl WindowSystem for FakeWindowSystem {
-        fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-            self.focused_window.clone()
-        }
-
-        fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-            self.displays.clone()
-        }
-
-        fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
-            if let Some(error) = self.move_error.clone() {
-                if let WindowSystemError::PartialMove { observed, .. } = &error
-                    && let Ok(Some(focused)) = &mut self.focused_window
-                {
-                    focused.geometry = *observed;
-                }
-                return Err(error);
-            }
-
-            self.moves.push(window_move.clone());
-            // The fake compositor applies moves immediately.
-            if let Ok(Some(focused)) = &mut self.focused_window
-                && focused.id == window_move.window
-            {
-                focused.geometry = window_move.target;
-            }
-            Ok(())
-        }
+    fn move_to_left_half_action() -> (String, BTreeMap<String, ZoneDefinition>) {
+        ("left-half".to_string(), BTreeMap::new())
     }
 
     fn window_id() -> WindowId {
-        WindowId::new("window-a")
+        WindowId::new("window")
     }
 
     fn fake_with_focus(geometry: Rect) -> FakeWindowSystem {
-        FakeWindowSystem {
-            focused_window: Ok(Some(FocusedWindow::new(window_id(), geometry))),
-            displays: Ok(vec![
-                DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
-                DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
-            ]),
-            moves: Vec::new(),
-            move_error: None,
-        }
+        FakeWindowSystem::with_focus(geometry)
     }
 
     fn moved_to(target: Rect) -> WindowMove {
@@ -492,41 +450,18 @@ mod tests {
 
     #[test]
     fn moves_focused_window_to_zone_on_current_display() {
-        for (zone, geometry, expected) in [
-            (
-                "left-half",
-                Rect::new(100, 100, 800, 600),
-                Rect::new(0, 0, 960, 1080),
-            ),
-            (
-                "right-half",
-                Rect::new(100, 100, 800, 600),
-                Rect::new(960, 0, 960, 1080),
-            ),
-            (
-                "left-half",
-                Rect::new(960, 0, 960, 1080),
-                Rect::new(0, 0, 960, 1080),
-            ),
-            (
-                "right-half",
-                Rect::new(0, 0, 960, 1080),
-                Rect::new(960, 0, 960, 1080),
-            ),
-        ] {
-            let mut fake = fake_with_focus(geometry);
-            execute_action(
-                &Action::MoveToZone {
-                    zone: zone.to_string(),
-                },
-                &BTreeMap::new(),
-                &mut WindowHistory::default(),
-                &mut fake,
-            )
-            .unwrap();
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(100, 100, 800, 600));
 
-            assert_eq!(fake.moves, vec![moved_to(expected)], "{zone}");
-        }
+        let (zone, zones) = move_to_left_half_action();
+        execute_action(
+            &Action::MoveToZone { zone },
+            &zones,
+            &mut WindowHistory::default(),
+            &mut fake,
+        )
+        .unwrap();
+
+        assert_eq!(fake.moves, vec![moved_to(Rect::new(0, 0, 960, 1080))]);
     }
 
     #[test]
@@ -724,7 +659,7 @@ mod tests {
 
     #[test]
     fn moves_to_custom_zone_from_map() {
-        let mut fake = fake_with_focus(Rect::new(200, 200, 800, 600));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
 
         let mut zones = BTreeMap::new();
         zones.insert(
@@ -750,7 +685,7 @@ mod tests {
 
     #[test]
     fn moves_to_next_display_preserving_recognized_zone() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
 
         execute(&mut fake, &Action::MoveToNextDisplay {}).unwrap();
 
@@ -759,7 +694,7 @@ mod tests {
 
     #[test]
     fn wraps_next_display_from_last_to_first() {
-        let mut fake = fake_with_focus(Rect::new(1920, 0, 1280, 1440));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(1920, 0, 1280, 1440));
 
         execute(&mut fake, &Action::MoveToNextDisplay {}).unwrap();
 
@@ -768,7 +703,7 @@ mod tests {
 
     #[test]
     fn wraps_previous_display_from_first_to_last() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
 
         execute(&mut fake, &Action::MoveToPreviousDisplay {}).unwrap();
 
@@ -1216,7 +1151,7 @@ mod tests {
 
     #[test]
     fn returns_no_focused_window_without_moving() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
         fake.focused_window = Ok(None);
 
         let err = execute(&mut fake, &zone("left-half")).unwrap_err();
@@ -1227,7 +1162,7 @@ mod tests {
 
     #[test]
     fn returns_no_displays_without_moving() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
         fake.displays = Ok(Vec::new());
 
         let err = execute(&mut fake, &zone("left-half")).unwrap_err();
@@ -1238,7 +1173,7 @@ mod tests {
 
     #[test]
     fn returns_no_displays_when_only_zero_sized_displays_without_moving() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
         fake.displays = Ok(vec![
             DisplayGeometry::new("zero-width", Rect::new(0, 0, 0, 1080)),
             DisplayGeometry::new("zero-height", Rect::new(10, 10, 640, 0)),
@@ -1252,7 +1187,7 @@ mod tests {
 
     #[test]
     fn returns_unknown_zone_without_moving() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
 
         let err = execute(&mut fake, &zone("missing-zone")).unwrap_err();
 
@@ -1267,7 +1202,7 @@ mod tests {
 
     #[test]
     fn wraps_platform_errors() {
-        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        let mut fake = FakeWindowSystem::with_focus(Rect::new(0, 0, 960, 1080));
         fake.move_error = Some(WindowSystemError::Platform("denied".to_string()));
 
         let err = execute(&mut fake, &zone("left-half")).unwrap_err();

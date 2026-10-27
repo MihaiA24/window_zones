@@ -3,24 +3,16 @@
 ## Prerequisites
 
 - Rust toolchain with `cargo` in `PATH`.
-- On Linux, `pkg-config`, D-Bus headers, and X11/XInput/XTest development libraries
-  are required for tray, KWin companion, and global hotkey support; the Linux
-  build links X11 libraries even when runtime integration is native Wayland:
-  - Arch/CachyOS: `sudo pacman -S --needed base-devel rust pkgconf dbus libx11 libxi libxtst`
-  - Debian/Ubuntu: `sudo apt install build-essential pkg-config libdbus-1-dev libx11-dev libxi-dev libxtst-dev`
-  - Fedora: `sudo dnf install gcc pkgconf-pkg-config dbus-devel libX11-devel libXi-devel libXtst-devel`
-- `$HOME/.local/bin` (or `<prefix>/bin`) on `PATH` to type `window_zones` in any
-  terminal; the installer checks this and prints the exact line to add for your
-  shell (fish, zsh, or bash) when it is missing.
-- For GNOME Wayland, GNOME Shell 50 or 51 and `gnome-extensions`; see
-  [GNOME Wayland](gnome-wayland.md) for companion lifecycle and diagnostics.
-- For KDE Plasma Wayland, `kpackagetool6` and the graphical user's session bus;
-  see [KDE Wayland](kde-wayland.md) for script and companion lifecycle.
-- On macOS, the Xcode Command Line Tools (`xcode-select --install`). The installer
-  runs with the stock `/bin/bash` 3.2. macOS needs no compositor companion; moving
-  windows and capturing global keys need the permissions described in
-  [macOS LaunchAgent](#macos-launchagent); native window operations do not use
-  System Events or require its Automation grant.
+- On Linux, `pkg-config` and D-Bus development headers are required for tray
+  and KWin companion support:
+  - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
+  - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
+- (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
+- For GNOME Wayland, GNOME Shell 50 or 51 and `gnome-extensions` are required when
+  using the optional companion; install steps are in
+  `docs/runbooks/gnome-wayland.md`.
+- For KDE Plasma Wayland, `kpackagetool6` is required to install the KWin
+  script; setup steps are in `docs/runbooks/kde-wayland.md`.
 
 Run the installer as your desktop user, not with `sudo`. Binaries use the chosen
 prefix; companions and autostart are per-user. On Linux, absolute `XDG_CONFIG_HOME`
@@ -306,9 +298,9 @@ Follow the [native macOS smoke procedure](testing.md#macos-native-smoke-ungated)
 ```
 
 Substitute your prefix if it differs. Follow the compositor-specific runbook for
-companion and hotkey verification. Record observed results and limitations only
-in the PR description; verification artifacts are temporary and must not be
-checked in.
+companion and hotkey verification. Report observed results, limitations, and
+retained evidence paths in the PR description. Verifier cleanup preserves its
+evidence; do not check verification artifacts into the repository.
 
 Uninstall using the same prefix used for installation:
 
