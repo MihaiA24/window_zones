@@ -1,4 +1,5 @@
 """Real terminal and native desktop journeys using one workspace."""
+import contextlib
 import errno
 import os
 from pathlib import Path
@@ -17,21 +18,38 @@ from .runtime import fail
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def tui_dispatch_action(observed):
+    completed = observed.rsplit("Window Zones TUI", 1)[-1].replace("\r", "")
+    result = re.search(r"^Last action: ([^\n]+)\nLast error: ([^\n]*)\n", completed, re.MULTILINE)
+    if not result or "window-zones tui> " not in completed[result.end():]:
+        fail("TUI dispatch response is incomplete. Inspect the completed response and prompt.")
+    action, error = result.groups()
+    if action == "<none>" or error.startswith("dispatch:"):
+        fail("TUI dispatch failed despite recording the requested hotkey. Inspect the completed response.")
+    return action
+
+
 class Terminal:
     def __init__(self, workspace, command, label, prompt="window-zones> "):
         self.workspace = workspace
         self.prompt = prompt
-        self.master, slave = pty.openpty()
-        attributes = termios.tcgetattr(slave)
-        attributes[3] &= ~termios.ECHO
-        termios.tcsetattr(slave, termios.TCSANOW, attributes)
-        self.raw = (self.workspace.artifact() / f"{label}.ansi").open("wb")
         self.text = ""
-        self.workspace.event("pty-launch", command=shlex.join(command), transcript=self.raw.name)
-        self.child = subprocess.Popen(command, cwd=self.workspace.root, env=self.workspace.env(), stdin=slave, stdout=slave, stderr=slave,
-                                      start_new_session=True)
-        os.close(slave)
-        self.workspace.track(self.child)
+        with contextlib.ExitStack() as failed:
+            self.master, slave = pty.openpty()
+            failed.callback(os.close, self.master)
+            try:
+                attributes = termios.tcgetattr(slave)
+                attributes[3] &= ~termios.ECHO
+                termios.tcsetattr(slave, termios.TCSANOW, attributes)
+                self.raw = failed.enter_context((self.workspace.artifact() / f"{label}.ansi").open("wb"))
+                self.workspace.event("pty-launch", command=shlex.join(command), transcript=self.raw.name)
+                self.child = subprocess.Popen(command, cwd=self.workspace.root, env=self.workspace.env(),
+                                              stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+                failed.callback(self.workspace.stop, self.child)
+                self.workspace.track(self.child)
+            finally:
+                os.close(slave)
+            failed.pop_all()
 
     def read(self, timeout):
         if select.select([self.master], [], [], timeout)[0]:
@@ -97,15 +115,19 @@ def session(workspace, options):
             for command, expected in zip(options.command, options.expect):
                 if command.lower() in ("quit", "q", "exit"):
                     fail("Use --quit for exit paths; --command must leave the app running.")
-                terminal.send(command, expected)
+                observed = terminal.send(command, expected)
+                control = command.strip().split(" ", 1)[0].lower()
+                if (options.mode == "tui" and control not in ("", "status", "refresh", "reload", "restart", "help", "?")
+                        and not re.match(r"Last error: dispatch:\s*\S", expected)):
+                    tui_dispatch_action(observed)
         else:
             terminal.send("status", heading)
             if options.mode == "tui":
                 terminal.send("refresh", heading)
             observed = terminal.send("dispatch Alt+Ctrl+Left", "Last action: alt+ctrl+left" if options.mode == "tui"
                                      else "Dispatch state: Succeeded")
-            if "Last error: dispatch:" in observed:
-                fail("TUI dispatch failed despite recording the requested hotkey. Inspect the completed response.")
+            if options.mode == "tui":
+                tui_dispatch_action(observed)
             if options.journey in ("reload", "watcher"):
                 for seed, expected in (("changed", "right-half" if options.mode == "tui" else "binding count: 1"),
                                        ("invalid", "(Error" if options.mode == "tui" else "config state: Error"),
@@ -122,8 +144,8 @@ def session(workspace, options):
                             fail("Invalid config did not retain the last valid binding. Keep evidence and report this failure.")
                         observed = terminal.send("dispatch Alt+Ctrl+Left", "Last action: alt+ctrl+left" if options.mode == "tui"
                                                  else "Dispatch state: Succeeded")
-                        if "Last error: dispatch:" in observed:
-                            fail("Retained TUI binding failed to dispatch. Inspect the completed response.")
+                        if options.mode == "tui":
+                            tui_dispatch_action(observed)
             terminal.send("reload", heading if options.mode == "tui" else "Reload requested.")
             terminal.send("restart", heading if options.mode == "tui" else "Runtime restarted.")
             observed = terminal.status("Loaded", options.mode)

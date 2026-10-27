@@ -183,12 +183,15 @@ impl WindowSystem for X11WindowSystem {
             .height(height)
             .border_width(0);
 
-        conn.configure_window(window, &values).map_err(|error| {
-            WindowSystemError::Platform(format!("failed to configure focused window: {error}"))
-        })?;
-        conn.flush().map_err(|error| {
-            WindowSystemError::Platform(format!("failed to flush X11 queue: {error}"))
-        })?;
+        // Wait for the server before dropping this short-lived connection.
+        conn.configure_window(window, &values)
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("failed to configure focused window: {error}"))
+            })?
+            .check()
+            .map_err(|error| {
+                WindowSystemError::Platform(format!("X11 rejected window configuration: {error}"))
+            })?;
 
         Ok(())
     }

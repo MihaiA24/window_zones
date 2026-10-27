@@ -998,28 +998,17 @@ run_gnome_dispatch() {
 }
 
 run_x11_dispatch() {
-    local label=$1 hotkey=$2 expected=${3:-} rc=0 attempts=0
+    local label=$1 hotkey=$2 rc=0
     local out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log"
-    while :; do
-        attempts=$((attempts + 1))
-        sleep 2
-        DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
-        sleep 0.5
-        log "X11 dispatch $label precondition: active=$(DISPLAY="$X11_DISPLAY" xdotool getactivewindow 2>/dev/null || printf unavailable) geometry=$(x11_geometry)"
-        if env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 XDG_CONFIG_HOME="$X11_CONFIG" \
-            XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" "$BIN_PATH" --backend x11 \
-            --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1; then
-            rc=0
-        else
-            rc=$?
-        fi
-        if [[ "$rc" -eq 0 && -n "$expected" && "$attempts" -lt 5 ]] \
-            && ! wait_x11_geometry "$expected" 2 >/dev/null; then
-            log "Harness timing: $label dispatch did not reach '$expected'; retrying (attempt $((attempts + 1))/5)"
-            continue
-        fi
-        break
-    done
+    DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
+    log "X11 dispatch $label precondition: active=$(DISPLAY="$X11_DISPLAY" xdotool getactivewindow 2>/dev/null || printf unavailable) geometry=$(x11_geometry)"
+    if env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 XDG_CONFIG_HOME="$X11_CONFIG" \
+        XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" "$BIN_PATH" --backend x11 \
+        --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
     cat "$out" >>"$ASSERT_LOG"
     assert_eq "$label dispatch exit" 0 "$rc"
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
@@ -1176,11 +1165,19 @@ run_tui_lifecycle() {
 
     tui_control_checks "$tui_log" "$label"
 
+    if [[ "$backend" == x11 ]]; then
+        run_x11_dispatch tui-baseline alt+ctrl+up
+        x11_assert_geometry 'X11 TUI baseline' '640,0,640,1080'
+    fi
+
     send_app 'dispatch alt+ctrl+left'
     if wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8; then
         assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(<"$tui_log")"
     else
         assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
+    fi
+    if [[ "$backend" == x11 ]]; then
+        x11_assert_geometry 'X11 TUI dispatch moves window' '0,0,960,1080'
     fi
 
     send_app quit
@@ -3525,15 +3522,15 @@ run_x11() {
         return 0
     fi
 
-    run_x11_dispatch half alt+ctrl+left '0,0,960,1080'
+    run_x11_dispatch half alt+ctrl+left
     x11_assert_geometry 'x11-left-half' '0,0,960,1080'
-    run_x11_dispatch center-third alt+ctrl+up '640,0,640,1080'
+    run_x11_dispatch center-third alt+ctrl+up
     x11_assert_geometry 'x11-center-third' '640,0,640,1080'
-    run_x11_dispatch reset-before-two-thirds alt+ctrl+left '0,0,960,1080'
+    run_x11_dispatch reset-before-two-thirds alt+ctrl+left
     x11_assert_geometry 'x11-reset-before-two-thirds' '0,0,960,1080'
-    run_x11_dispatch two-thirds alt+ctrl+right '0,0,1280,1080'
+    run_x11_dispatch two-thirds alt+ctrl+right
     x11_assert_geometry 'x11-left-two-thirds' '0,0,1280,1080'
-    run_x11_dispatch next-display alt+ctrl+down '1920,0,1067,1080'
+    run_x11_dispatch next-display alt+ctrl+down
     x11_assert_geometry 'x11-next-display' '1920,0,1067,1080'
     local geometry center_x
     geometry=$(x11_geometry)
@@ -3549,7 +3546,7 @@ run_x11() {
     DISPLAY="$X11_DISPLAY" xdotool windowsize "$WINDOW_ID" 1280 1080 >/dev/null 2>&1 || true
     DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
     wait_x11_geometry '0,0,1280,1080' 5 >/dev/null || true
-    run_x11_dispatch previous-display alt+ctrl+shift+right '1920,0,1067,1080'
+    run_x11_dispatch previous-display alt+ctrl+shift+right
     x11_assert_geometry 'x11-previous-display' '1920,0,1067,1080'
     # Move back to the left display before the hotkey baseline.
     DISPLAY="$X11_DISPLAY" xdotool windowmove "$WINDOW_ID" 640 0 >/dev/null 2>&1 || true
@@ -3559,7 +3556,7 @@ run_x11() {
         log "Harness setup: could not reset hotkey baseline geometry (observed '$(x11_geometry)')"
     fi
 
-    run_x11_dispatch center-before-hotkey alt+ctrl+up '640,0,640,1080'
+    run_x11_dispatch center-before-hotkey alt+ctrl+up
     x11_assert_geometry 'x11-center-before-hotkey' '640,0,640,1080'
 
     # Real XRecord/XTEST hotkey capture through the running App.

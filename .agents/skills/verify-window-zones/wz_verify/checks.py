@@ -12,7 +12,7 @@ import sys
 import uuid
 
 from .runtime import CHECK_EPOCH, VALID, ZONES, digest, fail, load, save
-from .journeys import ANSI, session, smoke
+from .journeys import ANSI, session, smoke, tui_dispatch_action
 
 
 def differences(expected, actual, path="$"):
@@ -138,7 +138,10 @@ def check_e2e(workspace, prefix):
     after_error = native_run.partition("Config reload error:")[2]
     retained = re.search(r"binding count: (\d+)", after_error)
     action = re.findall(r"last action: (alt\+ctrl\+\w+)", native_run)
-    tui_action = re.findall(r"Last action: (alt\+ctrl\+\w+)", tui)
+    tui_action = tui_dispatch_action(tui)
+    if not re.search(r"^PASS X11 TUI dispatch moves window: expected '(-?\d+,-?\d+,\d+,\d+)' observed '\1'(?: \(screenshot [^\n]+\))?$",
+                     assertions, re.MULTILINE):
+        fail("Native TUI dispatch lacks independent matching window geometry. Inspect assertions.log.")
     captures = sorted(p.name for p in native.glob("*.png")
                       if p.name in {"x11-x11-left-half.png", "x11-x11-center-third.png", "x11-x11-left-two-thirds.png",
                                     "x11-x11-next-display.png", "x11-x11-previous-display.png", "x11-x11-real-hotkey.png"}
@@ -154,7 +157,7 @@ def check_e2e(workspace, prefix):
             "native_backend": "x11" if "Window backend: x11" in native_run else None,
             "hotkey_action": action[-1] if action else None, "retained_binding_count": int(retained.group(1)) if retained else None,
             "config_recovered": "Config state: Loaded" in after_error,
-            "tui_action": tui_action[-1] if tui_action else None, "run_closed": "Session closed." in native_run,
+            "tui_action": tui_action, "run_closed": "Session closed." in native_run,
             "tui_closed": "Session closed." in tui, "cancel_config_unchanged": workspace.config.read_bytes() == before_cancel,
             "persisted_dispatch": dispatch_observation(code, text, persisted)}
 

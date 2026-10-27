@@ -43,7 +43,9 @@ def parser(workspace):
     interactive.add_argument("--mode", choices=("run", "tui"), default="tui")
     interactive.add_argument("--journey", choices=("lifecycle", "reload", "watcher"), default="lifecycle")
     interactive.add_argument("--command", action="append", default=[], help="Literal user line; pair each with --expect. Overrides the built-in journey.")
-    interactive.add_argument("--expect", action="append", default=[], help="Literal observable result for the corresponding --command.")
+    interactive.add_argument("--expect", action="append", default=[],
+                             help="Literal result for the paired command. TUI dispatch also requires completed success; "
+                                  "intentional failures must expect 'Last error: dispatch: …'.")
     interactive.add_argument("--quit", choices=("quit", "q", "exit", "eof"), default="quit", help="Exit/cancel entry point, including terminal Ctrl-D.")
     native = drivers.add_parser("smoke", help="Run existing synthetic compositor gate, keeping assertions, logs and screenshots.",
                                epilog="gnome is seatless; kde-live is nested despite its name. Neither proves seated accelerator behavior. "

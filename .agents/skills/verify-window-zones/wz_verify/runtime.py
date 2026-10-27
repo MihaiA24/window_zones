@@ -69,13 +69,22 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def process_identity(pid):
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        return {"pid": pid, "start": fields[19], "state": fields[0]}
+    except (OSError, IndexError):
+        return None
+
+
 def process(pid):
+    identity = process_identity(pid)
+    if not identity:
+        return None
     try:
         proc = Path("/proc") / str(pid)
-        fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
         environment = (proc / "environ").read_bytes().split(b"\0")
-        return {"pid": pid, "start": fields[19], "state": fields[0],
-                "cwd": str((proc / "cwd").resolve(strict=True)),
+        return {**identity, "cwd": str((proc / "cwd").resolve(strict=True)),
                 "command": (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip(),
                 "checkout_marker": next((v.decode(errors="replace").split("=", 1)[1]
                                          for v in environment if v.startswith(b"WINDOW_ZONES_VERIFY_CHECKOUT=")), None),
@@ -161,6 +170,23 @@ class Workspace:
             return observed
         return None
 
+    def owns_runtime(self, marker):
+        if not marker:
+            return False
+        path = Path(marker)
+        try:
+            relative = path.relative_to(self.scratch)
+        except ValueError:
+            return False
+        if not relative.parts or ".." in relative.parts:
+            return False
+        current = self.scratch
+        for part in relative.parts:
+            current /= part
+            if current.is_symlink():
+                return False
+        return True
+
     def runtime_processes(self):
         result = []
         for directory in Path("/proc").iterdir():
@@ -173,7 +199,7 @@ class Workspace:
                 continue
             observed = process(int(directory.name))
             if (observed and observed["state"] != "Z" and observed["checkout_marker"] == str(self.root)
-                    and observed["runtime_marker"] == str(self.scratch / "runtime") and observed["pid"] != os.getpid()):
+                    and self.owns_runtime(observed["runtime_marker"]) and observed["pid"] != os.getpid()):
                 result.append(observed)
         return result
 
@@ -239,18 +265,25 @@ class Workspace:
                  "Refusing to attach. Stop it from its owning checkout, then retry.")
 
     def track(self, child):
-        details = process(child.pid)
+        if child.poll() is not None:
+            return
+        # An unreaped direct child is ours; cwd/environ can vanish before it exits.
+        details = process_identity(child.pid)
         if not details:
-            fail(f"Process {child.pid} exited before ownership could be recorded. Inspect logs, then cleanup.")
+            if child.poll() is not None:
+                return
+            fail(f"Cannot record ownership of live process {child.pid}. Inspect logs, then cleanup.")
         save(self.scratch / "active.json", details)
 
     def stop(self, child):
         if child.poll() is None:
-            os.killpg(child.pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGTERM)
             try:
                 child.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
         (self.scratch / "active.json").unlink(missing_ok=True)
 
@@ -262,10 +295,12 @@ class Workspace:
             started = time.perf_counter_ns()
             child = subprocess.Popen(command, cwd=self.root, env=environment or self.env(), stdout=out, stderr=err,
                                      stdin=subprocess.DEVNULL, start_new_session=True)
-            self.track(child)
             try:
+                self.track(child)
                 if timings is None:
                     rc = child.wait(timeout=timeout)
+                elif child.poll() is not None:
+                    rc = child.returncode
                 else:
                     finished = os.pidfd_open(child.pid)
                     try:
@@ -359,7 +394,14 @@ class Workspace:
             return
         running = self.active()
         runtime = self.runtime_processes()
-        mounts = [path for path in (self.scratch / "runtime/doc", self.scratch / "runtime/gvfs") if os.path.ismount(path)]
+        mounts = []
+        for directory, children, _ in os.walk(self.scratch, followlinks=False):
+            path = Path(directory)
+            children[:] = [name for name in children if not (path / name).is_symlink()]
+            if path.name == "runtime" and self.owns_runtime(str(path)):
+                mounts.extend(path / name for name in ("doc", "gvfs")
+                              if not (path / name).is_symlink() and os.path.ismount(path / name))
+                children.clear()
         plan = {"terminate": running, "terminate_runtime": runtime, "unmount": list(map(str, mounts)),
                 "remove": str(self.scratch), "retain_evidence": profile["evidence"]}
         print(json.dumps(plan, indent=2))
@@ -372,18 +414,24 @@ class Workspace:
                 select.select([], [], [], 0.1)
             if self.active():
                 fail(f"PID {running['pid']} did not stop. Inspect it before retrying cleanup; evidence is retained.")
-        for observed in runtime:
-            current = process(observed["pid"])
-            if current and current["start"] == observed["start"]:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(observed["pid"], signal.SIGTERM)
-        deadline = time.monotonic() + 5
-        while self.runtime_processes() and time.monotonic() < deadline:
-            select.select([], [], [], 0.1)
-        for observed in self.runtime_processes():
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(observed["pid"], signal.SIGKILL)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for observed in self.runtime_processes():
+                current = process(observed["pid"])
+                if (current and current["start"] == observed["start"]
+                        and current["checkout_marker"] == str(self.root)
+                        and current["runtime_marker"] == observed["runtime_marker"]
+                        and self.owns_runtime(current["runtime_marker"])):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(observed["pid"], sig)
+            deadline = time.monotonic() + 5
+            while self.runtime_processes() and time.monotonic() < deadline:
+                select.select([], [], [], 0.1)
+        remaining = self.runtime_processes()
+        if remaining:
+            fail(f"Runtime helpers did not stop: {remaining}. Inspect them before retrying cleanup; ownership and evidence are retained.")
         for path in mounts:
+            if path.is_symlink() or not self.owns_runtime(str(path.parent)):
+                fail(f"Unsafe runtime mount path {path}. Inspect it before retrying cleanup; ownership and evidence are retained.")
             if os.path.ismount(path):
                 unmount = subprocess.run(["fusermount3", "-u", str(path)], capture_output=True, text=True)
                 if unmount.returncode and os.path.ismount(path):

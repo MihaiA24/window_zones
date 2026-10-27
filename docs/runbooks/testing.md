@@ -15,7 +15,7 @@ What this verifies:
 - `bash -n scripts/*.sh` (shell syntax, including the 2000-line Smoke harness)
 - `node --check gnome-extension/extension.js`
 - `node --check kwin-script/contents/code/main.js`
-- `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, dry-run, freshness, evidence retention, JSON mismatches, median/spread, and application-only clock scope)
+- Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
 
 The repository test script covers formatting, unit/integration tests, doc tests,
 and clippy when installed. The GNOME and KDE adapter contract tests use fake
@@ -38,6 +38,12 @@ For direct smoke-runner integrations, `WINDOW_ZONES_BINARY` pins the app binary,
 `WINDOW_ZONES_SMOKE_ROOT` selects a new absolute scratch directory, and
 `WINDOW_ZONES_SMOKE_DISPLAY` selects a free X11 display number. An occupied
 display is rejected rather than attached to; retain proof with `--keep-logs`.
+
+X11 one-shot movement waits for the X server to acknowledge the configure request
+before its connection closes. The smoke runner dispatches each placement once,
+without retrying a reported success, then independently checks geometry. Its TUI
+check first establishes a different geometry and requires the dispatched move and
+completed response to succeed; a requested action label alone is not proof.
 
 ## V1 verification matrix
 

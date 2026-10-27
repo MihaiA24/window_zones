@@ -30,6 +30,8 @@ Teardown: `"$V" cleanup --dry-run`, then `"$V" cleanup`. An existing profile req
 
 `"$V" doctor` is read-only. Require exit 0, the expected checkout/profile/config, `build: current`, and no foreign display owner. `active_process: null` between short-lived drives is normal. During a drive it reports the recorded PID/start identity. Never borrow a live instance or copy another checkout's owner/build metadata.
 
+Direct-child ownership uses the stable `/proc` PID/start identity, not cwd/environment that can disappear during exit. Already-reaped commands retain their true output and exit status; a live child with unreadable stable identity fails and is stopped/reaped.
+
 Freshness compares content hashes of Rust/Cargo inputs, compositor code, scripts, the `verify` launcher and every `wz_verify/**/*.py` module, fixed-clock C source and default expected-result JSON, the Rust toolchain/build environment, and both binary hashes. Adding, changing or removing an implementation module invalidates old proof; bytecode caches are not inputs. A stale build is **not evidence**. Run cleanup, launch and the affected journeys again after source changes. Doctor does not rebuild to hide staleness. Each drive/check validates freshness before and after; a mid-run change invalidates the proof.
 
 ## Drive
@@ -93,7 +95,7 @@ Failures retain proof and remove the owned profile; fix the reported cause, then
 "$V" doctor
 ```
 
-Cleanup validates checkout/PID start identity and private-runtime markers, terminates only owned processes (including orphaned native helpers), unmounts its private portal/GVFS mounts, then removes scratch while preserving evidence/build metadata. Ownership survives a partial removal failure so cleanup can be retried. Never kill by process name or remove another display's lock/socket. Confirm evidence remains and doctor shows no launched profile/active instance/display; exit 1 after cleanup is expected (`launched: false`), while freshness remains separately visible. The smoke runner also tears down its compositor/window-manager/editor children.
+Cleanup validates UID, checkout/PID start identity and private-runtime markers, including native runtime directories nested beneath owned scratch; symlinked runtimes and sibling-prefix paths are not adopted. It terminates only owned processes (including orphaned native helpers), waits for them to stop after TERM/KILL, unmounts private portal/GVFS mounts, then removes scratch while preserving evidence/build metadata. Ownership survives a helper that will not stop or a partial removal failure so cleanup can be retried. Never kill by process name or remove another display's lock/socket. Confirm evidence remains and doctor shows no launched profile/active instance/display; exit 1 after cleanup is expected (`launched: false`), while freshness remains separately visible. The smoke runner also tears down its compositor/window-manager/editor children.
 
 ## Helpers
 
