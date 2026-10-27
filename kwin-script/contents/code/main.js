@@ -7,13 +7,6 @@ const PROTOCOL_MAJOR = 1;
 const REQUEST_MOVE = 'move';
 const REQUEST_REGISTER_HOTKEYS = 'register-hotkeys';
 
-const CAPABILITIES = [
-    'focused-window',
-    'displays',
-    'move-resize',
-    'hotkeys',
-];
-
 const MODIFIER_NAMES = new Map([
     ['alt', 'Alt'],
     ['ctrl', 'Ctrl'],

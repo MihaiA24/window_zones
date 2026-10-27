@@ -2,6 +2,6 @@
   "uuid": "window-zones@mihai-a24",
   "name": "Window Zones",
   "description": "Native Window Zones integration for GNOME Wayland.",
-  "shell-version": ["50"],
+  "shell-version": ["50", "51"],
   "version": 1
 }

@@ -1,6 +1,6 @@
 # GNOME Wayland Runbook
 
-The GNOME integration targets GNOME Shell 50 and uses the in-repository Shell extension as the compositor companion. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session.
+The GNOME integration targets GNOME Shell 50 and 51 and uses the in-repository Shell extension as the compositor companion. The Rust process is a client of the user-session D-Bus service; it does not fall back to X11 inside a Wayland session.
 
 ## Target version
 
@@ -10,6 +10,11 @@ Record the exact point release before a manual run:
 gnome-shell --version
 # Local reference run: GNOME Shell 50.4
 ```
+
+GNOME Shell 51.1 has passed the private Synthetic companion/capability/display,
+config reload and CLI/TUI journeys with extension-version validation enabled.
+Seated Shell 51 placement and accelerator capture remain unverified; the
+existing seated reference remains Shell 50.4.
 
 ## Install and enable the companion
 

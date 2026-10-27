@@ -393,6 +393,7 @@ mod tests {
         DispatchHotkeyError, DispatchState, HotkeyRegistrationState, Platform,
         resolve_config_path_for,
     };
+    use crate::window_system::FakeWindowSystem;
     use crate::{
         Action, Binding, DisplayGeometry, ExecuteActionError, FocusedWindow, HotkeyEvent,
         HotkeySystem, HotkeySystemError, Rect, WindowMove, WindowSystem, WindowSystemError,
@@ -1194,50 +1195,6 @@ action = { type = "move-to-zone", zone = "left-half" }
 
         fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
             self.events.pop_front().transpose()
-        }
-    }
-
-    #[derive(Debug)]
-    struct FakeWindowSystem {
-        focused_window: Result<Option<FocusedWindow>, WindowSystemError>,
-        displays: Result<Vec<DisplayGeometry>, WindowSystemError>,
-        moves: Vec<WindowMove>,
-        move_error: Option<WindowSystemError>,
-    }
-
-    impl FakeWindowSystem {
-        fn with_focus(display_id: &str, geometry: Rect) -> Self {
-            Self {
-                focused_window: Ok(Some(FocusedWindow::new(display_id, geometry))),
-                displays: Ok(vec![
-                    DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
-                    DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
-                ]),
-                moves: Vec::new(),
-                move_error: None,
-            }
-        }
-    }
-
-    impl WindowSystem for FakeWindowSystem {
-        fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-            self.focused_window.clone()
-        }
-
-        fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-            self.displays.clone()
-        }
-
-        fn move_focused_window(
-            &mut self,
-            window_move: WindowMove,
-        ) -> Result<(), WindowSystemError> {
-            if let Some(error) = self.move_error.clone() {
-                return Err(error);
-            }
-
-            self.moves.push(window_move);
-            Ok(())
         }
     }
 

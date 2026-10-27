@@ -7,7 +7,7 @@
   - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
   - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
 - (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
-- For GNOME Wayland, GNOME Shell 50 and `gnome-extensions` are required when
+- For GNOME Wayland, GNOME Shell 50 or 51 and `gnome-extensions` are required when
   using the optional companion; install steps are in
   `docs/runbooks/gnome-wayland.md`.
 - For KDE Plasma Wayland, `kpackagetool6` is required to install the KWin
