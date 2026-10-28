@@ -289,10 +289,18 @@ successful geometry check, outside the repository.
 
    Record the exact key sequence, `Dispatch state: Succeeded`, the observed
    frame, and the receiving application's behavior. Type `status` in the App
-   console to record `hotkey state: Registered`. This adapter uses a process-wide
-   rdev grab, not `RegisterHotKey`: it consumes registered combinations but
-   cannot detect or arbitrate other programs' global-hook ordering. Record any
-   collision with another global shortcut owner as a failed smoke check.
+   console to record `hotkey state: Registered`. The adapter owns a Win32
+   low-level hook, not `RegisterHotKey`, and waits for native readiness. It
+   consumes configured combinations but cannot arbitrate other programs'
+   hook ordering; record any collision as a failed smoke check.
+   On a Polish or German layout, verify AltGr+E/C still types the expected
+   characters and does not move the window. Left-Ctrl/right-Alt is reserved
+   for AltGr; use left-Alt for Ctrl+Alt bindings. After Ctrl+Alt+Del and Cancel,
+   plain Left/C/Backspace must remain ordinary editing keys.
+   Exercise actual hook timeout/removal, then `restart`, and require one working
+   listener with no duplicate dispatches. A native unhook regression is not
+   proof of an OS-induced timeout. Also load `--dry-run status` on pre-1903
+   Windows 10: optional `IsWindowArranged` lookup must not prevent startup.
 
 6. **Config reload atomicity with an invalid config.** Leave `run` active. In
    the observer PowerShell, replace the file with invalid TOML and wait at least

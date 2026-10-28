@@ -15,9 +15,6 @@ use parking_lot::Mutex;
 use crate::Rect;
 
 use super::companion::CompanionState;
-use super::kglobalaccel::{
-    KGLOBALACCEL_COMPONENT, KGLOBALACCEL_INTERFACE, KGLOBALACCEL_PATH, KGLOBALACCEL_SERVICE,
-};
 use super::protocol::{
     DISPLAYS_CAPABILITY, DisplayPayload, FOCUSED_WINDOW_CAPABILITY, HOTKEYS_CAPABILITY,
     KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_SERVICE_NAME, MOVE_RESIZE_CAPABILITY, parse_hotkeys,
@@ -50,7 +47,6 @@ pub(super) struct FakeServiceState {
     pub(super) request_error: Option<(&'static str, String)>,
     pub(super) move_error: Option<(&'static str, String)>,
     pub(super) move_observed: Option<Rect>,
-    pub(super) expose_stale_accelerator: bool,
     pub(super) focused: Option<(String, i32, i32, u32, u32)>,
     pub(super) displays: Vec<DisplayPayload>,
     pub(super) next_displays: Option<Vec<DisplayPayload>>,
@@ -75,7 +71,6 @@ impl FakeServiceState {
             request_error: None,
             move_error: None,
             move_observed: None,
-            expose_stale_accelerator: false,
             focused: Some(("window-1".to_string(), -300, -20, 801, 602)),
             displays: vec![
                 ("monitor-0".to_string(), -1920, 0, 1920, 1080),
@@ -151,14 +146,7 @@ impl FakeBus {
                     return;
                 }
             };
-            if let Err(error) = connection.request_name(KWIN_SERVICE_NAME, false, true, false) {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-            if state.lock().expose_stale_accelerator
-                && let Err(error) =
-                    connection.request_name(KGLOBALACCEL_SERVICE, false, true, false)
-            {
+            if let Err(error) = connection.request_name(KWIN_SERVICE_NAME, false, false, true) {
                 let _ = ready_tx.send(Err(error.to_string()));
                 return;
             }
@@ -186,12 +174,17 @@ impl FakeBus {
                                 .interface(KWIN_INTERFACE, ())
                                 .add_m(factory.method("RegisterCompanion", (), move |method| {
                                     let (protocol, reset): (String, bool) = method.msg.read2()?;
-                                    companion_state.lock().script_state.mark_ready(
-                                        protocol.parse().unwrap(),
-                                        sender_name(method.msg)?,
-                                        reset,
-                                    )?;
-                                    Ok(vec![method.msg.method_return()])
+                                    let pending_reply =
+                                        companion_state.lock().script_state.mark_ready(
+                                            protocol.parse().unwrap(),
+                                            sender_name(method.msg)?,
+                                            reset,
+                                        )?;
+                                    let reply = method.msg.method_return();
+                                    Ok(match pending_reply {
+                                        Some(pending) => vec![pending, reply],
+                                        None => vec![reply],
+                                    })
                                 }))
                                 .add_m(factory.method("NextRequest", (), move |method| {
                                     next_request_state
@@ -383,25 +376,6 @@ impl FakeBus {
                                     Ok(vec![reply])
                                 })),
                         ),
-                )
-                .add(
-                    factory.object_path(KGLOBALACCEL_PATH, ()).add(
-                        factory
-                            .interface(KGLOBALACCEL_INTERFACE, ())
-                            .add_m(factory.method("allMainComponents", (), move |method| {
-                                Ok(vec![
-                                    method
-                                        .msg
-                                        .method_return()
-                                        .append1(vec![vec![KGLOBALACCEL_COMPONENT.to_string()]]),
-                                ])
-                            }))
-                            .add_m(factory.method("shortcutKeys", (), move |method| {
-                                // A later, stale sampler must not veto a committed request.
-                                let keys: Vec<(Vec<i32>,)> = Vec::new();
-                                Ok(vec![method.msg.method_return().append1(keys)])
-                            })),
-                    ),
                 )
                 .add(factory.object_path("/", ()).introspectable());
             tree.start_receive(&connection);

@@ -1,3 +1,8 @@
+owned_process() {
+    /usr/bin/python3 "$SCRIPT_DIR/smoke/owned_process.py" "$1" \
+        "$PID_FILE" "$WINDOW_ZONES_SMOKE_OWNER" "$$" "${@:2}"
+}
+
 start_group() {
     local pid_variable=$1 log_file=$2
     shift 2
@@ -5,54 +10,59 @@ start_group() {
     setsid -- "$@" >"$log_file" 2>&1 &
     local child_pid=$!
     printf -v "$pid_variable" '%s' "$child_pid"
-    printf '%s\n' "$child_pid" >>"$PID_FILE"
-    printf '%s\n' "$child_pid" >>"$GROUP_PID_FILE"
+    owned_process register "$child_pid"
 }
 
 stop_pid() {
-    local pid=$1
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    [[ -n "$1" ]] || return 0
+    owned_process signal "$1" "${2:-TERM}"
 }
 
 wait_pid() {
-    local pid=$1 timeout_s=${2:-10} state
+    local pid=$1 timeout_s=${2:-10}
     local deadline=$((SECONDS + timeout_s))
-    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
-        state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
-        [[ "$state" == Z* ]] && break
+    while owned_process alive "$pid"; do
+        (( SECONDS < deadline )) || return 124
         sleep 0.1
     done
-    state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
-    if kill -0 "$pid" 2>/dev/null && [[ "$state" != Z* ]]; then
-        return 124
-    fi
     # The initial KWin service is an owned descendant of the launcher, not our child.
     [[ "${3:-child}" == external ]] && return 0
     wait "$pid"
 }
 
 cleanup() {
-    local pid
-    set +e
-    while read -r pid; do
-        [[ -n "$pid" ]] || continue
-        kill -- -"$pid" 2>/dev/null || true
-        kill "$pid" 2>/dev/null || true
-    done <"$GROUP_PID_FILE"
-    while read -r pid; do
-        [[ -n "$pid" ]] || continue
-        kill "$pid" 2>/dev/null || true
-    done <"$PID_FILE"
-    sleep 0.2
-    while read -r pid; do
-        [[ -n "$pid" ]] || continue
-        kill -KILL "$pid" 2>/dev/null || true
-    done <"$PID_FILE"
+    local rc=0
+    if [[ "$GNOME_LIVE_ACTIVE" -eq 1 ]]; then
+        restore_gnome_live || GNOME_LIVE_RESTORE_FAILURE=1
+    fi
+    if ! owned_process cleanup; then
+        KEEP_LOGS=1
+        rc=1
+    fi
+    if [[ "$GNOME_LIVE_RESTORE_FAILURE" -ne 0 ]]; then
+        KEEP_LOGS=1
+        rc=1
+    fi
     if [[ "$KEEP_LOGS" -eq 0 ]]; then
-        rm -rf "$TMP_DIR"
+        rm -rf "$TMP_DIR" || rc=1
     else
         printf 'Logs retained in %s\n' "$TMP_DIR"
     fi
+    return "$rc"
+}
+
+smoke_exit_trap() {
+    local status=$1
+    trap - EXIT
+    trap '' INT TERM
+    cleanup || status=1
+    exit "$status"
+}
+
+install_smoke_traps() {
+    trap 'smoke_exit_trap $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }
 
 start_fifo_app() {
@@ -68,7 +78,7 @@ start_fifo_app() {
         XDG_DATA_HOME="${XDG_DATA_HOME:-$TMP_DIR/data}" \
         "$BIN_PATH" --backend "$backend" --config "$CONFIG_PATH" "$mode" <"$fifo" >"$log_file" 2>&1 &
     APP_PID=$!
-    printf '%s\n' "$APP_PID" >>"$PID_FILE"
+    owned_process register "$APP_PID"
     exec {APP_FD}>"$fifo"
 }
 

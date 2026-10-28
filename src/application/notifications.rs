@@ -53,7 +53,9 @@ impl NotificationPolicy {
                 self.pending_outage = Some((since, event.to_string()));
                 return None;
             }
-            RuntimeEvent::ConfigFailed { .. } | RuntimeEvent::ConfigRejected { .. } => {
+            RuntimeEvent::ConfigFailed { .. }
+            | RuntimeEvent::ConfigPending { .. }
+            | RuntimeEvent::ConfigRejected { .. } => {
                 return Some(self.problem(ProblemKind::Config, event));
             }
             RuntimeEvent::HotkeysRejected { .. } => {
@@ -285,6 +287,34 @@ mod tests {
         assert_eq!(
             policy.tick(start + HOTKEY_OUTAGE_GRACE),
             Some(Notification::Problem(changed.to_string()))
+        );
+    }
+
+    #[test]
+    fn pending_config_notifies_and_only_acceptance_resolves_it() {
+        let mut policy = NotificationPolicy::default();
+        let start = Instant::now();
+        policy.event(
+            &RuntimeEvent::HotkeysUnavailable {
+                message: "companion absent".into(),
+            },
+            start,
+        );
+        let pending = RuntimeEvent::ConfigPending {
+            message: "hotkeys unavailable: companion absent".into(),
+        };
+        assert_eq!(
+            policy.event(&pending, start + Duration::from_secs(1)),
+            Some(Notification::Problem(pending.to_string()))
+        );
+        assert_eq!(
+            policy.event(&RuntimeEvent::HotkeysRecovered { count: 1 }, start),
+            None
+        );
+        let loaded = RuntimeEvent::ConfigLoaded { bindings: 1 };
+        assert_eq!(
+            policy.event(&loaded, start),
+            Some(Notification::Resolved(loaded.to_string()))
         );
     }
 

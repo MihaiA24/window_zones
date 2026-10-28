@@ -91,14 +91,70 @@ run_x11_adr9_window_checks() {
     x11_geometry_stable 5 || true
     xdotool windowactivate --sync "$a" >/dev/null 2>&1 || true
 
-    # Transactional grabs at the adapter seam: the ignored real-server test against this
-    # isolated display. The App-level replacement is checked in the run session below.
+    # Transactional grabs and keyboard remapping at the adapter seam, serially on this owned
+    # display before the App takes its grabs. No seated keyboard mapping is changed.
     local test_output='' test_rc=0
     test_output=$(WZ_X11_TEST_DISPLAY="$X11_DISPLAY" cargo test --locked \
         --manifest-path "$PROJECT_ROOT/Cargo.toml" --lib \
-        x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored 2>&1) || test_rc=$?
+        x11_real_server -- --ignored --test-threads=1 2>&1) || test_rc=$?
     printf '%s\n' "$test_output" >>"$ASSERT_LOG"
     assert_rc_zero 'X11 real-server grabs are exclusive, atomic and released' "$test_rc" \
-        'cargo test --lib x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored'
-    assert_text 'X11 real-server grab test ran' '1 passed' "$test_output"
+        'cargo test --lib x11_real_server -- --ignored --test-threads=1'
+    assert_text 'X11 real-server grab tests ran' '2 passed' "$test_output"
+    assert_text 'X11 real-server remapping and conflict test ran' \
+        'x11_real_server_remaps_accepted_grabs_and_fails_closed_on_conflict ... ok' "$test_output"
+}
+
+run_x11_constrained_restore_check() {
+    [[ -n "${SEAM_HELPER:-}" ]] || return 0
+    local saved_frame baseline='80,80,1400,800' hints="$X11_ROOT/original-normal-hints"
+    local saved_config="$X11_ROOT/pre-constrained-config.toml" run_log="$X11_ROOT/constrained-run.log"
+    local observed='' x='' y='' width='' height='' failed_before=0 succeeded_before=0
+    saved_frame=$(x11_geometry)
+    cp "$CONFIG_PATH" "$saved_config"
+    seam move "$WINDOW_ID" 80 80 1400 800 >/dev/null
+    x11_assert_geometry 'X11 constrained move original frame' "$baseline"
+    assert_eq 'X11 fixture minimum-width constraint installs' constrained \
+        "$(seam hints "$WINDOW_ID" "$hints" 1200)"
+    cat >>"$CONFIG_PATH" <<'EOF'
+
+[[bindings]]
+hotkey = "Alt+Ctrl+Backspace"
+action = { type = "restore" }
+EOF
+    start_fifo_app run x11 "$run_log"
+    wait_for_text "$run_log" 'Interactive session started' 15 || true
+    send_app status
+    wait_for_text "$run_log" 'hotkey state: Registered' 10 || true
+    assert_text 'X11 constrained move session registers' 'hotkey state: Registered' "$(<"$run_log")"
+    failed_before=$(count_text "$run_log" 'Dispatch state: Error')
+    send_app 'dispatch alt+ctrl+left'
+    wait_for_new_text "$run_log" 'Dispatch state: Error' "$failed_before" 10 || true
+    assert_eq 'X11 constrained move reports completed failure' 1 \
+        "$(( $(count_text "$run_log" 'Dispatch state: Error') > failed_before ? 1 : 0 ))"
+    assert_text 'X11 constrained move reports independent placement mismatch' \
+        'X11 window manager did not apply placement' "$(<"$run_log")"
+    x11_geometry_stable 5 || true
+    observed=$(x11_geometry)
+    IFS=, read -r x y width height <<<"$observed"
+    log "OBSERVED X11 constrained frame: $observed (requested 0,0,960,1080; original $baseline)"
+    local constrained=0
+    if [[ "$x" == 0 && "$y" == 0 && "$height" == 1080 && "$width" =~ ^[0-9]+$ ]] \
+        && (( width >= 1200 && width < 1400 )); then
+        constrained=1
+    fi
+    assert_eq 'X11 window manager really constrains the owned fixture' 1 "$constrained"
+    succeeded_before=$(count_text "$run_log" 'Dispatch state: Succeeded')
+    send_app 'dispatch alt+ctrl+backspace'
+    wait_for_new_text "$run_log" 'Dispatch state: Succeeded' "$succeeded_before" 10 || true
+    assert_eq 'X11 Restore succeeds after a constrained partial move' 1 \
+        "$(( $(count_text "$run_log" 'Dispatch state: Succeeded') > succeeded_before ? 1 : 0 ))"
+    x11_assert_geometry 'X11 constrained move Restore returns exact original frame' "$baseline"
+    stop_app_cleanly 'X11 constrained move session quits cleanly' "$run_log"
+    assert_eq 'X11 fixture original size hints restored' restored \
+        "$(seam hints "$WINDOW_ID" "$hints")"
+    cp "$saved_config" "$CONFIG_PATH"
+    IFS=, read -r x y width height <<<"$saved_frame"
+    seam move "$WINDOW_ID" "$x" "$y" "$width" "$height" >/dev/null
+    x11_assert_geometry 'X11 constrained check restores previous gate frame' "$saved_frame"
 }

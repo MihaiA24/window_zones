@@ -5,8 +5,9 @@ Users edit TOML bindings/zones, reload without losing the last valid configurati
 ## Sub-features
 
 - `config-path`: explicit `--config` and platform config discovery select the startup file.
-- `config-replace`: a valid rewrite replaces bindings; watcher polling and `reload` both expose the new state.
+- `config-replace`: a valid rewrite replaces bindings only after capture accepts it; watcher polling and `reload` expose acceptance.
 - `config-retain`: malformed TOML/validation/read failures expose errors while retaining the last valid runtime config.
+- `config-pending`: unavailable capture retains the active config and reports a pending replacement; an explicit reload reports its outcome even during an unchanged outage.
 - `config-empty`: missing file and empty TOML are distinct states with zero bindings.
 - `config-persist`: restart and a new process reload the on-disk file; runtime last action is not durable.
 
@@ -30,6 +31,8 @@ Preconditions:
 - **Persistence.** `"$V" drive config changed`, then `"$V" drive cli --expect 'last move: x=960 y=0 w=960 h=1080' -- dispatch Alt+Ctrl+Left` in a new process. Repeat status expecting count 1. This confirms disk contents, not only a live runtime cache. Restore valid afterward.
 - **Cancel.** `"$V" drive session --mode tui --command status --expect 'Config:' --quit eof` exits without an edit; compare the recorded config hashes. There is no config-edit dialog to cancel, so cancellation leaves the file unchanged.
 - **Native variants.** `"$V" drive smoke x11`, `drive smoke gnome` and `drive smoke kde-live` exercise their existing native retention/recovery paths. Keep the parse error, retained count/binding, successful recovery and new status, not just `failures: 0`.
+- **Deferred replacement.** In an isolated native session with unavailable capture, replace valid TOML and request `reload`. Require `Config reload pending`, unchanged active bindings and no dispatch through the unaccepted binding. Restore capture and require the replacement to become active.
+- **Stable symlink path.** On Sway/Hyprland, start through an owned config symlink, retarget it to another valid file and reload. New clients using the same pathname must still reach the runtime, including after in-process `restart`; config and dispatch identity must not freeze different targets.
 
 ## Gotchas
 

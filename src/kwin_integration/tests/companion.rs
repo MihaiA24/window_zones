@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 
 use dbus::blocking::Connection;
 
+use crate::HotkeySystemError;
+
 use super::super::protocol::{
     CALL_TIMEOUT, KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_PROTOCOL_MAJOR, KWIN_SERVICE_NAME,
-    NextRequestPayload, REQUEST_MOVE, REQUEST_REGISTER_HOTKEYS,
+    NextRequestPayload, REQUEST_MOVE, REQUEST_REGISTER_HOTKEYS, classify_dbus_error,
 };
 use super::super::server::run_kwin_companion_service;
 use super::super::test_bus::{FakeBus, FakeServiceState};
@@ -217,7 +219,7 @@ fn idle_next_request_waits_but_queued_move_wakes_it() {
 #[test]
 fn request_payloads_are_claimed_and_complete_atomically() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     let request_id = state.enqueue_move("window-1".to_string(), -123, 456, 777, 888);
@@ -251,7 +253,7 @@ fn request_payloads_are_claimed_and_complete_atomically() {
 #[test]
 fn request_ids_start_at_one_wrap_and_survive_reconnection() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     for expected in [1, u32::MAX, 1] {
@@ -266,7 +268,7 @@ fn request_ids_start_at_one_wrap_and_survive_reconnection() {
         assert!(state.request_result(expected).0);
     }
 
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "replacement-script".to_string(), true)
         .unwrap();
     assert_eq!(state.enqueue_refresh_displays(), 2);
@@ -277,7 +279,7 @@ fn request_ids_start_at_one_wrap_and_survive_reconnection() {
 #[test]
 fn rejected_hotkey_registration_keeps_previous_set() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
@@ -305,7 +307,7 @@ fn rejected_hotkey_registration_keeps_previous_set() {
 #[test]
 fn empty_registration_releases_controller_after_completion() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state
@@ -336,7 +338,7 @@ fn empty_registration_releases_controller_after_completion() {
 #[test]
 fn disconnect_release_does_not_release_the_next_controllers_claim() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state.authorize_controller("old".to_string()).unwrap();
@@ -366,7 +368,7 @@ fn disconnect_release_does_not_release_the_next_controllers_claim() {
 #[test]
 fn companion_reconnection_releases_keys_left_after_state_loss() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state.authorize_controller("old".to_string()).unwrap();
@@ -379,7 +381,7 @@ fn companion_reconnection_releases_keys_left_after_state_loss() {
     assert!(state.ensure_ready().is_err());
     state.owner_lost("old");
 
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), false)
         .unwrap();
     let (_, kind, _, _, _, _, _, hotkeys) = state.next_request("kwin-script").unwrap();
@@ -388,9 +390,86 @@ fn companion_reconnection_releases_keys_left_after_state_loss() {
 }
 
 #[test]
+fn script_reset_makes_inflight_registration_retryable() {
+    let mut state = CompanionState::default();
+    let _ = state
+        .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
+        .unwrap();
+    state
+        .authorize_controller("controller".to_string())
+        .unwrap();
+    let hotkeys = vec!["alt+ctrl+left".to_string()];
+    let interrupted = state.enqueue_hotkeys(hotkeys.clone());
+    assert_eq!(state.next_request("kwin-script").unwrap().0, interrupted);
+
+    let _ = state
+        .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
+        .unwrap();
+    let (complete, name, message) = state.request_result(interrupted);
+    assert!(complete);
+    assert!(matches!(
+        classify_dbus_error(dbus::Error::new_custom(&name, &message)).into_hotkey_error(),
+        HotkeySystemError::Unavailable(_)
+    ));
+    assert!(state.registered_hotkeys.is_empty());
+
+    let retry = state.enqueue_hotkeys(hotkeys.clone());
+    assert_ne!(retry, interrupted);
+    assert_eq!(state.next_request("kwin-script").unwrap().0, retry);
+    assert!(
+        state
+            .complete_request(interrupted, true, String::new(), String::new())
+            .is_err(),
+        "a stale completion must not commit the retry"
+    );
+    state
+        .complete_request(retry, true, String::new(), String::new())
+        .unwrap();
+    assert_eq!(
+        state.request_result(retry),
+        (true, String::new(), String::new())
+    );
+    assert_eq!(state.registered_hotkeys, hotkeys);
+}
+
+#[test]
+fn script_reset_invalidates_its_deferred_poll_before_restored_requests() {
+    let mut state = CompanionState::default();
+    let _ = state
+        .mark_ready(KWIN_PROTOCOL_MAJOR, ":1.20".to_string(), true)
+        .unwrap();
+    state.registered_hotkeys = vec!["alt+ctrl+left".to_string()];
+    let mut call = dbus::Message::new_method_call(
+        KWIN_SERVICE_NAME,
+        KWIN_OBJECT_PATH,
+        KWIN_INTERFACE,
+        "NextRequest",
+    )
+    .unwrap();
+    call.set_serial(7);
+    call.set_sender(Some(":1.20".into()));
+    assert!(state.poll_next_request(&call).unwrap().is_empty());
+
+    let mut cancelled = state
+        .mark_ready(KWIN_PROTOCOL_MAJOR, ":1.20".to_string(), true)
+        .unwrap()
+        .expect("reset must answer the obsolete poll without claiming restored keys");
+    assert_eq!(cancelled.get_reply_serial(), Some(7));
+    assert_eq!(
+        cancelled.as_result().unwrap_err().name(),
+        Some("org.window_zones.KWin.Error.Unavailable")
+    );
+    assert!(state.pending_next_request.is_none());
+    assert!(state.take_next_request_reply(Instant::now()).is_none());
+    let restored = state.next_request(":1.20").unwrap();
+    assert_eq!(restored.1, REQUEST_REGISTER_HOTKEYS);
+    assert_eq!(restored.7, r#"["alt+ctrl+left"]"#);
+}
+
+#[test]
 fn script_reset_requeues_registered_hotkeys_once() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state
@@ -404,7 +483,7 @@ fn script_reset_requeues_registered_hotkeys_once() {
         .unwrap();
     let _ = state.request_result(first);
 
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     assert_eq!(state.controller_sender.as_deref(), Some("window-zones-1"));
@@ -417,7 +496,7 @@ fn script_reset_requeues_registered_hotkeys_once() {
         .unwrap();
     let _ = state.request_result(request_id);
 
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), false)
         .unwrap();
     assert_eq!(
@@ -437,7 +516,7 @@ fn script_reset_requeues_registered_hotkeys_once() {
 #[test]
 fn sender_ownership_is_enforced_and_released() {
     let mut state = CompanionState::default();
-    state
+    let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state

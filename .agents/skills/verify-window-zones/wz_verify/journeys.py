@@ -12,7 +12,7 @@ import subprocess
 import termios
 import time
 
-from .runtime import fail
+from .runtime import fail, gnome_resource_environment
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -181,13 +181,16 @@ def smoke_summary(text, gate):
 
 def smoke(workspace, options):
     required = {"x11": ["Xvfb", "openbox", "xdotool", "xrandr", "xprop", "xdpyinfo", "gnome-text-editor", "ffmpeg", "dbus-run-session"],
-                "gnome": ["gnome-shell", "gjs", "dbus-run-session", "gnome-text-editor"],
+                "gnome": ["gnome-shell", "dbus-daemon", "/usr/bin/python3", "gst-launch-1.0",
+                          "gst-inspect-1.0", "gsettings", "Xwayland"],
                 "kde-live": ["kwin_wayland", "kpackagetool6", "kwriteconfig6", "busctl", "gjs", "xdotool",
                              "xprop", "dbus-run-session", "python", "setsid", "gnome-text-editor"]}
     missing = [tool for tool in required[options.gate] if not shutil.which(tool)]
     if missing:
         fail(f"Missing {', '.join(missing)}. Install the prerequisites in docs/runbooks/testing.md; do not substitute a fake compositor.")
+    resources = gnome_resource_environment() if options.gate == "gnome" else {}
     environment = workspace.env()
+    environment.update(resources)
     label = options.gate + "-" + str(time.time_ns())
     native_state = workspace.scratch / label
     native_proof = workspace.artifact() / label
@@ -202,7 +205,7 @@ def smoke(workspace, options):
         # Preserve proof files, not compositor sockets, profiles or application data.
         for path in native_state.rglob("*"):
             relative = path.relative_to(native_state)
-            if path.is_file() and not any(part in {"home", "config", "data", "runtime", "cache", "state"}
+            if path.is_file() and not any(part in {"home", "config", "data", "runtime", "cache", "state", "target"}
                                           for part in relative.parts[:-1]):
                 destination = native_proof / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)

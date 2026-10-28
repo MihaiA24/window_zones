@@ -251,11 +251,7 @@ impl WindowSystem for X11WindowSystem {
         let mut size = frame_target_size(window_move.target, Self::frame_extents(&conn, window)?)?;
         let restore_states = [maximized_horz, maximized_vert, shaded];
         let restoring = states.iter().any(|atom| restore_states.contains(atom));
-        let before = if restoring {
-            Some(Self::focused_window_geometry(&conn, window, root)?)
-        } else {
-            None
-        };
+        let before = Self::focused_window_geometry(&conn, window, root)?;
         let result = (|| {
             if restoring {
                 for removed in [[maximized_horz, maximized_vert], [shaded, 0]] {
@@ -303,7 +299,7 @@ impl WindowSystem for X11WindowSystem {
                 .height(height)
                 .border_width(0);
 
-            // Wait for the server before dropping this short-lived connection.
+            // The server acknowledgement only queues the WM's ConfigureRequest.
             conn.configure_window(window, &values)
                 .map_err(|error| {
                     WindowSystemError::Platform(format!(
@@ -312,15 +308,27 @@ impl WindowSystem for X11WindowSystem {
                 })?
                 .check()
                 .map_err(|error| window_reply_error(window, "configure window", error))?;
-            Ok(())
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            observe_placement(
+                before,
+                window_move.target,
+                || Self::focused_window_geometry(&conn, window, root),
+                || {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    true
+                },
+            )
         })();
         result.map_err(|error| {
-            if matches!(error, WindowSystemError::WindowGone(_)) {
+            if matches!(
+                error,
+                WindowSystemError::WindowGone(_) | WindowSystemError::PartialMove { .. }
+            ) {
                 return error;
             }
-            let Some(before) = before else {
-                return error;
-            };
             match Self::focused_window_geometry(&conn, window, root) {
                 Ok(observed) if observed != before => WindowSystemError::PartialMove {
                     observed,
@@ -330,6 +338,31 @@ impl WindowSystem for X11WindowSystem {
                 _ => error,
             }
         })
+    }
+}
+
+fn observe_placement(
+    before: Rect,
+    target: Rect,
+    mut observe: impl FnMut() -> Result<Rect, WindowSystemError>,
+    mut wait: impl FnMut() -> bool,
+) -> Result<(), WindowSystemError> {
+    loop {
+        let observed = observe()?;
+        if observed == target {
+            return Ok(());
+        }
+        if wait() {
+            continue;
+        }
+        let message = format!(
+            "X11 window manager did not apply placement: requested {target:?}, observed {observed:?}"
+        );
+        return Err(if observed != before {
+            WindowSystemError::PartialMove { observed, message }
+        } else {
+            WindowSystemError::Platform(message)
+        });
     }
 }
 
@@ -502,6 +535,11 @@ fn collect_struts(
     root_width: u32,
     root_height: u32,
 ) -> Result<Vec<Strut>, WindowSystemError> {
+    let clients = property_values(conn, root, "_NET_CLIENT_LIST", AtomEnum::WINDOW, u32::MAX)?;
+    let current_desktop =
+        property_values(conn, root, "_NET_CURRENT_DESKTOP", AtomEnum::CARDINAL, 1)?
+            .first()
+            .copied();
     let mut windows = conn
         .query_tree(root)
         .map_err(|error| {
@@ -512,42 +550,99 @@ fn collect_struts(
             WindowSystemError::Platform(format!("failed to read root windows: {error}"))
         })?
         .children;
-    windows.extend(property_values(
-        conn,
-        root,
-        "_NET_CLIENT_LIST",
-        AtomEnum::WINDOW,
-        u32::MAX,
-    )?);
+    windows.extend(&clients);
     windows.sort_unstable();
     windows.dedup();
     let mut struts = Vec::new();
     for window in windows {
-        let partial = match property_values(
+        match window_strut(
             conn,
             window,
-            "_NET_WM_STRUT_PARTIAL",
-            AtomEnum::CARDINAL,
-            12,
+            clients.contains(&window),
+            current_desktop,
+            root_width,
+            root_height,
         ) {
-            Ok(values) => values,
-            Err(WindowSystemError::WindowGone(_)) => continue,
+            Ok(Some(strut)) => struts.push(strut),
+            Ok(None) | Err(WindowSystemError::WindowGone(_)) => {}
             Err(error) => return Err(error),
-        };
-        let values = if partial.len() == 12 {
-            partial
-        } else {
-            match property_values(conn, window, "_NET_WM_STRUT", AtomEnum::CARDINAL, 4) {
-                Ok(values) => values,
-                Err(WindowSystemError::WindowGone(_)) => continue,
-                Err(error) => return Err(error),
-            }
-        };
-        if let Some(strut) = Strut::from_values(&values, root_width, root_height) {
-            struts.push(strut);
         }
     }
     Ok(struts)
+}
+
+fn strut_window_is_eligible(
+    managed: bool,
+    override_redirect: bool,
+    map_state: xproto::MapState,
+    wm_state: Option<u32>,
+    desktop: Option<u32>,
+    current_desktop: Option<u32>,
+) -> bool {
+    // Managed auto-hide panels may be unmapped and still reserve their reveal edge.
+    let active = if managed {
+        wm_state != Some(0) // ICCCM WithdrawnState.
+    } else {
+        override_redirect && map_state == xproto::MapState::VIEWABLE
+    };
+    active
+        && match (desktop, current_desktop) {
+            (Some(desktop), Some(current)) => desktop == u32::MAX || desktop == current,
+            _ => true,
+        }
+}
+
+fn window_strut(
+    conn: &RustConnection,
+    window: Window,
+    managed: bool,
+    current_desktop: Option<u32>,
+    root_width: u32,
+    root_height: u32,
+) -> Result<Option<Strut>, WindowSystemError> {
+    let attributes = conn
+        .get_window_attributes(window)
+        .map_err(|error| {
+            WindowSystemError::Platform(format!("failed to query strut window: {error}"))
+        })?
+        .reply()
+        .map_err(|error| window_reply_error(window, "query strut window", error))?;
+    if !managed
+        && (!attributes.override_redirect || attributes.map_state != xproto::MapState::VIEWABLE)
+    {
+        return Ok(None);
+    }
+    let wm_state = if managed {
+        property_values(conn, window, "WM_STATE", AtomEnum::ANY, 2)?
+            .first()
+            .copied()
+    } else {
+        None
+    };
+    let desktop = property_values(conn, window, "_NET_WM_DESKTOP", AtomEnum::CARDINAL, 1)?;
+    if !strut_window_is_eligible(
+        managed,
+        attributes.override_redirect,
+        attributes.map_state,
+        wm_state,
+        desktop.first().copied(),
+        current_desktop,
+    ) {
+        return Ok(None);
+    }
+    let partial = property_values(
+        conn,
+        window,
+        "_NET_WM_STRUT_PARTIAL",
+        AtomEnum::CARDINAL,
+        12,
+    )?;
+    let values = if partial.len() == 12 {
+        partial
+    } else {
+        property_values(conn, window, "_NET_WM_STRUT", AtomEnum::CARDINAL, 4)?
+    };
+    Ok(Strut::from_values(&values, root_width, root_height))
 }
 
 fn usable_area(bounds: Rect, root_width: u32, root_height: u32, struts: &[Strut]) -> Rect {
@@ -588,6 +683,130 @@ fn usable_area(bounds: Rect, root_width: u32, root_height: u32, struts: &[Strut]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x11_placement_waits_for_the_identified_frame_and_keeps_constraints() {
+        let before = Rect::new(100, 100, 800, 600);
+        let target = Rect::new(0, 0, 960, 1080);
+        let constrained = Rect::new(0, 0, 1200, 1080);
+        let mut frames = [before, constrained, target].into_iter();
+        assert_eq!(
+            observe_placement(before, target, || Ok(frames.next().unwrap()), || true),
+            Ok(())
+        );
+        let mut frames = [before, constrained, constrained].into_iter();
+        let mut waits = [true, true, false].into_iter();
+        assert!(matches!(
+            observe_placement(
+                before,
+                target,
+                || Ok(frames.next().unwrap()),
+                || waits.next().unwrap()
+            ),
+            Err(WindowSystemError::PartialMove { observed, .. }) if observed == constrained
+        ));
+        let one_pixel_short = Rect::new(0, 0, 959, 1080);
+        assert!(matches!(
+            observe_placement(before, target, || Ok(one_pixel_short), || false),
+            Err(WindowSystemError::PartialMove { observed, .. }) if observed == one_pixel_short
+        ));
+        assert!(matches!(
+            observe_placement(before, target, || Ok(before), || false),
+            Err(WindowSystemError::Platform(_))
+        ));
+        let gone = WindowSystemError::WindowGone(WindowId::new("123"));
+        assert_eq!(
+            observe_placement(before, target, || Err(gone.clone()), || false),
+            Err(gone)
+        );
+        assert_eq!(
+            observe_placement(before, before, || Ok(before), || false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn x11_constrained_observation_keeps_restore_history() {
+        use crate::window_system::FakeWindowSystem;
+        use crate::{Action, ExecuteActionError, WindowHistory, execute_action};
+        use std::collections::BTreeMap;
+
+        let original = Rect::new(100, 100, 800, 600);
+        let requested = Rect::new(0, 0, 960, 1080);
+        let constrained = Rect::new(0, 0, 1200, 1080);
+        let mut system = FakeWindowSystem::with_focus(original);
+        system.move_error =
+            observe_placement(original, requested, || Ok(constrained), || false).err();
+        let mut history = WindowHistory::default();
+        assert!(matches!(
+            execute_action(
+                &Action::MoveToZone { zone: "left-half".to_string() },
+                &BTreeMap::new(),
+                &mut history,
+                &mut system,
+            ),
+            Err(ExecuteActionError::WindowSystem(WindowSystemError::PartialMove {
+                observed, ..
+            })) if observed == constrained
+        ));
+        system.move_error = None;
+        execute_action(
+            &Action::Restore {},
+            &BTreeMap::new(),
+            &mut history,
+            &mut system,
+        )
+        .unwrap();
+        assert_eq!(system.focused_window().unwrap().unwrap().geometry, original);
+    }
+
+    #[test]
+    fn x11_struts_follow_managed_lifetime_and_current_desktop_not_visibility() {
+        use xproto::MapState;
+
+        let eligible = |managed, override_redirect, map_state, wm_state, desktop| {
+            strut_window_is_eligible(
+                managed,
+                override_redirect,
+                map_state,
+                wm_state,
+                desktop,
+                Some(2),
+            )
+        };
+        assert!(!eligible(false, false, MapState::VIEWABLE, None, None));
+        assert!(!eligible(false, false, MapState::UNMAPPED, Some(0), None));
+        assert!(!eligible(true, false, MapState::UNMAPPED, Some(0), None));
+        assert!(eligible(false, true, MapState::VIEWABLE, None, None));
+        assert!(!eligible(false, true, MapState::UNMAPPED, None, None));
+        assert!(eligible(true, false, MapState::UNMAPPED, Some(1), Some(2)));
+        assert!(eligible(
+            true,
+            false,
+            MapState::UNMAPPED,
+            Some(3),
+            Some(u32::MAX)
+        ));
+        assert!(!eligible(true, false, MapState::VIEWABLE, Some(1), Some(1)));
+        assert!(!eligible(false, true, MapState::VIEWABLE, None, Some(1)));
+        assert!(eligible(true, false, MapState::VIEWABLE, None, None));
+
+        let struts: Vec<_> = [
+            (false, Some(2), 70),
+            (true, Some(1), 60),
+            (true, Some(2), 2),
+        ]
+        .into_iter()
+        .filter(|(managed, desktop, _)| {
+            eligible(*managed, false, MapState::UNMAPPED, Some(1), *desktop)
+        })
+        .map(|(_, _, top)| Strut::from_values(&[0, 0, top, 0], 1920, 1080).unwrap())
+        .collect();
+        assert_eq!(
+            usable_area(Rect::new(0, 0, 1920, 1080), 1920, 1080, &struts),
+            Rect::new(0, 2, 1920, 1078)
+        );
+    }
 
     #[test]
     fn fixed_size_requires_both_valid_minimum_and_maximum_hints() {

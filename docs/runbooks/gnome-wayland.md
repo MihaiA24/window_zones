@@ -137,6 +137,8 @@ $HOME/.local/bin/window_zones --backend auto status
 ```
 
 Expected status identifies `gnome-wayland` and reports the companion capabilities. If the extension is disabled or absent, status remains usable and reports the GNOME companion as unavailable. Actions and hotkey registration fail explicitly until the companion returns; X11 is not selected as a fallback.
+Explicit status/capability probes query the current companion, so TUI refresh
+can observe disappearance and recovery without first attempting a move.
 
 Zone and display actions automatically restore a maximized or GNOME-tiled
 window before applying the requested frame. A maximized window moved to
@@ -148,7 +150,8 @@ Repeated left/right-half placement crosses to the nearest physically
 left/right display and lands on the half nearest the source. With no
 neighbour it stays at the outer edge; explicit next/previous-display actions
 still wrap. Normal, maximized, and tiled placements use a single 250 ms
-compositor transition, respecting disabled animations and reduced motion.
+compositor transition, respecting disabled animations. GNOME 51's reduced-motion
+preference is optional; its absent API does not disable GNOME 50 placement.
 Use [`--perf-log PATH`](running.md#performance-logging) to record per-move
 request/completion times and Linux App-process memory.
 
@@ -227,6 +230,9 @@ Automated `gnome-live` requires writable `/dev/uinput` and fails its preflight
 without it; it has no XTEST or physical-key fallback. Physical key presses can
 provide separate manual evidence, but a direct dispatch is not
 accelerator-delivery evidence.
+The automated gate presses each placement accelerator once, then waits for
+observed geometry. It only adopts the fixture's PID; a matching title in
+another application is not ownership.
 
 If an administrator explicitly approves temporary injector access, grant it
 only to the current user, save the original ACL, and restore it even if the

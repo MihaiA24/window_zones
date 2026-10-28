@@ -6,7 +6,9 @@ use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
 use x11rb::protocol::xkb::{self, ConnectionExt as XkbConnectionExt};
-use x11rb::protocol::xproto::{ConnectionExt as XProtoConnectionExt, GrabMode, ModMask, Window};
+use x11rb::protocol::xproto::{
+    ConnectionExt as XProtoConnectionExt, GrabMode, Mapping, ModMask, Window,
+};
 use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 
@@ -142,12 +144,16 @@ fn run_listener(
     let root = conn.setup().roots[screen].root;
     enable_detectable_repeat(&conn)?;
     let mut grabs = Grabs::new();
+    let mut accepted = Vec::new();
     let mut pressed = [false; 256];
     loop {
         match commands.recv_timeout(Duration::from_millis(5)) {
             Ok(Command::Register(hotkeys, response)) => {
                 let result = resolve_grabs(&conn, &hotkeys)
                     .and_then(|new| replace_grabs(&conn, root, &mut grabs, new));
+                if result.is_ok() {
+                    accepted = hotkeys;
+                }
                 let failed = match &result {
                     Err(error @ HotkeySystemError::Unavailable(_)) => Some(error.clone()),
                     _ => None,
@@ -172,7 +178,7 @@ fn run_listener(
                     if std::mem::replace(&mut pressed[usize::from(event.detail)], true) {
                         continue;
                     }
-                    let modifiers = u16::from(event.state) & 0xff & !lock_mask();
+                    let modifiers = u16::from(event.state) & 0xff;
                     if let Some(hotkey) = grabs.get(&(event.detail, modifiers)) {
                         let _ = events.send(HotkeyEvent::Pressed {
                             hotkey: hotkey.clone(),
@@ -182,12 +188,33 @@ fn run_listener(
                 Event::KeyRelease(event) => {
                     pressed[usize::from(event.detail)] = false;
                 }
+                event if keyboard_mapping_changed(&event) => {
+                    // A rejected remap cannot retain grabs for the old physical keys.
+                    // Closing this connection releases them and reports a listener failure.
+                    resolve_grabs(&conn, &accepted)
+                        .and_then(|new| replace_grabs(&conn, root, &mut grabs, new))
+                        .map_err(|error| {
+                            unavailable(format!(
+                                "rebuild grabs after keyboard mapping change: {error}"
+                            ))
+                        })?;
+                }
                 Event::Error(error) => {
                     return Err(unavailable(format!("process X11 request: {error:?}")));
                 }
                 _ => {}
             }
         }
+    }
+}
+
+fn keyboard_mapping_changed(event: &Event) -> bool {
+    match event {
+        Event::MappingNotify(event) => {
+            event.request == Mapping::KEYBOARD || event.request == Mapping::MODIFIER
+        }
+        Event::XkbMapNotify(_) | Event::XkbNewKeyboardNotify(_) => true,
+        _ => false,
     }
 }
 
@@ -218,6 +245,21 @@ fn enable_detectable_repeat(conn: &RustConnection) -> Result<(), HotkeySystemErr
     if reply.value & repeat != repeat {
         return Err(unavailable("enable XKB detectable auto-repeat"));
     }
+    let map = xkb::MapPart::KEY_SYMS
+        | xkb::MapPart::MODIFIER_MAP
+        | xkb::MapPart::VIRTUAL_MODS
+        | xkb::MapPart::VIRTUAL_MOD_MAP;
+    conn.xkb_select_events(
+        u16::from(xkb::ID::USE_CORE_KBD),
+        xkb::EventType::default(),
+        xkb::EventType::NEW_KEYBOARD_NOTIFY | xkb::EventType::MAP_NOTIFY,
+        map,
+        map,
+        &xkb::SelectEventsAux::default(),
+    )
+    .map_err(|error| unavailable(format!("watch keyboard mapping: {error}")))?
+    .check()
+    .map_err(|error| unavailable(format!("watch keyboard mapping: {error}")))?;
     Ok(())
 }
 
@@ -233,22 +275,39 @@ fn resolve_grabs(conn: &RustConnection, hotkeys: &[String]) -> Result<Grabs, Hot
         .map_err(|error| unavailable(format!("read keyboard mapping: {error}")))?
         .reply()
         .map_err(|error| unavailable(format!("read keyboard mapping: {error}")))?;
+    let modifiers = conn
+        .get_modifier_mapping()
+        .map_err(|error| unavailable(format!("read modifier mapping: {error}")))?
+        .reply()
+        .map_err(|error| unavailable(format!("read modifier mapping: {error}")))?;
+    grabs_for_mapping(
+        hotkeys,
+        setup.min_keycode,
+        mapping.keysyms_per_keycode,
+        &mapping.keysyms,
+        &modifiers.keycodes,
+    )
+}
+
+fn grabs_for_mapping(
+    hotkeys: &[String],
+    min_keycode: u8,
+    width: u8,
+    keysyms: &[u32],
+    modifier_keycodes: &[u8],
+) -> Result<Grabs, HotkeySystemError> {
+    let locks = lock_mask(min_keycode, width, keysyms, modifier_keycodes);
     let mut grabs = Grabs::new();
     for hotkey in hotkeys {
         let (keysym, modifiers) = parse_hotkey(hotkey)?;
-        let codes = keycodes_for_keysym(
-            setup.min_keycode,
-            mapping.keysyms_per_keycode,
-            &mapping.keysyms,
-            keysym,
-        );
+        let codes = keycodes_for_keysym(min_keycode, width, keysyms, keysym);
         if codes.is_empty() {
             return Err(HotkeySystemError::Rejected(format!(
                 "{hotkey} is unavailable in the X11 keyboard mapping; choose a mapped key"
             )));
         }
         for code in codes {
-            for variant in lock_variants(modifiers) {
+            for variant in lock_variants(modifiers, locks) {
                 if let Some(previous) = grabs.insert((code, variant), hotkey.clone())
                     && previous != *hotkey
                 {
@@ -321,19 +380,36 @@ fn ungrab_all(
         .map_err(|error| unavailable(format!("flush key grabs: {error}")))
 }
 
-fn lock_mask() -> u16 {
-    u16::from(ModMask::LOCK | ModMask::M2)
+fn lock_mask(min: u8, width: u8, keysyms: &[u32], modifier_keycodes: &[u8]) -> u16 {
+    let per_modifier = modifier_keycodes.len() / 8;
+    if width == 0 || per_modifier == 0 {
+        return 0;
+    }
+    modifier_keycodes
+        .chunks_exact(per_modifier)
+        .enumerate()
+        .filter(|(_, codes)| {
+            codes.iter().any(|code| {
+                let Some(index) = code.checked_sub(min) else {
+                    return false;
+                };
+                let start = usize::from(index) * usize::from(width);
+                keysyms
+                    .get(start..start + usize::from(width))
+                    .is_some_and(|symbols| symbols.contains(&0xffe5) || symbols.contains(&0xff7f))
+            })
+        })
+        .fold(0, |mask, (index, _)| mask | (1 << index))
 }
 
-fn lock_variants(modifiers: u16) -> [u16; 4] {
-    let lock = u16::from(ModMask::LOCK);
-    let numlock = u16::from(ModMask::M2);
-    [
-        modifiers,
-        modifiers | lock,
-        modifiers | numlock,
-        modifiers | lock | numlock,
-    ]
+fn lock_variants(modifiers: u16, locks: u16) -> impl Iterator<Item = u16> {
+    let locks = locks & !modifiers;
+    let mut next = Some(0u16);
+    std::iter::from_fn(move || {
+        let variant = next?;
+        next = (variant != locks).then(|| variant.wrapping_sub(locks) & locks);
+        Some(modifiers | variant)
+    })
 }
 
 fn keycodes_for_keysym(min: u8, width: u8, mapping: &[u32], keysym: u32) -> Vec<u8> {
@@ -508,11 +584,83 @@ mod tests {
     }
 
     #[test]
-    fn x11_hotkeys_grab_all_capslock_numlock_variants() {
-        assert_eq!(lock_variants(4 | 8), [12, 14, 28, 30]);
-        for state in lock_variants(4 | 8) {
-            assert_eq!(state & !lock_mask(), 4 | 8);
+    fn x11_hotkeys_derive_lock_variants_from_actual_modifier_slots() {
+        let symbols = [0x61, 0x41, 0xffe5, 0, 0xff7f, 0];
+        let modifier_codes = [0, 9, 0, 0, 0, 10, 0, 0];
+        let locks = lock_mask(8, 2, &symbols, &modifier_codes);
+        assert_eq!(locks, 2 | 32);
+        assert_eq!(
+            lock_variants(4 | 8, locks).collect::<Vec<_>>(),
+            [12, 14, 44, 46]
+        );
+        let grabs =
+            grabs_for_mapping(&["ctrl+a".to_string()], 8, 2, &symbols, &modifier_codes).unwrap();
+        for modifiers in lock_variants(4, locks) {
+            assert_eq!(
+                grabs.get(&(8, modifiers)).map(String::as_str),
+                Some("ctrl+a")
+            );
         }
+        assert!(!grabs.contains_key(&(8, 4 | 16))); // Mod2 is not a lock in this map.
+        assert_eq!(lock_variants(4, 0).collect::<Vec<_>>(), [4]);
+        assert_eq!(lock_variants(4, 4).collect::<Vec<_>>(), [4]);
+        assert_eq!(lock_mask(8, 0, &symbols, &modifier_codes), 0);
+        assert_eq!(lock_mask(8, 2, &symbols, &[]), 0);
+    }
+
+    #[test]
+    fn x11_hotkeys_rebuild_keycodes_and_locks_without_changing_accepted_bindings() {
+        let accepted = ["ctrl+y".to_string()];
+        let before = grabs_for_mapping(
+            &accepted,
+            8,
+            1,
+            &[0x79, 0x7a, 0xff7f],
+            &[0, 0, 0, 0, 10, 0, 0, 0],
+        )
+        .unwrap();
+        let after = grabs_for_mapping(
+            &accepted,
+            8,
+            1,
+            &[0x7a, 0x79, 0xff7f],
+            &[0, 0, 0, 0, 0, 10, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(
+            before.keys().copied().collect::<Vec<_>>(),
+            [(8, 4), (8, 20)]
+        );
+        assert_eq!(after.keys().copied().collect::<Vec<_>>(), [(9, 4), (9, 36)]);
+        assert!(matches!(
+            grabs_for_mapping(&accepted, 8, 1, &[0x7a, 0x78, 0xff7f], &[]),
+            Err(HotkeySystemError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn x11_hotkeys_refresh_on_keyboard_and_modifier_notifications_only() {
+        use x11rb::protocol::xproto::MappingNotifyEvent;
+
+        for (request, expected) in [
+            (Mapping::KEYBOARD, true),
+            (Mapping::MODIFIER, true),
+            (Mapping::POINTER, false),
+        ] {
+            assert_eq!(
+                keyboard_mapping_changed(&Event::MappingNotify(MappingNotifyEvent {
+                    request,
+                    ..Default::default()
+                })),
+                expected
+            );
+        }
+        assert!(keyboard_mapping_changed(&Event::XkbMapNotify(
+            Default::default()
+        )));
+        assert!(keyboard_mapping_changed(&Event::XkbNewKeyboardNotify(
+            Default::default()
+        )));
     }
 
     #[test]
@@ -618,6 +766,13 @@ mod tests {
             .unwrap()
             .reply()
             .unwrap();
+        let modifiers = observer.get_modifier_mapping().unwrap().reply().unwrap();
+        let locks = lock_mask(
+            observer.setup().min_keycode,
+            keyboard.keysyms_per_keycode,
+            &keyboard.keysyms,
+            &modifiers.keycodes,
+        );
         let ctrl = keycodes_for_keysym(
             observer.setup().min_keycode,
             keyboard.keysyms_per_keycode,
@@ -627,7 +782,7 @@ mod tests {
         let mut listener = X11HotkeySystem::with_display(Some(display));
         listener.register_hotkeys(&["ctrl+f8".to_string()]).unwrap();
         listener.register_hotkeys(&["ctrl+f8".to_string()]).unwrap(); // Shared old/new grabs must survive.
-        for modifiers in lock_variants(4) {
+        for modifiers in lock_variants(4, locks) {
             let error = grab(&competitor, f8, modifiers).unwrap_err();
             assert!(
                 matches!(error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Access)
@@ -638,7 +793,7 @@ mod tests {
         assert!(
             matches!(rejected, Err(HotkeySystemError::Rejected(message)) if message == "ctrl+f9 is already grabbed by another program")
         );
-        for modifiers in lock_variants(4) {
+        for modifiers in lock_variants(4, locks) {
             grab(&competitor, f7, modifiers).unwrap(); // The partially acquired set rolled back.
         }
 
@@ -691,33 +846,246 @@ mod tests {
             ungrab_all(
                 &competitor,
                 root,
-                lock_variants(4)
-                    .into_iter()
-                    .map(|modifiers| (code, modifiers)),
+                lock_variants(4, locks).map(|modifiers| (code, modifiers)),
             )
             .unwrap();
         }
         listener.register_hotkeys(&["ctrl+f9".to_string()]).unwrap();
-        for modifiers in lock_variants(4) {
+        for modifiers in lock_variants(4, locks) {
             grab(&competitor, f8, modifiers).unwrap(); // Replacing a set released old grabs.
         }
         listener.register_hotkeys(&[]).unwrap();
-        for modifiers in lock_variants(4) {
+        for modifiers in lock_variants(4, locks) {
             grab(&competitor, f9, modifiers).unwrap();
         }
         ungrab_all(
             &competitor,
             root,
-            lock_variants(4)
-                .into_iter()
-                .map(|modifiers| (f9, modifiers)),
+            lock_variants(4, locks).map(|modifiers| (f9, modifiers)),
         )
         .unwrap();
         listener.register_hotkeys(&["ctrl+f9".to_string()]).unwrap();
         drop(listener);
-        for modifiers in lock_variants(4) {
+        for modifiers in lock_variants(4, locks) {
             grab(&competitor, f9, modifiers).unwrap(); // Drop joined the thread and released every variant.
         }
         observer.destroy_window(window).unwrap().check().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires WZ_X11_TEST_DISPLAY pointing at an isolated X server; changes its keymap"]
+    fn x11_real_server_remaps_accepted_grabs_and_fails_closed_on_conflict() {
+        use std::time::Instant;
+        use x11rb::protocol::xproto::{
+            GetKeyboardMappingReply, GetModifierMappingReply, MappingStatus,
+        };
+
+        struct RestoreMapping<'a> {
+            conn: &'a RustConnection,
+            min: u8,
+            count: u8,
+            keyboard: GetKeyboardMappingReply,
+            modifiers: GetModifierMappingReply,
+        }
+        impl Drop for RestoreMapping<'_> {
+            fn drop(&mut self) {
+                if let Ok(cookie) = self.conn.change_keyboard_mapping(
+                    self.count,
+                    self.min,
+                    self.keyboard.keysyms_per_keycode,
+                    &self.keyboard.keysyms,
+                ) {
+                    let _ = cookie.check();
+                }
+                if let Ok(cookie) = self.conn.set_modifier_mapping(&self.modifiers.keycodes) {
+                    let _ = cookie.reply();
+                }
+            }
+        }
+
+        let display =
+            std::env::var("WZ_X11_TEST_DISPLAY").expect("supply an isolated test DISPLAY");
+        assert_ne!(display, ":0", "never change the user's keyboard mapping");
+        let (observer, screen) = x11rb::connect(Some(&display)).unwrap();
+        let (competitor, _) = x11rb::connect(Some(&display)).unwrap();
+        let root = observer.setup().roots[screen].root;
+        let min = observer.setup().min_keycode;
+        let count = observer.setup().max_keycode - min + 1;
+        let saved = RestoreMapping {
+            conn: &observer,
+            min,
+            count,
+            keyboard: observer
+                .get_keyboard_mapping(min, count)
+                .unwrap()
+                .reply()
+                .unwrap(),
+            modifiers: observer.get_modifier_mapping().unwrap().reply().unwrap(),
+        };
+        let width = saved.keyboard.keysyms_per_keycode;
+        let code = |keysym| keycodes_for_keysym(min, width, &saved.keyboard.keysyms, keysym)[0];
+        let f7 = code(0xffc4);
+        let f8 = code(0xffc5);
+        let numlock = code(0xff7f);
+        assert_ne!(f7, f8);
+        let locks = lock_mask(
+            min,
+            width,
+            &saved.keyboard.keysyms,
+            &saved.modifiers.keycodes,
+        );
+        let grab = |keycode, modifiers: u16| {
+            competitor
+                .grab_key(
+                    false,
+                    root,
+                    modifiers.into(),
+                    keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )
+                .unwrap()
+                .check()
+        };
+        let mut listener = X11HotkeySystem::with_display(Some(display));
+        listener.register_hotkeys(&["ctrl+f7".to_string()]).unwrap();
+
+        let mut remapped = saved.keyboard.keysyms.clone();
+        let a = usize::from(f7 - min) * usize::from(width);
+        let b = usize::from(f8 - min) * usize::from(width);
+        for offset in 0..usize::from(width) {
+            remapped.swap(a + offset, b + offset);
+        }
+        observer
+            .change_keyboard_mapping(count, min, width, &remapped)
+            .unwrap()
+            .check()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            listener.next_hotkey().unwrap();
+            match grab(f7, 4) {
+                Ok(()) => {
+                    ungrab_all(&competitor, root, [(f7, 4)].into_iter()).unwrap();
+                    break;
+                }
+                Err(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Access => {}
+                Err(error) => panic!("probe old key grab: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "remapping retained the old physical key"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        for modifiers in lock_variants(4, locks) {
+            assert!(matches!(
+                grab(f8, modifiers),
+                Err(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Access
+            ));
+        }
+
+        // Relocate NumLock to a modifier slot that was not previously a lock.
+        let slot = [5, 7, 6, 4, 3]
+            .into_iter()
+            .find(|slot| locks & (1 << slot) == 0)
+            .unwrap();
+        let per_modifier = usize::from(saved.modifiers.keycodes_per_modifier());
+        let mut groups: Vec<Vec<u8>> = saved
+            .modifiers
+            .keycodes
+            .chunks_exact(per_modifier)
+            .map(|codes| {
+                codes
+                    .iter()
+                    .copied()
+                    .filter(|code| *code != 0 && *code != numlock)
+                    .collect()
+            })
+            .collect();
+        groups[slot].push(numlock);
+        let new_width = groups.iter().map(Vec::len).max().unwrap();
+        let mut modifier_codes = Vec::new();
+        for mut group in groups {
+            group.resize(new_width, 0);
+            modifier_codes.extend(group);
+        }
+        assert_eq!(
+            observer
+                .set_modifier_mapping(&modifier_codes)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .status,
+            MappingStatus::SUCCESS
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            listener.next_hotkey().unwrap();
+            match grab(f8, 4 | (1 << slot)) {
+                Err(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Access => break,
+                Ok(()) => {
+                    ungrab_all(&competitor, root, [(f8, 4 | (1 << slot))].into_iter()).unwrap();
+                }
+                Err(error) => panic!("probe relocated NumLock grab: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "modifier remapping did not rebuild lock variants"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let new_locks = lock_mask(min, width, &remapped, &modifier_codes);
+        for modifiers in lock_variants(4, locks & !new_locks).filter(|state| *state != 4) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                listener.next_hotkey().unwrap();
+                match grab(f8, modifiers) {
+                    Ok(()) => {
+                        ungrab_all(&competitor, root, [(f8, modifiers)].into_iter()).unwrap();
+                        break;
+                    }
+                    Err(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Access => {}
+                    Err(error) => panic!("probe obsolete lock variant: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "remapping retained an obsolete lock variant"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        // A conflicting remap must release the old key, not preserve a wrong grab.
+        for modifiers in lock_variants(4, new_locks) {
+            grab(f7, modifiers).unwrap();
+        }
+        observer
+            .change_keyboard_mapping(count, min, width, &saved.keyboard.keysyms)
+            .unwrap()
+            .check()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.next_hotkey() {
+                Err(HotkeySystemError::Unavailable(message)) => {
+                    assert!(message.contains("keyboard mapping change"));
+                    break;
+                }
+                Ok(None) => {}
+                other => panic!("unexpected remap result: {other:?}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "conflicting remap did not fail closed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        for modifiers in lock_variants(4, new_locks) {
+            grab(f8, modifiers).unwrap();
+        }
+        drop(listener);
+        drop(competitor);
+        drop(saved);
     }
 }

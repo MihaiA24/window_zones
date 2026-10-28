@@ -106,7 +106,9 @@ impl GnomeWindowSystem {
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, GnomeIntegrationError> {
-        self.with_connection(|cached| Ok(cached.capabilities.as_ref().unwrap().clone()))
+        self.with_connection(true, |cached| {
+            Ok(cached.capabilities.as_ref().unwrap().clone())
+        })
     }
 
     #[cfg(test)]
@@ -119,6 +121,7 @@ impl GnomeWindowSystem {
 
     fn with_connection<R>(
         &self,
+        refresh_capabilities: bool,
         call: impl FnOnce(&mut WindowConnection) -> Result<R, GnomeIntegrationError>,
     ) -> Result<R, GnomeIntegrationError> {
         let mut cache = self.cache.lock();
@@ -131,7 +134,8 @@ impl GnomeWindowSystem {
                 });
             }
             let cached = cache.as_mut().unwrap();
-            if cached.capabilities.is_none() {
+            if refresh_capabilities || cached.capabilities.is_none() {
+                cached.capabilities = None;
                 cached.capabilities = Some(get_capabilities(&cached.connection)?);
             }
             call(cached)
@@ -155,7 +159,8 @@ impl GnomeWindowSystem {
         R: ReadAll,
         A: AppendAll,
     {
-        self.with_connection(|cached| {
+        self.with_connection(false, |cached| {
+            cached.has_transition = false;
             require_capability(cached.capabilities.as_ref().unwrap(), capability)?;
             let proxy =
                 cached
@@ -207,6 +212,9 @@ impl WindowSystem for GnomeWindowSystem {
             .as_str()
             .parse::<u64>()
             .map_err(|error| {
+                if let Some(cached) = self.cache.lock().as_mut() {
+                    cached.has_transition = false;
+                }
                 WindowSystemError::Platform(format!(
                     "invalid GNOME window id '{}': {error}; refocus the window and retry",
                     window_move.window.as_str()
@@ -221,7 +229,7 @@ impl WindowSystem for GnomeWindowSystem {
             message: String,
         }
         let mut partial_move = None;
-        let result: Result<(), GnomeIntegrationError> = self.with_connection(|cached| {
+        let result: Result<(), GnomeIntegrationError> = self.with_connection(false, |cached| {
             cached.has_transition = false;
             require_capability(
                 cached.capabilities.as_ref().unwrap(),
@@ -268,8 +276,8 @@ impl WindowSystem for GnomeWindowSystem {
     }
 
     fn transition_metrics(&self) -> Result<Option<TransitionMetrics>, WindowSystemError> {
-        self.with_connection(|cached| {
-            if !cached.has_transition
+        self.with_connection(false, |cached| {
+            if !std::mem::take(&mut cached.has_transition)
                 || !cached
                     .capabilities
                     .as_ref()
@@ -1135,37 +1143,73 @@ mod tests {
     }
 
     #[test]
-    fn window_adapter_reuses_connection_and_capabilities_across_operations() {
-        let bus = FakeBus::new(FakeServiceState::complete());
+    fn capability_refresh_observes_live_errors_replacement_and_recovery() {
+        let mut bus = FakeBus::new(FakeServiceState::complete());
         let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        assert_eq!(
+            system.capabilities().unwrap(),
+            FakeServiceState::complete().capabilities
+        );
+        bus.update_state(|state| {
+            assert_eq!(
+                state.capabilities_calls, 1,
+                "initial refresh makes one request"
+            );
+            state.capabilities_error = Some((
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "session policy denied inspection".to_string(),
+            ));
+        });
+        // Action paths retain the established handshake until an explicit refresh.
         let focused = system.focused_window().unwrap().unwrap();
         system.displays().unwrap();
-        system
-            .move_window(&WindowMove::new(focused.id, Rect::new(1, 2, 300, 400)))
-            .unwrap();
-        system.capabilities().unwrap();
-        system.capabilities().unwrap();
-        assert!(system.transition_metrics().unwrap().is_none());
+        let window_move = WindowMove::new(focused.id, Rect::new(1, 2, 300, 400));
+        system.move_window(&window_move).unwrap();
+        assert!(matches!(
+            system.capabilities(),
+            Err(GnomeIntegrationError::Denied { .. })
+        ));
 
         bus.update_state(|state| {
-            assert_eq!(state.capabilities_calls, 1, "capability list is cached");
-            assert_eq!(
-                state.window_senders.len(),
-                4,
-                "one handshake and three operations"
-            );
-            assert!(
-                state
-                    .window_senders
-                    .iter()
-                    .all(|sender| sender == &state.window_senders[0]),
-                "all calls use the same unique bus sender"
-            );
+            state.capabilities_error = None;
         });
+        assert_eq!(
+            system.capabilities().unwrap(),
+            FakeServiceState::complete().capabilities
+        );
+        bus.stop_companion();
+        assert!(matches!(
+            system.capabilities(),
+            Err(GnomeIntegrationError::Unavailable { .. })
+        ));
+        bus.start_companion();
+        assert_eq!(
+            system.capabilities().unwrap(),
+            FakeServiceState::complete().capabilities
+        );
+
+        // A replacement must also be observed without probing during its outage.
+        bus.stop_companion();
+        bus.update_state(|state| {
+            state.capabilities = vec![DISPLAYS_CAPABILITY.to_string()];
+        });
+        bus.start_companion();
+        assert_eq!(
+            system.capabilities().unwrap(),
+            vec![DISPLAYS_CAPABILITY.to_string()]
+        );
+        assert!(
+            system
+                .move_window(&window_move)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support move-resize")
+        );
+        assert_eq!(system.displays().unwrap().len(), 2);
     }
 
     #[test]
-    fn transition_metrics_use_the_cached_move_sender_and_clear_after_failure() {
+    fn transition_metrics_use_the_cached_move_sender_once_and_clear_after_failure() {
         let mut state = FakeServiceState::complete();
         state
             .capabilities
@@ -1178,8 +1222,13 @@ mod tests {
         system.move_window(&window_move).unwrap();
         let metrics = system.transition_metrics().unwrap().unwrap();
         assert_eq!((metrics.request_ms, metrics.completion_ms), (3.0, 250.0));
+        assert!(system.transition_metrics().unwrap().is_none());
+        system.move_window(&window_move).unwrap();
+        let invalid_move = WindowMove::new(WindowId::new("not-a-number"), window_move.target);
+        assert!(system.move_window(&invalid_move).is_err());
+        assert!(system.transition_metrics().unwrap().is_none());
+        system.move_window(&window_move).unwrap();
         bus.update_state(|state| {
-            assert_eq!(state.capabilities_calls, 1);
             assert!(
                 state
                     .window_senders
@@ -1196,6 +1245,44 @@ mod tests {
             Err(WindowSystemError::WindowGone(focused.id))
         );
         assert!(system.transition_metrics().unwrap().is_none());
+    }
+
+    #[test]
+    fn next_and_previous_display_noops_discard_unread_previous_metrics() {
+        let mut state = FakeServiceState::complete();
+        state
+            .capabilities
+            .push(TRANSITION_METRICS_CAPABILITY.to_string());
+        state.displays.truncate(1);
+        let bus = FakeBus::new(state);
+        let mut system = GnomeWindowSystem::with_bus_address(bus.address.clone());
+        let window_move =
+            WindowMove::new(WindowId::new("4294967301"), Rect::new(-1900, 20, 300, 400));
+        let mut history = crate::WindowHistory::default();
+        for action in [
+            crate::Action::MoveToNextDisplay {},
+            crate::Action::MoveToPreviousDisplay {},
+        ] {
+            system.move_window(&window_move).unwrap();
+            crate::execute_action(
+                &action,
+                &std::collections::BTreeMap::new(),
+                &mut history,
+                &mut system,
+            )
+            .unwrap();
+            assert!(system.transition_metrics().unwrap().is_none());
+        }
+        bus.update_state(|state| {
+            assert_eq!(
+                state.moves,
+                vec![
+                    (4294967301, -1900, 20, 300, 400),
+                    (4294967301, -1900, 20, 300, 400),
+                ],
+                "single-display actions do not move the window"
+            );
+        });
     }
 
     #[test]

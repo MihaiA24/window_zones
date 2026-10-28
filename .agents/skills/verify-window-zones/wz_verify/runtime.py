@@ -48,6 +48,20 @@ def fail(message):
     raise RuntimeError(message)
 
 
+def gnome_resource_environment():
+    """Capture only installed extension roots and the real capture socket before isolation."""
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    if not data_home.is_absolute():
+        data_home = Path.home() / ".local/share"
+    roots = [data_home, *(Path(value) for value in
+                         (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(os.pathsep)
+                         if value and Path(value).is_absolute())]
+    return {"WINDOW_ZONES_SMOKE_GNOME_DATA_DIRS": json.dumps(list(dict.fromkeys(map(str, roots)))),
+            "WINDOW_ZONES_SMOKE_PIPEWIRE_RUNTIME_DIR": os.environ.get("PIPEWIRE_RUNTIME_DIR")
+            or os.environ.get("XDG_RUNTIME_DIR", ""),
+            "WINDOW_ZONES_SMOKE_PIPEWIRE_REMOTE": os.environ.get("PIPEWIRE_REMOTE") or "pipewire-0"}
+
+
 def load(path):
     try:
         value = json.loads(path.read_text())
@@ -118,7 +132,7 @@ class Workspace:
                  self.skill / "verify", self.expected, self.fixed_clock]
         files.extend((self.skill / "wz_verify").rglob("*.py"))
         for directory in ("src", "gnome-extension", "kwin-script", "scripts", ".cargo"):
-            files.extend(p for p in (self.root / directory).rglob("*") if p.is_file())
+            files.extend(p for p in (self.root / directory).rglob("*") if p.is_file() and p.suffix not in (".pyc", ".pyo"))
         hashed = hashlib.sha256()
         for path in sorted(files):
             hashed.update(os.fsencode(path.relative_to(self.root)))
@@ -219,13 +233,17 @@ class Workspace:
     def env(self):
         result = dict(os.environ)
         for name in ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET", "SWAYSOCK", "HYPRLAND_INSTANCE_SIGNATURE",
-                     "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY", "DCONF_PROFILE"):
+                     "DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE",
+                     "XAUTHORITY", "DCONF_PROFILE", "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE",
+                     "WINDOW_ZONES_SMOKE_GNOME_DATA_DIRS", "WINDOW_ZONES_SMOKE_PIPEWIRE_RUNTIME_DIR",
+                     "WINDOW_ZONES_SMOKE_PIPEWIRE_REMOTE"):
             result.pop(name, None)
         result["CARGO_HOME"] = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
         result["RUSTUP_HOME"] = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
         result.update({"HOME": str(self.scratch / "home"), "XDG_CONFIG_HOME": str(self.scratch / "config"),
                        "XDG_DATA_HOME": str(self.scratch / "data"), "XDG_STATE_HOME": str(self.scratch / "state"),
                        "XDG_CACHE_HOME": str(self.scratch / "cache"), "XDG_RUNTIME_DIR": str(self.scratch / "runtime"),
+                       "XDG_DATA_DIRS": "/usr/local/share:/usr/share",
                        "WINDOW_ZONES_BINARY": str(self.binary), "CARGO_TARGET_DIR": str(self.root / "target"),
                        "WINDOW_ZONES_VERIFY_CHECKOUT": str(self.root), "XDG_SESSION_TYPE": "x11"})
         return result

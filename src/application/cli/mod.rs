@@ -62,7 +62,8 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
 
         match arg.as_str() {
             "--config" | "--perf-log" | "--log-file" | "--backend" | "--chord" => {
-                let Some(value) = args.get(index + 1) else {
+                let Some(value) = args.get(index + 1).filter(|value| !value.starts_with('-'))
+                else {
                     return ParseStatus::Err(format!("{arg} requires a value"));
                 };
                 match arg.as_str() {
@@ -172,6 +173,36 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{CliArgs, Command, ParseStatus, parse_args_from_inputs};
+
+    #[test]
+    fn required_values_never_consume_option_tokens() {
+        for option in [
+            "--config",
+            "--perf-log",
+            "--log-file",
+            "--backend",
+            "--chord",
+        ] {
+            for next_option in ["--dry-run", "--backend", "--force", "--tray", "-x"] {
+                assert!(
+                    matches!(
+                        parse(&[option, next_option, "run"]),
+                        ParseStatus::Err(message) if message == format!("{option} requires a value")
+                    ),
+                    "{option} {next_option}"
+                );
+            }
+        }
+        let ParseStatus::Ok(args) = parse(&["--log-file", "./--dry-run", "--dry-run", "status"])
+        else {
+            panic!("explicit dash-prefixed path should remain supported");
+        };
+        assert_eq!(args.log_file_path, Some(PathBuf::from("./--dry-run")));
+        assert!(matches!(
+            args.backend,
+            crate::application::backends::BackendPreference::DryRun
+        ));
+    }
 
     #[test]
     fn parses_perf_log_for_dispatch_run_tui_and_tray() {

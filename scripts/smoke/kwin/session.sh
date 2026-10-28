@@ -209,11 +209,11 @@ kde_live_start_fixture() {
     fi
     if wait_for_file "$KDE_SERVICE_PID_FILE" 10; then
         KDE_SERVICE_PID=$(cat "$KDE_SERVICE_PID_FILE")
-        printf '%s\n' "$KDE_SERVICE_PID" >>"$PID_FILE"
+        owned_process register "$KDE_SERVICE_PID"
     fi
     if wait_for_file "$KDE_KWIN_PID_FILE" 10; then
         KDE_KWIN_PID=$(cat "$KDE_KWIN_PID_FILE")
-        printf '%s\n' "$KDE_KWIN_PID" >>"$PID_FILE"
+        owned_process register "$KDE_KWIN_PID"
     fi
     wait_for_text "$KDE_SERVICE_LOG" 'KWin companion service started' 15 || true
     assert_text 'KDE companion service starts before KWin' \

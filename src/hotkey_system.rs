@@ -1,23 +1,22 @@
 use thiserror::Error;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+use rdev::{EventType, Key};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "macos")]
+use std::sync::PoisonError;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::sync::mpsc::{self, TryRecvError};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::sync::{Arc, Mutex, PoisonError};
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use std::thread;
-
-#[cfg(target_os = "windows")]
-use rdev::Event;
-#[cfg(target_os = "windows")]
-use rdev::grab;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use rdev::{EventType, Key};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// Event generated when a configured global hotkey is activated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +50,9 @@ pub trait HotkeySystem {
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError>;
 }
 
-/// A live native listener is shared by Windows/macOS instances and never
-/// replaced while its hook may still run.
-/// The singleton passes input through after its active registration is dropped
-/// (apart from releases whose presses it already consumed). The next instance
-/// reuses it on restart, or starts a fresh one once the native hook stopped.
+/// Native keyboard capture for Windows/macOS, using rdev's key vocabulary.
+/// Windows owns and joins its hook thread on replacement/drop; macOS reuses
+/// its event tap while it remains live. Registration waits for native readiness.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug)]
 pub struct RdevHotkeySystem {
@@ -63,6 +60,8 @@ pub struct RdevHotkeySystem {
     owner: Arc<()>,
     event_tx: mpsc::Sender<HotkeyEvent>,
     events: mpsc::Receiver<HotkeyEvent>,
+    #[cfg(target_os = "windows")]
+    native_listener: Option<Arc<windows::NativeListener>>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -107,6 +106,12 @@ impl RdevListener {
                 if modifier_mask(&key).is_some() {
                     return false;
                 }
+                #[cfg(target_os = "windows")]
+                if self.pressed.contains(&Key::AltGr) && self.pressed.contains(&Key::ControlLeft) {
+                    // AltGr synthesizes left Ctrl + right Alt on Windows.
+                    // Reserve that chord for typing, not Ctrl+Alt bindings.
+                    return false;
+                }
                 let modifiers = self
                     .pressed
                     .iter()
@@ -142,10 +147,21 @@ impl RdevListener {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 impl RdevHotkeySystem {
     pub fn new() -> Self {
-        static LISTENER: Mutex<Option<Arc<Mutex<RdevListener>>>> = Mutex::new(None);
-        Self::with_listener(Self::shared_listener(&LISTENER, Self::spawn_listener))
+        #[cfg(target_os = "windows")]
+        {
+            let native = windows::new_listener();
+            let mut system = Self::with_listener(Arc::clone(&native.state));
+            system.native_listener = Some(native);
+            system
+        }
+        #[cfg(target_os = "macos")]
+        {
+            static LISTENER: Mutex<Option<Arc<Mutex<RdevListener>>>> = Mutex::new(None);
+            Self::with_listener(Self::shared_listener(&LISTENER, Self::spawn_listener))
+        }
     }
 
+    #[cfg(target_os = "macos")]
     /// Reuse the shared listener while its native hook may still run; build a
     /// new one only after the old hook stopped, so a single hook stays live.
     fn shared_listener(
@@ -182,45 +198,46 @@ impl RdevHotkeySystem {
             owner: Arc::new(()),
             event_tx,
             events,
+            #[cfg(target_os = "windows")]
+            native_listener: None,
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn spawn_listener(listener: Arc<Mutex<RdevListener>>) {
         let error_state = Arc::clone(&listener);
         let spawn_error_state = Arc::clone(&listener);
-        let spawn = thread::Builder::new().name("window-zones-hotkeys".to_string()).spawn(move || {
-            let result = std::panic::catch_unwind(move || {
-                #[cfg(target_os = "windows")]
-                let result = grab(move |event: Event| {
-                    let consume = listener.lock().map(|mut state| state.handle_event(event.event_type))
-                        .unwrap_or(false);
-                    if consume { None } else { Some(event) }
-                }).map_err(|error| format!("{error:?}"));
-
-                #[cfg(target_os = "macos")]
-                let result = macos::listen(listener);
-
-                result
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let spawn = thread::Builder::new()
+            .name("window-zones-hotkeys".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(move || macos::listen(listener, ready_tx));
+                let details = match result {
+                    Ok(Err(error)) => error,
+                    Ok(Ok(())) => "native listener exited".to_string(),
+                    Err(_) => "native listener panicked".to_string(),
+                };
+                error_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .stop(format!(
+                        "global hotkey listener stopped: {details}; restore Accessibility permission and restart Window Zones"
+                    ));
             });
-            let details = match result {
-                Ok(Err(error)) => error,
-                Ok(Ok(())) => "native listener exited".to_string(),
-                Err(_) => "native listener panicked".to_string(),
-            };
-            error_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .stop(format!(
-                    "global hotkey listener stopped: {details}; restore input/Accessibility permission and restart Window Zones"
-                ));
-        });
-        if let Err(error) = spawn {
-            spawn_error_state
+        match spawn {
+            Ok(worker) => {
+                // A disconnected readiness channel means initialization failed;
+                // joining publishes its error before registration can succeed.
+                if ready_rx.recv().is_err() {
+                    let _ = worker.join();
+                }
+            }
+            Err(error) => spawn_error_state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .stop(format!(
                     "failed to start global hotkey listener: {error}; restart Window Zones"
-                ));
+                )),
         }
     }
 }
@@ -286,6 +303,10 @@ impl Drop for RdevHotkeySystem {
                 .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner))
         {
             state.clear_registration();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(native) = &self.native_listener {
+            let _ = native.stop();
         }
     }
 }
@@ -696,6 +717,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn restart_reuses_a_live_listener_and_rebuilds_a_stopped_one() {
         let slot = Mutex::new(None);

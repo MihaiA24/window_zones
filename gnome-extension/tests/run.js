@@ -2,7 +2,7 @@
 // Exercise the real service dispatcher without a Shell session or session bus.
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {display, makeWindow, Main, Meta, settings, Shell, TestActor} from './stubs.js';
+import {display, makeWindow, Main, Meta, settings, Shell, St, TestActor} from './stubs.js';
 
 const here = Gio.File.new_for_uri(import.meta.url).get_parent();
 const source = here.get_parent().get_child('extension.js');
@@ -189,22 +189,35 @@ window.operations = [];
 await call('MoveWindow', [window.id, 10, 20, 600, 700]);
 equal(window.operations, [['restore'], ['monitor', 1], ['move', true, 10, 20, 600, 700]],
     'animated maximized display move waits for restore before changing monitor');
+await call('GetFocusedWindow', [], ':1.99');
+await call('GetLastTransitionMetrics', [], ':1.99', invalid);
 let metrics = await call('GetLastTransitionMetrics');
 equal(metrics[0] >= 0 && metrics[0] < metrics[1] && metrics[1] >= 200, true,
-    'completion metrics include the finished compositor animation');
+    'Shell 50 without the reduced-motion API preserves the finished compositor animation');
 equal(actor.frozen, false, 'animation releases the frozen live actor');
 equal(global.window_group.children.every(clone => clone.destroyed), true, 'completed animation removes snapshots');
-await call('GetLastTransitionMetrics', [], ':1.99', invalid);
-for (const [animations, reducedMotion] of [[false, 0], [true, 1]]) {
+await call('GetLastTransitionMetrics', [], ':1.42', invalid);
+St.ReducedMotion = {REDUCE: 1};
+for (const [animations, reducedMotion, x] of [[false, 0, 30], [true, 1, 50], [true, 0, 70]]) {
     settings.enable_animations = animations;
     settings.reducedMotion = reducedMotion;
-    await call('MoveWindow', [window.id, animations ? 50 : 30, 40, 600, 700]);
+    await call('MoveWindow', [window.id, x, 40, 600, 700]);
     metrics = await call('GetLastTransitionMetrics');
-    equal(metrics[1] < 200, true, `animations ${animations}, reduced motion ${reducedMotion}: no animation delay`);
+    equal(metrics[1] >= 200, animations && reducedMotion === 0,
+        `Shell 51 animations ${animations}, reduced motion ${reducedMotion}: preserves animation preference`);
 }
 settings.enable_animations = true;
 settings.reducedMotion = 0;
 window.actor = null;
+for (const discovery of ['GetFocusedWindow', 'GetDisplays']) {
+    await call('MoveWindow', [window.id, 80, 40, 600, 700]);
+    await call(discovery);
+    await call('GetLastTransitionMetrics', [], ':1.42', invalid);
+}
+await call('MoveWindow', [window.id, 90, 40, 600, 700]);
+await call('MoveWindow', [window.id, 90, 40, 0, 700], ':1.42', invalid);
+await call('GetLastTransitionMetrics', [], ':1.42', invalid);
+await call('MoveWindow', [window.id, 100, 40, 600, 700]);
 connection.vanish(':1.42');
 await call('GetLastTransitionMetrics', [], ':1.42', invalid);
 

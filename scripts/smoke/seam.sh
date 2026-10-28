@@ -3,9 +3,19 @@ build_seam_helper() {
     # `dispatch` always acts on the focused window, so captured-id moves drive the X11 seam
     # directly; `state` sends the EWMH request a pager would to put a test window into
     # maximized or fullscreen state; `grab` holds an accelerator as another X client.
-    local dir="$TMP_DIR/seam-helper" target_dir="${TARGET_DIR:-$TMP_DIR}/smoke-seam-helper"
+    local dir="$TMP_DIR/seam-helper" target_dir=''
     local output='' rc=0
     SEAM_HELPER=''
+    # A pinned application skips its build, not Cargo's persistent helper cache.
+    # Never put target/ beneath scratch: the verifier retains scratch as evidence.
+    if [[ -z "$TARGET_DIR" ]]; then
+        TARGET_DIR=$(cargo metadata --locked --no-deps --format-version 1 \
+            --manifest-path "$PROJECT_ROOT/Cargo.toml" \
+            | /usr/bin/python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])') || rc=$?
+        assert_rc_zero "$1 seam helper target directory resolves" "$rc" 'cargo metadata'
+        [[ "$rc" -eq 0 ]] || return "$rc"
+    fi
+    target_dir="$TARGET_DIR/smoke-seam-helper"
     mkdir -p "$dir/src"
     cat >"$dir/Cargo.toml" <<EOF
 [package]

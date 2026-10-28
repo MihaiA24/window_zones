@@ -14,13 +14,12 @@ node --check "$PROJECT_ROOT/gnome-extension/extension.js"
 if command -v gjs >/dev/null 2>&1; then
   gjs -m "$PROJECT_ROOT/gnome-extension/tests/run.js"
 fi
-node --check "$PROJECT_ROOT/kwin-script/contents/code/main.js"
 node "$PROJECT_ROOT/kwin-script/tests/run.js"
 find "$SCRIPT_DIR" "$PROJECT_ROOT/src" -type f -name '*.js' -print0 |
   while IFS= read -r -d '' fixture; do
     node --input-type=module --check < "$fixture"
   done
-/usr/bin/python3 - <<'PY'
+python3 - <<'PY'
 import ast
 from pathlib import Path
 
@@ -32,9 +31,10 @@ if command -v qmllint >/dev/null 2>&1; then
   qmllint "$PROJECT_ROOT/kwin-script/contents/code/main.js"
 fi
 if [[ "$(uname -s)" == Linux ]]; then
+  python3 "$PROJECT_ROOT/scripts/smoke/test_helpers.py"
   python3 "$PROJECT_ROOT/.agents/skills/verify-window-zones/test_verify.py"
 else
-  echo "Skipping Linux-only verifier safety checks on $(uname -s)."
+  echo "Skipping Linux-only smoke/verifier safety checks on $(uname -s)."
 fi
 
 cargo fmt --all -- --check

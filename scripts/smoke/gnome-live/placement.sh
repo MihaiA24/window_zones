@@ -63,7 +63,6 @@ run_gnome_live_adr9_window_checks() {
 
     stop_pid "$b_pid"
     wait_pid "$b_pid" 5 || true
-    set +e
     wait_xwindow_gone "$b" 10 || true
     before=$(gnome_live_geometry)
     out=$(gnome_live_move "$b_id" "$GNOME_LIVE_CENTER_THIRD")

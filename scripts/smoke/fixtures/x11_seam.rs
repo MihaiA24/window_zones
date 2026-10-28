@@ -6,7 +6,8 @@ use window_zones::{
     X11WindowSystem,
 };
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask};
+use x11rb::protocol::xproto::{AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, PropMode};
+use x11rb::wrapper::ConnectionExt as _;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -60,6 +61,89 @@ fn main() {
             .expect("_NET_WM_STATE request");
             println!("sent");
         }
+        ["hints", window, backup, width @ ..] if width.len() <= 1 => {
+            let (conn, _) = x11rb::connect(None).expect("connect to DISPLAY");
+            let window: u32 = window.parse().expect("window");
+            let current = conn
+                .get_property(
+                    false,
+                    window,
+                    AtomEnum::WM_NORMAL_HINTS,
+                    AtomEnum::WM_SIZE_HINTS,
+                    0,
+                    u32::MAX,
+                )
+                .expect("get normal hints")
+                .reply()
+                .expect("normal hints reply");
+            if let Some(width) = width.first() {
+                let width: u32 = width.parse().expect("minimum width");
+                assert!(width > 0);
+                let mut hints = if current.type_ == u32::from(AtomEnum::NONE) {
+                    Vec::new()
+                } else {
+                    assert_eq!(current.type_, u32::from(AtomEnum::WM_SIZE_HINTS));
+                    assert_eq!(current.format, 32, "normal hints format");
+                    current
+                        .value32()
+                        .expect("32-bit normal hints")
+                        .collect::<Vec<_>>()
+                };
+                std::fs::write(backup, &current.value).expect("save original normal hints");
+                hints.resize(hints.len().max(18), 0);
+                if hints[0] & (1 << 4) == 0 {
+                    hints[6] = 1;
+                }
+                hints[0] |= 1 << 4; // ICCCM PMinSize.
+                hints[5] = width;
+                conn.change_property32(
+                    PropMode::REPLACE,
+                    window,
+                    AtomEnum::WM_NORMAL_HINTS,
+                    AtomEnum::WM_SIZE_HINTS,
+                    &hints,
+                )
+                .expect("set constrained normal hints")
+                .check()
+                .expect("constrained normal hints request");
+                println!("constrained");
+            } else {
+                let saved = std::fs::read(backup).expect("read original normal hints");
+                if saved.is_empty() {
+                    conn.delete_property(window, AtomEnum::WM_NORMAL_HINTS.into())
+                        .expect("delete temporary normal hints")
+                        .check()
+                        .expect("delete normal hints request");
+                } else {
+                    conn.change_property(
+                        PropMode::REPLACE,
+                        window,
+                        AtomEnum::WM_NORMAL_HINTS,
+                        AtomEnum::WM_SIZE_HINTS,
+                        32,
+                        (saved.len() / 4).try_into().expect("normal hints length"),
+                        &saved,
+                    )
+                    .expect("restore original normal hints")
+                    .check()
+                    .expect("restore normal hints request");
+                }
+                let restored = conn
+                    .get_property(
+                        false,
+                        window,
+                        AtomEnum::WM_NORMAL_HINTS,
+                        AtomEnum::WM_SIZE_HINTS,
+                        0,
+                        u32::MAX,
+                    )
+                    .expect("get restored normal hints")
+                    .reply()
+                    .expect("restored normal hints reply");
+                assert_eq!(restored.value, saved, "original hints restored byte-for-byte");
+                println!("restored");
+            }
+        }
         ["grab", hotkey] => {
             let hotkey = normalize_hotkey(hotkey).expect("hotkey");
             let mut hotkeys = X11HotkeySystem::new();
@@ -74,7 +158,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: focused | move ID X Y WIDTH HEIGHT | state WINDOW add|remove ATOM [ATOM] | grab HOTKEY");
+            eprintln!("usage: focused | move ID X Y WIDTH HEIGHT | state WINDOW add|remove ATOM [ATOM] | hints WINDOW BACKUP [MIN_WIDTH] | grab HOTKEY");
             process::exit(2);
         }
     }

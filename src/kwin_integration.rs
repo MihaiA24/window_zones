@@ -8,7 +8,7 @@ pub use client::{KwinHotkeySystem, KwinWindowSystem};
 pub use protocol::{
     KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_PROTOCOL_MAJOR, KWIN_SERVICE_NAME, KwinIntegrationError,
 };
-pub use server::run_kwin_companion_service;
+pub use server::{KwinCompanionServiceError, run_kwin_companion_service};
 
 #[cfg(test)]
 mod test_bus;

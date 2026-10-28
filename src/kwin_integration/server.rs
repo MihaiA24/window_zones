@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dbus::blocking::LocalConnection;
+use dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply;
 use dbus::channel::Sender;
 use dbus::message::MatchRule;
 use dbus_tree::Factory;
@@ -17,16 +18,38 @@ use super::protocol::{
 
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-pub fn run_kwin_companion_service() -> Result<(), String> {
+#[derive(Debug, thiserror::Error)]
+pub enum KwinCompanionServiceError {
+    #[error("another KWin companion already owns the session D-Bus service name")]
+    AlreadyRunning,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for KwinCompanionServiceError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+fn request_service_name(connection: &LocalConnection) -> Result<(), KwinCompanionServiceError> {
+    let reply = connection
+        .request_name(KWIN_SERVICE_NAME, false, false, true)
+        .map_err(|error| format!("own {KWIN_SERVICE_NAME}: {error}"))?;
+    if reply != RequestNameReply::PrimaryOwner {
+        return Err(KwinCompanionServiceError::AlreadyRunning);
+    }
+    Ok(())
+}
+
+pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
     let connection = LocalConnection::new_session()
         .map_err(|error| format!("connect to the user session bus: {error}"))?;
+    request_service_name(&connection)?;
     // Keep outbound accelerator calls off the D-Bus server connection, and never hold
     // CompanionState while KWin processes them.
     let accelerator_connection = LocalConnection::new_session()
         .map_err(|error| format!("connect to KGlobalAccel on the user session bus: {error}"))?;
-    connection
-        .request_name(KWIN_SERVICE_NAME, false, true, false)
-        .map_err(|error| format!("own {KWIN_SERVICE_NAME}: {error}"))?;
 
     let state = Arc::new(Mutex::new(CompanionState::default()));
     let owner_state = Arc::clone(&state);
@@ -76,12 +99,16 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                                 "KWin companion protocol major must be an unsigned integer",
                             )?;
                             let sender = sender_name(method.msg)?;
-                            register_state.lock().mark_ready(
+                            let pending_reply = register_state.lock().mark_ready(
                                 protocol_major,
                                 sender,
                                 reset_state,
                             )?;
-                            Ok(vec![method.msg.method_return()])
+                            let reply = method.msg.method_return();
+                            Ok(match pending_reply {
+                                Some(pending) => vec![pending, reply],
+                                None => vec![reply],
+                            })
                         }))
                         .add_m(factory.method("GetCapabilities", (), move |method| {
                             let mut state = capabilities_state.lock();
@@ -247,5 +274,38 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
         connection
             .process(SERVICE_POLL_INTERVAL)
             .map_err(|error| format!("process KWin companion D-Bus requests: {error}"))?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kwin_integration::test_bus::{FakeBus, FakeServiceState};
+
+    #[test]
+    fn duplicate_companion_cannot_queue_for_the_service_name() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let duplicate = LocalConnection::new_address(&bus.address).unwrap();
+        assert!(matches!(
+            request_service_name(&duplicate),
+            Err(KwinCompanionServiceError::AlreadyRunning)
+        ));
+        let bus_proxy = duplicate.with_proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            Duration::from_secs(1),
+        );
+        let (owner,): (String,) = bus_proxy
+            .method_call("org.freedesktop.DBus", "GetNameOwner", (KWIN_SERVICE_NAME,))
+            .unwrap();
+        let (queued,): (Vec<String>,) = bus_proxy
+            .method_call(
+                "org.freedesktop.DBus",
+                "ListQueuedOwners",
+                (KWIN_SERVICE_NAME,),
+            )
+            .unwrap();
+        assert_ne!(owner, duplicate.unique_name().to_string());
+        assert_eq!(queued, vec![owner]);
     }
 }

@@ -115,8 +115,6 @@ struct HyprWindow {
     address: String,
     at: [i32; 2],
     size: [u32; 2],
-    #[serde(rename = "monitor")]
-    _monitor: i64,
     floating: bool,
     fullscreen: u32,
     #[serde(rename = "fullscreenClient")]
@@ -126,8 +124,6 @@ struct HyprWindow {
 #[derive(Debug, Deserialize)]
 struct HyprMonitor {
     name: String,
-    #[serde(rename = "id")]
-    _id: i64,
     x: i32,
     y: i32,
     width: u32,

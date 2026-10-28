@@ -13,6 +13,7 @@ Users keep the background utility alive through a line-oriented CLI, ANSI dashbo
 - `runtime-notify`: non-terminal Linux/macOS problems notify after the documented grace period; terminal and dry-run sessions do not notify, including tray mode. Changing outage diagnostics does not restart the grace period.
 - `runtime-perf`: opt-in JSONL logging records dispatch outcomes and available native metrics, persists through restart and disables visibly on write failure.
 - `runtime-logging`: explicit `--log-file` appends timestamped session/config/hotkey/dispatch events, stays open across restart and closes on normal Quit. File/diagnostic sink errors do not replace operation exit codes.
+- `runtime-install`: installer ownership survives reinstall/uninstall, duplicate exit 75, inactive graphical-session targets and KDE launcher crashes without changing user config.
 
 ## How to get to it (user POV)
 
@@ -41,6 +42,8 @@ Preconditions:
 - **Notifications/profiling.** On an explicitly controlled desktop, observe problem/recovery notifications through terminal versus non-terminal and tray versus plain run; dry-run must send none. For `--perf-log PATH`, exercise success, failure and restart and inspect actual JSONL rows and PID scope; unwritable startup paths fail before movement. Sway/Hyprland performance logging belongs to the persistent session, not dispatch clients.
 - **Session logging.** `"$V" drive cli -- --log-file target/session-events.log status` exercises the flag through the launcher; a later dispatch process must append its outcome. In recorded `run`/`tui` PTYs using the isolated config, dispatch a valid and unbound key, reload, restart, then explicitly Quit. Require one start/end pair, both outcomes, preserved pre-restart records, and the completed terminal result. Keep separate file paths when combining with `--perf-log`.
 - **Sink/error boundaries.** With session logging, `/dev/null/window_zones.log` (open failure) and `/dev/full` (write failure) must leave `status` usable. `tests/logging.rs` also routes stderr to `/dev/full`, requires invalid arguments and fatal performance-log startup errors to remain exit 1, and bounds explicit service Quit to avoid EOF hangs.
+- **Installer boundaries.** `bash scripts/test-install.sh` drives the real installer with isolated Linux/systemd/XDG and macOS/launchd command boundaries. Require stale-lock/crash recovery, timezone-independent ownership, inactive-target fallback, duplicate-owner diagnostics, prefix protection and preserved config. These fixtures are not a real systemd/launchd or login-session pass; follow the installation runbook for those desktops.
+- **Native profiling.** After a measured GNOME move, attempt next/previous display on a one-display fixture. Its no-op row must have no previous transition timings. Current-action metrics are consumed once; a capability refresh is a live probe, not an action.
 
 ## Gotchas
 
@@ -50,3 +53,5 @@ Preconditions:
 - GNOME's synthetic smoke drives the real AppIndicator menu (Show status, Reload, Restart, status row, Quit) and native placement. Other tray hosts and Windows still require their own menu/action evidence; a CLI-only pass is not tray proof.
 - Explicit backend/config flags, discovery, the binary's default run entry, help aliases and quit aliases are separate affected variants. A default lifecycle pass only covers the entry/options it records.
 - Desktop state created by native fixtures differs from hardware/seated sessions. Synthetic evidence does not prove login-seat ownership, real monitor hardware, tray host integration or platform-specific lifecycle behavior.
+- Native smoke cleanup uses Linux pidfds and start identities. `python3 scripts/smoke/test_helpers.py` covers foreign-window refusal, reused-PID safety, orphan cleanup, signal exit and completed TUI proof without borrowing a desktop.
+- `verify drive tests` builds in persistent `target/verification-tests`, separate from the pinned App. Test/dev feature unification must not replace its binaries; generated Python bytecode must not invalidate source freshness.

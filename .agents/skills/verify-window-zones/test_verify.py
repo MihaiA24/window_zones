@@ -3,10 +3,12 @@
 import argparse
 import contextlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,8 +18,8 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 
 from wz_verify.checks import differences, measurement_summary
-from wz_verify.journeys import Terminal, session, smoke_summary
-from wz_verify.runtime import Workspace, digest, process, save
+from wz_verify.journeys import Terminal, session, smoke, smoke_summary
+from wz_verify.runtime import Workspace, digest, gnome_resource_environment, process, save
 
 
 def rejected(action, reason):
@@ -48,6 +50,85 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
     base = Path(directory)
     workspace = Workspace(Path(__file__).resolve().parents[3], base=base,
                           scratch=base / "scratch", binary=base / "window_zones")
+    # Native resources are captured before app isolation, not rediscovered in its empty HOME.
+    driver_spec = importlib.util.spec_from_file_location("gnome_smoke", workspace.root / "scripts/gnome-smoke.py")
+    gnome = importlib.util.module_from_spec(driver_spec)
+    driver_spec.loader.exec_module(gnome)
+    host_home = base / "host-home"
+    user_data = host_home / "custom-data"
+    system_data = base / "system-data"
+    host_runtime = base / "host-runtime"
+    host_runtime.mkdir()
+    indicator_uuid = "appindicatorsupport@rgcjonas.gmail.com"
+
+    def indicator(data, versions):
+        extension = data / "gnome-shell/extensions" / indicator_uuid
+        extension.mkdir(parents=True)
+        (extension / "metadata.json").write_text(json.dumps({"uuid": indicator_uuid, "shell-version": versions}))
+        (extension / "extension.js").write_text("// installed resource\n")
+        return extension
+
+    user_indicator = indicator(user_data, ["50", "51"])
+    system_indicator = indicator(system_data, ["51"])
+    resources_env = {"HOME": str(host_home), "XDG_DATA_HOME": str(user_data),
+                     "XDG_DATA_DIRS": str(system_data), "XDG_RUNTIME_DIR": str(host_runtime),
+                     "PIPEWIRE_REMOTE": "user-pipewire", "DISPLAY": ":7", "WAYLAND_DISPLAY": "wayland-host",
+                     "SWAYSOCK": "/host/sway.sock", "HYPRLAND_INSTANCE_SIGNATURE": "host-hyprland",
+                     "KDE_FULL_SESSION": "true", "KDE_SESSION_VERSION": "6",
+                     "XDG_SESSION_DESKTOP": "KDE", "DESKTOP_SESSION": "sway",
+                     "DBUS_SESSION_BUS_ADDRESS": "unix:path=/host/bus",
+                     "DBUS_STARTER_ADDRESS": "unix:path=/host/starter", "DCONF_PROFILE": "host-profile"}
+    with socket.socket(socket.AF_UNIX) as pipewire, socket.socket(socket.AF_UNIX) as default_pipewire:
+        pipewire.bind(str(host_runtime / "user-pipewire"))
+        default_pipewire.bind(str(host_runtime / "pipewire-0"))
+        with patch.dict(os.environ, resources_env, clear=True):
+            resource_inputs = gnome_resource_environment()
+            environment = workspace.env()
+            assert not any(name in environment for name in ("PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE",
+                                                            "DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS"))
+            environment.update(resource_inputs)
+            roots, runtime, remote = gnome.resource_sources(environment)
+            assert roots == [user_data, system_data] and runtime == host_runtime and remote == "user-pipewire"
+            assert gnome.find_appindicator(roots, "50") == user_indicator
+            assert gnome.find_appindicator(roots, "51") == user_indicator
+            (user_indicator / "metadata.json").write_text(json.dumps({"uuid": indicator_uuid, "shell-version": ["49"]}))
+            assert gnome.find_appindicator(roots, "51") == system_indicator
+            rejected(lambda: gnome.find_appindicator(roots, "50"), "compatible with GNOME 50")
+            (user_indicator / "metadata.json").write_text(json.dumps({"uuid": indicator_uuid, "shell-version": ["50", "51"]}))
+            native_env = gnome.isolated_environment(base / "private-gnome", runtime, remote, environment)
+            for name, directory_name in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"),
+                                         ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"),
+                                         ("XDG_CACHE_HOME", "cache"), ("XDG_RUNTIME_DIR", "runtime")):
+                assert native_env[name] == str(base / "private-gnome" / directory_name)
+            assert native_env["PIPEWIRE_RUNTIME_DIR"] == str(host_runtime)
+            assert native_env["PIPEWIRE_REMOTE"] == "user-pipewire"
+            assert not any(name in native_env for name in ("DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS",
+                                                           "DCONF_PROFILE", "DISPLAY", "WAYLAND_SOCKET",
+                                                           "SWAYSOCK", "HYPRLAND_INSTANCE_SIGNATURE",
+                                                           "KDE_FULL_SESSION", "KDE_SESSION_VERSION",
+                                                           "XDG_SESSION_DESKTOP", "DESKTOP_SESSION",
+                                                           *resource_inputs))
+        with patch.dict(os.environ, {"HOME": str(host_home), "XDG_RUNTIME_DIR": str(host_runtime)}, clear=True):
+            roots, runtime, remote = gnome.resource_sources(gnome_resource_environment())
+            assert roots == [host_home / ".local/share", Path("/usr/local/share"), Path("/usr/share")]
+            assert runtime == host_runtime and remote == "pipewire-0"
+        override = base / "pipewire-override"
+        override.mkdir()
+        with patch.dict(os.environ, {**resources_env, "PIPEWIRE_RUNTIME_DIR": str(override),
+                                    "PIPEWIRE_REMOTE": str(host_runtime / "user-pipewire")}, clear=True):
+            roots, runtime, remote = gnome.resource_sources(gnome_resource_environment())
+            assert runtime == override and remote == str(host_runtime / "user-pipewire")
+    rejected(lambda: gnome.resource_sources({**resource_inputs, "WINDOW_ZONES_SMOKE_PIPEWIRE_REMOTE": "missing"}),
+             "PipeWire socket")
+    rejected(lambda: gnome.resource_sources({**resource_inputs, "WINDOW_ZONES_SMOKE_GNOME_DATA_DIRS": '["relative"]'}),
+             "absolute")
+    complete_frame = "Window Zones TUI\nLast action: alt+ctrl+left\nLast error: none\nLast event: none\nwindow-zones tui> "
+    assert gnome.completed_tui_frame(complete_frame) == complete_frame
+    assert not gnome.completed_tui_frame(complete_frame + "\x1b[2JWindow Zones TUI\nLast action: alt+ctrl+right\n")
+    assert gnome.completed_tui_frame(complete_frame + "\x1b[2JWindow Zones TUI\nLast action: alt+ctrl+right\n",
+                                     first=True) == complete_frame
+    assert not gnome.completed_tui_frame("Last action: alt+ctrl+left\nwindow-zones tui> ")
+
     workspace.scratch.mkdir(mode=0o700)
     proof = workspace.evidence / "proof"
     proof.mkdir(parents=True)
@@ -58,6 +139,34 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
     rejected(lambda: workspace.cleanup(False), "Foreign profile")
     assert workspace.scratch.is_dir() and survivor.read_text() == "must survive cleanup"
     save(workspace.scratch / "owner.json", owner)
+    def native_launch(command, label, *, timeout, environment):
+        assert environment["HOME"] == str(workspace.scratch / "home")
+        assert environment["XDG_RUNTIME_DIR"] == str(workspace.scratch / "runtime")
+        assert not environment.get("DBUS_SESSION_BUS_ADDRESS")
+        assert json.loads(environment["WINDOW_ZONES_SMOKE_GNOME_DATA_DIRS"]) == [str(user_data), str(system_data)]
+        roots, runtime, remote = gnome.resource_sources(environment)
+        assert gnome.find_appindicator(roots, "51") == user_indicator
+        assert runtime == host_runtime and remote == "user-pipewire"
+        native_state = Path(environment["WINDOW_ZONES_SMOKE_ROOT"])
+        for relative in ("gnome/results.json", "gnome/native.png", "gnome/target/debug/build-output.log",
+                         "gnome/home/private.log", "gnome/data/private.log"):
+            path = native_state / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("proof" if relative in ("gnome/results.json", "gnome/native.png") else "not proof")
+        return 0, "Smoke assertions (gnome): 1; passed: 1; failed: 0; skipped: 0"
+
+    with patch.dict(os.environ, resources_env, clear=True):
+        with patch("wz_verify.journeys.shutil.which", return_value="/installed/tool"):
+            with patch.object(workspace, "run", side_effect=native_launch):
+                native_proof = smoke(workspace, argparse.Namespace(gate="gnome"))
+        with patch("wz_verify.journeys.shutil.which", side_effect=lambda tool: None if tool == "gst-launch-1.0" else "/installed/tool"):
+            with patch.object(workspace, "run") as launch:
+                rejected(lambda: smoke(workspace, argparse.Namespace(gate="gnome")), "gst-launch-1.0")
+                launch.assert_not_called()
+    assert sorted(str(path.relative_to(native_proof)) for path in native_proof.rglob("*") if path.is_file()) == [
+        "gnome/native.png", "gnome/results.json",
+    ], "Private app data or build outputs leaked into native proof"
+
     workspace.scratch.chmod(0o755)
     rejected(lambda: workspace.cleanup(False), "Unsafe profile")
     assert survivor.exists() and (workspace.scratch / "owner.json").exists()
@@ -193,6 +302,13 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
             added.unlink(missing_ok=True)
             save(checkout.stamp, {"inputs": fingerprint, "binaries": {checkout.binary.name: digest(checkout.binary)}})
         assert checkout.build_status() == "current"
+
+    cache = checkout.root / "scripts" / "smoke" / "__pycache__" / "probe.cpython-314.pyc"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"generated interpreter cache")
+    assert checkout.build_status() == "current", "Python bytecode invalidated source proof"
+    cache.unlink()
+    assert checkout.build_status() == "current", "removing Python bytecode invalidated source proof"
 
     # Cleaning one workspace must not remove another workspace's profile or proof.
     other = Workspace(workspace.root, base=base / "other", scratch=base / "other-scratch")

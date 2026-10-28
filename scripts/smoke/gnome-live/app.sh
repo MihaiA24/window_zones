@@ -43,8 +43,8 @@ run_gnome_live_dispatch() {
 
 run_gnome_live_app_checks() {
     local run_log="$GNOME_ROOT/live-run.log"
-    local registered=0 real_geometry='' real_ok=0 real_path='uinput'
-    local attempts=0 deadline=0 disable_out='' enable_out=''
+    local registered=0 real_geometry=''
+    local injection_rc=0 deadline=0 disable_out='' enable_out=''
     write_gnome_live_valid_config
     start_fifo_app run wayland "$run_log"
     wait_for_text "$run_log" 'Interactive session started' 15 || true
@@ -64,36 +64,15 @@ run_gnome_live_app_checks() {
     log "GNOME live safe binding registration verified: $registered ($GNOME_SAFE_LEFT_HOTKEY)"
 
     if [[ "$registered" -eq 1 ]]; then
+        run_gnome_live_dispatch real-hotkey-baseline "$GNOME_SAFE_CENTER_HOTKEY"
+        gnome_live_assert_geometry 'GNOME live real hotkey baseline' "$GNOME_LIVE_CENTER_THIRD"
         gnome_live_activate_window || true
-        deadline=$((SECONDS + 10))
-        while (( SECONDS < deadline )); do
-            attempts=$((attempts + 1))
-            gnome_live_inject_hotkey || true
-            sleep 0.25
-            real_geometry=$(gtk_frame_geometry "$GNOME_XDISPLAY" "$GNOME_XAUTHORITY")
-            if [[ "$real_geometry" == "$GNOME_LIVE_LEFT_HALF" ]]; then
-                real_ok=1
-                break
-            fi
-        done
+        gnome_live_inject_hotkey || injection_rc=$?
+        assert_rc_zero 'GNOME live uinput injection' "$injection_rc" 'one accelerator press'
+        real_geometry=$(wait_observed gnome_live_geometry "$GNOME_LIVE_LEFT_HALF" 10)
     else
         log 'GNOME live real-hotkey injection not attempted because the live grab did not register'
     fi
-    if [[ "$real_ok" -eq 0 ]]; then
-        log "Harness limitation GNOME live input did not move the window after $attempts attempts"
-        log "MANUAL ACTION REQUIRED: press $GNOME_SAFE_LEFT_HOTKEY once in the focused Text Editor window"
-        deadline=$((SECONDS + 15))
-        while (( SECONDS < deadline )); do
-            real_geometry=$(gtk_frame_geometry "$GNOME_XDISPLAY" "$GNOME_XAUTHORITY")
-            if [[ "$real_geometry" == "$GNOME_LIVE_LEFT_HALF" ]]; then
-                real_ok=1
-                real_path='manual'
-                break
-            fi
-            sleep 0.25
-        done
-    fi
-    log "GNOME live real-hotkey evidence path: $real_path"
     assert_eq 'GNOME live real hotkey moves window' "$GNOME_LIVE_LEFT_HALF" "$real_geometry"
     gnome_live_capture real-hotkey
     if [[ -n "${APP_FD:-}" ]]; then
@@ -110,19 +89,22 @@ run_gnome_live_app_checks() {
     # and gnome_live_finish asserts enabled-extensions came back unchanged.
     local app_pid_before="${APP_PID:-}" disable_out enable_out errors_after
     local backend_after='' pid_alive=0 pid_same=0 companion_back=0
+    local unavailable_before recovered_before
+    unavailable_before=$(count_text "$run_log" 'GNOME companion is unavailable')
+    recovered_before=$(count_text "$run_log" 'Hotkey registration now recovered')
     disable_out=$(gnome_shell_call /org/gnome/Shell \
         org.gnome.Shell.Extensions.DisableExtension window-zones@mihai-a24 2>&1 || true)
     log "GNOME live companion disable: $disable_out"
     assert_text 'GNOME live companion disable call' 'true' "$disable_out"
     # The App notices the loss on its next poll of the companion, which is not instant.
-    wait_for_text "$run_log" 'GNOME companion is unavailable' 45 || true
-    assert_text 'GNOME live disconnect surfaces explicit unavailable state' \
-        'GNOME companion is unavailable' "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'GNOME companion is unavailable' "$unavailable_before" 45 || true
+    assert_eq 'GNOME live disconnect surfaces explicit unavailable state' 1 \
+        "$(( $(count_text "$run_log" 'GNOME companion is unavailable') > unavailable_before ? 1 : 0 ))"
     send_app status
     # Every backend line the App ever printed must still name the native path: no X11 fallback.
     backend_after=$(sed -n 's/^Window backend: //p' "$run_log" | sort -u | tr '\n' ',' | sed 's/,$//')
     assert_eq 'GNOME live disconnect keeps native backend' 'gnome-wayland' "$backend_after"
-    kill -0 "$app_pid_before" 2>/dev/null && pid_alive=1
+    owned_process alive "$app_pid_before" && pid_alive=1
     assert_eq 'GNOME live App survives companion disconnect' 1 "$pid_alive"
     gnome_live_capture companion-disconnected
 
@@ -135,23 +117,25 @@ run_gnome_live_app_checks() {
     errors_after=$(gnome_shell_call /org/gnome/Shell \
         org.gnome.Shell.Extensions.GetExtensionErrors window-zones@mihai-a24 2>&1 || true)
     assert_text 'GNOME live extension errors empty after recovery' '[]' "$errors_after"
-    wait_for_text "$run_log" 'Hotkey registration now recovered' 45 || true
-    assert_text 'GNOME live companion recovers without App restart' \
-        'Hotkey registration now recovered' "$(cat "$run_log" 2>/dev/null || true)"
-    kill -0 "$app_pid_before" 2>/dev/null && pid_same=1
+    wait_for_new_text "$run_log" 'Hotkey registration now recovered' "$recovered_before" 45 || true
+    assert_eq 'GNOME live companion recovers without App restart' 1 \
+        "$(( $(count_text "$run_log" 'Hotkey registration now recovered') > recovered_before ? 1 : 0 ))"
+    owned_process alive "$app_pid_before" && pid_same=1
     assert_eq 'GNOME live App PID unchanged after recovery' 1 "$pid_same"
     gnome_live_capture companion-recovered
 
     run_gnome_live_dispatch config-baseline "$GNOME_SAFE_RIGHT_HOTKEY"
     gnome_live_assert_geometry config-baseline "$GNOME_LIVE_TWO_THIRDS"
+    local invalid_before
+    invalid_before=$(count_text "$run_log" 'Config reload error')
     write_gnome_live_invalid_config
     sleep 0.4
     send_app reload
     sleep 0.3
     send_app reload
-    wait_for_text "$run_log" 'Config reload error' 10 || true
-    assert_text 'GNOME live invalid config exposes actionable error' \
-        'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'Config reload error' "$invalid_before" 10 || true
+    assert_eq 'GNOME live invalid config exposes actionable error' 1 \
+        "$(( $(count_text "$run_log" 'Config reload error') > invalid_before ? 1 : 0 ))"
     local bindings_before hotkeys_before
     bindings_before=$(count_text "$run_log" 'binding count: 4')
     hotkeys_before=$(count_text "$run_log" 'hotkey state: Registered')
@@ -207,14 +191,16 @@ EOF
         "$GNOME_LIVE_LEFT_HALF" "$(wait_observed gnome_live_geometry "$GNOME_LIVE_LEFT_HALF" 10)"
     gnome_live_capture rejected-replacement-binding
 
+    local loaded_before
+    loaded_before=$(count_text "$run_log" 'Config state: Loaded')
     write_gnome_live_valid_config
     sleep 0.4
     send_app reload
     sleep 0.3
     send_app reload
-    wait_for_text "$run_log" 'Config state: Loaded' 10 || true
-    assert_text 'GNOME live valid config recovers' 'Config state: Loaded' \
-        "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'Config state: Loaded' "$loaded_before" 10 || true
+    assert_eq 'GNOME live valid config recovers' 1 \
+        "$(( $(count_text "$run_log" 'Config state: Loaded') > loaded_before ? 1 : 0 ))"
     bindings_before=$(count_text "$run_log" 'binding count: 4')
     send_app status
     wait_for_new_text "$run_log" 'binding count: 4' "$bindings_before" 10 || true
@@ -233,11 +219,11 @@ run_gnome_live_tui_lifecycle() {
 
     tui_control_checks "$tui_log" 'GNOME live'
 
+    run_gnome_live_dispatch tui-baseline "$GNOME_SAFE_CENTER_HOTKEY"
+    gnome_live_assert_geometry 'GNOME live TUI baseline' "$GNOME_LIVE_CENTER_THIRD"
     gnome_live_activate_window || true
-    send_app "dispatch $GNOME_SAFE_LEFT_HOTKEY"
-    assert_eq 'GNOME live TUI dispatch' \
-        "$(sorted_hotkey "$GNOME_SAFE_LEFT_HOTKEY")" \
-        "$(sorted_hotkey "$(wait_for_reported_action "$tui_log" 'Last action: ' 10)")"
+    tui_dispatch "$tui_log" 'GNOME live TUI dispatch' "$GNOME_SAFE_LEFT_HOTKEY"
+    gnome_live_assert_geometry 'GNOME live TUI dispatch' "$GNOME_LIVE_LEFT_HALF"
 
-    tui_end 'GNOME live' "$tui_log"
+    stop_app_cleanly 'GNOME live TUI quit' "$tui_log"
 }

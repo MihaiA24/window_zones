@@ -1,9 +1,10 @@
 run_gnome() {
     CURRENT_GATE='gnome'
     GNOME_ROOT="$TMP_DIR/gnome"
-    local output="$TMP_DIR/gnome-native.log" rc=0 checks=0 failures=0
-    /usr/bin/python3 "$SCRIPT_DIR/gnome-smoke.py" --binary "$BIN_PATH" \
-        --output-dir "$GNOME_ROOT" --keep-logs >"$output" 2>&1 || rc=$?
+    local output="$TMP_DIR/gnome-native.log" rc=0 checks=0 failures=0 native_pid=''
+    start_group native_pid "$output" /usr/bin/python3 "$SCRIPT_DIR/gnome-smoke.py" \
+        --binary "$BIN_PATH" --output-dir "$GNOME_ROOT" --keep-logs
+    wait "$native_pid" || rc=$?
     log "$(<"$output")"
     if [[ -f "$GNOME_ROOT/results.json" ]]; then
         read -r checks failures < <(/usr/bin/python3 -c \

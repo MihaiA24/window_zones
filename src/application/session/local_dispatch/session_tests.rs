@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
@@ -55,13 +55,19 @@ struct Session {
 
 impl Session {
     fn new() -> Self {
+        Self::with_config(|path| {
+            fs::write(path, window_zones::starter_config("Ctrl+Alt")).unwrap();
+        })
+    }
+
+    fn with_config(prepare: impl FnOnce(&Path)) -> Self {
         let dir = TestDirectory::new();
         let lock_path = dir.0.join("instance.lock");
         let config = dir.0.join("config.toml");
         let log = dir.0.join("perf.jsonl");
-        fs::write(&config, window_zones::starter_config("Ctrl+Alt")).unwrap();
+        prepare(&config);
         let lock = acquire_instance_lock(&lock_path).unwrap();
-        let identity = Identity::new("sway", &config).unwrap();
+        let identity = Identity::new("sway", &dir.0.join("sway.sock"), &config).unwrap();
         let (instructions, receiver) = mpsc::channel();
         let server = Server::start(&lock, identity.clone(), instructions.clone()).unwrap();
         let runtime_config = config.clone();
@@ -98,7 +104,11 @@ impl Session {
     }
 
     fn dispatch(&self, hotkey: &str) -> Response {
-        dispatch(&self.lock_path, self.identity.clone(), hotkey).unwrap()
+        self.dispatch_as(self.identity.clone(), hotkey)
+    }
+
+    fn dispatch_as(&self, identity: Identity, hotkey: &str) -> Response {
+        dispatch(&self.lock_path, identity, hotkey).unwrap()
     }
 
     fn raw(&self, bytes: &[u8]) -> Response {
@@ -210,8 +220,24 @@ fn separate_clients_share_runtime_history_reload_and_session_logging() {
 fn mismatch_and_malformed_requests_fail_without_dispatching() {
     let session = Session::new();
     for identity in [
-        Identity::new("hyprland", &session.config).unwrap(),
-        Identity::new("sway", &session.config.with_file_name("other.toml")).unwrap(),
+        Identity::new(
+            "hyprland",
+            &session.identity.compositor_socket,
+            &session.config,
+        )
+        .unwrap(),
+        Identity::new(
+            "sway",
+            &session.identity.compositor_socket,
+            &session.config.with_file_name("other.toml"),
+        )
+        .unwrap(),
+        Identity::new(
+            "sway",
+            &session.config.with_file_name("other-sway.sock"),
+            &session.config,
+        )
+        .unwrap(),
     ] {
         let response = dispatch(&session.lock_path, identity, "Ctrl+Alt+Left").unwrap();
         assert!(!response.success);
@@ -239,11 +265,145 @@ fn mismatch_and_malformed_requests_fail_without_dispatching() {
 }
 
 #[test]
+fn symlink_retargets_and_restart_keep_the_watched_path_routable() {
+    let session = Session::with_config(|path| {
+        let first = path.with_file_name("first.toml");
+        fs::write(&first, window_zones::starter_config("Ctrl+Alt")).unwrap();
+        fs::write(
+            path.with_file_name("second.toml"),
+            window_zones::starter_config("Ctrl+Super"),
+        )
+        .unwrap();
+        symlink(first, path).unwrap();
+    });
+    let first = session.config.with_file_name("first.toml");
+    let second = session.config.with_file_name("second.toml");
+    let identity =
+        |path: &Path| Identity::new("sway", &session.identity.compositor_socket, path).unwrap();
+    assert!(
+        session
+            .dispatch_as(identity(&first), "Ctrl+Alt+Left")
+            .success
+    );
+
+    fs::remove_file(&session.config).unwrap();
+    symlink(&second, &session.config).unwrap();
+    session
+        .instructions
+        .send(RuntimeInstruction::Reload.into())
+        .unwrap();
+    assert!(
+        session
+            .dispatch_as(identity(&session.config), "Ctrl+Super+Left")
+            .success
+    );
+    assert!(
+        session
+            .dispatch_as(identity(&second), "Ctrl+Super+Right")
+            .success
+    );
+    let stale_target = session.dispatch_as(identity(&first), "Ctrl+Super+Left");
+    assert!(!stale_target.success);
+    assert!(stale_target.output.contains("backend/config mismatch"));
+
+    session
+        .instructions
+        .send(RuntimeInstruction::Restart.into())
+        .unwrap();
+    assert!(
+        session
+            .dispatch_as(identity(&session.config), "Ctrl+Super+Left")
+            .success
+    );
+}
+
+#[test]
+fn a_missing_config_can_appear_without_changing_dispatch_identity() {
+    let session = Session::with_config(|_| {});
+    let initial = session.dispatch("Ctrl+Alt+Left");
+    assert!(!initial.success);
+    assert!(initial.output.contains("no binding configured for hotkey"));
+    fs::write(&session.config, window_zones::starter_config("Ctrl+Alt")).unwrap();
+    session
+        .instructions
+        .send(RuntimeInstruction::Reload.into())
+        .unwrap();
+    let identity =
+        Identity::new("sway", &session.identity.compositor_socket, &session.config).unwrap();
+    assert!(
+        session
+            .dispatch_as(identity.clone(), "Ctrl+Alt+Left")
+            .success
+    );
+    session
+        .instructions
+        .send(RuntimeInstruction::Restart.into())
+        .unwrap();
+    assert!(session.dispatch_as(identity, "Ctrl+Alt+Right").success);
+}
+
+#[test]
+fn replacing_the_compositor_socket_refuses_old_and_new_client_identities() {
+    let dir = TestDirectory::new();
+    let lock_path = dir.0.join("instance.lock");
+    let lock = acquire_instance_lock(&lock_path).unwrap();
+    let socket_path = dir.0.join("sway.sock");
+    let old_socket = UnixDatagram::bind(&socket_path).unwrap();
+    let config = dir.0.join("config.toml");
+    let old_identity = Identity::new("sway", &socket_path, &config).unwrap();
+    let (tx, receiver) = mpsc::channel();
+    let _server = Server::start(&lock, old_identity.clone(), tx).unwrap();
+    fs::remove_file(&socket_path).unwrap();
+    let _replacement = UnixDatagram::bind(&socket_path).unwrap();
+    let new_identity = Identity::new("sway", &socket_path, &config).unwrap();
+    assert_ne!(old_identity, new_identity);
+    for identity in [old_identity, new_identity] {
+        let response = dispatch(&lock_path, identity, "Ctrl+Alt+Left").unwrap();
+        assert!(!response.success);
+        assert!(response.output.contains("compositor instance mismatch"));
+    }
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    drop(old_socket);
+}
+
+#[test]
+fn retargeting_a_compositor_socket_symlink_refuses_clients_of_the_original_socket() {
+    let dir = TestDirectory::new();
+    let lock_path = dir.0.join("instance.lock");
+    let lock = acquire_instance_lock(&lock_path).unwrap();
+    let first = dir.0.join("first.sock");
+    let second = dir.0.join("second.sock");
+    let _first = UnixDatagram::bind(&first).unwrap();
+    let _second = UnixDatagram::bind(&second).unwrap();
+    let watched = dir.0.join("current.sock");
+    symlink(&first, &watched).unwrap();
+    let config = dir.0.join("config.toml");
+    let identity = Identity::new("sway", &watched, &config).unwrap();
+    let original_client = Identity::new("sway", &first, &config).unwrap();
+    assert!(identity.matches(&original_client));
+    let (tx, receiver) = mpsc::channel();
+    let _server = Server::start(&lock, identity, tx).unwrap();
+    fs::remove_file(&watched).unwrap();
+    symlink(&second, &watched).unwrap();
+    let response = dispatch(&lock_path, original_client, "Ctrl+Alt+Left").unwrap();
+    assert!(!response.success);
+    assert!(response.output.contains("compositor instance mismatch"));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn socket_lifecycle_rejects_symlinks_and_preserves_replacements() {
     let dir = TestDirectory::new();
     let lock_path = dir.0.join("instance.lock");
     let lock = acquire_instance_lock(&lock_path).unwrap();
-    let identity = Identity::new("sway", &dir.0.join("config.toml")).unwrap();
+    let identity =
+        Identity::new("sway", &dir.0.join("sway.sock"), &dir.0.join("config.toml")).unwrap();
     let endpoint = directory(&lock_path);
     let witness = dir.0.join("witness");
     fs::create_dir(&witness).unwrap();
@@ -307,7 +467,8 @@ fn a_pending_action_does_not_delay_receiving_the_next_request() {
     let dir = TestDirectory::new();
     let lock_path = dir.0.join("instance.lock");
     let lock = acquire_instance_lock(&lock_path).unwrap();
-    let identity = Identity::new("sway", &dir.0.join("config.toml")).unwrap();
+    let identity =
+        Identity::new("sway", &dir.0.join("sway.sock"), &dir.0.join("config.toml")).unwrap();
     let (tx, receiver) = mpsc::channel();
     let server = Server::start(&lock, identity.clone(), tx).unwrap();
     let first_path = lock_path.clone();
@@ -335,7 +496,8 @@ fn shutdown_rejects_a_pending_request_and_removes_only_the_owned_socket() {
     let dir = TestDirectory::new();
     let lock_path = dir.0.join("instance.lock");
     let lock = acquire_instance_lock(&lock_path).unwrap();
-    let identity = Identity::new("sway", &dir.0.join("config.toml")).unwrap();
+    let identity =
+        Identity::new("sway", &dir.0.join("sway.sock"), &dir.0.join("config.toml")).unwrap();
     let (tx, receiver) = mpsc::channel();
     let server = Server::start(&lock, identity.clone(), tx).unwrap();
     let client_lock = lock_path.clone();

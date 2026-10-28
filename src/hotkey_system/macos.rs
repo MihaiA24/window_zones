@@ -287,9 +287,15 @@ unsafe extern "C" fn tap_callback(
     }
 }
 
-pub(super) fn listen(listener: Arc<Mutex<RdevListener>>) -> Result<(), String> {
+pub(super) fn listen(
+    listener: Arc<Mutex<RdevListener>>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) -> Result<(), String> {
     let mut context = CallbackContext::new(listener);
     let tap = NativeTap::new(&mut context)?;
+    if ready.send(()).is_err() {
+        return Ok(());
+    }
     unsafe { CFRunLoopRun() };
     drop(tap);
     match context.failure {

@@ -55,9 +55,8 @@ fi
 ASSERT_LOG="$TMP_DIR/assertions.log"
 : >"$ASSERT_LOG"
 PID_FILE="$TMP_DIR/pids"
-GROUP_PID_FILE="$TMP_DIR/group-pids"
 : >"$PID_FILE"
-: >"$GROUP_PID_FILE"
+export WINDOW_ZONES_SMOKE_OWNER="$TMP_DIR"
 FAILURES=0
 ASSERTIONS=0
 SKIPPED=0
@@ -88,7 +87,8 @@ source "$SCRIPT_DIR/smoke/kwin/runner.sh"
 source "$SCRIPT_DIR/smoke/x11/observations.sh"
 source "$SCRIPT_DIR/smoke/x11/placement.sh"
 source "$SCRIPT_DIR/smoke/x11/runner.sh"
-trap cleanup EXIT INT TERM
+install_smoke_traps
+owned_process require
 
 main() {
     if [[ "$COMMAND" == kde-live ]]; then

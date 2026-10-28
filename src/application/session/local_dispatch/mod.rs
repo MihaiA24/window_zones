@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -25,47 +25,60 @@ static CLIENT_ID: AtomicU64 = AtomicU64::new(0);
 #[serde(deny_unknown_fields)]
 pub(super) struct Identity {
     backend: String,
+    compositor_socket: PathBuf,
+    socket_identity: Option<(u64, u64)>,
     config_path: PathBuf,
 }
 
 impl Identity {
-    pub(super) fn new(backend: &str, config_path: &Path) -> io::Result<Self> {
+    pub(super) fn new(
+        backend: &str,
+        compositor_socket: &Path,
+        config_path: &Path,
+    ) -> io::Result<Self> {
+        let compositor_socket = std::path::absolute(compositor_socket)?;
         Ok(Self {
             backend: backend.to_string(),
-            config_path: normalized_path(config_path)?,
+            socket_identity: compositor_socket_identity(&compositor_socket)?,
+            compositor_socket,
+            // Keep the pathname the App watches, not its replaceable symlink target.
+            config_path: std::path::absolute(config_path)?,
         })
+    }
+
+    fn matches(&self, candidate: &Self) -> bool {
+        self.backend == candidate.backend
+            && self.socket_identity == candidate.socket_identity
+            && (self.compositor_socket == candidate.compositor_socket
+                || self.socket_identity.is_some())
+            // Check the original endpoint, including any symlink the native client follows.
+            && self.compositor_is_current()
+            && (self.config_path == candidate.config_path
+                || fs::canonicalize(&self.config_path)
+                    .and_then(|path| {
+                        fs::canonicalize(&candidate.config_path).map(|candidate| path == candidate)
+                    })
+                    .unwrap_or(false))
+    }
+
+    pub(super) fn compositor_is_current(&self) -> bool {
+        compositor_socket_identity(&self.compositor_socket)
+            .is_ok_and(|current| current == self.socket_identity)
     }
 }
 
-// Resolve existing symlinks, including parents of a not-yet-created config.
-fn normalized_path(path: &Path) -> io::Result<PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    let mut ancestor = absolute.as_path();
-    let mut missing = Vec::new();
-    let mut resolved = loop {
-        match fs::canonicalize(ancestor) {
-            Ok(path) => break path,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(ancestor.file_name().ok_or(error)?);
-                ancestor = ancestor.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "config has no parent")
-                })?;
-            }
-            Err(error) => return Err(error),
+fn compositor_socket_identity(path: &Path) -> io::Result<Option<(u64, u64)>> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            Ok(Some((metadata.dev(), metadata.ino())))
         }
-    };
-    for part in missing.into_iter().rev() {
-        resolved.push(part);
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "compositor connection must name a Unix socket",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    let mut normalized = PathBuf::new();
-    for component in resolved.components() {
-        if component == Component::ParentDir {
-            normalized.pop();
-        } else {
-            normalized.push(component);
-        }
-    }
-    Ok(normalized)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -95,6 +108,7 @@ impl Response {
 pub(super) struct Reply {
     pub(super) sender: mpsc::SyncSender<Response>,
     pub(super) deadline: Instant,
+    pub(super) identity: Arc<Identity>,
 }
 
 fn directory(lock_path: &Path) -> PathBuf {
@@ -173,9 +187,8 @@ struct PendingResponse {
 }
 
 fn send_response(socket: &UnixDatagram, client: &Path, response: Response) {
-    let response = serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"success\":false,\"output\":\"Error: cannot encode dispatch response\\n\"}".to_vec()
-    });
+    let response = serde_json::to_vec(&response)
+        .expect("dispatch response contains only strings and booleans");
     if response.len() <= MAX_RESPONSE {
         let _ = socket.send_to(&response, client);
     } else {
@@ -226,6 +239,7 @@ impl Server {
             Err(error) => return Err(error),
         }
         let owned = OwnedSocket::bind(path)?;
+        let identity = Arc::new(identity);
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = stopping.clone();
         let worker = thread::Builder::new().name("session-dispatch".to_string()).spawn(move || {
@@ -261,8 +275,8 @@ impl Server {
                 } else {
                     match serde_json::from_slice::<Request>(&bytes[..count]) {
                         Err(error) => Response::error(format!("malformed dispatch request: {error}")),
-                        Ok(request) if request.identity != identity => Response::error(format!(
-                            "dispatch backend/config mismatch; running session uses {} and {}; use the same --backend and --config, or restart that session",
+                        Ok(request) if !identity.matches(&request.identity) => Response::error(format!(
+                            "dispatch backend/config mismatch or compositor instance mismatch; running session uses {} and {}; use the same --backend, --config and compositor connection, or restart that session",
                             identity.backend, identity.config_path.display()
                         )),
                         Ok(request) => {
@@ -270,7 +284,7 @@ impl Server {
                             let deadline = Instant::now() + ACTION_TIMEOUT;
                             let request = RuntimeRequest {
                                 instruction: RuntimeInstruction::Dispatch(request.hotkey),
-                                reply: Some(Reply { sender, deadline }),
+                                reply: Some(Reply { sender, deadline, identity: identity.clone() }),
                             };
                             if instructions.send(request).is_err() {
                                 Response::error("running session is shutting down; start `window_zones run`")

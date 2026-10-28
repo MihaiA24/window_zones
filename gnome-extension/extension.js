@@ -228,10 +228,12 @@ export class WindowZonesService {
                 invocation.return_value(new GLib.Variant('(as)', [CAPABILITIES]));
                 return;
             case 'GetFocusedWindow':
+                this._transitionMetrics.delete(sender);
                 invocation.return_value(
                     new GLib.Variant('(btiiuu)', this.GetFocusedWindow()));
                 return;
             case 'GetDisplays':
+                this._transitionMetrics.delete(sender);
                 invocation.return_value(new GLib.Variant('(a(siiuu))', [this.GetDisplays()]));
                 return;
             case 'MoveWindow': {
@@ -245,6 +247,7 @@ export class WindowZonesService {
                 const metrics = this._transitionMetrics.get(sender);
                 if (!metrics)
                     throw dbusError('org.window_zones.Gnome.Error.InvalidWindowState', 'this caller has no completed transition');
+                this._transitionMetrics.delete(sender);
                 invocation.return_value(new GLib.Variant('(dd)', metrics));
                 return;
             }
@@ -301,6 +304,7 @@ export class WindowZonesService {
     }
 
     MoveWindow(sender, id, x, y, width, height) {
+        this._transitionMetrics.delete(sender);
         const started = GLib.get_monotonic_time();
         const window = global.display.list_all_windows()
             .find(candidate => candidate.get_id() === id);
@@ -328,7 +332,6 @@ export class WindowZonesService {
 
         this._moves.get(window)?.finish(
             dbusError('org.window_zones.Gnome.Error.InvalidWindowState', 'transition superseded by another request'));
-        this._transitionMetrics.delete(sender);
         const actor = window.get_compositor_private();
         const restoring = window.get_maximize_flags() !== 0;
         if (actor)
@@ -340,7 +343,7 @@ export class WindowZonesService {
         const settings = St.Settings.get();
         let clone = null;
         if (actor && settings.enable_animations
-            && settings.reducedMotion !== St.ReducedMotion.REDUCE
+            && (!St.ReducedMotion || settings.reducedMotion !== St.ReducedMotion.REDUCE)
             && (restoring || oldFrame.x !== x || oldFrame.y !== y || oldFrame.width !== width || oldFrame.height !== height)) {
             // One compositor snapshot; do not send a resize request on every animation frame.
             clone = new St.Widget({

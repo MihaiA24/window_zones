@@ -185,8 +185,8 @@ pub enum HotkeyRegistrationState {
     Error(HotkeySystemError),
 }
 
-/// A runtime state change worth reporting to the user. Events are produced on
-/// transitions only, so a surface can print every one without repeating itself.
+/// A runtime state change worth reporting to the user. Automatic events are
+/// transition-only; an explicit reload also reports an unchanged outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     ConfigLoaded {
@@ -197,6 +197,10 @@ pub enum RuntimeEvent {
     },
     /// The config could not be read or parsed; the previous bindings stay active.
     ConfigFailed {
+        message: String,
+    },
+    /// A replacement is waiting for hotkey capture; the previous config stays active.
+    ConfigPending {
         message: String,
     },
     /// The config's hotkey set was refused; the previous config and hotkeys stay active.
@@ -234,6 +238,10 @@ impl fmt::Display for RuntimeEvent {
             Self::ConfigFailed { message } => write!(
                 formatter,
                 "Config reload error: {message}; the previous bindings remain active"
+            ),
+            Self::ConfigPending { message } => write!(
+                formatter,
+                "Config reload pending: {message}; the previous config remains active; retrying"
             ),
             Self::ConfigRejected { message } => write!(formatter, "Config reload error: {message}"),
             Self::HotkeysRegistered { count } => write!(formatter, "Hotkeys registered: {count}"),
@@ -273,7 +281,6 @@ pub struct App {
     rejected_hotkeys: Option<Vec<String>>,
     registration_retry_at: Option<Instant>,
     last_config_error: Option<String>,
-    last_hotkey_error: Option<String>,
     last_config_signature: Option<ConfigFileSignature>,
     reload_deadline: Option<Instant>,
     perf_log: Option<PerfLog>,
@@ -528,6 +535,7 @@ impl App {
 
         if self.last_config_signature != signature {
             self.last_config_signature = signature;
+            self.last_config_error = None;
             self.reload_deadline = Some(now + CONFIG_RELOAD_DEBOUNCE);
         }
 
@@ -578,10 +586,16 @@ impl App {
                     }
                     return;
                 }
-                Err(error @ HotkeySystemError::Unavailable(_)) => {
+                Err(HotkeySystemError::Unavailable(message)) => {
                     self.registered_hotkeys = None;
                     self.registration_retry_at = Some(now + HOTKEY_RETRY_INTERVAL);
-                    events.extend(self.hotkey_failed(error));
+                    if self.last_config_error.as_ref() != Some(&message) {
+                        self.last_config_error = Some(message.clone());
+                        events.push(RuntimeEvent::ConfigPending {
+                            message: message.clone(),
+                        });
+                    }
+                    events.extend(self.hotkey_failed(HotkeySystemError::Unavailable(message)));
                     self.reload_deadline = self.registration_retry_at;
                     return;
                 }
@@ -636,7 +650,6 @@ impl App {
                 self.rejected_hotkeys = Some(wanted);
                 self.hotkey_state =
                     HotkeyRegistrationState::Error(HotkeySystemError::Rejected(message.clone()));
-                self.last_hotkey_error = Some(message.clone());
                 events.push(RuntimeEvent::HotkeysRejected { message });
             }
             Err(error @ HotkeySystemError::Unavailable(_)) => {
@@ -649,7 +662,7 @@ impl App {
 
     fn hotkeys_registered_as(&mut self, hotkeys: Vec<String>, events: &mut Vec<RuntimeEvent>) {
         let count = hotkeys.len();
-        let recovered = self.last_hotkey_error.take().is_some();
+        let recovered = matches!(self.hotkey_state, HotkeyRegistrationState::Error(_));
         self.registered_hotkeys = Some(hotkeys);
         self.rejected_hotkeys = None;
         self.registration_retry_at = None;
@@ -662,16 +675,16 @@ impl App {
     }
 
     fn hotkey_failed(&mut self, error: HotkeySystemError) -> Option<RuntimeEvent> {
+        if matches!(&self.hotkey_state, HotkeyRegistrationState::Error(previous) if previous == &error)
+        {
+            return None;
+        }
         let message = match &error {
             HotkeySystemError::Rejected(message) | HotkeySystemError::Unavailable(message) => {
                 message.clone()
             }
         };
         self.hotkey_state = HotkeyRegistrationState::Error(error);
-        if self.last_hotkey_error.as_ref() == Some(&message) {
-            return None;
-        }
-        self.last_hotkey_error = Some(message.clone());
         Some(RuntimeEvent::HotkeysUnavailable { message })
     }
 
@@ -737,7 +750,6 @@ impl App {
             rejected_hotkeys: None,
             registration_retry_at: None,
             last_config_error: None,
-            last_hotkey_error: None,
             last_config_signature: None,
             reload_deadline: None,
             perf_log: None,
@@ -1823,6 +1835,49 @@ action = { type = "move-to-zone", zone = "left-half" }
     }
 
     #[test]
+    fn an_unchanged_capture_outage_reports_new_pending_configs_without_applying_them() {
+        let config = TestConfig::new("pending_during_existing_outage");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkey_system = FakeHotkeySystem {
+            unavailable: true,
+            ..FakeHotkeySystem::default()
+        };
+        let start = Instant::now();
+        assert!(matches!(
+            app.tick(&mut hotkey_system, start).as_slice(),
+            [RuntimeEvent::HotkeysUnavailable { .. }]
+        ));
+        config.write(&zone_binding("Ctrl+Alt+Right", "right-half"));
+        assert!(matches!(
+            app.reload(&mut hotkey_system, start).as_slice(),
+            [RuntimeEvent::ConfigPending { .. }]
+        ));
+        assert!(
+            app.tick(&mut hotkey_system, start + HOTKEY_RETRY_INTERVAL)
+                .is_empty()
+        );
+
+        config.write(&zone_binding("Ctrl+Alt+Up", "maximize"));
+        let changed_at = start + HOTKEY_RETRY_INTERVAL * 2;
+        assert!(matches!(
+            settle(&mut app, &mut hotkey_system, changed_at).as_slice(),
+            [RuntimeEvent::ConfigPending { .. }]
+        ));
+        assert_eq!(hotkeys(&app), ["alt+ctrl+left"]);
+        assert!(!app.hotkeys_registered());
+        hotkey_system.unavailable = false;
+        let accepted = app.tick(
+            &mut hotkey_system,
+            changed_at + CONFIG_RELOAD_DEBOUNCE + HOTKEY_RETRY_INTERVAL,
+        );
+        assert!(accepted.contains(&RuntimeEvent::ConfigLoaded { bindings: 1 }));
+        assert!(accepted.contains(&RuntimeEvent::HotkeysRecovered { count: 1 }));
+        assert_eq!(hotkeys(&app), ["alt+ctrl+up"]);
+        assert_eq!(hotkey_system.registered, ["alt+ctrl+up"]);
+    }
+
+    #[test]
     fn unavailable_config_replacement_waits_for_acceptance() {
         for refused_on_recovery in [false, true] {
             let config = TestConfig::new("reload_unavailable_hotkey");
@@ -1841,7 +1896,10 @@ action = { type = "move-to-zone", zone = "left-half" }
             let unavailable = app.reload(&mut hotkeys, start);
             assert!(matches!(
                 unavailable.as_slice(),
-                [RuntimeEvent::HotkeysUnavailable { .. }]
+                [
+                    RuntimeEvent::ConfigPending { .. },
+                    RuntimeEvent::HotkeysUnavailable { .. }
+                ]
             ));
             assert_eq!(app.config().bindings.len(), 1);
             assert_eq!(
@@ -1852,6 +1910,16 @@ action = { type = "move-to-zone", zone = "left-half" }
             let attempts = hotkeys.attempts;
             app.tick(&mut hotkeys, start + HOTKEY_RETRY_INTERVAL / 2);
             assert_eq!(hotkeys.attempts, attempts);
+            let repeated = app.reload(&mut hotkeys, start);
+            assert!(
+                matches!(repeated.as_slice(), [RuntimeEvent::ConfigPending { message }] if message.contains("companion absent"))
+            );
+            assert!(
+                repeated[0]
+                    .to_string()
+                    .contains("previous config remains active")
+            );
+            assert_eq!(app.config().bindings[0].hotkey, "alt+ctrl+left");
             hotkeys.unavailable = false;
             hotkeys.refuse = refused_on_recovery.then(|| "alt+ctrl+x".to_string());
             let recovered = app.tick(&mut hotkeys, start + HOTKEY_RETRY_INTERVAL);

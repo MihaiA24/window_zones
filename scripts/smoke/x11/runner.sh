@@ -45,12 +45,10 @@ run_x11_tui_lifecycle() {
     run_x11_dispatch tui-baseline alt+ctrl+up
     x11_assert_geometry 'X11 TUI baseline' '640,0,640,1080'
 
-    send_app 'dispatch alt+ctrl+left'
-    wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8 || true
-    assert_text 'x11 TUI dispatch' 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
+    tui_dispatch "$tui_log" 'x11 TUI dispatch' alt+ctrl+left
     x11_assert_geometry 'X11 TUI dispatch moves window' '0,0,960,1080'
 
-    tui_end x11 "$tui_log"
+    stop_app_cleanly 'x11 TUI quit' "$tui_log"
 }
 
 run_x11() {
@@ -176,6 +174,7 @@ EOF
     fi
     assert_eq 'X11 cross-display observer sees second monitor' 1 "$((center_x >= 1920 && center_x < 3520 ? 1 : 0))"
     run_x11_adr9_window_checks
+    run_x11_constrained_restore_check
     # Put the frame back on the first display as a recognized built-in zone so
     # previous-display exercises index-0 wrapping to the last display.
     DISPLAY="$X11_DISPLAY" xdotool windowmove "$WINDOW_ID" 0 0 >/dev/null 2>&1 || true
@@ -233,22 +232,30 @@ EOF
         x11_hotkey_diagnostics "$run_log"
     fi
 
+    local invalid_before loaded_before bindings_before
+    invalid_before=$(count_text "$run_log" 'Config reload error')
     sleep 0.3
     write_invalid_config
     send_app reload
     sleep 0.5
     send_app reload
-    wait_for_text "$run_log" 'Config reload error' 8 || true
-    assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'Config reload error' "$invalid_before" 8 || true
+    assert_eq 'X11 invalid config exposes actionable error' 1 \
+        "$(( $(count_text "$run_log" 'Config reload error') > invalid_before ? 1 : 0 ))"
+    bindings_before=$(count_text "$run_log" 'binding count: 5')
     send_app status
-    sleep 0.3
-    assert_text 'X11 invalid reload preserves previous bindings' 'binding count: 5' "$(<"$run_log")"
+    wait_for_new_text "$run_log" 'binding count: 5' "$bindings_before" 8 || true
+    assert_eq 'X11 invalid reload preserves previous bindings' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 5') > bindings_before ? 1 : 0 ))"
+    loaded_before=$(count_text "$run_log" 'Config state: Loaded')
     write_five_bindings_config
     sleep 0.3
     send_app reload
     sleep 0.5
     send_app reload
-    assert_text 'X11 config recovers after valid rewrite' 'Config state: Loaded' "$(<"$run_log")"
+    wait_for_new_text "$run_log" 'Config state: Loaded' "$loaded_before" 10 || true
+    assert_eq 'X11 config recovers after valid rewrite' 1 \
+        "$(( $(count_text "$run_log" 'Config state: Loaded') > loaded_before ? 1 : 0 ))"
 
     # ADR 0009: a replacement set the X server refuses keeps the old config and its grabs.
     local grab_log="$X11_ROOT/competitor-grab.log" grab_pid='' refused_before=0

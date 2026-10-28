@@ -50,10 +50,11 @@ xwindow_for_pid() {
     local pid=$1 timeout_s=${2:-20} id='' owner=''
     local deadline=$((SECONDS + timeout_s))
     while (( SECONDS < deadline )); do
+        owned_process alive "$pid" || return 1
         while read -r id; do
             [[ -n "$id" ]] || continue
             owner=$(xon xdotool getwindowpid "$id" 2>/dev/null || true)
-            if [[ "$owner" == "$pid" ]]; then
+            if [[ "$owner" == "$pid" ]] && owned_process alive "$pid"; then
                 printf '%s' "$id"
                 return 0
             fi

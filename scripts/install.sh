@@ -126,7 +126,12 @@ AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones.desktop"
 KWIN_UNIT_FILE="$UNIT_DIR/window-zones-kwin.service"
 KWIN_AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones_kwin.desktop"
 KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
-KDE_SESSION_STATE="$INSTALL_PREFIX/share/window-zones/kde-session-running"
+KDE_LEGACY_STATE="$INSTALL_PREFIX/share/window-zones/kde-session-running"
+KDE_SESSION_KEY=''
+if [[ "$OS" == Linux ]]; then
+  KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
+  KDE_SESSION_KEY="${KDE_SESSION_KEY%% *}"
+fi
 GNOME_ID='window-zones@mihai-a24'
 GNOME_DIR="$DATA_HOME/gnome-shell/extensions/$GNOME_ID"
 KWIN_ID='window-zones'
@@ -192,21 +197,102 @@ kde_launcher_owned() {
   [[ -f "$KDE_LAUNCHER" ]] && grep -Fqx -- "# Window Zones KDE login: $INSTALL_DIR" "$KDE_LAUNCHER"
 }
 
+# /proc start ticks and boot ID do not depend on locale or timezone.
+process_identity() {
+  local pid="$1" status
+  local -a fields
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  IFS= read -r status 2>/dev/null <"/proc/$pid/stat" || return 1
+  read -r -a fields <<<"${status##*) }"
+  [[ "${fields[0]-}" != Z && -n "${fields[19]-}" ]] || return 1
+  IFS= read -r PROCESS_IDENTITY </proc/sys/kernel/random/boot_id || return 1
+  PROCESS_IDENTITY="$PROCESS_IDENTITY:${fields[19]}"
+}
+
+process_matches() {
+  process_identity "$1" && [[ "$PROCESS_IDENTITY" == "$2" ]]
+}
+
+kde_runtime_state() {
+  local root="${XDG_RUNTIME_DIR:-/tmp/window-zones-runtime-$UID}"
+  [[ "$root" == /* ]] || return 1
+  if [[ "${1:-}" == create ]]; then
+    (umask 077; mkdir -p -- "$root") || return 1
+  fi
+  [[ -d "$root" && ! -L "$root" && -O "$root" && "$(stat -c %a -- "$root")" == 700 ]] || return 1
+  KDE_SESSION_STATE="$root/window-zones-kde-$KDE_SESSION_KEY"
+  if [[ "${1:-}" == create ]]; then
+    (umask 077; mkdir -p -- "$KDE_SESSION_STATE") || return 1
+  fi
+  [[ -d "$KDE_SESSION_STATE" && ! -L "$KDE_SESSION_STATE" && -O "$KDE_SESSION_STATE" \
+    && "$(stat -c %a -- "$KDE_SESSION_STATE")" == 700 ]]
+}
+
+legacy_kde_session_running() {
+  local pid argument
+  [[ -d "$KDE_LEGACY_STATE" && ! -L "$KDE_LEGACY_STATE" && -O "$KDE_LEGACY_STATE" \
+    && -f "$KDE_LEGACY_STATE/owner" && ! -L "$KDE_LEGACY_STATE/owner" ]] || return 1
+  IFS= read -r pid <"$KDE_LEGACY_STATE/owner" || return 1
+  process_identity "$pid" || return 1
+  # Old records used timezone-sensitive ps text. Never trust it to signal a PID:
+  # require the exact owned launcher as an argv entry, then pin its current identity.
+  while IFS= read -r -d '' argument; do
+    if [[ "$argument" == "$KDE_LAUNCHER" ]]; then
+      KDE_SESSION_PID="$pid"
+      KDE_SESSION_IDENTITY="$PROCESS_IDENTITY"
+      return 0
+    fi
+  done <"/proc/$pid/cmdline"
+  return 1
+}
+
+cleanup_empty_legacy_state() {
+  if [[ -d "$KDE_LEGACY_STATE" && ! -L "$KDE_LEGACY_STATE" && -O "$KDE_LEGACY_STATE" ]]; then
+    rmdir -- "$KDE_LEGACY_STATE" 2>/dev/null || true
+  fi
+}
+
+stop_recorded_kde_supervisors() {
+  local file pid started attempt
+  for file in companion app; do
+    pid='' started=''
+    if [[ -e "$KDE_SESSION_STATE/$file" || -L "$KDE_SESSION_STATE/$file" ]]; then
+      [[ -f "$KDE_SESSION_STATE/$file" && ! -L "$KDE_SESSION_STATE/$file" && -O "$KDE_SESSION_STATE/$file" ]] || return 1
+      { IFS= read -r pid; IFS= read -r started; } <"$KDE_SESSION_STATE/$file" || true
+    fi
+    if process_matches "$pid" "$started"; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for ((attempt=0; attempt<50; attempt++)); do
+        process_matches "$pid" "$started" || break
+        sleep 0.1
+      done
+      if process_matches "$pid" "$started"; then
+        echo 'An owned KDE supervisor did not stop; refusing to start or remove binaries.' >&2
+        return 1
+      fi
+    fi
+    rm -f -- "$KDE_SESSION_STATE/$file"
+  done
+}
+
 kde_session_running() {
   local pid started
-  [[ -f "$KDE_SESSION_STATE/owner" ]] || return 1
-  {
-    IFS= read -r pid || return 1
-    IFS= read -r started || return 1
-  } <"$KDE_SESSION_STATE/owner"
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  [[ -n "$started" && "$(ps -p "$pid" -o lstart= 2>/dev/null)" == "$started" ]] || return 1
-  KDE_SESSION_PID="$pid"
+  if kde_runtime_state && [[ -f "$KDE_SESSION_STATE/owner" && ! -L "$KDE_SESSION_STATE/owner" ]]; then
+    if {
+      IFS= read -r pid && IFS= read -r started
+    } <"$KDE_SESSION_STATE/owner" && process_matches "$pid" "$started"; then
+      KDE_SESSION_PID="$pid"
+      KDE_SESSION_IDENTITY="$started"
+      return 0
+    fi
+  fi
+  legacy_kde_session_running
 }
 
 stop_kde_session() {
   local attempt
   if kde_launcher_owned && kde_session_running; then
+    process_matches "$KDE_SESSION_PID" "$KDE_SESSION_IDENTITY" || return 0
     kill -TERM "$KDE_SESSION_PID" 2>/dev/null || return 0
     for attempt in 1 2 3 4 5; do
       kde_session_running || return 0
@@ -215,6 +301,21 @@ stop_kde_session() {
     echo 'The owned KDE login launcher did not stop; refusing to remove its binaries.' >&2
     exit 1
   fi
+  if kde_launcher_owned && kde_runtime_state; then
+    (
+      umask 077
+      for file in lock owner; do
+        if [[ -e "$KDE_SESSION_STATE/$file" || -L "$KDE_SESSION_STATE/$file" ]]; then
+          [[ -f "$KDE_SESSION_STATE/$file" && ! -L "$KDE_SESSION_STATE/$file" && -O "$KDE_SESSION_STATE/$file" ]] || exit 1
+        fi
+      done
+      exec 9>"$KDE_SESSION_STATE/lock"
+      flock -n 9 || exit 1
+      stop_recorded_kde_supervisors || exit 1
+      rm -f -- "$KDE_SESSION_STATE/owner"
+    ) || { echo 'Could not stop the owned KDE session safely; leaving its binaries installed.' >&2; exit 1; }
+  fi
+  if kde_launcher_owned; then cleanup_empty_legacy_state; fi
 }
 
 remove_unit() {
@@ -241,13 +342,47 @@ user_systemd_available() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
 }
 
+graphical_systemd_available() {
+  user_systemd_available && systemctl --user is-active --quiet graphical-session.target
+}
+
+report_systemd_start() {
+  local unit="$1" file="$2" state='' status='' property
+  # Type=simple's start job completes before an immediate duplicate-owner exit.
+  sleep 0.2
+  while IFS= read -r property; do
+    case "$property" in
+      ActiveState=*) state="${property#*=}" ;;
+      ExecMainStatus=*) status="${property#*=}" ;;
+    esac
+  done < <(systemctl --user show "$unit" --property=ActiveState --property=ExecMainStatus)
+  if [[ "$status" == 75 && "$state" != active ]]; then
+    warn "Autostart: $file (enabled; not running: another instance already owns the session resources, exit 75)."
+  elif [[ "$state" == active ]]; then
+    printf 'Autostart: %s (enabled and running)\n' "$file"
+  else
+    warn "Autostart: $file (enabled; not running, inspect systemctl --user status $unit)."
+  fi
+}
+
 launch_agent_loaded() {
   launchctl print "$LAUNCH_TARGET" >/dev/null 2>&1
 }
 
+report_launch_agent_start() {
+  local state
+  sleep 0.2
+  state="$(launchctl print "$LAUNCH_TARGET" 2>/dev/null || true)"
+  if [[ "$state" == *'last exit code = 75'* && "$state" != *'state = running'* ]]; then
+    warn "Autostart: $LAUNCH_AGENT (loaded; not running: another instance already owns the session resources, exit 75)."
+  else
+    printf 'Autostart: %s (loaded; start requested, starts at every login)\n' "$LAUNCH_AGENT"
+  fi
+}
+
 launch_agent_owned() {
   [[ -f "$LAUNCH_AGENT" ]] \
-    && [[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$LAUNCH_AGENT" 2>/dev/null)" == "$INSTALL_DIR/window_zones" ]]
+    && [[ "$(plutil -extract ProgramArguments.0 raw -o - "$LAUNCH_AGENT" 2>/dev/null)" == "$INSTALL_DIR/window_zones" ]]
 }
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
@@ -456,14 +591,17 @@ EOF
   if [[ "$RESTART_LOADED_AGENT" -eq 1 ]]; then
     # Keep the loaded job: bootout followed immediately by bootstrap can race
     # launchd's asynchronous teardown on reinstall.
-    launchctl kickstart -k "$LAUNCH_TARGET" || warn "Could not restart $LAUNCH_LABEL."
-    printf 'Autostart: %s (loaded; restart requested)\n' "$LAUNCH_AGENT"
+    if launchctl kickstart -k "$LAUNCH_TARGET"; then
+      report_launch_agent_start
+    else
+      warn "Could not restart $LAUNCH_LABEL."
+    fi
   else
     if launch_agent_loaded; then
       launchctl bootout "$LAUNCH_TARGET" || warn "Could not unload the previous $LAUNCH_LABEL."
     fi
     if launchctl bootstrap "gui/$UID" "$LAUNCH_AGENT"; then
-      printf 'Autostart: %s (loaded; starts at every login)\n' "$LAUNCH_AGENT"
+      report_launch_agent_start
     else
       warn "Could not load the LaunchAgent into gui/$UID; it loads at your next login, or run: launchctl bootstrap gui/$UID \"$LAUNCH_AGENT\""
     fi
@@ -477,11 +615,20 @@ elif [[ "$AUTOSTART" -eq 1 ]]; then
     echo 'The recorded KWin companion is missing; reinstall with --kwin-script --autostart.' >&2
     exit 1
   fi
-  if [[ "$KDE_AUTOSTART" -eq 1 ]] && ! user_systemd_available \
+  USE_GRAPHICAL_SYSTEMD=0
+  if graphical_systemd_available; then USE_GRAPHICAL_SYSTEMD=1; fi
+  if [[ "$KDE_AUTOSTART" -eq 1 && "$USE_GRAPHICAL_SYSTEMD" -eq 0 ]] \
     && ! command -v busctl >/dev/null 2>&1 && ! command -v dbus-send >/dev/null 2>&1; then
     echo 'KDE XDG autostart needs busctl or dbus-send to wait for the companion session bus name.' >&2
     exit 1
   fi
+  if [[ "$KDE_AUTOSTART" -eq 1 && "$USE_GRAPHICAL_SYSTEMD" -eq 0 ]] && ! command -v flock >/dev/null 2>&1; then
+    echo 'KDE XDG autostart needs flock for crash-safe session ownership.' >&2
+    exit 1
+  fi
+  record_install autostart
+  if [[ "$KDE_AUTOSTART" -eq 1 ]]; then record_install kwin-autostart; fi
+  if [[ "$USE_GRAPHICAL_SYSTEMD" -eq 1 ]]; then
   mkdir -p "$UNIT_DIR"
   cat >"$UNIT_FILE" <<EOF
 [Unit]
@@ -500,7 +647,6 @@ RestartPreventExitStatus=75
 [Install]
 WantedBy=graphical-session.target
 EOF
-  record_install autostart
   if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
     cat >"$KWIN_UNIT_FILE" <<EOF
 [Unit]
@@ -514,18 +660,18 @@ BusName=org.window_zones.KWin
 ExecStart="$(systemd_escape "$INSTALL_DIR/window_zones_kwin")"
 Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=75
 
 [Install]
 WantedBy=graphical-session.target
 EOF
-    record_install kwin-autostart
   fi
-  if user_systemd_available; then
     systemctl --user daemon-reload
     if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
       stop_kde_session
       systemctl --user enable window-zones-kwin.service
-      systemctl --user restart window-zones-kwin.service
+      systemctl --user restart window-zones-kwin.service || warn 'Could not start the owned KWin companion.'
+      report_systemd_start window-zones-kwin.service "$KWIN_UNIT_FILE"
       if desktop_owned "$KWIN_AUTOSTART_FILE" /bin/bash "\"$(desktop_escape "$KDE_LAUNCHER")\""; then
         rm -f -- "$KWIN_AUTOSTART_FILE"
       fi
@@ -539,86 +685,136 @@ EOF
       # Starting now would only retry until GNOME Shell loads the companion at login.
       printf 'Autostart: %s (enabled; starts at your next login, once GNOME Shell loads the companion)\n' "$UNIT_FILE"
     else
-      systemctl --user restart window-zones.service
-      printf 'Autostart: %s (enabled and running)\n' "$UNIT_FILE"
+      systemctl --user restart window-zones.service || warn 'Could not start the owned App.'
+      report_systemd_start window-zones.service "$UNIT_FILE"
     fi
     echo 'Manage it: systemctl --user status|stop|start|restart window-zones'
     echo 'Logs: journalctl --user -u window-zones -f'
   else
+    remove_unit "$UNIT_FILE" "$INSTALL_DIR/window_zones" run
+    if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
+      remove_unit "$KWIN_UNIT_FILE" "$INSTALL_DIR/window_zones_kwin" ''
+    fi
     mkdir -p "$(dirname -- "$AUTOSTART_FILE")"
     if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
       {
         printf '#!/usr/bin/env bash\n# Window Zones KDE login: %s\n' "$INSTALL_DIR"
-        printf 'INSTALL_DIR=%q\nSESSION_STATE=%q\n' "$INSTALL_DIR" "$KDE_SESSION_STATE"
+        printf 'INSTALL_DIR=%q\nKDE_LAUNCHER=%q\nKDE_LEGACY_STATE=%q\nKDE_SESSION_KEY=%q\n' \
+          "$INSTALL_DIR" "$KDE_LAUNCHER" "$KDE_LEGACY_STATE" "$KDE_SESSION_KEY"
+        declare -f process_identity process_matches kde_runtime_state legacy_kde_session_running cleanup_empty_legacy_state stop_recorded_kde_supervisors
         cat <<'EOF'
 set -u
 umask 077
-if ! mkdir "$SESSION_STATE" 2>/dev/null; then
-  old_pid='' old_start=''
-  if [[ -f "$SESSION_STATE/owner" ]]; then
-    { IFS= read -r old_pid; IFS= read -r old_start; } <"$SESSION_STATE/owner"
+kde_runtime_state create || { echo 'Unsafe or unavailable KDE runtime directory.' >&2; exit 1; }
+for file in lock owner companion app; do
+  if [[ -e "$KDE_SESSION_STATE/$file" || -L "$KDE_SESSION_STATE/$file" ]]; then
+    [[ -f "$KDE_SESSION_STATE/$file" && ! -L "$KDE_SESSION_STATE/$file" && -O "$KDE_SESSION_STATE/$file" ]] || exit 1
   fi
-  case "$old_pid" in ''|*[!0-9]*) exit 75 ;; esac
-  if [[ -n "$old_start" && "$(ps -p "$old_pid" -o lstart= 2>/dev/null)" == "$old_start" ]]; then
-    exit 75
-  fi
-  rm -f -- "$SESSION_STATE/owner"
-  rmdir "$SESSION_STATE" && mkdir "$SESSION_STATE" || exit 75
-fi
+done
+exec 9>"$KDE_SESSION_STATE/lock"
+flock -n 9 || exit 75
+if legacy_kde_session_running && [[ "$KDE_SESSION_PID" != "$$" ]]; then exit 75; fi
+cleanup_empty_legacy_state
+# Never unlink the lock: another launcher may already have opened this inode.
+# Supervisors and native children close fd 9 and stop when this shell's identity dies.
+stop_recorded_kde_supervisors || exit 1
+SESSION_PID=$$
+process_identity "$SESSION_PID" || exit 1
+SESSION_IDENTITY="$PROCESS_IDENTITY"
 children=()
+child_identities=()
 stop_children() {
   if [[ -n "${children[*]-}" ]]; then
-    kill -TERM "${children[@]}" 2>/dev/null || true
+    for index in "${!children[@]}"; do
+      if process_matches "${children[index]}" "${child_identities[index]-}"; then
+        kill -TERM "${children[index]}" 2>/dev/null || true
+      fi
+    done
     wait "${children[@]}" 2>/dev/null || true
     children=()
   fi
 }
 cleanup() {
   stop_children
-  rm -f -- "$SESSION_STATE/owner"
-  rmdir "$SESSION_STATE"
+  rm -f -- "$KDE_SESSION_STATE/owner" "$KDE_SESSION_STATE/companion" "$KDE_SESSION_STATE/app"
 }
 trap cleanup EXIT
 trap 'exit 0' TERM INT HUP
-trap 'cleanup; trap - EXIT; exec "$0"' USR1
-printf '%s\n%s\n' "$$" "$(ps -p "$$" -o lstart=)" >"$SESSION_STATE/owner"
+trap 'cleanup; trap - EXIT; exec 9>&-; exec "$0"' USR1
+printf '%s\n%s\n' "$SESSION_PID" "$SESSION_IDENTITY" >"$KDE_SESSION_STATE/owner"
 supervise() {
-  child=''
-  trap 'if [[ -n "$child" ]]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; exit 0' TERM INT
+  local record="$1" child='' child_identity='' result
+  trap - EXIT
+  shift
+  stop_child() {
+    if [[ -n "$child" ]]; then
+      if process_matches "$child" "$child_identity"; then kill -TERM "$child" 2>/dev/null || true; fi
+      wait "$child" 2>/dev/null || true
+    fi
+  }
+  trap 'stop_child; exit 0' TERM INT
   trap '' HUP USR1
+  process_identity "$BASHPID" || exit 1
+  printf '%s\n%s\n' "$BASHPID" "$PROCESS_IDENTITY" >"$KDE_SESSION_STATE/$record"
+  wait_child() {
+    if process_identity "$child"; then
+      child_identity="$PROCESS_IDENTITY"
+      while process_matches "$child" "$child_identity"; do
+        process_matches "$SESSION_PID" "$SESSION_IDENTITY" || { stop_child; exit 0; }
+        sleep 0.2
+      done
+    fi
+    wait "$child"
+  }
   while :; do
+    process_matches "$SESSION_PID" "$SESSION_IDENTITY" || exit 0
     "$@" &
     child=$!
     result=0
-    wait "$child" || result=$?
+    wait_child || result=$?
     child=''
-    if [[ "$1" == "$INSTALL_DIR/window_zones" && ( "$result" -eq 0 || "$result" -eq 75 ) ]]; then
+    if [[ "$result" -eq 75 || ( "$1" == "$INSTALL_DIR/window_zones" && "$result" -eq 0 ) ]]; then
       exit "$result"
     fi
     sleep 2 &
     child=$!
-    wait "$child" || true
+    wait_child || true
     child=''
   done
 }
-supervise "$INSTALL_DIR/window_zones_kwin" &
+supervise companion "$INSTALL_DIR/window_zones_kwin" 9>&- &
 children+=("$!")
+child_identities+=('')
+companion_pid=$!
+companion_identity=''
+if process_identity "$companion_pid"; then companion_identity="$PROCESS_IDENTITY"; fi
+child_identities[0]="$companion_identity"
 companion_ready() {
   if command -v busctl >/dev/null 2>&1; then
-    busctl --user status org.window_zones.KWin >/dev/null 2>&1
+    busctl --user status org.window_zones.KWin 9>&- >/dev/null 2>&1
   else
     dbus-send --session --type=method_call --print-reply --dest=org.freedesktop.DBus \
-      /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner string:org.window_zones.KWin >/dev/null 2>&1
+      /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner string:org.window_zones.KWin 9>&- >/dev/null 2>&1
   fi
 }
 until companion_ready; do
-  sleep 1 &
-  children+=("$!")
-  wait "$!" || true
-  unset 'children[1]'
+  if ! process_matches "$companion_pid" "$companion_identity"; then
+    result=0
+    wait "$companion_pid" || result=$?
+    exit "$result"
+  fi
+  sleep 1 9>&-
 done
-supervise "$INSTALL_DIR/window_zones" run &
+if ! process_matches "$companion_pid" "$companion_identity"; then
+  result=0
+  wait "$companion_pid" || result=$?
+  exit "$result"
+fi
+supervise app "$INSTALL_DIR/window_zones" run 9>&- &
 children+=("$!")
+app_identity=''
+if process_identity "$!"; then app_identity="$PROCESS_IDENTITY"; fi
+child_identities+=("$app_identity")
 wait "${children[@]}"
 EOF
       } >"$KDE_LAUNCHER"
@@ -636,7 +832,8 @@ EOF
       if kde_session_running; then
         kill -USR1 "$KDE_SESSION_PID"
       fi
-      printf 'User systemd is unreachable; KDE companion and App use XDG login supervision: %s\n' "$KWIN_AUTOSTART_FILE"
+      cleanup_empty_legacy_state
+      printf 'Graphical user systemd is unavailable; KDE companion and App use XDG login supervision: %s\n' "$KWIN_AUTOSTART_FILE"
     else
       cat >"$AUTOSTART_FILE" <<EOF
 [Desktop Entry]
@@ -646,7 +843,7 @@ Exec="$(desktop_escape "$INSTALL_DIR/window_zones")" run
 X-GNOME-Autostart-enabled=true
 Terminal=false
 EOF
-      printf 'User systemd is unreachable; using XDG autostart: %s\n' "$AUTOSTART_FILE"
+      printf 'Graphical user systemd is unavailable; using XDG autostart: %s\n' "$AUTOSTART_FILE"
     fi
     echo 'To switch to systemd later, re-run the installer with --autostart.'
   fi

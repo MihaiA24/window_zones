@@ -1,4 +1,8 @@
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -72,7 +76,7 @@ pub(in crate::application) fn execute_session(
                 )
             })?;
             let identity =
-                local_dispatch::Identity::new(compositor_dispatch_backend(backend), path)?;
+                compositor_dispatch_identity(backend, path, |name| std::env::var_os(name))?;
             local_dispatch::Server::start(
                 _lock.as_ref().expect("live session holds instance lock"),
                 identity,
@@ -133,12 +137,55 @@ pub(in crate::application) fn execute_session(
 }
 
 #[cfg(target_os = "linux")]
-fn compositor_dispatch_backend(backend: RuntimeBackend) -> &'static str {
-    match backend {
-        RuntimeBackend::Wayland(ScriptedCompositor::Sway) => "sway",
-        RuntimeBackend::Wayland(ScriptedCompositor::Hyprland) => "hyprland",
+fn compositor_dispatch_identity(
+    backend: RuntimeBackend,
+    config_path: &Path,
+    get_env: impl Fn(&str) -> Option<OsString>,
+) -> io::Result<local_dispatch::Identity> {
+    let required = |name| {
+        get_env(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is required to identify the compositor instance"),
+                )
+            })
+    };
+    let (backend, socket) = match backend {
+        RuntimeBackend::Wayland(ScriptedCompositor::Sway) => {
+            ("sway", PathBuf::from(required("SWAYSOCK")?))
+        }
+        RuntimeBackend::Wayland(ScriptedCompositor::Hyprland) => {
+            let signature = required("HYPRLAND_INSTANCE_SIGNATURE")?;
+            let runtime_dir = get_env("XDG_RUNTIME_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(format!(
+                        "/run/user/{}",
+                        crate::application::ownership::current_uid()
+                    ))
+                });
+            let socket = runtime_dir
+                .join("hypr")
+                .join(&signature)
+                .join(".socket.sock");
+            let legacy = PathBuf::from("/tmp/hypr")
+                .join(signature)
+                .join(".socket.sock");
+            (
+                "hyprland",
+                if !socket.exists() && legacy.exists() {
+                    legacy
+                } else {
+                    socket
+                },
+            )
+        }
         _ => unreachable!("only compositor-bound backends use local dispatch"),
-    }
+    };
+    local_dispatch::Identity::new(backend, &socket, config_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -159,8 +206,8 @@ pub(in crate::application) fn execute_compositor_dispatch(
         let path = config_path
             .map_or_else(default_config_path, Ok)
             .map_err(|error| error.to_string())?;
-        let identity = local_dispatch::Identity::new(compositor_dispatch_backend(backend), &path)
-            .map_err(|error| format!("cannot resolve dispatch config path: {error}"))?;
+        let identity = compositor_dispatch_identity(backend, &path, |name| std::env::var_os(name))
+            .map_err(|error| format!("cannot identify dispatch session: {error}"))?;
         local_dispatch::dispatch(&instance_lock_path()?, identity, hotkey)
     })();
     match response {
@@ -185,5 +232,66 @@ pub(in crate::application) fn execute_compositor_dispatch(
             window_zones::logging::diagnostic(format_args!("Error: {error}"));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use window_zones::ScriptedCompositor;
+
+    use super::compositor_dispatch_identity;
+    use crate::application::backends::RuntimeBackend;
+
+    #[test]
+    fn dispatch_identity_requires_and_distinguishes_compositor_connections() {
+        let config = Path::new("/nonexistent/window-zones-dispatch.toml");
+        for (compositor, variable, first, second) in [
+            (
+                ScriptedCompositor::Sway,
+                "SWAYSOCK",
+                "/nonexistent/sway-a.sock",
+                "/nonexistent/sway-b.sock",
+            ),
+            (
+                ScriptedCompositor::Hyprland,
+                "HYPRLAND_INSTANCE_SIGNATURE",
+                "window-zones-a",
+                "window-zones-b",
+            ),
+        ] {
+            let backend = RuntimeBackend::Wayland(compositor);
+            assert!(compositor_dispatch_identity(backend, config, |_| None).is_err());
+            assert!(
+                compositor_dispatch_identity(backend, config, |_| Some(OsString::new())).is_err()
+            );
+            let identity = |instance| {
+                compositor_dispatch_identity(backend, config, |name| match name {
+                    name if name == variable => Some(OsString::from(instance)),
+                    "XDG_RUNTIME_DIR" => Some(OsString::from("/nonexistent/window-zones-runtime")),
+                    _ => None,
+                })
+                .unwrap()
+            };
+            assert_eq!(identity(first), identity(first));
+            assert_ne!(identity(first), identity(second));
+        }
+        let hyprland = RuntimeBackend::Wayland(ScriptedCompositor::Hyprland);
+        let identity = |runtime_dir| {
+            compositor_dispatch_identity(hyprland, config, |name| match name {
+                "HYPRLAND_INSTANCE_SIGNATURE" => {
+                    Some(OsString::from("window-zones-same-signature"))
+                }
+                "XDG_RUNTIME_DIR" => Some(OsString::from(runtime_dir)),
+                _ => None,
+            })
+            .unwrap()
+        };
+        assert_ne!(
+            identity("/nonexistent/runtime-a"),
+            identity("/nonexistent/runtime-b")
+        );
     }
 }

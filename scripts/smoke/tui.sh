@@ -1,18 +1,29 @@
+tui_command_frame() {
+    local tui_log=$1 command=$2 expected=$3 before
+    before=$(stat -c '%s' "$tui_log")
+    send_app "$command"
+    /usr/bin/python3 "$SCRIPT_DIR/smoke/tui_frame.py" "$tui_log" "$before" "$expected" 10
+}
+
 tui_control_checks() {
-    local tui_log=$1 label=$2 command expected before
+    local tui_log=$1 label=$2 command expected frame
     while IFS='|' read -r command expected; do
-        before=$(stat -c '%s' "$tui_log" 2>/dev/null || printf '0')
-        send_app "$command"
-        if wait_for_size_growth "$tui_log" "$before" 8; then
-            assert_text "$label TUI $command" "$expected" "$(<"$tui_log")"
-        else
-            assert_text "$label TUI $command" "$expected" ''
-        fi
-    done <<'EOF'
-reload|Config:
-restart|Hotkey state:
-status|Commands: reload
+        frame=$(tui_command_frame "$tui_log" "$command" "$expected") || true
+        assert_text "$label TUI $command" "$expected" "$frame"
+        assert_text "$label TUI $command completes successfully" 'Last error: none' "$frame"
+    done <<EOF
+reload|Config: $CONFIG_PATH (Loaded)
+restart|Last action: <none>
+status|Hotkey state: Registered
 EOF
+}
+
+tui_dispatch() {
+    local tui_log=$1 label=$2 hotkey=$3 frame reported
+    frame=$(tui_command_frame "$tui_log" "dispatch $hotkey" "Last action: $hotkey") || true
+    reported=$(printf '%s\n' "$frame" | sed -n 's/^Last action: //p')
+    assert_eq "$label" "$(sorted_hotkey "$hotkey")" "$(sorted_hotkey "$reported")"
+    assert_text "$label completes successfully" 'Last error: none' "$frame"
 }
 
 tui_begin() {
@@ -22,15 +33,4 @@ tui_begin() {
     assert_text "$label TUI starts" 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
 
     tui_control_checks "$tui_log" "$label"
-}
-
-tui_end() {
-    local label=$1 tui_log=$2 rc=0
-    send_app quit
-    close_app_input
-    if [[ -n "${APP_PID:-}" ]]; then
-        wait_pid "$APP_PID" 12 || rc=$?
-        APP_PID=''
-    fi
-    assert_rc_zero "$label TUI quit" "$rc" "tui log $tui_log"
 }

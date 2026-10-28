@@ -53,15 +53,23 @@ pub(super) fn run_runtime(
         let handled_input = instruction.is_some();
         if let Some(request) = instruction {
             #[cfg(any(target_os = "linux", all(test, unix)))]
-            if let Some(reply) = &request.reply
-                && now >= reply.deadline
-            {
-                let _ = reply.sender.try_send(local_dispatch::Response {
-                    success: false,
-                    output: "Error: dispatch expired before execution; no action was run\n"
-                        .to_string(),
-                });
-                continue;
+            if let Some(reply) = &request.reply {
+                let rejection = if now >= reply.deadline {
+                    Some("Error: dispatch expired before execution; no action was run\n")
+                } else if !reply.identity.compositor_is_current() {
+                    Some(
+                        "Error: compositor instance changed before execution; no action was run; restart the session\n",
+                    )
+                } else {
+                    None
+                };
+                if let Some(output) = rejection {
+                    let _ = reply.sender.try_send(local_dispatch::Response {
+                        success: false,
+                        output: output.to_string(),
+                    });
+                    continue;
+                }
             }
             match request.instruction {
                 RuntimeInstruction::Quit => break,
@@ -77,7 +85,7 @@ pub(super) fn run_runtime(
                 }
                 RuntimeInstruction::Reload => {
                     surface.report(runtime, Report::ReloadRequested);
-                    for event in runtime.reload(now) {
+                    for event in runtime.app.reload(&mut runtime.hotkey_system, now) {
                         surface.report(runtime, Report::Event(event));
                     }
                 }

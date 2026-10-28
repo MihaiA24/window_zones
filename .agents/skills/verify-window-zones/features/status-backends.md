@@ -8,6 +8,7 @@ Users inspect the resolved backend, loaded configuration, bindings and recent ru
 - `status-runtime`: interactive status and TUI refresh show the running instance rather than a fresh process.
 - `status-routing`: auto/explicit X11 or Wayland routing identifies the real backend; missing companions remain visible without X11 fallback.
 - `status-dry-run`: `--backend dry-run` and `--dry-run` provide a safe core-only status path.
+- `status-options`: missing option values fail before backend startup; an option token cannot become a config/log pathname.
 
 ## How to get to it (user POV)
 
@@ -25,8 +26,10 @@ Preconditions:
 - **CLI success.** `"$V" drive cli --expect 'config state: Loaded' --expect 'binding count: 5' -- status` reports the private config and five bindings.
 - **Flag/discovery variants.** Repeat with `"$V" drive cli --backend-flag alias --discovery --expect 'config state: Loaded' -- status`; also exercise alias/explicit-path and backend/discovery combinations when affected.
 - **Runtime views.** `"$V" drive session --mode run --command status --expect 'binding count: 5'` and `"$V" drive session --mode tui --command refresh --expect 'Window Zones TUI'` capture the typed command and returned view. For dispatch state, send dispatch and status in the same session.
+- **Missing values.** `"$V" drive cli --expect-exit 1 --expect '--log-file requires a value' -- --log-file --dry-run status`; repeat with `--perf-log --dry-run run`. No file named `--dry-run` may be created. Use `./--dry-run` when intentionally selecting that literal filename.
 - **Empty/error.** Run `"$V" drive config missing`, then `"$V" drive cli --expect 'config state: Missing' --expect 'binding count: 0' -- status`. Repeat with `drive config invalid` and expect `config state: Error`; empty TOML must be `Loaded` with count 0, not Missing. Restore `drive config valid`.
 - **Real routing.** `"$V" drive smoke x11` asserts auto resolves X11; `"$V" drive smoke gnome` / `"$V" drive smoke kde-live` cover their own native capabilities/status. Retain the backend/capability logs, not just the gate summary.
+- **Live capability refresh.** In an owned GNOME session, inspect capabilities, disable the owned companion, then request TUI `refresh`: require unavailable labels without first dispatching. Re-enable it and require fresh capabilities; the prior successful cache is not proof of current health.
 - **Persistence/cancel.** Re-run one-shot status after a config mutation and after session quit. Config survives; runtime last action starts at `<none>`. Status is read-only, with no edit/cancel dialog; session quit is its cancellation boundary.
 
 ## Gotchas

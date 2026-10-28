@@ -76,7 +76,7 @@ impl CompanionState {
         protocol_major: u32,
         script_sender: String,
         reset_state: bool,
-    ) -> Result<(), MethodErr> {
+    ) -> Result<Option<dbus::Message>, MethodErr> {
         if protocol_major != KWIN_PROTOCOL_MAJOR {
             return Err(method_error(
                 "org.window_zones.KWin.Error.Incompatible",
@@ -85,9 +85,16 @@ impl CompanionState {
         }
         if !reset_state && self.script_sender.as_deref() == Some(script_sender.as_str()) {
             self.touch();
-            return Ok(());
+            return Ok(None);
         }
 
+        let pending_reply = self.pending_next_request.take().map(|pending| {
+            method_error(
+                "org.window_zones.KWin.Error.Unavailable",
+                "KWin script reset the request session",
+            )
+            .to_message(&pending.call)
+        });
         let previous_hotkeys = std::mem::take(&mut self.registered_hotkeys);
         self.script_sender = Some(script_sender);
         self.last_seen = Some(Instant::now());
@@ -101,7 +108,7 @@ impl CompanionState {
         if !previous_hotkeys.is_empty() || !reset_state {
             self.enqueue_hotkeys(previous_hotkeys);
         }
-        Ok(())
+        Ok(pending_reply)
     }
 
     pub(super) fn ensure_ready(&mut self) -> Result<(), MethodErr> {
@@ -393,8 +400,9 @@ impl CompanionState {
         }
         (
             true,
-            "org.window_zones.KWin.Error.Invalid".to_string(),
-            "unknown KWin request id".to_string(),
+            "org.window_zones.KWin.Error.Unavailable".to_string(),
+            "KWin request result is no longer available; its session was reset or released"
+                .to_string(),
         )
     }
 }

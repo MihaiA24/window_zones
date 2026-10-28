@@ -1,7 +1,8 @@
 // Shell-hosted APIs are stubbed; Gio, GLib and D-Bus variants remain real.
 import GLib from 'gi://GLib';
 
-export const settings = {enable_animations: true, reducedMotion: 0};
+// Shell 50 lacks the reduced-motion enum and setting; tests also exercise 51.
+export const settings = {enable_animations: true};
 export const Clutter = {AnimationMode: {EASE_OUT_QUAD: 0}};
 export const WINDOW_ANIMATION_TIME = 250;
 
@@ -52,7 +53,6 @@ export class TestActor {
 
 export const St = {
     Settings: {get: () => settings},
-    ReducedMotion: {REDUCE: 1},
     Widget: TestActor,
 };
 

@@ -1,6 +1,6 @@
 # Window Zones verification map
 
-Maintained source for user-facing verification journeys. Read the index, then the affected feature files. `docs/runbooks/testing.md` remains the release-gate status record; this map does not promote synthetic evidence to a seated release pass.
+Maintained source for user-facing verification journeys. `docs/runbooks/testing.md` defines release gates; observed results and retained evidence belong in the PR description. Synthetic evidence does not close seated release gates.
 
 ## Baseline preconditions
 
@@ -28,4 +28,4 @@ Maintained source for user-facing verification journeys. Read the index, then th
 - [Window placement and display movement](placement.md): fourteen built-in zones, custom zones, directional/cyclic displays, half crossing, center/restore, identified moves and partial failures.
 - [Configuration and atomic reload](configuration.md): discovery/explicit paths, valid replacement, invalid retention, empty/missing configs, restart and disk persistence.
 - [Global hotkeys and dispatch](hotkeys.md): physical accelerators, one-shot/interactive/compositor-bound dispatch, exclusive controller ownership, transactional registration and recovery.
-- [Runtime controls](runtime-controls.md): CLI/TUI/tray lifecycle, initialization, single-instance ownership, notifications, best-effort session logs and performance logging.
+- [Runtime controls](runtime-controls.md): CLI/TUI/tray lifecycle, initialization, installer/autostart ownership, notifications, session logs and performance logging.

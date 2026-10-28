@@ -3,7 +3,7 @@ use crate::{DisplayGeometry, FocusedWindow, WindowId, WindowMove, WindowSystem};
 use crate::{Rect, WindowSystemError};
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{E_ACCESSDENIED, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, E_ACCESSDENIED, HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 #[cfg(target_os = "windows")]
@@ -12,15 +12,34 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFOEXW, MonitorFromWindow,
 };
 #[cfg(target_os = "windows")]
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
-    IsWindowArranged, IsZoomed, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetWindowPos, ShowWindow, WS_CAPTION, WS_THICKFRAME,
+    GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow, IsZoomed,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
+    WS_CAPTION, WS_THICKFRAME,
 };
+#[cfg(target_os = "windows")]
+use windows::core::{s, w};
+
+#[cfg(target_os = "windows")]
+fn window_is_arranged(hwnd: HWND) -> Option<bool> {
+    type IsArranged = unsafe extern "system" fn(HWND) -> BOOL;
+    static IS_ARRANGED: std::sync::LazyLock<Option<IsArranged>> = std::sync::LazyLock::new(|| {
+        // IsWindowArranged only exists from Windows 10 1903. A static import
+        // would prevent older Windows 10 from loading even dry-run commands.
+        let module = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok()?;
+        let address = unsafe { GetProcAddress(module, s!("IsWindowArranged")) }?;
+        Some(unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, IsArranged>(address)
+        })
+    });
+    IS_ARRANGED.map(|query| unsafe { query(hwnd) }.as_bool())
+}
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
@@ -192,8 +211,12 @@ impl WindowSystem for WindowsWindowSystem {
             ));
         }
         let result = (|| {
-            if maximized || minimized || unsafe { IsWindowArranged(hwnd) }.as_bool() {
-                let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+            // Older Windows cannot report the snapped state. Restoring a
+            // normal window is harmless, and keeps snapped placement working.
+            if maximized || minimized || window_is_arranged(hwnd).unwrap_or(true) {
+                // SW_RESTORE activates a captured window even if focus changed
+                // since dispatch. This restores it without stealing focus.
+                let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
             }
 
             let outer = Self::frame_rect(hwnd, id, false)?;

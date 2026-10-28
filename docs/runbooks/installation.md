@@ -143,11 +143,11 @@ installs `window-zones-kwin.service` and orders the App after the companion
 acquires `org.window_zones.KWin`. The App stays running while the companion
 recovers, reconnecting when it becomes available again.
 
-Without reachable user systemd, `window_zones_kwin.desktop` starts an installed
-KDE session launcher at login. It starts the companion, waits for its bus name,
-then starts the App and supervises both. This fallback needs `busctl` or
-`dbus-send`. Reinstall restarts an owned active service or launcher onto the
-new binaries; the KWin script itself still needs the reload above.
+Without an active systemd `graphical-session.target`, `window_zones_kwin.desktop`
+starts an installed KDE session launcher at login. It starts the companion,
+waits for its bus name, then starts the App and supervises both. This fallback
+needs `flock` (util-linux) and `busctl` or `dbus-send`. Reinstall restarts the
+owned launcher onto new binaries; the KWin script still needs the reload above.
 
 For an install **without `--autostart`**, start the Rust companion manually
 before the App and keep it running:
@@ -155,6 +155,10 @@ before the App and keep it running:
 ```bash
 "$HOME/.local/bin/window_zones_kwin"
 ```
+
+A second companion exits 75 instead of queueing behind the service-name owner.
+Both the systemd unit and XDG supervisor stop retrying that duplicate-owner
+exit; stop the existing companion before starting another.
 
 See [KDE Wayland](kde-wayland.md) for startup and runtime checks.
 
@@ -182,10 +186,11 @@ RestartPreventExitStatus=75
 WantedBy=graphical-session.target
 ```
 
-The installer substitutes and escapes the absolute installed binary path. When
-user systemd is reachable, it runs `systemctl --user daemon-reload` and
-`systemctl --user enable window-zones.service`, then starts (or restarts onto
-the new binary) the service with `systemctl --user restart window-zones.service`.
+The installer substitutes and escapes the absolute installed binary path.
+It selects systemd only when the user manager is reachable and
+`graphical-session.target` is active, then reloads/enables the owned units and
+requests startup. Diagnostics report the observed service state, including
+duplicate-owner exit 75, rather than assuming a successful start job is a live App.
 On GNOME, when the companion is not on the session bus yet (it was just
 installed and GNOME Shell loads it at login), the service is only enabled and
 starts at the next login instead of retrying until then. Re-running the
@@ -221,20 +226,23 @@ so an already-running instance does not cause a restart/log loop. Other failures
 are retried after two seconds. Stop the other listener before manually starting
 or restarting the service.
 
-If user systemd is unreachable, non-KDE installs use
-`${XDG_CONFIG_HOME:-$HOME/.config}/autostart/window_zones.desktop`. That entry
-runs the installed `window_zones run` at login without supervision or guaranteed
-journal capture. KDE installs instead use `window_zones_kwin.desktop` and the
-owned `<prefix>/share/window-zones/kde-session` launcher described above.
-The launcher retries failures after two seconds, but does not retry an App
-that exits normally or with **75**. It records its process start identity so
-reinstall/uninstall signal only that prefix's owned launcher. Stopping the
-launcher also stops its supervised App and companion before removing its owner
-record.
+If the user manager or its graphical-session target is unavailable, non-KDE
+installs use `${XDG_CONFIG_HOME:-$HOME/.config}/autostart/window_zones.desktop`,
+without supervision or guaranteed journal capture. KDE instead uses
+`window_zones_kwin.desktop` and the owned session launcher above.
+It retries crashes after two seconds, but does not retry exit 75 or an App
+that exits normally.
 
-The systemd units are still installed. To switch from XDG to systemd later,
-re-run the installer with `--autostart` once user systemd is reachable; it stops
-the owned KDE launcher, removes the owned desktop fallback and starts the units.
+KDE launcher state lives in an owned private runtime directory. `flock` releases
+ownership on a crash; the lock inode remains so competing launchers cannot
+lock different files. PID/start-tick and boot identities are timezone-independent,
+and guarded cleanup handles orphaned supervisors before replacement/removal.
+Stopping the launcher stops its supervised App and companion. An abandoned
+empty legacy lock directory is removable; foreign/nonempty state is preserved.
+
+To switch from XDG to systemd later, re-run `--autostart` inside a desktop with
+an active graphical target. The installer stops the owned KDE launcher, removes
+the owned desktop fallback and installs/enables the units.
 
 ### macOS LaunchAgent
 
@@ -299,6 +307,9 @@ Substitute your prefix if it differs. Follow the compositor-specific runbook for
 companion and hotkey verification. Report observed results, limitations, and
 retained evidence paths in the PR description. Verifier cleanup preserves its
 evidence; do not check verification artifacts into the repository.
+`bash scripts/test-install.sh` verifies these lifecycle and ownership paths
+against isolated Linux/systemd/XDG and macOS/launchd command boundaries.
+It does not prove real login-session startup, systemd or launchd behavior.
 
 Uninstall using the same prefix used for installation:
 

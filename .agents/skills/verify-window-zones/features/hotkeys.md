@@ -8,6 +8,8 @@ Users bind accelerators to positioning actions and trigger them from the desktop
 - `hotkey-input`: one-shot dispatch, interactive `dispatch` and bare-hotkey input normalize equivalent hotkeys.
 - `hotkey-registration`: startup/config changes register the new set atomically; conflicts/disconnects expose actionable errors and recover.
 - `hotkey-unbound`: malformed/unbound input reports failure without moving a window.
+- `hotkey-layout`: X11 grabs follow keyboard/modifier-map changes, including actual CapsLock/NumLock slots; failed remapping releases obsolete grabs.
+- `hotkey-native-recovery`: Windows preserves AltGr typing, reconciles missed releases and replaces its single owned hook on restart; macOS waits for native tap readiness.
 
 ## How to get to it (user POV)
 
@@ -30,7 +32,10 @@ Preconditions:
 - **Registration/config persistence.** `"$V" drive session --mode run --journey reload` observes replacement/retention/recovery; `drive tests` runs the repo's existing private-D-Bus contract tests as supplemental checks. Reopen with valid on-disk bindings and dispatch again.
 - **Cancel.** Exit with each affected `--quit` variant before accelerator injection; verify owned runtime/input listeners end and later accelerators do not dispatch through the exited app.
 - **GNOME controller isolation.** A second private-bus client may inspect but cannot replace another controller's grabs or receive its `HotkeyPressed` events. Disconnecting the controller releases its set; a new controller can then register.
-- **Compositor-bound dispatch.** On Sway/Hyprland, start a real `run`/`tui` with the same backend/config as its `dispatch` clients. Verify two clients share Restore history, mismatched identities fail, absent runtime fails without one-shot fallback, and an earlier pending action cannot delay accepting later requests past their execution deadline.
+- **Compositor-bound dispatch.** On Sway/Hyprland, start `run`/`tui` with the same config pathname and compositor connection as its clients (`SWAYSOCK`, or `HYPRLAND_INSTANCE_SIGNATURE` plus runtime namespace). Verify shared Restore history, symlink retarget/reload/restart, refusal of another instance or replaced socket, and queued-action expiration. A replaced compositor connection requires closing and relaunching the session, not only in-process `restart`.
+- **X11 mapping/work areas.** `check e2e` runs both ignored `x11_real_server*` regressions on its owned display. Map/remap keys and move NumLock to a different modifier slot only there; require the intended accelerator and no stale exclusive grab. A refused remap must release capture and report unavailability.
+- **KWin reset/ownership.** On a private bus, reset the script during pending registration and require retry/recovery, not permanent rejection. A second companion must exit 75 without queueing for the service name.
+- **Windows typing/recovery.** Follow the Windows native runbook: Polish/German AltGr input, secure-desktop return, ordinary editing keys, held-key release order and real hook removal followed by `restart`. Cross-target checks and synthetic event delivery do not prove these paths.
 
 ## Gotchas
 

@@ -103,10 +103,6 @@ impl Runtime {
         (events, dispatches)
     }
 
-    fn reload(&mut self, now: Instant) -> Vec<RuntimeEvent> {
-        self.app.reload(&mut self.hotkey_system, now)
-    }
-
     /// Rebuilds the App and adapters from scratch, releasing the old grabs first.
     fn restart(&mut self, now: Instant) -> Vec<RuntimeEvent> {
         self.hotkey_system = RuntimeHotkeySystem::Noop(NoopHotkeySystem);

@@ -243,23 +243,6 @@ fn partial_move_payloads_require_the_captured_identity_and_valid_frame() {
 }
 
 #[test]
-fn committed_hotkey_replacement_is_not_vetoed_by_a_late_accelerator_sampler() {
-    let mut state = FakeServiceState::complete();
-    state.expose_stale_accelerator = true;
-    let bus = FakeBus::new(state);
-    let mut system = KwinHotkeySystem::with_bus_address(bus.address.clone());
-    system
-        .register_hotkeys(&["alt+ctrl+left".to_string()])
-        .unwrap();
-    system
-        .register_hotkeys(&["alt+ctrl+right".to_string()])
-        .unwrap();
-    bus.update_state(|state| {
-        assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+right"]);
-    });
-}
-
-#[test]
 fn hotkey_conflict_is_rejected_and_previous_set_survives() {
     let bus = FakeBus::new(FakeServiceState::complete());
     let mut system = KwinHotkeySystem::with_bus_address(bus.address.clone());

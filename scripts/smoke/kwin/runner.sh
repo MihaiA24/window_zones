@@ -14,14 +14,13 @@ kde_live_tui_lifecycle() {
     assert_text 'KDE TUI starts' 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
     tui_control_checks "$tui_log" 'KDE'
     kde_live_activate_window || true
-    send_app 'dispatch alt+ctrl+left'
-    wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 10 || true
-    assert_text 'KDE TUI dispatch action' 'Last action: alt+ctrl+left' \
-        "$(cat "$tui_log" 2>/dev/null || true)"
+    kde_live_dispatch 'KDE TUI baseline' alt+ctrl+up
+    kde_live_refresh_targets
+    kde_live_assert_zone 'KDE TUI baseline geometry' center-third A
+    tui_dispatch "$tui_log" 'KDE TUI dispatch action' alt+ctrl+left
     kde_live_refresh_targets
     kde_live_assert_zone 'KDE TUI dispatch geometry' left-half A
-    tui_end KDE "$tui_log"
-    set +e
+    stop_app_cleanly 'KDE TUI quit' "$tui_log"
 }
 
 run_kde_live() {
@@ -59,17 +58,14 @@ run_kde_live() {
     APP_FD=''
     WINDOW_ID=''
     mkdir -p "$KDE_ROOT"
-    set +e
 
     if ! kde_live_preflight; then
-        set -e
         return 0
     fi
 
     mkdir -p "$KDE_CONFIG" "$KDE_DATA" "$KDE_CACHE" "$KDE_STATE" "$KDE_RUNTIME" "$KDE_HOME"
     chmod 700 "$KDE_RUNTIME" "$KDE_HOME"
     if ! build_binaries KDE --bin window_zones_kwin; then
-        set -e
         return 0
     fi
 
@@ -112,13 +108,11 @@ run_kde_live() {
     assert_eq 'KDE installed companion matches repository files' 1 "$installed_files_ok"
     if [[ "$installed_files_ok" -ne 1 ]]; then
         log 'BLOCKED KDE live: installed private KWin package does not match repository metadata/code'
-        set -e
         return 0
     fi
 
     if ! kde_live_start_fixture; then
         assert_eq 'KDE nested KWin fixture starts' 1 0
-        set -e
         return 0
     fi
     local kwin_alive=0
@@ -154,7 +148,6 @@ run_kde_live() {
     assert_eq 'KDE GetDisplays reports two outputs at readiness' 2 "$initial_display_count"
     if [[ "$KDE_COMPANION_READY" -ne 1 ]]; then
         log 'BLOCKED KDE live: repository KWin script did not complete its handshake; see nested KWin and Companion logs'
-        set -e
         return 0
     fi
     local kwin_diagnostics=''
@@ -212,7 +205,6 @@ PY
     log "KDE GetDisplays versus independent MaximizeArea: $(printf '%s\n' "$display_compare" | sed '$d')"
     if [[ "$observer_layout_ok" -ne 1 || "$observer_display_count" -ne 2 ]]; then
         log 'BLOCKED KDE live: independent observer did not provide two valid nonoverlapping output rectangles'
-        set -e
         return 0
     fi
     assert_eq 'KDE GetDisplays matches independent MaximizeArea observer' 1 "$display_compare_result"
@@ -304,6 +296,8 @@ PY
     skip_assert 'KDE seated accelerator capture' \
         'nested KWin uses a Noop session and does not own the login seat; XTEST/EIS tests compositor dispatch, not physical-seat input or host shortcut arbitration'
 
+    local script_recovered_before
+    script_recovered_before=$(count_text "$run_log" 'Hotkey registration now recovered')
     local app_pid_before="$APP_PID" script_unload='' script_unloaded='' unavailable_ok=0
     script_unload=$(kde_live_kwin_call unloadScript s window-zones 2>&1 || true)
     log "KDE repository script unload: $script_unload"
@@ -329,7 +323,7 @@ PY
     kde_live_wait_companion_ready 30 && script_reload_ready=1
     assert_eq 'KDE script reconnect restores capabilities' 1 "$script_reload_ready"
     local app_recovered=0
-    wait_for_text "$run_log" 'Hotkey registration now recovered' 20 && app_recovered=1
+    wait_for_new_text "$run_log" 'Hotkey registration now recovered' "$script_recovered_before" 20 && app_recovered=1
     assert_eq 'KDE App hotkey registration recovers after script reload' 1 "$app_recovered"
     kill -0 "$app_pid_before" 2>/dev/null && app_alive=1 || app_alive=0
     assert_eq 'KDE App PID unchanged after script reload' 1 "$app_alive"
@@ -341,9 +335,8 @@ PY
     # SIGTERM would otherwise be reported as stopped only by timeout, so escalate and confirm the
     # bus name is actually gone.
     stop_pid "$old_service_pid"
-    wait_pid "$old_service_pid" 5 external || kill -9 "$old_service_pid" 2>/dev/null || true
+    wait_pid "$old_service_pid" 5 external || stop_pid "$old_service_pid" KILL
     wait_pid "$old_service_pid" 5 external || true
-    set +e
     local service_owner_gone=0 stop_deadline=$((SECONDS + 10))
     while (( SECONDS < stop_deadline )); do
         if ! busctl --address="$KDE_BUS" list 2>/dev/null | grep -q 'org.window_zones.KWin'; then
@@ -384,17 +377,21 @@ PY
     send_app 'dispatch alt+ctrl+up'
     kde_live_refresh_targets
     kde_live_assert_zone 'KDE invalid config retention baseline center-third' center-third A
+    local invalid_before bindings_before
+    invalid_before=$(count_text "$run_log" 'Config reload error')
     write_invalid_config
     sleep 0.4
     send_app reload
     sleep 0.3
     send_app reload
-    wait_for_text "$run_log" 'Config reload error' 12 || true
-    assert_text 'KDE invalid config exposes actionable error' 'Config reload error' \
-        "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'Config reload error' "$invalid_before" 12 || true
+    assert_eq 'KDE invalid config exposes actionable error' 1 \
+        "$(( $(count_text "$run_log" 'Config reload error') > invalid_before ? 1 : 0 ))"
+    bindings_before=$(count_text "$run_log" 'binding count: 5')
     send_app status
-    assert_text 'KDE invalid reload preserves previous binding count' 'binding count: 5' \
-        "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'binding count: 5' "$bindings_before" 10 || true
+    assert_eq 'KDE invalid reload preserves previous binding count' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 5') > bindings_before ? 1 : 0 ))"
     kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
     kde_live_assert_zone 'KDE invalid config retains active binding' left-half A
 
@@ -466,16 +463,12 @@ EOF
     wait_for_new_text "$run_log" 'binding count: 5' "$bindings_before" 30 || true
     assert_eq 'KDE valid config restores binding count' 1 \
         "$(( $(count_text "$run_log" 'binding count: 5') > bindings_before ? 1 : 0 ))"
-    set +e
     stop_app_cleanly 'KDE App quits cleanly' "$run_log"
-    set +e
 
     kde_live_tui_lifecycle
     kde_live_unload_script window-zones-observer
     stop_pid "$KDE_EDITOR_PID"
     wait_pid "$KDE_EDITOR_PID" 5 || true
-    set +e
     stop_pid "$KDE_SERVICE_PID"
     stop_pid "$KDE_GROUP_PID"
-    set -e
 }

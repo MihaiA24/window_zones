@@ -1,17 +1,3 @@
-gnome_live_exit_trap() {
-    local status=$?
-    trap - EXIT INT TERM
-    set +e
-    if [[ "$GNOME_LIVE_ACTIVE" -eq 1 ]]; then
-        restore_gnome_live || GNOME_LIVE_RESTORE_FAILURE=1
-    fi
-    cleanup
-    if [[ "$GNOME_LIVE_RESTORE_FAILURE" -ne 0 ]]; then
-        status=1
-    fi
-    exit "$status"
-}
-
 record_versions_gnome() {
     record_versions_common
     log "VERSION gnome-shell: $(gnome-shell --version 2>&1)"
@@ -115,6 +101,7 @@ gnome_live_skip_after_companion() {
         'left-two-thirds dispatch state'
         'GNOME live left-two-thirds xdotool geometry'
         'GNOME live left-two-thirds companion geometry'
+        'GNOME live seam helper target directory resolves'
         'GNOME live seam helper builds against the public API'
         'GNOME live captures the test window id'
         'GNOME live second test window maps'
@@ -150,6 +137,10 @@ gnome_live_skip_after_companion() {
         'GNOME live atomic registration preserves previous set'
         'GNOME live App starts'
         'GNOME live safe hotkeys register'
+        'real-hotkey-baseline dispatch exit'
+        'real-hotkey-baseline dispatch state'
+        'GNOME live real hotkey baseline xdotool geometry'
+        'GNOME live real hotkey baseline companion geometry'
         'GNOME live real hotkey moves window'
         'GNOME live real hotkey reports action'
         'GNOME live companion disable call'
@@ -178,9 +169,19 @@ gnome_live_skip_after_companion() {
         'GNOME live App quits cleanly'
         'GNOME live TUI starts'
         'GNOME live TUI reload'
+        'GNOME live TUI reload completes successfully'
         'GNOME live TUI restart'
+        'GNOME live TUI restart completes successfully'
         'GNOME live TUI status'
+        'GNOME live TUI status completes successfully'
+        'tui-baseline dispatch exit'
+        'tui-baseline dispatch state'
+        'GNOME live TUI baseline xdotool geometry'
+        'GNOME live TUI baseline companion geometry'
         'GNOME live TUI dispatch'
+        'GNOME live TUI dispatch completes successfully'
+        'GNOME live TUI dispatch xdotool geometry'
+        'GNOME live TUI dispatch companion geometry'
         'GNOME live TUI quit'
     )
     for name in "${names[@]}"; do
@@ -193,11 +194,9 @@ gnome_live_skip_after_companion() {
 gnome_live_finish() {
     local rc=0
     restore_gnome_live || rc=$?
-    if [[ "$rc" -eq 0 ]]; then
-        trap cleanup EXIT INT TERM
-    else
+    if [[ "$rc" -ne 0 ]]; then
         GNOME_LIVE_RESTORE_FAILURE=1
-        log 'FAIL GNOME live restoration did not complete; retaining strict EXIT trap'
+        log 'FAIL GNOME live restoration did not complete; EXIT will retry restoration'
     fi
 }
 
@@ -219,7 +218,6 @@ run_gnome_live() {
     GNOME_LIVE_EXT_UUID='window-zones@mihai-a24'
     GNOME_LIVE_TILING_UUID='tilingshell@ferrarodomenico.com'
     GNOME_LIVE_EXT_DIR="$GNOME_LIVE_HOME/.local/share/gnome-shell/extensions/$GNOME_LIVE_EXT_UUID"
-    GNOME_LIVE_BACKUP_DIR="$GNOME_ROOT/installed-extension"
     GNOME_BUS="unix:path=$GNOME_RUNTIME/bus"
     WAYLAND_DISPLAY='wayland-0'
     GNOME_XDISPLAY=':0'
@@ -236,8 +234,6 @@ run_gnome_live() {
         WAYLAND_DISPLAY DISPLAY="$GNOME_XDISPLAY" GDK_BACKEND=''
     mkdir -p "$GNOME_CONFIG" "$GNOME_DATA" "$GNOME_HOME"
     chmod 700 "$GNOME_HOME"
-    trap gnome_live_exit_trap EXIT INT TERM
-    set +e
 
     record_versions_gnome
     local enabled_before window_info_before tiling_info_before
@@ -258,13 +254,6 @@ run_gnome_live() {
     log "SNAPSHOT tilingshell info before: $tiling_info_before"
     if [[ "$enabled_before" != \[* ]]; then
         snapshot_ok=0
-    fi
-    if [[ -d "$GNOME_LIVE_EXT_DIR" ]]; then
-        if ! cp -a -- "$GNOME_LIVE_EXT_DIR" "$GNOME_LIVE_BACKUP_DIR"; then
-            snapshot_ok=0
-        fi
-    else
-        log "SNAPSHOT installed extension directory: absent ($GNOME_LIVE_EXT_DIR)"
     fi
     if [[ "$snapshot_ok" -ne 1 ]]; then
         assert_eq 'GNOME live snapshot complete' 1 0
@@ -291,7 +280,6 @@ run_gnome_live() {
         gnome_live_skip_after_companion \
             'org.window_zones.Gnome absent or extension not ACTIVE; install the current companion and log out and back in'
         gnome_live_finish
-        set -e
         return 0
     fi
 
@@ -309,7 +297,6 @@ run_gnome_live() {
         log 'BLOCKED GNOME live: active companion is not the repository copy; install it and log out and back in before rerunning'
         gnome_live_skip_after_companion 'active companion files differ from repository copy'
         gnome_live_finish
-        set -e
         return 0
     fi
 
@@ -318,7 +305,6 @@ run_gnome_live() {
         log 'GNOME live could not find four unreserved bindings; live checks stopped'
         gnome_live_skip_after_companion 'fewer than four unreserved live accelerator candidates'
         gnome_live_finish
-        set -e
         return 0
     fi
     GNOME_SAFE_LEFT_HOTKEY="${GNOME_SAFE_HOTKEYS[0]}"
@@ -360,7 +346,6 @@ run_gnome_live() {
         assert_text 'GNOME live usable display geometry' '|' "$first_display"
         log 'GNOME live display geometry unavailable; remaining live checks stopped'
         gnome_live_finish
-        set -e
         return 0
     fi
     IFS='|' read -r GNOME_LIVE_DISPLAY_ID GNOME_LIVE_X GNOME_LIVE_Y \
@@ -373,7 +358,7 @@ run_gnome_live() {
     GNOME_LIVE_DISPLAY_TOTAL="$display_count"
     write_gnome_live_valid_config
 
-    local editor_log="$GNOME_ROOT/editor.log" editor_pid='' editor_deadline
+    local editor_log="$GNOME_ROOT/editor.log" editor_pid=''
     start_group editor_pid "$editor_log" env \
         DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
@@ -381,11 +366,7 @@ run_gnome_live() {
         XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland gnome-text-editor --standalone
     EDITOR_PID="$editor_pid"
     log "OBSERVED GNOME live editor pid: $EDITOR_PID"
-    editor_deadline=$((SECONDS + 20))
-    while (( SECONDS < editor_deadline )); do
-        gnome_live_find_window && break
-        sleep 0.2
-    done
+    gnome_live_find_window || true
     log "OBSERVED GNOME live editor X11 window: ${WINDOW_ID:-unavailable}"
     gnome_live_activate_window || true
     gnome_live_focus_baseline 10 || true
@@ -398,7 +379,6 @@ run_gnome_live() {
     if [[ -z "${WINDOW_ID:-}" ]]; then
         log 'GNOME live test window was not observable through Xwayland; remaining checks stopped'
         gnome_live_finish
-        set -e
         return 0
     fi
 
@@ -430,5 +410,4 @@ run_gnome_live() {
     run_gnome_live_tui_lifecycle
     stop_pid "$EDITOR_PID"
     gnome_live_finish
-    set -e
 }

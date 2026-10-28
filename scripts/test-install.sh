@@ -3,9 +3,11 @@ set -euo pipefail
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 exec python3 - "$PROJECT_ROOT" <<'PY'
 import configparser
+import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shlex
 import signal
@@ -16,11 +18,11 @@ import time
 
 root = Path(sys.argv[1])
 fixture_binary = r'''
-import json, os, signal, subprocess, sys, time
+import json, os, signal, sys, time
 from pathlib import Path
 role = Path(__file__).name
 pid = os.getpid()
-started = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart='], text=True, capture_output=True).stdout.strip()
+started = Path('/proc/self/stat').read_text().rsplit(') ', 1)[1].split()[19]
 ready = Path(os.environ['WZI_READY'])
 def event(kind):
     data = dict(kind=kind, role=role, pid=pid, stamp=started, version=VERSION, path=__file__, args=sys.argv[1:])
@@ -34,16 +36,20 @@ def stop(*args):
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 if sys.argv[1:] == ['init']:
-    config = Path(os.environ['XDG_CONFIG_HOME']) / 'window_zones/config.toml'
+    config = (Path(os.environ['HOME']) / 'Library/Application Support' if os.environ['WZI_OS'] == 'Darwin'
+              else Path(os.environ['XDG_CONFIG_HOME'])) / 'window_zones/config.toml'
     config.parent.mkdir(parents=True, exist_ok=True)
     if not config.exists():
         config.write_text('starter config\n')
     sys.exit(0)
 event('start')
+if role == 'window_zones_kwin' and Path(os.environ['WZI_KWIN_EXIT75']).exists():
+    event('exit75')
+    sys.exit(75)
 if role == 'window_zones_kwin':
     time.sleep(0.25)
     ready.write_text(str(pid))
-elif not ready.exists():
+elif os.environ['WZI_OS'] != 'Darwin' and not ready.exists():
     event('early-app')
     sys.exit(91)
 while True:
@@ -56,7 +62,7 @@ while True:
 # All desktop/service commands are fixture executables, including on a real KDE host.
 # The small manager executes generated units rather than testing installer source text.
 fixture_tool = r'''
-import ast, configparser, json, os, shlex, shutil, signal, subprocess, sys, time
+import ast, configparser, json, os, plistlib, shlex, shutil, signal, subprocess, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -67,9 +73,20 @@ def log(kind, **data):
     with open(os.environ['WZI_EVENTS'], 'a') as stream:
         stream.write(json.dumps(dict(kind=kind, tool=name, args=args, **data)) + '\n')
 def stamp(pid):
-    return subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart='], text=True, capture_output=True).stdout.strip()
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        return fields[19] if fields[0] != 'Z' else ''
+    except (FileNotFoundError, ProcessLookupError):
+        return ''
 def live(record):
     return bool(record and stamp(record['pid']) == record['stamp'])
+def exit_status(record):
+    if record:
+        events = Path(os.environ['WZI_EVENTS']).read_text().splitlines()
+        if any(item.get('pid') == record['pid'] and item['kind'] == 'exit75'
+               for item in map(json.loads, events)):
+            return 75
+    return 0
 def state():
     file = base / 'services.json'
     return json.loads(file.read_text()) if file.exists() else {}
@@ -108,12 +125,14 @@ def start(unit, restart=False):
     if parser['Service'].get('Type') == 'dbus':
         for _ in range(200):
             if ready.exists() and ready.read_text() == str(child.pid):
-                break
+                return 0
+            if not live(value[unit]):
+                return exit_status(value[unit]) or 1
             time.sleep(0.02)
-        else:
-            raise RuntimeError('companion did not acquire its bus name')
+        raise RuntimeError('companion did not acquire its bus name')
+    return 0
 if name == 'uname':
-    print('Linux')
+    print(os.environ['WZI_OS'])
 elif name == 'pkg-config':
     pass
 elif name == 'cargo':
@@ -154,9 +173,14 @@ elif name == 'systemctl':
         if action == 'disable':
             (config / 'systemd/user/graphical-session.target.wants' / unit).unlink(missing_ok=True)
     elif action in ('start', 'restart'):
-        start(unit, action == 'restart')
+        sys.exit(start(unit, action == 'restart'))
     elif action == 'is-active':
-        sys.exit(0 if live(state().get(unit)) else 1)
+        active = os.environ['WZI_GRAPHICAL'] == '1' if unit == 'graphical-session.target' else live(state().get(unit))
+        sys.exit(0 if active else 1)
+    elif action == 'show':
+        record = state().get(args[1])
+        print('ActiveState=' + ('active' if live(record) else 'failed'))
+        print('ExecMainStatus=' + str(exit_status(record)))
     elif action != 'daemon-reload':
         raise RuntimeError('unexpected systemctl action: ' + repr(args))
 elif name in ('busctl', 'dbus-send'):
@@ -183,6 +207,44 @@ elif name == 'gsettings':
         file.write_text(json.dumps(enabled))
     else:
         raise RuntimeError('unexpected gsettings command: ' + repr(args))
+elif name == 'plutil':
+    if args[:5] != ['-extract', 'ProgramArguments.0', 'raw', '-o', '-']:
+        raise RuntimeError('unexpected plutil command: ' + repr(args))
+    print(plistlib.loads(Path(args[5]).read_bytes())['ProgramArguments'][0])
+elif name == 'launchctl':
+    log('launchctl')
+    file = base / 'launch-agent.json'
+    record = json.loads(file.read_text()) if file.exists() else None
+    def launch(path):
+        plist = plistlib.loads(Path(path).read_bytes())
+        child = subprocess.Popen(plist['ProgramArguments'], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        file.write_text(json.dumps(dict(pid=child.pid, stamp=stamp(child.pid), path=path)))
+    def unload():
+        if live(record):
+            os.kill(record['pid'], signal.SIGTERM)
+            for _ in range(100):
+                if not live(record):
+                    break
+                time.sleep(0.02)
+    if args[0] == 'print':
+        if not record:
+            sys.exit(1)
+        print('state = ' + ('running' if live(record) else 'exited'))
+        print('last exit code = ' + str(exit_status(record)))
+    elif args[0] == 'bootstrap':
+        assert not record, 'bootstrap raced an already loaded job'
+        launch(args[2])
+    elif args[0] == 'kickstart':
+        assert args[1] == '-k' and record, 'kickstart needs a loaded job'
+        unload()
+        launch(record['path'])
+    elif args[0] == 'bootout':
+        unload()
+        file.unlink(missing_ok=True)
+    else:
+        raise RuntimeError('unexpected launchctl command: ' + repr(args))
 else:
     raise RuntimeError('unexpected desktop command: ' + name)
 '''
@@ -195,17 +257,19 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
     events_file.touch()
     (base / 'binary.py').write_text(fixture_binary)
     for name in ('uname', 'pkg-config', 'cargo', 'kpackagetool6', 'systemctl', 'busctl',
-                 'dbus-send', 'kwriteconfig6', 'qdbus6', 'launchctl', 'gnome-extensions', 'gsettings'):
+                 'dbus-send', 'kwriteconfig6', 'qdbus6', 'launchctl', 'plutil', 'gnome-extensions', 'gsettings'):
         tool = tools / name
         tool.write_text('#!' + sys.executable + '\n' + fixture_tool)
         tool.chmod(0o755)
     env = dict(os.environ, HOME=str(base / 'home'), XDG_CONFIG_HOME=str(base / 'config'),
-               XDG_DATA_HOME=str(base / 'data'), XDG_CURRENT_DESKTOP='KDE',
+               XDG_DATA_HOME=str(base / 'data'), XDG_RUNTIME_DIR=str(base / 'runtime'), XDG_CURRENT_DESKTOP='KDE',
                CARGO_TARGET_DIR=str(base / 'target'), PATH=str(tools) + ':/usr/bin:/bin',
                SHELL='/bin/bash', WZI_FIXTURE=str(base), WZI_EVENTS=str(events_file),
                WZI_READY=str(base / 'ready'), WZI_EXIT75=str(base / 'exit75'),
-               WZI_SYSTEMD='1', WZI_VERSION='one')
+               WZI_KWIN_EXIT75=str(base / 'kwin-exit75'), WZI_OS='Linux',
+               WZI_SYSTEMD='1', WZI_GRAPHICAL='1', WZI_VERSION='one', TZ='UTC')
     Path(env['HOME']).mkdir()
+    Path(env['XDG_RUNTIME_DIR']).mkdir(mode=0o700)
     config = Path(env['XDG_CONFIG_HOME'])
     witness = config / 'window_zones/config.toml'
     witness.parent.mkdir(parents=True)
@@ -250,6 +314,24 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         value = parser['Desktop Entry']['Exec']
         value = re.sub(r'\\([\\sntr])', lambda match: {'\\': '\\', 's': ' ', 'n': '\n', 't': '\t', 'r': '\r'}[match[1]], value)
         return [part.replace('\\$', '$').replace('\\`', '`').replace('%%', '%') for part in shlex.split(value)]
+
+    def runtime_state(location):
+        key = hashlib.sha256(str(location / 'bin').encode()).hexdigest()
+        return Path(env['XDG_RUNTIME_DIR']) / ('window-zones-kde-' + key)
+
+    def launch_desktop(file):
+        child = subprocess.Popen(desktop_command(file), env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        launchers.append(child)
+        return child
+
+    def identity(pid):
+        try:
+            fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+            return fields[19] if fields[0] != 'Z' else ''
+        except (FileNotFoundError, ProcessLookupError):
+            return ''
 
     try:
         env['XDG_CURRENT_DESKTOP'] = 'GNOME'
@@ -330,6 +412,12 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         assert 'kwin-autostart' in record
         install(prefix, '--autostart')
         assert witness.read_text() == 'user config witness\n'
+        Path(env['WZI_EXIT75']).touch()
+        result = install(prefix, '--autostart')
+        assert 'not running' in result.stderr and 'exit 75' in result.stderr, 'immediate App duplicate exit was reported as running'
+        assert f'Autostart: {config / "systemd/user/window-zones.service"} (enabled and running)' not in result.stdout
+        Path(env['WZI_EXIT75']).unlink()
+        install(prefix, '--autostart')
         install(replacement, '--kwin-script', '--autostart')
         replacement_pid = starts('window_zones_kwin', path=replacement / 'bin/window_zones_kwin')[-1]['pid']
         offset = len(events())
@@ -347,19 +435,52 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         assert witness.read_text() == 'user config witness\n'
         print('PASS systemd ordering, recorded companion reuse, reinstall, ownership, uninstall')
 
-        env['WZI_SYSTEMD'] = '0'
+        env['WZI_SYSTEMD'] = '1'
+        env['WZI_GRAPHICAL'] = '0'
         env['WZI_VERSION'] = 'three'
         install(fallback, '--kwin-script')
-        install(fallback, '--autostart')
+        legacy = fallback / 'share/window-zones/kde-session-running'
+        legacy.mkdir(mode=0o700)
+        offset = len(events())
+        result = install(fallback, '--autostart')
+        assert 'XDG login supervision' in result.stdout, 'inactive graphical target did not select XDG'
+        assert not any(item['kind'] == 'systemctl' and item['args'][0] in ('enable', 'start', 'restart')
+                       for item in events()[offset:]), 'inactive graphical target started systemd units'
+        assert not legacy.exists(), 'abandoned empty legacy state was not removed'
         desktop = config / 'autostart/window_zones_kwin.desktop'
         assert desktop.exists() and not (config / 'autostart/window_zones.desktop').exists()
-        child = subprocess.Popen(desktop_command(desktop), env=env, stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        launchers.append(child)
+        state_dir = runtime_state(fallback)
+        state_dir.mkdir(mode=0o700)
+        (state_dir / 'lock').touch()
+        lock_inode = (state_dir / 'lock').stat().st_ino
+        unrelated_process = subprocess.Popen(['/bin/sleep', '60'])
+        launchers.append(unrelated_process)
+        (state_dir / 'owner').write_text(f'{unrelated_process.pid}\nnot-its-start-identity\n')
+        (state_dir / 'companion').write_text(f'{unrelated_process.pid}\nnot-its-start-identity\n')
+        child = launch_desktop(desktop)
         wait_for(lambda: starts('window_zones', 'three'), 'XDG launcher did not start App')
         assert not any(item['kind'] == 'early-app' for item in events())
         duplicate = subprocess.run(desktop_command(desktop), env=env, capture_output=True)
         assert duplicate.returncode == 75, 'second XDG launcher was not rejected'
+        assert unrelated_process.poll() is None, 'stale process record signalled an unrelated process'
+        old_pids = {starts(role, 'three')[-1]['pid'] for role in ('window_zones', 'window_zones_kwin')}
+        child.kill()
+        child.wait(timeout=8)
+        child = launch_desktop(desktop)
+        wait_for(lambda: all(starts(role, 'three')[-1]['pid'] not in old_pids
+                             for role in ('window_zones', 'window_zones_kwin')),
+                 'launcher crash left a permanent lock or stale supervised children')
+        wait_for(lambda: old_pids <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
+                 'crashed launcher left its native children running')
+        assert (state_dir / 'lock').stat().st_ino == lock_inode, 'runtime lock inode was replaced'
+        env['TZ'] = 'Pacific/Honolulu'
+        count = len(starts('window_zones', 'three'))
+        install(fallback, '--autostart')
+        wait_for(lambda: len(starts('window_zones', 'three')) > count, 'timezone change broke owned launcher restart')
+        env['WZI_SYSTEMD'] = '0'
+        count = len(starts('window_zones', 'three'))
+        install(fallback, '--autostart')
+        wait_for(lambda: len(starts('window_zones', 'three')) > count, 'unreachable user manager removed working XDG fallback')
         previous = starts('window_zones_kwin', 'three')[-1]['pid']
         os.kill(previous, signal.SIGKILL)
         wait_for(lambda: starts('window_zones_kwin', 'three')[-1]['pid'] != previous, 'XDG companion was not recovered')
@@ -367,7 +488,7 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         os.kill(previous, signal.SIGKILL)
         wait_for(lambda: starts('window_zones', 'three')[-1]['pid'] != previous, 'XDG App was not recovered')
         Path(env['WZI_EXIT75']).touch()
-        wait_for(lambda: any(item['kind'] == 'exit75' for item in events()), 'App did not exit 75')
+        wait_for(lambda: any(item['kind'] == 'exit75' and item.get('version') == 'three' for item in events()), 'App did not exit 75')
         count = len(starts('window_zones', 'three'))
         time.sleep(2.5)
         assert len(starts('window_zones', 'three')) == count, 'XDG launcher retried duplicate App owner'
@@ -386,6 +507,102 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         assert not (fallback / 'bin/window_zones_kwin').exists()
         assert witness.read_text() == 'user config witness\n'
         print('PASS XDG ordering, companion/App recovery, duplicate-owner exit, reinstall, uninstall')
+
+        # Exit 75 from the companion is permanent too, including before bus readiness.
+        install(fallback, '--kwin-script', '--autostart')
+        saved_state = state_dir.with_name(state_dir.name + '-saved')
+        foreign_runtime = base / 'foreign-runtime'
+        foreign_runtime.mkdir(mode=0o700)
+        foreign_runtime_witness = foreign_runtime / 'witness'
+        foreign_runtime_witness.write_text('foreign runtime witness\n')
+        state_dir.rename(saved_state)
+        state_dir.symlink_to(foreign_runtime, target_is_directory=True)
+        refused = subprocess.run(desktop_command(desktop), env=env, capture_output=True)
+        assert refused.returncode != 0 and foreign_runtime_witness.read_text() == 'foreign runtime witness\n'
+        assert set(foreign_runtime.iterdir()) == {foreign_runtime_witness}, 'launcher wrote through a foreign runtime symlink'
+        state_dir.unlink()
+        saved_state.rename(state_dir)
+        Path(env['WZI_KWIN_EXIT75']).touch()
+        count = len(starts('window_zones_kwin', 'four'))
+        duplicate = launch_desktop(desktop)
+        assert duplicate.wait(timeout=8) == 75, 'companion duplicate owner did not stop XDG startup'
+        time.sleep(2.5)
+        assert len(starts('window_zones_kwin', 'four')) == count + 1, 'XDG supervisor retried permanent companion duplicate'
+        Path(env['WZI_KWIN_EXIT75']).unlink()
+        count = len(starts('window_zones', 'four'))
+        child = launch_desktop(desktop)
+        wait_for(lambda: len(starts('window_zones', 'four')) > count, 'duplicate-owner stop prevented a later fresh launch')
+        orphan_pids = {starts(role, 'four')[-1]['pid'] for role in ('window_zones', 'window_zones_kwin')}
+        child.kill()
+        child.wait(timeout=8)
+        install(fallback, '--uninstall')
+        wait_for(lambda: orphan_pids <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
+                 'uninstall after launcher crash left supervised binaries alive')
+        legacy.mkdir(mode=0o700)
+        legacy_witness = legacy / 'foreign-witness'
+        legacy_witness.write_text('do not remove\n')
+        install(fallback, '--kwin-script', '--autostart')
+        install(fallback, '--uninstall')
+        assert legacy_witness.read_text() == 'do not remove\n', 'nonempty legacy state was removed'
+        print('PASS inactive-target/unreachable fallback, stale identity, launcher crash, timezone, companion duplicate, legacy preservation')
+
+        # A reachable manager with a failed dbus service must not claim it is running.
+        env['WZI_SYSTEMD'] = env['WZI_GRAPHICAL'] = '1'
+        Path(env['WZI_KWIN_EXIT75']).touch()
+        result = install(fallback, '--kwin-script', '--autostart')
+        assert 'not running' in result.stderr and 'exit 75' in result.stderr
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(config / 'systemd/user/window-zones-kwin.service')
+        assert parser['Service']['RestartPreventExitStatus'] == '75'
+        Path(env['WZI_KWIN_EXIT75']).unlink()
+        install(fallback, '--uninstall')
+
+        env['WZI_OS'] = 'Darwin'
+        env['XDG_CURRENT_DESKTOP'] = ''
+        env['WZI_VERSION'] = 'mac-one'
+        mac_prefix = base / 'macOS & <tag> "quoted"'
+        mac_replacement = base / 'macOS replacement'
+        mac_witness = Path(env['HOME']) / 'Library/Application Support/window_zones/config.toml'
+        mac_witness.parent.mkdir(parents=True)
+        mac_witness.write_text('mac user config witness\n')
+        agent = Path(env['HOME']) / 'Library/LaunchAgents/org.window_zones.run.plist'
+        install(mac_prefix, '--autostart', '--init-config')
+        wait_for(lambda: starts('window_zones', 'mac-one'), 'LaunchAgent did not start the App')
+        plist = plistlib.loads(agent.read_bytes())
+        assert plist['ProgramArguments'] == [str(mac_prefix / 'bin/window_zones'), 'run']
+        assert plist['RunAtLoad'] is True and 'KeepAlive' not in plist
+        assert agent.stat().st_mode & 0o777 == 0o644
+        assert plist['StandardOutPath'] == plist['StandardErrorPath'] == str(Path(env['HOME']) / 'Library/Logs/window_zones.log')
+        for options, version in (((), 'mac-two'), (('--autostart',), 'mac-three')):
+            env['WZI_VERSION'] = version
+            offset = len(events())
+            install(mac_prefix, *options)
+            wait_for(lambda: starts('window_zones', version), 'owned LaunchAgent reinstall did not restart')
+            actions = [item['args'][0] for item in events()[offset:] if item['kind'] == 'launchctl']
+            assert actions.count('kickstart') == 1 and 'bootstrap' not in actions and 'bootout' not in actions
+        Path(env['WZI_EXIT75']).touch()
+        result = install(mac_prefix, '--autostart')
+        assert 'not running' in result.stderr and 'exit 75' in result.stderr, 'LaunchAgent duplicate exit was not diagnosed'
+        count = len(starts('window_zones', 'mac-three'))
+        time.sleep(0.5)
+        assert len(starts('window_zones', 'mac-three')) == count, 'LaunchAgent retried a duplicate owner'
+        Path(env['WZI_EXIT75']).unlink()
+        env['WZI_VERSION'] = 'mac-replacement'
+        install(mac_replacement, '--autostart')
+        wait_for(lambda: starts('window_zones', 'mac-replacement'), 'replacement LaunchAgent did not load')
+        replacement_pid = starts('window_zones', 'mac-replacement')[-1]['pid']
+        offset = len(events())
+        install(mac_prefix)
+        result = install(mac_prefix, '--uninstall')
+        assert not any(item['kind'] == 'launchctl' and item['args'][0] in ('kickstart', 'bootout', 'bootstrap')
+                       for item in events()[offset:]), 'stale prefix changed the replacement LaunchAgent'
+        assert 'leaving it untouched' in result.stderr and identity(replacement_pid)
+        assert plistlib.loads(agent.read_bytes())['ProgramArguments'][0] == str(mac_replacement / 'bin/window_zones')
+        install(mac_replacement, '--uninstall')
+        assert not agent.exists() and not identity(replacement_pid)
+        assert mac_witness.read_text() == 'mac user config witness\n'
+        assert witness.read_text() == 'user config witness\n'
+        print('PASS macOS LaunchAgent XML/permissions, bootstrap, kickstart reinstall, duplicate exit, prefix ownership, uninstall')
     finally:
         for child in launchers:
             if child.poll() is None:
@@ -397,7 +614,7 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
                     child.wait()
         # Kill only fixture binaries whose process start identity still matches this run.
         for record in starts() if events_file.exists() else []:
-            current = subprocess.run(['/bin/ps', '-p', str(record['pid']), '-o', 'lstart='], text=True, capture_output=True).stdout.strip()
+            current = identity(record['pid'])
             if current and current == record['stamp']:
                 try:
                     os.kill(record['pid'], signal.SIGTERM)

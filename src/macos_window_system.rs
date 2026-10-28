@@ -6,6 +6,9 @@
 //! rejected before changes.
 //! AXZoomed/AXMinimized are restored when exposed; ordinary AppKit zoom/tiling
 //! is released by setting the window's size and position.
+//!
+//! Display queries initialize background-only AppKit and deliver pending main
+//! run-loop events before reading uncached usable areas, on the main thread.
 
 use crate::{
     DisplayGeometry, FocusedWindow, Rect, WindowId, WindowMove, WindowSystem, WindowSystemError,
@@ -117,18 +120,23 @@ fn as_u32(field: &str, value: f64) -> Result<u32, WindowSystemError> {
 /// calling thread. The SDK defines AXUIElement identity through CFEqual.
 mod native {
     use super::*;
-    use cocoa::appkit::NSScreen;
-    use cocoa::base::nil;
-    use cocoa::foundation::NSArray;
+    use cocoa::appkit::{
+        NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyProhibited,
+        NSEventMask, NSScreen,
+    };
+    use cocoa::base::{YES, nil};
+    use cocoa::foundation::{NSArray, NSDefaultRunLoopMode};
     use objc::rc::autoreleasepool;
     use std::ffi::{CStr, c_void};
     use std::ptr::{self, NonNull};
+    use std::sync::OnceLock;
 
     type Ref = *const c_void;
     const INVALID_ELEMENT: i32 = -25202;
     const CANNOT_COMPLETE: i32 = -25204;
     const UNSUPPORTED: i32 = -25205;
     const NO_VALUE: i32 = -25212;
+    const RUN_LOOP_HANDLED_SOURCE: i32 = 4;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -153,11 +161,14 @@ mod native {
         fn CFStringCreateWithCString(allocator: Ref, string: *const i8, encoding: u32) -> Ref;
         fn CFBooleanGetTypeID() -> usize;
         fn CFBooleanGetValue(value: Ref) -> u8;
+        fn CFRunLoopRunInMode(mode: Ref, seconds: f64, return_after_source: u8) -> i32;
+        static kCFRunLoopDefaultMode: Ref;
         static kCFBooleanFalse: Ref;
     }
 
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
+        fn pthread_main_np() -> i32;
     }
 
     #[derive(Debug)]
@@ -514,10 +525,54 @@ mod native {
     }
 
     pub(super) fn displays() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        // AppKit initialization and event delivery belong to the process's main
+        // thread, not merely whichever thread first constructed the adapter.
+        if unsafe { pthread_main_np() } == 0 {
+            return Err(WindowSystemError::Platform(
+                "macOS display queries must run on the main thread".into(),
+            ));
+        }
         autoreleasepool(|| {
-            // SAFETY: NSScreen provides Cocoa screen rectangles in points;
-            // objects stay alive in this autorelease pool.
+            // SAFETY: this is the main thread; all AppKit objects remain alive
+            // inside the pool, and NSApplication retains its process singleton.
             unsafe {
+                static APPKIT_READY: OnceLock<bool> = OnceLock::new();
+                let application = NSApplication::sharedApplication(nil);
+                if !*APPKIT_READY.get_or_init(|| {
+                    // Prohibited prevents finishLaunching from activating the
+                    // CLI/TUI or adding a Dock icon or windows.
+                    if application.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+                        != YES
+                    {
+                        return false;
+                    }
+                    application.finishLaunching();
+                    true
+                }) {
+                    return Err(WindowSystemError::Platform(
+                        "could not initialize background AppKit application".into(),
+                    ));
+                }
+                // The CLI/TUI owns the outer loop. Drain ready native sources
+                // without waiting; a zero-second pass handles at most one source.
+                while CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1) == RUN_LOOP_HANDLED_SOURCE {
+                }
+                loop {
+                    // nil expires immediately, but queued AppKit events still
+                    // need normal dispatch before NSScreen observes changes.
+                    let event = application.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                        NSEventMask::NSAnyEventMask.bits(),
+                        nil,
+                        NSDefaultRunLoopMode,
+                        YES,
+                    );
+                    if event == nil {
+                        break;
+                    }
+                    application.sendEvent_(event);
+                }
+                // Never cache either the screen list or visibleFrame: display,
+                // Dock and menu-bar settings can change while run/tui persists.
                 let screens = NSScreen::screens(nil);
                 let count = screens.count();
                 if count == 0 {
@@ -591,7 +646,7 @@ mod native {
         }
 
         #[test]
-        #[ignore = "needs an owned lower-screen window and WZ_MACOS_TEST_PID"]
+        #[ignore = "needs an owned lower-screen window, WZ_MACOS_TEST_PID and WZ_MACOS_TEST_AREA"]
         fn expansion_finishes_at_target_origin() {
             let expected_pid: i32 = std::env::var("WZ_MACOS_TEST_PID")
                 .expect("set WZ_MACOS_TEST_PID to the owned fixture PID")
@@ -610,7 +665,14 @@ mod native {
                 actual_pid, expected_pid,
                 "refusing to move an unowned window"
             );
-            let area = system.displays().unwrap()[0].usable_area;
+            // libtest uses a worker thread, so obtain the fixture's independently
+            // observed usable area without invoking main-thread-only AppKit.
+            let area: Rect = serde_json::from_str(
+                &std::env::var("WZ_MACOS_TEST_AREA")
+                    .expect("set WZ_MACOS_TEST_AREA to the observed usable-area JSON rectangle"),
+            )
+            .expect("fixture usable-area JSON rectangle");
+            assert!(area.width >= 2 && area.height > 0);
             assert!(
                 captured.geometry.y > area.y,
                 "start below the target origin"
@@ -634,6 +696,19 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_queries_reject_background_threads_before_using_appkit() {
+        let result = std::thread::spawn(|| MacOSWindowSystem::new().displays())
+            .join()
+            .unwrap();
+        assert_eq!(
+            result,
+            Err(WindowSystemError::Platform(
+                "macOS display queries must run on the main thread".into(),
+            )),
+        );
+    }
 
     #[test]
     fn geometry_rounding_preserves_finite_and_range_validation() {

@@ -67,7 +67,6 @@ kde_live_atomic_registration() {
         sleep 0.1
     done
     assert_eq 'KDE controller disconnect releases native accelerator' 'b true' "$available_after_disconnect"
-    set +e
 }
 
 kde_live_conflict_registration() {
@@ -137,6 +136,5 @@ EOF
         'Window Zones conflict incumbent' "$(cat "$conflict_config_log" 2>/dev/null || true)"
     stop_app_cleanly 'KDE App with a conflicting accelerator quits cleanly' "$conflict_config_log"
     write_five_bindings_config
-    set +e
     kde_live_unload_script window-zones-conflict
 }

@@ -12,14 +12,92 @@ import sys
 import tempfile
 import time
 
-import gi
-from gi.repository import Gio, GLib
+
+INDICATOR_UUID = 'appindicatorsupport@rgcjonas.gmail.com'
+RESOURCE_VARIABLES = ('WINDOW_ZONES_SMOKE_GNOME_DATA_DIRS',
+                      'WINDOW_ZONES_SMOKE_PIPEWIRE_RUNTIME_DIR',
+                      'WINDOW_ZONES_SMOKE_PIPEWIRE_REMOTE')
+
+
+def resource_sources(environment):
+    encoded_roots = environment.get(RESOURCE_VARIABLES[0])
+    if encoded_roots is None:
+        data_home = Path(environment.get('XDG_DATA_HOME') or
+                         Path(environment.get('HOME') or Path.home()) / '.local/share')
+        if not data_home.is_absolute():
+            data_home = Path(environment.get('HOME') or Path.home()) / '.local/share'
+        roots = [str(data_home), *(value for value in
+                                  (environment.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share').split(os.pathsep)
+                                  if value and Path(value).is_absolute())]
+    else:
+        roots = json.loads(encoded_roots)
+    if not isinstance(roots, list) or not roots or any(not isinstance(value, str) or
+                                                      not Path(value).is_absolute() for value in roots):
+        raise RuntimeError('AppIndicator resource roots must be a nonempty list of absolute paths')
+    runtime = environment.get(RESOURCE_VARIABLES[1],
+                              environment.get('PIPEWIRE_RUNTIME_DIR') or environment.get('XDG_RUNTIME_DIR', ''))
+    remote = environment.get(RESOURCE_VARIABLES[2], environment.get('PIPEWIRE_REMOTE') or 'pipewire-0')
+    if not runtime or not Path(runtime).is_absolute() or not remote:
+        raise RuntimeError('PipeWire capture requires the original absolute runtime directory and remote socket name')
+    socket_path = Path(runtime) / remote
+    if not socket_path.is_socket():
+        raise RuntimeError('PipeWire socket is unavailable: ' + str(socket_path))
+    return list(dict.fromkeys(map(Path, roots))), Path(runtime), remote
+
+
+def find_appindicator(roots, shell_major):
+    diagnostics = []
+    for base in roots:
+        extension = base / 'gnome-shell/extensions' / INDICATOR_UUID
+        try:
+            metadata = json.loads((extension / 'metadata.json').read_text())
+            versions = metadata.get('shell-version', [])
+            if (metadata.get('uuid') == INDICATOR_UUID and isinstance(versions, list) and
+                    str(shell_major) in versions and (extension / 'extension.js').is_file()):
+                return extension
+            diagnostics.append(str(extension) + ': supported Shell versions ' + str(versions))
+        except (OSError, ValueError, AttributeError) as error:
+            diagnostics.append(str(extension) + ': ' + str(error))
+    raise RuntimeError('No installed AppIndicator compatible with GNOME ' + str(shell_major) +
+                       '; searched ' + '; '.join(diagnostics))
+
+
+def isolated_environment(work, pipewire_runtime, pipewire_remote, source):
+    environment = dict(source)
+    for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'XAUTHORITY', 'SSH_CONNECTION',
+                 'SWAYSOCK', 'HYPRLAND_INSTANCE_SIGNATURE', 'KDE_FULL_SESSION', 'KDE_SESSION_VERSION',
+                 'GNOME_DESKTOP_SESSION_ID', 'XDG_SESSION_DESKTOP', 'DESKTOP_SESSION',
+                 'DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS', 'DBUS_STARTER_BUS_TYPE',
+                 'DCONF_PROFILE', *RESOURCE_VARIABLES):
+        environment.pop(name, None)
+    for name, directory in (('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'), ('XDG_DATA_HOME', 'data'),
+                            ('XDG_STATE_HOME', 'state'), ('XDG_CACHE_HOME', 'cache'),
+                            ('XDG_RUNTIME_DIR', 'runtime')):
+        environment[name] = str(work / directory)
+    environment.update(XDG_DATA_DIRS='/usr/local/share:/usr/share', GSETTINGS_BACKEND='keyfile',
+                       XDG_CURRENT_DESKTOP='GNOME', XDG_SESSION_TYPE='wayland',
+                       WAYLAND_DISPLAY='window-zones-native-smoke', GDK_BACKEND='wayland', GTK_A11Y='none',
+                       PIPEWIRE_RUNTIME_DIR=str(pipewire_runtime), PIPEWIRE_REMOTE=pipewire_remote)
+    return environment
+
+
+def completed_tui_frame(output, *, first=False):
+    output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output).replace('\r', '')
+    if first:
+        before, prompt, _after = output.partition('window-zones tui> ')
+        output = before + prompt
+    if 'Window Zones TUI' not in output:
+        return ''
+    frame = 'Window Zones TUI' + output.rsplit('Window Zones TUI', 1)[1]
+    return frame if re.search(r'^Last action: [^\n]+\nLast error: [^\n]*\nLast event: [^\n]*\n'
+                              r'[\s\S]*window-zones tui> $', frame, re.M) else ''
 
 
 def test_window(title):
+    import gi
     gi.require_version('Gtk', '4.0')
     gi.require_version('Gdk', '4.0')
-    from gi.repository import Gdk, Gtk
+    from gi.repository import Gdk, GLib, Gtk
     Gtk.init()
     window = Gtk.Window(title='Window Zones test: ' + title)
     window.set_default_size(720, 480)
@@ -167,19 +245,41 @@ def run(binary, keep_logs, output_dir=None):
         def defer_termination(signum, _frame):
             nonlocal pending_signal
             pending_signal = signum
-        previous = signal.signal(signal.SIGTERM, defer_termination)
+        previous = {signum: signal.signal(signum, defer_termination)
+                    for signum in (signal.SIGINT, signal.SIGTERM)}
         try:
             process = subprocess.Popen(args, env=env if child_env is None else child_env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
             processes.append(process)
             session_starts[process.pid] = process_state(process.pid)[19]
         finally:
             log.close()
-            signal.signal(signal.SIGTERM, previous)
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
             if pending_signal:
                 os.kill(os.getpid(), pending_signal)
         return process, log_path
     def text(log):
         return log.read_text(errors='replace')
+    def assert_tui_frame(name, log, checkpoint=0, *, action=None, binding=None, first=False):
+        frame = ''
+        def matches():
+            if not frame or any(value not in frame for value in
+                                ('Window backend: gnome-wayland\n', 'Hotkey state: Registered',
+                                 'Last error: none\n', ' (Loaded)\n')):
+                return False
+            if action is not None and 'Last action: ' + action + '\n' not in frame:
+                return False
+            if binding is not None:
+                hotkey, zone = binding
+                return re.search(r'^  ' + re.escape(hotkey) + r' -> .*zone: "' +
+                                 re.escape(zone) + r'"', frame, re.M) is not None
+            return True
+        def ready():
+            nonlocal frame
+            frame = completed_tui_frame(text(log)[checkpoint:], first=first)
+            return bool(frame) and (first or matches())
+        check(name, wait_for(ready) and matches(), text(log)[checkpoint:])
+
     def send(process, command):
         process.stdin.write(command + '\n')
         process.stdin.flush()
@@ -287,29 +387,38 @@ def run(binary, keep_logs, output_dir=None):
         capture = subprocess.run(['gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]), 'num-buffers=1', '!', 'videoconvert', '!', 'pngenc', '!', 'filesink', 'location=' + str(screenshot)], env=env, capture_output=True, text=True, timeout=15)
         check(name + ' real compositor screenshot', capture.returncode == 0 and screenshot.is_file() and screenshot.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n', capture.stdout + capture.stderr + str(screenshot))
     try:
-        for directory in ('config/glib-2.0/settings', 'data/gnome-shell/extensions/window-zones@mihai-a24', 'runtime', 'home'):
+        import gi
+        gi.require_version('Gtk', '4.0')
+        from gi.repository import Gio, GLib
+
+        resource_roots, pipewire_runtime, pipewire_remote = resource_sources(os.environ)
+        shell_version = subprocess.check_output(['gnome-shell', '--version'], text=True).strip()
+        version_match = re.search(r'GNOME Shell (\d+)(?:\.\d+)*', shell_version)
+        check('Installed GNOME version is supported', version_match and version_match[1] in ('50', '51'), shell_version)
+        for plugin in ('pipewiresrc', 'videoconvert', 'pngenc', 'filesink', 'fakesink', 'multifilesink'):
+            result = subprocess.run(['gst-inspect-1.0', plugin], capture_output=True, text=True, timeout=8)
+            (work / ('gstreamer-' + plugin + '.log')).write_text(result.stdout + result.stderr)
+            check('GStreamer ' + plugin + ' capture plugin is installed', result.returncode == 0, result.stderr)
+        for directory in ('config/glib-2.0/settings', 'data/gnome-shell/extensions/window-zones@mihai-a24',
+                          'runtime', 'home', 'state', 'cache'):
             (work / directory).mkdir(parents=True, exist_ok=True)
         os.chmod(work / 'runtime', 0o700)
-        indicator_uuid = 'appindicatorsupport@rgcjonas.gmail.com'
-        indicator_dir = next((base / 'gnome-shell/extensions' / indicator_uuid for base in (Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))), Path('/usr/share')) if (base / 'gnome-shell/extensions' / indicator_uuid).is_dir()), None)
-        check('Installed AppIndicator supports real GNOME tray testing', indicator_dir is not None, indicator_dir)
-        shutil.copytree(indicator_dir, work / 'data/gnome-shell/extensions' / indicator_uuid, symlinks=True)
+        indicator_uuid = INDICATOR_UUID
+        indicator_dir = find_appindicator(resource_roots, version_match[1])
+        check('Installed AppIndicator supports real GNOME tray testing', indicator_dir.is_dir(), indicator_dir)
+        shutil.copytree(indicator_dir, work / 'data/gnome-shell/extensions' / indicator_uuid)
         (work / 'config/glib-2.0/settings/keyfile').write_text("[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\ndisable-user-extensions=false\ndisable-extension-version-validation=false\n")
         for name in ('metadata.json', 'extension.js'):
             shutil.copy2(root / 'gnome-extension' / name, work / 'data/gnome-shell/extensions/window-zones@mihai-a24' / name)
-        bus, bus_log = start(['dbus-daemon', '--session', '--nofork', '--print-address=1'], 'session-bus', os.environ.copy())
+        env = isolated_environment(work, pipewire_runtime, pipewire_remote, os.environ)
+        bus, bus_log = start(['dbus-daemon', '--session', '--nofork', '--print-address=1'], 'session-bus')
         if not wait_for(lambda: text(bus_log).strip() or bus.poll() is not None):
             raise RuntimeError('Private session bus did not start')
         address = text(bus_log).splitlines()[0]
-        env = os.environ.copy()
-        env.update(DBUS_SESSION_BUS_ADDRESS=address, XDG_RUNTIME_DIR=str(work / 'runtime'), XDG_CONFIG_HOME=str(work / 'config'), XDG_DATA_HOME=str(work / 'data'), HOME=str(work / 'home'), GSETTINGS_BACKEND='keyfile', XDG_CURRENT_DESKTOP='GNOME', XDG_SESSION_TYPE='wayland', WAYLAND_DISPLAY='window-zones-native-smoke', GDK_BACKEND='wayland', GTK_A11Y='none')
-        env.update(PIPEWIRE_RUNTIME_DIR=os.environ.get('PIPEWIRE_RUNTIME_DIR', os.environ['XDG_RUNTIME_DIR']), PIPEWIRE_REMOTE=os.environ.get('PIPEWIRE_REMOTE', 'pipewire-0'))
-        env.pop('DISPLAY', None)
-        env.pop('XAUTHORITY', None)
-        env.pop('SSH_CONNECTION', None)
+        env['DBUS_SESSION_BUS_ADDRESS'] = address
         connection = Gio.DBusConnection.new_for_address_sync(address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
         shell, shell_log = start(['gnome-shell', '--headless', '--force-animations', '--wayland-display', env['WAYLAND_DISPLAY'], '--virtual-monitor', '1920x1080', '--virtual-monitor', '1600x900'], 'shell')
-        check('Companion loaded by real GNOME', wait_for(lambda: 'move-resize' in companion('GetCapabilities')[0], 20), 'GNOME ' + subprocess.check_output(['gnome-shell', '--version'], text=True).strip())
+        check('Companion loaded by real GNOME', wait_for(lambda: 'move-resize' in companion('GetCapabilities')[0], 20), shell_version)
         check('GNOME finishes startup before input', wait_for(lambda: 'GNOME Shell started' in text(shell_log)), text(shell_log))
         check('Two real compositor displays and reserved panel area',
               wait_for(lambda: len(available := companion('GetDisplays')[0]) == 2 and available[0][2] > 0),
@@ -437,15 +546,36 @@ def run(binary, keep_logs, output_dir=None):
         runtime = None
         tui, tui_log = start([str(binary), '--backend', 'auto', '--config', str(config), 'tui'], 'auto-tui')
         runtime = tui
-        check('Auto TUI shows native capabilities and bindings', wait_for(lambda: 'Window Zones TUI' in text(tui_log) and 'Hotkey state: Registered' in text(tui_log)), text(tui_log))
+        assert_tui_frame('Auto TUI shows native capabilities and bindings', tui_log, action='<none>')
+        config.write_text(valid_config('right-half'))
+        checkpoint = len(text(tui_log))
         send(tui, 'reload')
-        send(tui, 'restart')
-        send(tui, 'status')
-        send(tui, 'dispatch ' + hotkeys[1])
+        assert_tui_frame('TUI reload applies the replacement binding', tui_log, checkpoint,
+                         binding=(canonical_hotkeys[0], 'right-half'), first=True)
+        checkpoint = len(text(tui_log))
+        send(tui, 'dispatch ' + hotkeys[0])
         assert_frame('TUI manual dispatch moves real window', expected_zones[1], window_log)
+        assert_tui_frame('TUI manual dispatch completes successfully', tui_log, checkpoint,
+                         action=canonical_hotkeys[0], first=True)
+        checkpoint = len(text(tui_log))
+        send(tui, 'restart')
+        assert_tui_frame('TUI restart clears action history and reloads persisted bindings', tui_log, checkpoint,
+                         action='<none>', binding=(canonical_hotkeys[0], 'right-half'), first=True)
+        checkpoint = len(text(tui_log))
+        send(tui, 'dispatch ' + hotkeys[2])
+        assert_frame('TUI remains usable after restart', expected_zones[2], window_log)
+        assert_tui_frame('TUI dispatch after restart completes successfully', tui_log, checkpoint,
+                         action=canonical_hotkeys[2], first=True)
+        config.write_text(valid_config())
+        checkpoint = len(text(tui_log))
+        send(tui, 'reload')
+        assert_tui_frame('TUI reload restores the original persisted binding', tui_log, checkpoint,
+                         binding=(canonical_hotkeys[0], 'left-half'), first=True)
+        checkpoint = len(text(tui_log))
         shortcut(keycodes[0])
         assert_frame('Real GNOME accelerator drives auto TUI', expected_zones[0], window_log)
-        check('TUI reports the actual hotkey action', wait_for(lambda: re.search(r'Last action: .*\ba\b', text(tui_log)) is not None), text(tui_log))
+        assert_tui_frame('TUI reports the successful actual hotkey action', tui_log, checkpoint,
+                         action=canonical_hotkeys[0])
         stop(tui)
         check('Auto TUI quits cleanly', tui.returncode == 0, tui.returncode)
         runtime = None
@@ -530,8 +660,17 @@ def run(binary, keep_logs, output_dir=None):
         dispatch(hotkeys[1], expected_zones[1], 'dry-run-baseline', window_log)
         dry = subprocess.check_output([str(binary), '--backend', 'dry-run', '--config', str(config), 'dispatch', hotkeys[0]], env=env, text=True)
         check('Dry-run calculates placement without touching real window', 'Dispatch state: Succeeded' in dry and tuple(focused()[2:]) == tuple(expected_zones[1]), dry.strip())
-        forced = subprocess.run([str(binary), '--backend', 'x11', 'status'], env=env, capture_output=True, text=True)
-        check('Explicit X11 is rejected within GNOME Wayland', forced.returncode != 0, forced.stderr.strip())
+        xdisplay = re.search(r'Using public X11 display (:\d+)', text(shell_log)).group(1)
+        xauth = next((work / 'runtime').glob('.mutter-Xwaylandauth.*'))
+        forced_env = dict(env, DISPLAY=xdisplay, XAUTHORITY=str(xauth))
+        forced = subprocess.run([str(binary), '--backend', 'x11', '--config', str(config), 'status'],
+                                env=forced_env, capture_output=True, text=True, timeout=8)
+        (work / 'explicit-x11-rejection.log').write_text(forced.stdout + forced.stderr)
+        check('Explicit X11 is rejected within GNOME Wayland',
+              forced.returncode != 0 and
+              'X11 backend is unavailable while WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland is set' in forced.stderr and
+              'native Wayland compositor integration' in forced.stderr, forced.stdout + forced.stderr)
+        assert_frame('Explicit X11 rejection leaves native geometry unchanged', expected_zones[1], window_log)
         capture_screen('native-window')
         events = []
         subscription = connection.signal_subscribe('org.window_zones.Gnome', 'org.window_zones.Gnome2', 'HotkeyPressed', '/org/window_zones/Gnome', None, Gio.DBusSignalFlags.NONE, lambda _c, _s, _p, _i, _n, value: events.append(value.unpack()[0]))
@@ -613,8 +752,10 @@ action = { type = "move-to-previous-display" }
         except GLib.Error as error:
             metrics_isolated = Gio.DBusError.get_remote_error(error) == 'org.window_zones.Gnome.Error.InvalidWindowState'
         check('Independent caller cannot read another controller transition metrics', metrics_isolated)
+        checkpoint = len(text(runtime_log))
         send(runtime, 'restart')
-        check('Performance TUI restarts without losing logger', wait_for(lambda: text(runtime_log).count('Last action: <none>') >= 2), text(runtime_log))
+        assert_tui_frame('Performance TUI restarts without losing logger', runtime_log, checkpoint,
+                         action='<none>', first=True)
         inject([29, 125, 105])
         assert_frame('Left returns to previous display nearest half after restart', expected_zones[1], window_log)
         check('Transition after restart appends to the same log', wait_for(lambda: len([row for row in perf_rows() if row['event'] == 'dispatch']) == 3), perf_rows())
@@ -653,8 +794,6 @@ action = { type = "move-to-previous-display" }
         stop(runtime)
         check('Default auto TUI quits cleanly', runtime.returncode == 0, runtime.returncode)
         runtime = None
-        xdisplay = re.search(r'Using public X11 display (:\d+)', text(shell_log)).group(1)
-        xauth = next((work / 'runtime').glob('.mutter-Xwaylandauth.*'))
         xenv = env.copy()
         xenv.update(GDK_BACKEND='x11', DISPLAY=xdisplay, XAUTHORITY=str(xauth))
         xwindow, xwindow_log = start([sys.executable, str(Path(__file__).resolve()), '--test-window', 'XWayland'], 'xwayland-window', xenv)
@@ -737,9 +876,11 @@ if __name__ == '__main__':
         def terminate(signum, _frame):
             global interrupted_signal
             interrupted_signal = signum
-            signal.signal(signum, signal.SIG_IGN)
+            for handled in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(handled, signal.SIG_IGN)
             raise SystemExit(128 + signum)
         signal.signal(signal.SIGTERM, terminate)
+        signal.signal(signal.SIGINT, terminate)
         try:
             run(args.binary.resolve(), args.keep_logs, args.output_dir)
         finally:

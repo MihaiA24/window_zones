@@ -127,8 +127,9 @@ def main():
                     elif options.driver == "smoke":
                         smoke(workspace, options)
                     elif options.driver == "tests":
+                        # Test/dev feature unification must not replace the pinned app.
                         rc, _ = workspace.run([str(workspace.root / "scripts/test.sh")], "tests-" + str(time.time_ns()), timeout=600,
-                                    environment=dict(os.environ, WINDOW_ZONES_VERIFY_CHECKOUT=str(workspace.root), CARGO_TARGET_DIR=str(workspace.root / "target")))
+                                    environment=dict(os.environ, WINDOW_ZONES_VERIFY_CHECKOUT=str(workspace.root), CARGO_TARGET_DIR=str(workspace.root / "target" / "verification-tests")))
                         if rc:
                             fail("Repository tests failed. Inspect the test logs and fix the reported failure.")
                     if workspace.build_status() != "current":

@@ -65,19 +65,6 @@ wait_for_file() {
     return 1
 }
 
-wait_for_size_growth() {
-    local file=$1 old_size=$2 timeout_s=${3:-10}
-    local deadline=$((SECONDS + timeout_s)) size
-    while (( SECONDS < deadline )); do
-        size=$(stat -c '%s' "$file" 2>/dev/null || printf '0')
-        if (( size > old_size )); then
-            return 0
-        fi
-        sleep 0.1
-    done
-    return 1
-}
-
 wait_observed() {
     # observer expected [timeout]: poll an observer function until it prints expected; print the last value.
     local observer=$1 expected=$2 timeout_s=${3:-8} observed=''

@@ -28,6 +28,10 @@ If no local binary exists, it falls back to `cargo run --release --bin window_zo
 ./scripts/run.sh run --backend dry-run
 ```
 
+Value-taking options reject another option token instead of treating it as a
+pathname or value. For example, `--log-file --dry-run status` fails before
+backend startup; use `./--dry-run` for a literal filename beginning with `--`.
+
 ## First run
 
 ```bash
@@ -115,6 +119,10 @@ an error; other backends retain one-shot dispatch logging.
 | `peak_rss_kib` | Linux process-lifetime `VmHWM`, not the peak of an individual transition |
 | `metrics_error` | Failed optional timing retrieval; action success is independent |
 
+Native transition metrics belong to the current action and are consumed once.
+A one-display next/previous no-op has no native request/completion timings;
+it cannot reuse those from an earlier move.
+
 `memory_scope` is `window_zones-process`: it excludes the shared GNOME Shell
 process, compositor/GPU snapshot memory, and other applications. Memory is
 sampled at startup and after dispatch, not continuously. Unsupported memory
@@ -137,6 +145,7 @@ The App prints runtime events once per change, never per retry:
 
 - `Config state: Loaded (N bindings)` / `Config state: Missing; run window_zones init ...`
 - `Config reload error: ...` — a broken file, or a file whose hotkeys were refused; the previous bindings stay active.
+- `Config reload pending: ...` — valid replacement TOML is waiting for unavailable capture; the previous config stays active. Explicit reload reports this outcome even when the outage diagnostic is unchanged.
 - `Hotkeys registered: N`, `Hotkey registration now recovered: ...`
 - `Hotkey registration refused: ...` — a binding is taken by the desktop or another program; nothing is retried until the config changes.
 - `Hotkey registration failed: ...; retrying` — the companion is absent or busy; retried every second.
@@ -183,6 +192,13 @@ asks you to start `window_zones run`. Use the same resolved compositor and
 `--config` path on the runtime and its clients; mismatches are refused.
 The runtime uses its current accepted config, including reloads.
 
+Clients must inherit the runtime's compositor connection: `SWAYSOCK` for Sway,
+or `HYPRLAND_INSTANCE_SIGNATURE` and the same runtime namespace for Hyprland.
+The watched config pathname remains valid when its symlink is retargeted.
+Compositor socket replacement fails closed, including queued requests; close
+and relaunch the process to adopt the new connection. In-process `restart`
+does not change transport identity.
+
 The socket has mode `0600` inside an owned `0700` directory next to the instance
 lock (`$XDG_RUNTIME_DIR/window_zones.dispatch/dispatch.sock` on a normal Linux
 login). Quit removes the owned socket; after a crash the next lock-owning session
@@ -192,7 +208,7 @@ Window and display state come from `swaymsg`/`hyprctl`; both integrations are un
 
 ## Linux X11
 
-Placement uses the window frame (client origin translated to root coordinates plus `_NET_FRAME_EXTENTS`) and restores maximized windows before configuring. Displays are RandR monitors minus the `_NET_WM_STRUT_PARTIAL`/`_NET_WM_STRUT` space panels reserve on each monitor. Hotkeys are exclusive `XGrabKey` grabs: a bound combination never reaches the focused application, and a combination another program already grabbed refuses the whole set.
+Placement uses the window frame (client origin translated to root coordinates plus `_NET_FRAME_EXTENTS`) and restores maximized windows before configuring. It waits for the WM's observed frame, not only X-server acknowledgement; constrained placement reports its actual partial frame so Restore remains available. RandR usable areas exclude effective current/all-desktop reservations, not withdrawn clients or another desktop's docks. Exclusive `XGrabKey` bindings follow keyboard/modifier remapping and actual lock slots. A failed remap releases obsolete grabs and reports unavailable capture; resolve the conflict and use `restart`.
 
 ## KDE Plasma Wayland
 
@@ -227,6 +243,10 @@ Use an explicit live backend: `./scripts/run.sh --backend macos run`; the runner
 default is dry-run. Native Accessibility references preserve the selected window
 across title, focus, and ordering changes. Native display coordinates use
 `NSScreen.visibleFrame` converted to global top-left coordinates.
+Display enumeration runs on the main thread, initializes a nonactivating
+AppKit application and drains pending native events before reading screens.
+Library callers must keep display queries on that thread; native hotplug and
+Dock/menu-bar changes still require independent desktop verification.
 
 Placement restores exposed zoom/minimized state, releases ordinary AppKit
 zoom/tiling through size and position, and verifies the resulting frame. Resize
@@ -240,6 +260,13 @@ and type `restart`. A live process-owned listener is reused; a recorded stopped
 one is replaced. There is no automatic hook reconstruction on registration
 retries. A LaunchAgent needs permission for its installed binary rather than
 relying on the terminal's grant.
+
+## Windows
+
+On Windows, the process owns the keyboard-hook thread and waits for native
+readiness. `restart` stops and joins it before installing a replacement, even
+when Windows silently removed the old hook. Left-Ctrl plus right-Alt is
+reserved for AltGr typing; use left-Alt for Ctrl+Alt placement bindings.
 
 ## TUI
 

@@ -14,16 +14,20 @@ What this verifies:
 - `bash -n` for every `scripts/**/*.sh` file, including sourced smoke modules and shell fixtures
 - `node --check gnome-extension/extension.js`
 - `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
-- `node --check kwin-script/contents/code/main.js`
 - `bash scripts/test-install.sh` (isolated installer/service ownership and lifecycle)
 - `node kwin-script/tests/run.js` and `qmllint kwin-script/contents/code/main.js` when available (native Qt syntax)
 - module-aware Node syntax checks for JavaScript fixtures under `scripts/` and `src/`
 - Python parsing of every `scripts/**/*.py` file, including extracted smoke fixtures
 - Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness after nested Rust/shell/fixture additions, edits and removals, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
+- Linux only: `python3 scripts/smoke/test_helpers.py` (owned-window selection, PID-reuse/orphan cleanup, signal exit, non-vacuous TUI responses and persistent helper build storage).
 
 The GNOME and KDE adapter contract tests use fake compositor services on private
 `dbus-daemon` instances; KWin controller ownership is also checked through the real
 Rust dispatcher. Neither requires a running compositor session.
+
+Verifier `drive tests` uses persistent `target/verification-tests` Cargo output.
+It must not overwrite the App binaries pinned by `launch`; test-only dependency
+features can produce different binaries even when the source is unchanged.
 
 ## Agent-driven verification
 
@@ -41,8 +45,8 @@ For direct smoke-runner integrations, `WINDOW_ZONES_BINARY` pins the app binary,
 `WINDOW_ZONES_SMOKE_DISPLAY` selects a free X11 display number. An occupied
 display is rejected rather than attached to; retain proof with `--keep-logs`.
 
-X11 one-shot movement waits for the X server to acknowledge the configure request
-before its connection closes. The smoke runner dispatches each placement once,
+X11 one-shot movement waits for the server acknowledgement and the WM's observed
+frame before its connection closes. The smoke runner dispatches each placement once,
 without retrying a reported success, then independently checks geometry. Its TUI
 check first establishes a different geometry and requires the dispatched move and
 completed response to succeed; a requested action label alone is not proof.
@@ -69,15 +73,28 @@ Run the GNOME Wayland or Linux X11 Smoke run with:
 ```
 The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit in each corresponding Synthetic or seated session.
 
-The isolated GNOME 51 gate uses `/usr/bin/python3` with PyGObject and GTK 4,
-`gst-launch-1.0` with the PipeWire, video-conversion, and PNG plugins, and a
-running user PipeWire daemon and session manager (for example WirePlumber).
-It copies the installed GNOME-compatible AppIndicator extension into its private
-XDG tree for real tray checks.
-On CachyOS/Arch the smoke dependencies are:
+Native smoke helpers require Python 3.9+ and Linux pidfd support for safe process
+signaling. The isolated GNOME gate requires `gnome-shell`, `dbus-daemon`,
+`gsettings`, Xwayland, `/usr/bin/python3` with PyGObject/GTK 4, and
+`gst-launch-1.0`/`gst-inspect-1.0` with PipeWire, video-conversion and PNG plugins.
+A running user PipeWire daemon/session manager and an installed AppIndicator
+compatible with the tested Shell version are required.
+
+Before isolation the verifier records the original user/system XDG data roots
+and PipeWire endpoint. The driver copies AppIndicator privately; it does not
+restore host HOME/config/data/runtime, desktop identity or the session bus.
+Compatible user-installed and system-installed extensions are both supported.
+On CachyOS/Arch the GNOME tool dependencies are:
 
 ```bash
-sudo pacman -S --needed python-gobject gtk4 gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire wireplumber
+sudo pacman -S --needed python-gobject gtk4 gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire wireplumber xorg-xwayland dbus util-linux
+```
+
+The X11 gate additionally needs Xvfb, Openbox, xdotool, xrandr, xdpyinfo,
+xprop, xkbcomp, GNOME Text Editor, ffmpeg and a private D-Bus session:
+
+```bash
+sudo pacman -S --needed xorg-server-xvfb openbox xdotool xorg-xrandr xorg-xdpyinfo xorg-xprop xorg-xkbcomp gnome-text-editor ffmpeg dbus
 ```
 
 Mutter's RemoteDesktop API supplies compositor-native keyboard and mouse
@@ -93,6 +110,10 @@ that device can reopen it.
 The X11 adapter owns exclusive `XGrabKey` accelerators (including CapsLock/NumLock variants); `xdotool` XTEST injection reaches these grabs without delivering the accelerator to the focused application. It does not require XRecord. The owned Openbox fixture uses an empty keyboard map so distro defaults do not preempt the test chords; a separate competing client proves real grab refusal.
 
 Pure X11 checks run with `cargo test --lib x11`. The ignored `x11_real_server_grabs_are_exclusive_atomic_and_released` test requires `WZ_X11_TEST_DISPLAY` and, when authentication is enabled, `XAUTHORITY` for an isolated X server, never the user's desktop. Use Xvfb or a separate rootful `Xwayland -geometry 800x600 -shm` on an isolated headless compositor, without `-enable-ei-portal`. Run it with `cargo test --lib x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored`.
+The gate runs both `x11_real_server*` tests serially on its own display,
+including remapping and a nonstandard NumLock slot. It also temporarily
+constrains its owned client's minimum size, requires a partial-frame error,
+and observes exact Restore before restoring the original hints and baseline.
 
 `gnome-live` has two prerequisites on the seated session:
 
@@ -109,7 +130,7 @@ The `x11`, `gnome-live`, and `kde-live` gates assert the ADR 0009 window contrac
 - A fullscreen window is rejected with `leave fullscreen first`, and its fullscreen state and frame do not change.
 - A hotkey replacement the platform refuses (X11: another client already grabs `Alt+Ctrl+F8`; GNOME: `Alt+Ctrl+Left` is reserved; KDE: the conflict incumbent holds `Alt+Ctrl+F24`) is reported as `were refused`, keeps the previous binding count and `hotkey state: Registered`, and the previous accelerator still moves the window.
 
-The X11 and GNOME checks build a small helper crate against the public `window_zones` API (`x11rb` from the repository lockfile), so the first run needs the crates available to Cargo. It uses Cargo's resolved target directory, or isolated temporary storage with a pinned app binary. Repository builds are manifest-qualified and a pinned `WINDOW_ZONES_BINARY` is never rebuilt. The helper captures/moves windows, sets EWMH states and holds a competing grab. X11 also runs the ignored exclusive-grab test against its owned display; `kde-live` needs KWin 6 scripting with `workspace.slotWindowQuickTileLeft()` and the window `tile` property.
+The X11 and seated `gnome-live` checks build a small helper crate against the public `window_zones` API (`x11rb` from the repository lockfile), so its crates must be available to Cargo. A pinned app binary is never rebuilt; the separate helper uses persistent Cargo target storage, not copied evidence. X11 runs its ignored real-server tests only on the owned display. `kde-live` needs KWin 6 scripting with `workspace.slotWindowQuickTileLeft()` and the window `tile` property.
 
 The harness preserves the invoking user's `CARGO_HOME` and `RUSTUP_HOME` before
 isolating the App's `HOME`; helper builds and the ignored X11 test therefore
@@ -123,9 +144,15 @@ below the target top edge and shorter than the usable height. Keep it frontmost
 and use its GUI PID, not the `open` launcher PID:
 
 ```bash
-WZ_MACOS_TEST_PID="$FIXTURE_PID" cargo test --locked --lib \
+WZ_MACOS_TEST_PID="$FIXTURE_PID" WZ_MACOS_TEST_AREA="$FIXTURE_USABLE_AREA_JSON" cargo test --locked --lib \
   expansion_finishes_at_target_origin -- --ignored --test-threads=1
 ```
+
+`FIXTURE_USABLE_AREA_JSON` is an independently observed primary usable area,
+for example the JSON shape `{"x":0,"y":25,"width":1440,"height":875}` in global
+top-left coordinates. Record the real values for the test desktop, not this
+example. Libtest uses worker threads; AppKit display enumeration is main-thread
+only, so this fixture input must come from an independent native observer.
 
 The test checks the native window's owning PID before mutation and refuses a
 different process. It is ignored by default because it requires the real GUI
@@ -173,6 +200,10 @@ restart. It does not cause a real OS timeout or post keys to an application.
 Also check actual left/right Control capture, repeat/release suppression in a
 disposable focused application, and OS-induced timeout recovery before and
 after a runtime `restart`; unit event delivery alone cannot verify those paths.
+In the actual macOS `run`/`tui` process, change monitor and Dock/menu-bar layout,
+then dispatch again and independently compare the refreshed usable areas.
+Require unchanged foreground focus and no utility Dock icon. Cross-compilation
+and the background-thread rejection regression do not establish that proof.
 
 ### Minimum verification
 

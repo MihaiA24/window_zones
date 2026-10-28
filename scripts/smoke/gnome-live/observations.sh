@@ -98,21 +98,9 @@ gnome_live_activate_window() {
 }
 
 gnome_live_find_window() {
-    WINDOW_ID=''
-    local id pid last=''
-    while read -r id; do
-        [[ -n "$id" ]] || continue
-        last=$id
-        pid=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-            xdotool getwindowpid "$id" 2>/dev/null || true)
-        if [[ "$pid" == "$EDITOR_PID" ]]; then
-            WINDOW_ID=$id
-            return 0
-        fi
-    done < <(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
-        xdotool search --onlyvisible --name 'Text Editor' 2>/dev/null || true)
-    WINDOW_ID=$last
-    [[ -n "$WINDOW_ID" ]]
+    XON_DISPLAY="$GNOME_XDISPLAY"
+    XON_XAUTHORITY="$GNOME_XAUTHORITY"
+    WINDOW_ID=$(xwindow_for_pid "$EDITOR_PID" 20) || return 1
 }
 
 gnome_live_capture() {
@@ -120,7 +108,6 @@ gnome_live_capture() {
     local path="$TMP_DIR/${CURRENT_GATE}-${label}.png"
     local capture_log="$TMP_DIR/${CURRENT_GATE}-${label}-ffmpeg.log"
     local geometry width height
-    LAST_SHOT=''
     geometry=$(DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY" \
         xdotool getdisplaygeometry 2>/dev/null || true)
     if [[ "$geometry" =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
@@ -131,7 +118,6 @@ gnome_live_capture() {
             -video_size "${width}x${height}" -i "${GNOME_XDISPLAY}.0+0,0" \
             -frames:v 1 -y "$path" >"$capture_log" 2>&1 \
             && [[ -s "$path" ]]; then
-            LAST_SHOT="$path"
             log "SCREENSHOT $label: $path (ffmpeg x11grab root ${width}x${height})"
         else
             log "SCREENSHOT $label: unavailable (ffmpeg x11grab failed; log $capture_log: $(cat "$capture_log" 2>/dev/null || true))"
