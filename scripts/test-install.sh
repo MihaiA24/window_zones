@@ -117,6 +117,9 @@ if name == 'uname':
 elif name == 'pkg-config':
     pass
 elif name == 'cargo':
+    if args[0] == 'metadata':
+        print(json.dumps(dict(target_directory=os.environ['CARGO_TARGET_DIR'])))
+        sys.exit(0)
     profile = 'release' if '--release' in args else 'debug'
     target = Path(os.environ['CARGO_TARGET_DIR']) / profile
     target.mkdir(parents=True, exist_ok=True)
@@ -309,7 +312,7 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         print('PASS GNOME prefix replacement, owned reinstall/uninstall, unowned preservation, config preservation')
         env['XDG_CURRENT_DESKTOP'] = 'KDE'
 
-        install(prefix, '--kwin-script', '--autostart', '--init-config')
+        install(str(prefix) + '/', '--kwin-script', '--autostart', '--init-config')
         wait_for(lambda: starts('window_zones'), 'systemd App did not start')
         assert not any(item['kind'] == 'early-app' for item in events()), 'App started before companion readiness'
         actions = [item['args'] for item in events() if item['kind'] == 'systemctl']
@@ -338,7 +341,7 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         assert not any(item['kind'] == 'kwin-setting' for item in events()[offset:]), 'stale prefix changed replacement KWin activation'
         assert Path(env['WZI_READY']).read_text() == str(replacement_pid)
         assert (Path(env['XDG_DATA_HOME']) / 'kwin/scripts/window-zones').is_dir()
-        install(replacement, '--uninstall')
+        install(str(replacement) + '/./', '--uninstall')
         assert not (config / 'systemd/user/window-zones-kwin.service').exists()
         assert not (config / 'systemd/user/window-zones.service').exists()
         assert witness.read_text() == 'user config witness\n'
@@ -373,7 +376,7 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         install(fallback, '--kwin-script')
         wait_for(lambda: starts('window_zones_kwin', 'four') and starts('window_zones', 'four'), 'XDG reinstall did not restart onto new binaries')
         running = {item['pid'] for item in starts(version='four')}
-        install(fallback, '--uninstall')
+        install(str(fallback) + '/', '--uninstall')
         child.wait(timeout=8)
         wait_for(lambda: running <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
                  'XDG logout/uninstall left supervised binaries running')

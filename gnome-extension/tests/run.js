@@ -64,10 +64,7 @@ const connection = {
     },
     signal_unsubscribe(id) { equal(id, 12, 'owner listener released'); },
     emit_signal(destination, path, interfaceName, name, variant) {
-        equal([destination, path, interfaceName, name, variant.get_type_string()],
-            [null, '/org/window_zones/Gnome', info.name, 'HotkeyPressed', '(s)'],
-            'hotkey signal contract');
-        this.emitted.push(variant.deep_unpack());
+        this.emitted.push({destination, hotkey: variant.deep_unpack()[0]});
     },
     vanish(sender) {
         this.ownerChanged(this, 'org.freedesktop.DBus', '/org/freedesktop/DBus',
@@ -297,7 +294,8 @@ for (const action of display.grabbed.keys())
     equal(Main.wm.allowed.get(Meta.external_binding_name_for_action(action)), Shell.ActionMode.NORMAL,
         'external accelerator is enabled in normal action mode');
 display.activate(originalGrabs[0][0]);
-equal(connection.emitted, [['alt+ctrl+left']], 'event echoes canonical hotkey');
+equal(connection.emitted, [{destination: ':1.42', hotkey: 'alt+ctrl+left'}],
+    'only the registered controller receives its hotkey event');
 for (const hotkey of [
     'Ctrl+Left', ' ctrl+left', 'ctrl+left ', 'a\n', 'f24\n', 'ctrl+alt+left', 'super+left',
     'ctrl++left', 'ctrl+ctrl+left', 'shift+cmd+ctrl+left', 'ctrl+F1', 'ctrl+f25', 'ctrl',

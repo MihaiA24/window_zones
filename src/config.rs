@@ -266,8 +266,8 @@ fn modifier_sort_key(token: &str) -> u8 {
     }
 }
 
-/// A complete, commented starter config binding every built-in action under one
-/// modifier chord, e.g. `"Ctrl+Alt"` or `"Ctrl+Super"`. Written by `window_zones init`.
+/// A commented starter config for zones, center, restore, and next/previous display,
+/// under one modifier chord. Directional display bindings can be added by the user.
 pub fn starter_config(chord: &str) -> String {
     let binding = |key: &str, action: &str| {
         format!("[[bindings]]\nhotkey = \"{chord}+{key}\"\naction = {action}\n\n")

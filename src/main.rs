@@ -8,6 +8,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use window_zones::logging::Logger;
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use tray_item::{IconSource, TrayItem};
 
@@ -71,6 +73,7 @@ struct CliArgs {
     command: Command,
     config_path: Option<PathBuf>,
     perf_log_path: Option<PathBuf>,
+    log_file_path: Option<PathBuf>,
     backend: BackendPreference,
     show_tray: bool,
     chord: Option<String>,
@@ -97,6 +100,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
     let mut command = None;
     let mut config_path = None;
     let mut perf_log_path = None;
+    let mut log_file_path = None;
     let mut backend = BackendPreference::Auto;
     let mut show_tray = false;
     let mut chord = None;
@@ -107,13 +111,14 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         let arg = &args[index];
 
         match arg.as_str() {
-            "--config" | "--perf-log" | "--backend" | "--chord" => {
+            "--config" | "--perf-log" | "--log-file" | "--backend" | "--chord" => {
                 let Some(value) = args.get(index + 1) else {
                     return ParseStatus::Err(format!("{arg} requires a value"));
                 };
                 match arg.as_str() {
                     "--config" => config_path = Some(PathBuf::from(value)),
                     "--perf-log" => perf_log_path = Some(PathBuf::from(value)),
+                    "--log-file" => log_file_path = Some(PathBuf::from(value)),
                     "--backend" => match parse_backend_preference(value) {
                         Ok(value) => backend = value,
                         Err(message) => return ParseStatus::Err(message),
@@ -188,6 +193,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         command,
         config_path,
         perf_log_path,
+        log_file_path,
         backend,
         show_tray,
         chord,
@@ -1316,7 +1322,7 @@ impl TraySurface {
             dirty: false,
             cli: CliSurface {
                 prompt: false,
-                notifier: Notifier::new(),
+                notifier: Notifier::new(runtime.backend),
             },
         })
     }
@@ -1358,7 +1364,9 @@ impl Surface for TraySurface {
                 Ok(()) => self.labels[index] = line,
                 Err(error) => {
                     self.dirty = true;
-                    eprintln!("Failed to refresh tray status: {error}");
+                    window_zones::logging::diagnostic(format_args!(
+                        "Failed to refresh tray status: {error}"
+                    ));
                 }
             }
         }
@@ -1405,7 +1413,11 @@ impl NotificationPolicy {
     fn event(&mut self, event: &RuntimeEvent, now: Instant) -> Option<Notification> {
         let resolved = match event {
             RuntimeEvent::HotkeysUnavailable { .. } => {
-                self.pending_outage = Some((now, event.to_string()));
+                let since = self
+                    .pending_outage
+                    .as_ref()
+                    .map_or(now, |(since, _)| *since);
+                self.pending_outage = Some((since, event.to_string()));
                 return None;
             }
             RuntimeEvent::ConfigFailed { .. } | RuntimeEvent::ConfigRejected { .. } => {
@@ -1459,7 +1471,10 @@ struct Notifier {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Notifier {
-    fn new() -> Option<Self> {
+    fn new(backend: RuntimeBackend) -> Option<Self> {
+        if io::stdout().is_terminal() || matches!(backend, RuntimeBackend::DryRun) {
+            return None;
+        }
         Some(Self {
             policy: NotificationPolicy::default(),
             #[cfg(target_os = "linux")]
@@ -1516,7 +1531,9 @@ impl Notifier {
         match result {
             Ok((id,)) => self.notification_id = id,
             Err(error) => {
-                eprintln!("Desktop notification failed: {error}");
+                window_zones::logging::diagnostic(format_args!(
+                    "Desktop notification failed: {error}"
+                ));
                 self.connection = None;
             }
         }
@@ -1540,8 +1557,12 @@ impl Notifier {
                 .status();
             match result {
                 Ok(status) if status.success() => {}
-                Ok(status) => eprintln!("Desktop notification failed: {status}"),
-                Err(error) => eprintln!("Desktop notification failed: {error}"),
+                Ok(status) => window_zones::logging::diagnostic(format_args!(
+                    "Desktop notification failed: {status}"
+                )),
+                Err(error) => window_zones::logging::diagnostic(format_args!(
+                    "Desktop notification failed: {error}"
+                )),
             }
         });
     }
@@ -1552,7 +1573,7 @@ struct Notifier;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Notifier {
-    fn new() -> Option<Self> {
+    fn new(_backend: RuntimeBackend) -> Option<Self> {
         None
     }
 
@@ -1583,18 +1604,71 @@ enum InstanceLockError {
     Io(String),
 }
 
-fn instance_lock_path() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
-        return PathBuf::from(runtime_dir).join("window_zones.lock");
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
     }
-    let user = env::var("USER")
-        .or_else(|_| env::var("USERNAME"))
-        .unwrap_or_default();
-    env::temp_dir().join(format!("window_zones-{user}.lock"))
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { geteuid() }
+}
+
+fn instance_lock_path() -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        let directory = env::temp_dir().join(format!("window_zones-{}", current_uid()));
+        #[cfg(target_os = "linux")]
+        let directory = env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map_or(directory, PathBuf::from);
+        let failure = |error: &str| {
+            format!(
+                "cannot prepare instance directory {}: {error}",
+                directory.display()
+            )
+        };
+        if !directory.is_absolute() {
+            return Err(failure("an absolute path is required"));
+        }
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(failure(&error.to_string())),
+        }
+        let metadata =
+            fs::symlink_metadata(&directory).map_err(|error| failure(&error.to_string()))?;
+        if !metadata.is_dir() || metadata.uid() != current_uid() || metadata.mode() & 0o077 != 0 {
+            return Err(failure(
+                "must be an owned, non-symlink directory with mode 0700",
+            ));
+        }
+        Ok(directory.join("window_zones.lock"))
+    }
+    #[cfg(not(unix))]
+    {
+        let user = env::var("USERNAME").unwrap_or_default();
+        Ok(env::temp_dir().join(format!("window_zones-{user}.lock")))
+    }
 }
 
 fn acquire_instance_lock(path: &Path) -> Result<InstanceLock, InstanceLockError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(InstanceLockError::Io(format!(
+                "cannot open instance lock {}: not a regular, non-symlink file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(InstanceLockError::Io(format!(
+                "cannot inspect instance lock {}: {error}",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
     let file = File::options()
         .write(true)
         .create(true)
@@ -1610,8 +1684,13 @@ fn acquire_instance_lock(path: &Path) -> Result<InstanceLock, InstanceLockError>
     let pid_path = path.with_extension("pid");
     match file.try_lock() {
         Ok(()) => {
-            // The pid is informational, for the message another instance prints.
-            let _ = fs::write(&pid_path, std::process::id().to_string());
+            // Recreate the informational sidecar without following a stale symlink.
+            let _ = fs::remove_file(&pid_path);
+            let _ = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&pid_path)
+                .and_then(|mut pid| write!(pid, "{}", std::process::id()));
             Ok(InstanceLock {
                 _file: file,
                 pid_path,
@@ -1734,11 +1813,15 @@ fn execute_session(
     command: &Command,
     show_tray: bool,
     perf_log_path: Option<&PathBuf>,
+    logger: Option<Logger>,
 ) -> ExitCode {
     let _lock = if matches!(backend, RuntimeBackend::DryRun) {
         None
     } else {
-        match acquire_instance_lock(&instance_lock_path()) {
+        match instance_lock_path()
+            .map_err(InstanceLockError::Io)
+            .and_then(|path| acquire_instance_lock(&path))
+        {
             Ok(lock) => Some(lock),
             Err(error) => {
                 let (message, code) = match error {
@@ -1747,7 +1830,7 @@ fn execute_session(
                     }
                     InstanceLockError::Io(message) => (message, ExitCode::FAILURE),
                 };
-                eprintln!("Error: {message}");
+                window_zones::logging::diagnostic(format_args!("Error: {message}"));
                 return code;
             }
         }
@@ -1756,10 +1839,13 @@ fn execute_session(
     let mut runtime = match Runtime::new(config_path, backend, perf_log_path) {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("{error}");
+            window_zones::logging::diagnostic(format_args!("{error}"));
             return ExitCode::FAILURE;
         }
     };
+    if let Some(logger) = logger {
+        runtime.app.enable_logging(logger);
+    }
     let (tx, instructions) = mpsc::channel();
     #[cfg(target_os = "linux")]
     let _dispatch_server = if matches!(backend, RuntimeBackend::Wayland(_)) {
@@ -1781,7 +1867,9 @@ fn execute_session(
         match server {
             Ok(server) => Some(server),
             Err(error) => {
-                eprintln!("Cannot start compositor-bound dispatch: {error}");
+                window_zones::logging::diagnostic(format_args!(
+                    "Cannot start compositor-bound dispatch: {error}"
+                ));
                 return ExitCode::FAILURE;
             }
         }
@@ -1802,7 +1890,9 @@ fn execute_session(
             let mut surface = match TraySurface::new(&runtime, &tx) {
                 Ok(surface) => surface,
                 Err(error) => {
-                    eprintln!("Failed to start tray surface: {error}");
+                    window_zones::logging::diagnostic(format_args!(
+                        "Failed to start tray surface: {error}"
+                    ));
                     return ExitCode::FAILURE;
                 }
             };
@@ -1812,17 +1902,15 @@ fn execute_session(
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        eprintln!("Tray mode is not supported on this platform yet; continuing without it.");
+        window_zones::logging::diagnostic(format_args!(
+            "Tray mode is not supported on this platform yet; continuing without it."
+        ));
     }
 
     let mut surface = CliSurface {
         prompt: interactive,
         // Without a terminal nobody reads stdout live: surface problems on the desktop.
-        notifier: if io::stdout().is_terminal() || matches!(backend, RuntimeBackend::DryRun) {
-            None
-        } else {
-            Notifier::new()
-        },
+        notifier: Notifier::new(backend),
     };
     spawn_stdin_reader(parse_runtime_input, tx);
     run_runtime(&mut runtime, &mut surface, instructions, interactive);
@@ -1888,7 +1976,7 @@ fn execute_init(config_path: Option<PathBuf>, chord: Option<&str>, force: bool) 
     let path = match config_path.map_or_else(default_config_path, Ok) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("Error: {error}");
+            window_zones::logging::diagnostic(format_args!("Error: {error}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1912,7 +2000,7 @@ fn execute_init(config_path: Option<PathBuf>, chord: Option<&str>, force: bool) 
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("Error: {error}");
+            window_zones::logging::diagnostic(format_args!("Error: {error}"));
             ExitCode::FAILURE
         }
     }
@@ -1940,6 +2028,7 @@ fn print_help() {
     println!("  tui              serve hotkeys with the ANSI dashboard");
     println!("Session commands: status, reload, restart, dispatch HOTKEY, help, q/quit/exit");
     println!("Options:");
+    println!("  --log-file PATH  append best-effort timestamped session events");
     println!("  --perf-log PATH  append JSONL dispatch timings and app-process memory");
     println!(
         "                   Linux RSS/peak RSS exclude GNOME Shell; unavailable values are null"
@@ -1954,12 +2043,22 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         ParseStatus::Err(message) => {
-            eprintln!("Error: {message}");
+            window_zones::logging::diagnostic(format_args!("Error: {message}"));
             print_help();
             return ExitCode::FAILURE;
         }
         ParseStatus::Ok(args) => args,
     };
+    let logger = args.log_file_path.as_ref().map(|path| {
+        let session = match &args.command {
+            Command::Status => "status",
+            Command::Dispatch { .. } => "dispatch",
+            Command::Run => "run",
+            Command::Tui => "tui",
+            Command::Init => "init",
+        };
+        Logger::new(Some(path.clone()), true, false, session)
+    });
 
     if matches!(args.command, Command::Init) {
         return execute_init(args.config_path, args.chord.as_deref(), args.force);
@@ -1967,14 +2066,16 @@ fn main() -> ExitCode {
 
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     if !matches!(args.backend, BackendPreference::DryRun) {
-        eprintln!("Unsupported host OS for live window-system actions. Use --dry-run.");
+        window_zones::logging::diagnostic(format_args!(
+            "Unsupported host OS for live window-system actions. Use --dry-run."
+        ));
         return ExitCode::FAILURE;
     }
 
     let backend = match resolve_runtime_backend(args.backend) {
         Ok(backend) => backend,
         Err(error) => {
-            eprintln!("Backend selection failed: {error}");
+            window_zones::logging::diagnostic(format_args!("Backend selection failed: {error}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1986,6 +2087,7 @@ fn main() -> ExitCode {
             &args.command,
             args.show_tray,
             args.perf_log_path.as_ref(),
+            logger,
         );
     }
     #[cfg(target_os = "linux")]
@@ -1997,15 +2099,19 @@ fn main() -> ExitCode {
             backend,
             args.perf_log_path.as_ref(),
             hotkey,
+            logger.as_ref(),
         );
     }
-    let app = match build_app(args.config_path.as_ref(), args.perf_log_path.as_ref()) {
+    let mut app = match build_app(args.config_path.as_ref(), args.perf_log_path.as_ref()) {
         Ok(app) => app,
         Err(error) => {
-            eprintln!("{error}");
+            window_zones::logging::diagnostic(format_args!("{error}"));
             return ExitCode::FAILURE;
         }
     };
+    if let Some(logger) = logger {
+        app.enable_logging(logger);
+    }
 
     match &args.command {
         Command::Status => {
@@ -2036,11 +2142,12 @@ fn execute_compositor_dispatch(
     backend: RuntimeBackend,
     perf_log_path: Option<&PathBuf>,
     hotkey: &str,
+    logger: Option<&Logger>,
 ) -> ExitCode {
     if perf_log_path.is_some() {
-        eprintln!(
+        window_zones::logging::diagnostic(format_args!(
             "Error: compositor-bound dispatch uses session-owned performance logging; set --perf-log on `window_zones run` or `tui`, not on dispatch clients"
-        );
+        ));
         return ExitCode::FAILURE;
     }
     let response = (|| {
@@ -2050,10 +2157,16 @@ fn execute_compositor_dispatch(
         let identity =
             local_session_dispatch::Identity::new(compositor_dispatch_backend(backend), &path)
                 .map_err(|error| format!("cannot resolve dispatch config path: {error}"))?;
-        local_session_dispatch::dispatch(&instance_lock_path(), identity, hotkey)
+        local_session_dispatch::dispatch(&instance_lock_path()?, identity, hotkey)
     })();
     match response {
         Ok(response) => {
+            if let Some(logger) = logger {
+                logger.log(format_args!(
+                    "compositor dispatch {hotkey}: {}",
+                    response.output
+                ));
+            }
             print!("{}", response.output);
             if response.success {
                 ExitCode::SUCCESS
@@ -2062,7 +2175,10 @@ fn execute_compositor_dispatch(
             }
         }
         Err(error) => {
-            eprintln!("Error: {error}");
+            if let Some(logger) = logger {
+                logger.log(format_args!("compositor dispatch {hotkey} failed: {error}"));
+            }
+            window_zones::logging::diagnostic(format_args!("Error: {error}"));
             ExitCode::FAILURE
         }
     }
@@ -2421,6 +2537,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn instance_pid_sidecar_never_overwrites_a_symlink_target() {
+        let directory = temp_path("pid_symlink");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("instance.lock");
+        let unrelated = directory.join("unrelated.txt");
+        fs::write(&unrelated, "keep this content").unwrap();
+        std::os::unix::fs::symlink(&unrelated, path.with_extension("pid")).unwrap();
+
+        let lock = acquire_instance_lock(&path).unwrap();
+        drop(lock);
+        let content = fs::read_to_string(&unrelated).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(content, "keep this content");
+    }
+
     #[test]
     fn instance_lock_io_failures_are_not_reported_as_contention() {
         let path = temp_path("missing_lock_parent").join("instance.lock");
@@ -2610,6 +2744,31 @@ mod tests {
         assert_eq!(
             resolution,
             Some(Notification::Resolved(recovered.to_string()))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn changing_outage_diagnostics_do_not_restart_the_grace_period() {
+        let mut policy = NotificationPolicy::default();
+        let start = Instant::now();
+        policy.event(
+            &RuntimeEvent::HotkeysUnavailable {
+                message: "absent".into(),
+            },
+            start,
+        );
+        let changed = RuntimeEvent::HotkeysUnavailable {
+            message: "reconnecting".into(),
+        };
+        policy.event(
+            &changed,
+            start + HOTKEY_OUTAGE_GRACE - Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            policy.tick(start + HOTKEY_OUTAGE_GRACE),
+            Some(Notification::Problem(changed.to_string()))
         );
     }
 

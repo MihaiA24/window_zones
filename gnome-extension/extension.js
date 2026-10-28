@@ -591,9 +591,9 @@ export class WindowZonesService {
 
     _emitHotkey(action) {
         const hotkey = this._hotkeysByAction.get(action);
-        if (hotkey !== undefined && this._connection) {
+        if (hotkey !== undefined && this._connection && this._controllerSender) {
             this._connection.emit_signal(
-                null,
+                this._controllerSender,
                 OBJECT_PATH,
                 INTERFACE_NAME,
                 'HotkeyPressed',

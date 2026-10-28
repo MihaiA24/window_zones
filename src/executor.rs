@@ -54,18 +54,9 @@ impl WindowHistory {
         self.records.get(window)
     }
 
-    /// The record for a window that is still where the App last put it.
-    fn placed_record(&self, window: &FocusedWindow) -> Option<&WindowRecord> {
-        self.record(&window.id).filter(|record| {
-            record
-                .applied
-                .nearly_equals(window.geometry, APPLIED_GEOMETRY_TOLERANCE_PX)
-        })
-    }
-
     fn remember(&mut self, window: &FocusedWindow, applied: Rect) {
         let restore = self
-            .placed_record(window)
+            .record(&window.id)
             .map_or(window.geometry, |record| record.restore);
 
         if !self.records.contains_key(&window.id) && self.records.len() >= HISTORY_CAPACITY {
@@ -114,6 +105,16 @@ pub fn execute_action<W: WindowSystem>(
             .nearly_equals(focused.geometry, APPLIED_GEOMETRY_TOLERANCE_PX)
     {
         history.forget(&focused.id);
+    }
+
+    if matches!(action, Action::Restore {}) {
+        let restore = history
+            .record(&focused.id)
+            .map(|record| record.restore)
+            .ok_or(ExecuteActionError::NothingToRestore)?;
+        move_window(window_system, history, &focused, restore)?;
+        history.forget(&focused.id);
+        return Ok(());
     }
 
     let mut displays = window_system.displays()?;
@@ -179,15 +180,7 @@ pub fn execute_action<W: WindowSystem>(
             )
         }
         Action::Center {} => centered(focused.geometry, current_area),
-        Action::Restore {} => {
-            let restore = history
-                .record(&focused.id)
-                .map(|record| record.restore)
-                .ok_or(ExecuteActionError::NothingToRestore)?;
-            move_window(window_system, history, &focused, restore)?;
-            history.forget(&focused.id);
-            return Ok(());
-        }
+        Action::Restore {} => unreachable!("Restore does not require display discovery"),
     };
 
     move_window(window_system, history, &focused, target)?;
@@ -200,15 +193,13 @@ fn horizontal_neighbour(
     current_index: usize,
     left: bool,
 ) -> Option<&DisplayGeometry> {
-    let current = &displays[current_index];
-    let source = current.usable_area;
+    let source = displays[current_index].usable_area;
     let source_right = i64::from(source.x) + i64::from(source.width);
     let source_bottom = i64::from(source.y) + i64::from(source.height);
     let source_center_y = 2 * i64::from(source.y) + i64::from(source.height);
 
     displays
         .iter()
-        .filter(|display| display.id != current.id)
         .filter_map(|display| {
             let area = display.usable_area;
             let right = i64::from(area.x) + i64::from(area.width);
@@ -929,6 +920,36 @@ mod tests {
 
         assert_eq!(targets(&fake).last(), Some(&original));
         assert_eq!(second_restore, ExecuteActionError::NothingToRestore);
+    }
+
+    #[test]
+    fn restore_remains_available_when_display_discovery_fails_or_is_empty() {
+        for displays in [
+            Err(WindowSystemError::Platform("display query failed".into())),
+            Ok(Vec::new()),
+        ] {
+            let original = Rect::new(100, 100, 800, 600);
+            let mut fake = fake_with_focus(original);
+            let mut history = WindowHistory::default();
+            execute_action(
+                &zone("left-half"),
+                &BTreeMap::new(),
+                &mut history,
+                &mut fake,
+            )
+            .unwrap();
+            fake.displays = displays;
+
+            execute_action(
+                &Action::Restore {},
+                &BTreeMap::new(),
+                &mut history,
+                &mut fake,
+            )
+            .unwrap();
+
+            assert_eq!(fake.focused_window().unwrap().unwrap().geometry, original);
+        }
     }
 
     #[test]

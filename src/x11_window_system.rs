@@ -166,9 +166,7 @@ impl X11WindowSystem {
                 WindowSystemError::Platform(format!("failed to query window geometry: {error}"))
             })?
             .reply()
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to read window geometry: {error}"))
-            })?;
+            .map_err(|error| window_reply_error(window, "read window geometry", error))?;
 
         let origin = conn
             .translate_coordinates(window, root, 0, 0)
@@ -176,9 +174,7 @@ impl X11WindowSystem {
                 WindowSystemError::Platform(format!("failed to translate window origin: {error}"))
             })?
             .reply()
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to read window origin: {error}"))
-            })?;
+            .map_err(|error| window_reply_error(window, "read window origin", error))?;
         let [left, right, top, bottom] = Self::frame_extents(conn, window)?;
         let invalid_frame =
             || WindowSystemError::Platform("window frame geometry is out of range".to_string());
@@ -268,62 +264,86 @@ impl WindowSystem for X11WindowSystem {
         }
         let mut size = frame_target_size(window_move.target, Self::frame_extents(&conn, window)?)?;
         let restore_states = [maximized_horz, maximized_vert, shaded];
-        if states.iter().any(|atom| restore_states.contains(atom)) {
-            for removed in [[maximized_horz, maximized_vert], [shaded, 0]] {
-                let event = xproto::ClientMessageEvent::new(
-                    32,
-                    window,
-                    state,
-                    [0, removed[0], removed[1], 2, 0],
-                );
-                conn.send_event(
-                    false,
-                    root,
-                    xproto::EventMask::SUBSTRUCTURE_REDIRECT
-                        | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
-                    event,
-                )
-                .map_err(|error| {
-                    WindowSystemError::Platform(format!("failed to restore window: {error}"))
-                })?
-                .check()
-                .map_err(|error| window_reply_error(window, "restore window", error))?;
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            loop {
-                let states =
-                    property_values(&conn, window, "_NET_WM_STATE", AtomEnum::ATOM, u32::MAX)?;
-                if !states.iter().any(|atom| restore_states.contains(atom)) {
-                    break;
+        let restoring = states.iter().any(|atom| restore_states.contains(atom));
+        let before = if restoring {
+            Some(Self::focused_window_geometry(&conn, window, root)?)
+        } else {
+            None
+        };
+        let result = (|| {
+            if restoring {
+                for removed in [[maximized_horz, maximized_vert], [shaded, 0]] {
+                    let event = xproto::ClientMessageEvent::new(
+                        32,
+                        window,
+                        state,
+                        [0, removed[0], removed[1], 2, 0],
+                    );
+                    conn.send_event(
+                        false,
+                        root,
+                        xproto::EventMask::SUBSTRUCTURE_REDIRECT
+                            | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                        event,
+                    )
+                    .map_err(|error| {
+                        WindowSystemError::Platform(format!("failed to restore window: {error}"))
+                    })?
+                    .check()
+                    .map_err(|error| window_reply_error(window, "restore window", error))?;
                 }
-                if std::time::Instant::now() >= deadline {
-                    return Err(WindowSystemError::Platform(
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    let states =
+                        property_values(&conn, window, "_NET_WM_STATE", AtomEnum::ATOM, u32::MAX)?;
+                    if !states.iter().any(|atom| restore_states.contains(atom)) {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(WindowSystemError::Platform(
                         "X11 window manager did not restore the window; unmaximize or unshade it first".to_string(),
                     ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                size = frame_target_size(window_move.target, Self::frame_extents(&conn, window)?)?;
             }
-            size = frame_target_size(window_move.target, Self::frame_extents(&conn, window)?)?;
-        }
 
-        let (width, height) = size;
-        let values = xproto::ConfigureWindowAux::new()
-            .x(window_move.target.x)
-            .y(window_move.target.y)
-            .width(width)
-            .height(height)
-            .border_width(0);
+            let (width, height) = size;
+            let values = xproto::ConfigureWindowAux::new()
+                .x(window_move.target.x)
+                .y(window_move.target.y)
+                .width(width)
+                .height(height)
+                .border_width(0);
 
-        // Wait for the server before dropping this short-lived connection.
-        conn.configure_window(window, &values)
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to configure focused window: {error}"))
-            })?
-            .check()
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("X11 rejected window configuration: {error}"))
-            })?;
-        Ok(())
+            // Wait for the server before dropping this short-lived connection.
+            conn.configure_window(window, &values)
+                .map_err(|error| {
+                    WindowSystemError::Platform(format!(
+                        "failed to configure focused window: {error}"
+                    ))
+                })?
+                .check()
+                .map_err(|error| window_reply_error(window, "configure window", error))?;
+            Ok(())
+        })();
+        result.map_err(|error| {
+            if matches!(error, WindowSystemError::WindowGone(_)) {
+                return error;
+            }
+            let Some(before) = before else {
+                return error;
+            };
+            match Self::focused_window_geometry(&conn, window, root) {
+                Ok(observed) if observed != before => WindowSystemError::PartialMove {
+                    observed,
+                    message: error.to_string(),
+                },
+                Err(gone @ WindowSystemError::WindowGone(_)) => gone,
+                _ => error,
+            }
+        })
     }
 }
 

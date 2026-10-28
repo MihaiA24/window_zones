@@ -10,10 +10,7 @@ Record the exact point release before a manual run:
 gnome-shell --version
 ```
 
-GNOME Shell 51.1 has passed the private Synthetic companion/capability/display,
-config reload and CLI/TUI journeys with extension-version validation enabled.
-Seated Shell 51 placement and accelerator capture remain unverified; the
-existing seated reference remains Shell 50.4.
+Record observed pass/fail results, exact Shell versions and synthetic/seated limitations in the PR description. A previous revision's pass does not verify an upgraded binary or companion.
 
 ## Install and enable the companion
 

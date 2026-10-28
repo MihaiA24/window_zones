@@ -1,21 +1,19 @@
 use thiserror::Error;
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::collections::{HashMap, HashSet};
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::sync::mpsc::{self, TryRecvError};
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::sync::{Arc, Mutex, PoisonError};
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::thread;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 use rdev::Event;
 #[cfg(target_os = "windows")]
 use rdev::grab;
-#[cfg(target_os = "linux")]
-use rdev::listen;
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use rdev::{EventType, Key};
 
 #[cfg(target_os = "macos")]
@@ -53,12 +51,12 @@ pub trait HotkeySystem {
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError>;
 }
 
-/// Instances share one process-owned native listener. A live listener is never
-/// replaced: rdev owns the Linux/Windows callbacks, and macOS owns its event tap.
+/// A live native listener is shared by Windows/macOS instances and never
+/// replaced while its hook may still run.
 /// The singleton passes input through after its active registration is dropped
 /// (apart from releases whose presses it already consumed). The next instance
 /// reuses it on restart, or starts a fresh one once the native hook stopped.
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug)]
 pub struct RdevHotkeySystem {
     listener: Arc<Mutex<RdevListener>>,
@@ -67,7 +65,7 @@ pub struct RdevHotkeySystem {
     events: mpsc::Receiver<HotkeyEvent>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug, Default)]
 struct RdevListener {
     bindings: HashMap<(u8, Key), String>,
@@ -78,7 +76,7 @@ struct RdevListener {
     swallowed: HashSet<Key>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl RdevListener {
     fn status(&self) -> Result<(), HotkeySystemError> {
         match &self.error {
@@ -143,7 +141,7 @@ impl RdevListener {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl RdevHotkeySystem {
     pub fn new() -> Self {
         static LISTENER: Mutex<Option<Arc<Mutex<RdevListener>>>> = Mutex::new(None);
@@ -204,12 +202,6 @@ impl RdevHotkeySystem {
                 #[cfg(target_os = "macos")]
                 let result = macos::listen(listener);
 
-                #[cfg(target_os = "linux")]
-                let result = listen(move |event: Event| {
-                    if let Ok(mut state) = listener.lock() {
-                        state.handle_event(event.event_type, false);
-                    }
-                }).map_err(|error| format!("{error:?}"));
                 result
             });
             let details = match result {
@@ -235,14 +227,14 @@ impl RdevHotkeySystem {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl Default for RdevHotkeySystem {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl HotkeySystem for RdevHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         let mut next = HashMap::with_capacity(hotkeys.len());
@@ -286,7 +278,7 @@ impl HotkeySystem for RdevHotkeySystem {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl Drop for RdevHotkeySystem {
     fn drop(&mut self) {
         if let Ok(mut state) = self.listener.lock()
@@ -300,16 +292,16 @@ impl Drop for RdevHotkeySystem {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const MOD_ALT: u8 = 0b0001;
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const MOD_CTRL: u8 = 0b0010;
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const MOD_SHIFT: u8 = 0b0100;
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const MOD_CMD: u8 = 0b1000;
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn modifier_mask(key: &Key) -> Option<u8> {
     Some(match key {
         Key::Alt | Key::AltGr => MOD_ALT,
@@ -320,7 +312,7 @@ fn modifier_mask(key: &Key) -> Option<u8> {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn canonical_binding(raw: &str) -> Result<((u8, Key), String), HotkeySystemError> {
     let canonical = crate::config::normalize_hotkey(raw)
         .map_err(|error| HotkeySystemError::Rejected(format!("invalid hotkey `{raw}`: {error}")))?;
@@ -332,7 +324,7 @@ fn canonical_binding(raw: &str) -> Result<((u8, Key), String), HotkeySystemError
     Ok((binding_code(&canonical)?, canonical))
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn binding_code(canonical: &str) -> Result<(u8, Key), HotkeySystemError> {
     let mut tokens = canonical.split('+');
     let key_token = tokens.next_back().unwrap_or_default();
@@ -353,7 +345,7 @@ fn binding_code(canonical: &str) -> Result<(u8, Key), HotkeySystemError> {
     Ok((modifiers, key))
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn key_token_to_code(token: &str) -> Option<Key> {
     #[cfg(target_os = "windows")]
     if let Some(number) = token
@@ -467,7 +459,7 @@ fn key_token_to_code(token: &str) -> Option<Key> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 mod tests {
     use super::*;
 

@@ -12,7 +12,7 @@ import sys
 import uuid
 
 from .runtime import CHECK_EPOCH, VALID, ZONES, digest, fail, load, save
-from .journeys import ANSI, session, smoke, tui_dispatch_action
+from .journeys import ANSI, session, smoke, smoke_summary, tui_dispatch_action
 
 
 def differences(expected, actual, path="$"):
@@ -134,7 +134,7 @@ def check_e2e(workspace, prefix):
         if name in ("x11-left-half", "x11-center-third", "x11-left-two-thirds", "x11-next-display",
                     "x11-previous-display", "X11 real hotkey moves window"):
             geometry[name] = list(map(int, match.groups()[1:]))
-    summary = re.search(r"Smoke assertions: \d+; failures: (\d+)", assertions)
+    summary = smoke_summary(assertions, "x11")
     after_error = native_run.partition("Config reload error:")[2]
     retained = re.search(r"binding count: (\d+)", after_error)
     action = re.findall(r"last action: (alt\+ctrl\+\w+)", native_run)
@@ -153,7 +153,7 @@ def check_e2e(workspace, prefix):
     before_cancel = workspace.config.read_bytes()
     session(workspace, argparse.Namespace(mode="tui", backend_flag="backend", discovery=False, journey="lifecycle",
                                command=["status"], expect=["Config:"], quit="eof"))
-    return {"failures": int(summary.group(1)) if summary else None, "geometry": geometry, "captured_png": captures,
+    return {"failures": summary["failed"], "geometry": geometry, "captured_png": captures,
             "native_backend": "x11" if "Window backend: x11" in native_run else None,
             "hotkey_action": action[-1] if action else None, "retained_binding_count": int(retained.group(1)) if retained else None,
             "config_recovered": "Config state: Loaded" in after_error,

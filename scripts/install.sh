@@ -105,6 +105,13 @@ if [[ "$UNINSTALL" -eq 0 && "$OS" == Darwin && ( "$GNOME_EXTENSION" -eq 1 || "$K
   exit 1
 fi
 
+if [[ "$UNINSTALL" -eq 0 ]]; then
+  mkdir -p -- "$INSTALL_PREFIX"
+fi
+if [[ -d "$INSTALL_PREFIX" ]]; then
+  INSTALL_PREFIX="$(cd -- "$INSTALL_PREFIX" && pwd -P)"
+fi
+
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 [[ "$CONFIG_HOME" == /* ]] || CONFIG_HOME="$HOME/.config"
 APP_CONFIG="$CONFIG_HOME/window_zones/config.toml"
@@ -331,16 +338,20 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo 'cargo is required to build Window Zones; install the Rust toolchain and re-run this script.' >&2
   exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo 'python3 is required to read Cargo build metadata.' >&2
+  exit 1
+fi
 if [[ "$KWIN_SCRIPT" -eq 1 ]] && ! command -v kpackagetool6 >/dev/null 2>&1; then
   echo '--kwin-script requires kpackagetool6; install the Plasma 6 package tools and re-run this script.' >&2
   exit 1
 fi
 if [[ "$OS" == Linux ]]; then
-  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists dbus-1 x11 xtst xi; then
-    echo 'Linux builds require pkg-config and D-Bus, X11, XTest, and Xi development libraries.' >&2
-    echo 'Arch/CachyOS: sudo pacman -S --needed pkgconf dbus libx11 libxtst libxi' >&2
-    echo 'Debian/Ubuntu: sudo apt install pkg-config libdbus-1-dev libx11-dev libxtst-dev libxi-dev' >&2
-    echo 'Fedora: sudo dnf install pkgconf-pkg-config dbus-devel libX11-devel libXtst-devel libXi-devel' >&2
+  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists dbus-1; then
+    echo 'Linux builds require pkg-config and D-Bus development libraries.' >&2
+    echo 'Arch/CachyOS: sudo pacman -S --needed pkgconf dbus' >&2
+    echo 'Debian/Ubuntu: sudo apt install pkg-config libdbus-1-dev' >&2
+    echo 'Fedora: sudo dnf install pkgconf-pkg-config dbus-devel' >&2
     exit 1
   fi
 fi
@@ -354,9 +365,9 @@ if [[ "$KWIN_SCRIPT" -eq 1 && "$BINARY_NAME" != window_zones_kwin ]]; then
   BUILD_ARGS+=(--bin window_zones_kwin)
 fi
 cargo "${BUILD_ARGS[@]}"
-TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
 mkdir -p "$INSTALL_DIR"
-INSTALL_DIR="$(cd -- "$INSTALL_DIR" && pwd)"
 BINARIES=("$BINARY_NAME")
 if [[ "$KWIN_SCRIPT" -eq 1 && "$BINARY_NAME" != window_zones_kwin ]]; then
   BINARIES+=(window_zones_kwin)

@@ -166,6 +166,19 @@ def session(workspace, options):
         terminal.close()
 
 
+def smoke_summary(text, gate):
+    matches = re.findall(
+        rf"^Smoke assertions \({re.escape(gate)}\): (\d+); passed: (\d+); failed: (\d+); skipped: (\d+)$",
+        text, re.MULTILINE,
+    )
+    if len(matches) != 1:
+        fail(f"Missing or ambiguous native smoke summary for {gate}.")
+    summary = dict(zip(("assertions", "passed", "failed", "skipped"), map(int, matches[0])))
+    if summary["assertions"] != summary["passed"] + summary["failed"] + summary["skipped"]:
+        fail(f"Inconsistent native smoke summary for {gate}.")
+    return summary
+
+
 def smoke(workspace, options):
     required = {"x11": ["Xvfb", "openbox", "xdotool", "xrandr", "xprop", "xdpyinfo", "gnome-text-editor", "ffmpeg", "dbus-run-session"],
                 "gnome": ["gnome-shell", "gjs", "dbus-run-session", "gnome-text-editor"],
@@ -195,6 +208,6 @@ def smoke(workspace, options):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, destination)
         workspace.event("native-evidence", path=str(native_proof))
-    if rc or "failures: 0" not in text:
+    if rc or smoke_summary(text, options.gate)["failed"]:
         fail(f"{options.gate} smoke failed. Keep its assertions/screenshots; fix the reported precondition or app behavior before retrying.")
     return native_proof

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust toolchain with `cargo` in `PATH`.
+- Rust toolchain with `cargo`, and Python 3 for Cargo metadata, in `PATH`.
 - On Linux, `pkg-config` and D-Bus development headers are required for tray
   and KWin companion support:
   - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
@@ -85,7 +85,7 @@ For example, use a custom prefix or a debug build:
 
 The script resolves the repository relative to its location, builds the selected
 binaries with `cargo build --locked`, and replaces `<prefix>/bin/<binary>`.
-`CARGO_TARGET_DIR` is honored. Re-running the same options replaces the installed
+`CARGO_TARGET_DIR` and Cargo's configured target directory are honored. Prefixes are canonicalized before ownership records and autostart paths are derived. Re-running the same options replaces the installed
 files without duplicating ownership records or overwriting config. Re-run with
 `--autostart` after changing the prefix so the service points at the new binary.
 

@@ -17,6 +17,7 @@ use crate::config::{
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 use crate::executor::WindowHistory;
 use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
+use crate::logging::Logger;
 use crate::window_system::{TransitionMetrics, WindowSystem};
 const CONFIG_DIRECTORY: &str = "window_zones";
 const CONFIG_FILE: &str = "config.toml";
@@ -290,6 +291,7 @@ pub struct App {
     reload_deadline: Option<Instant>,
     perf_log: Option<PerfLog>,
     perf_log_error: Option<String>,
+    session_log: Option<Logger>,
 }
 
 impl App {
@@ -313,8 +315,15 @@ impl App {
             Some(Err(error)) => app.config_state = ConfigState::Error(error),
         }
         app.last_config_error = app.config_error_message();
-        app.register_config_watcher();
         app
+    }
+
+    /// Attaches best-effort session logging and records the current config state.
+    pub fn enable_logging(&mut self, logger: Logger) {
+        if logger.is_active() {
+            logger.log(format_args!("{}", self.startup_event()));
+        }
+        self.session_log = Some(logger);
     }
 
     /// Opens an append-only JSONL log and records this process's initial memory.
@@ -329,7 +338,7 @@ impl App {
         self.perf_log_error.as_deref()
     }
 
-    /// Rebuilds runtime state without reopening or losing the performance log.
+    /// Rebuilds runtime state without reopening or losing either log.
     pub fn restart(&mut self) {
         let mut restarted = match self.config_path.as_ref() {
             Some(path) => Self::start_at(path),
@@ -337,7 +346,14 @@ impl App {
         };
         restarted.perf_log = self.perf_log.take();
         restarted.perf_log_error = self.perf_log_error.take();
+        restarted.session_log = self.session_log.take();
         *self = restarted;
+        if let Some(logger) = &self.session_log {
+            logger.log(format_args!("runtime restarted"));
+            if logger.is_active() {
+                logger.log(format_args!("{}", self.startup_event()));
+            }
+        }
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -396,6 +412,7 @@ impl App {
             self.apply_loaded_config(loaded, hotkey_system, now, &mut events);
         }
         self.sync_hotkeys(hotkey_system, now, &mut events);
+        self.log_events(&events);
         events
     }
 
@@ -406,8 +423,7 @@ impl App {
         now: Instant,
     ) -> Vec<RuntimeEvent> {
         let mut events = Vec::new();
-        if let Some(path) = self.config_path.as_deref() {
-            self.last_config_signature = config_file_signature(path).ok().flatten();
+        if self.config_path.is_some() {
             self.reload_deadline = None;
             // A manual reload always reports its outcome, even an unchanged error.
             self.last_config_error = None;
@@ -416,6 +432,7 @@ impl App {
             self.apply_loaded_config(loaded, hotkey_system, now, &mut events);
         }
         self.sync_hotkeys(hotkey_system, now, &mut events);
+        self.log_events(&events);
         events
     }
 
@@ -424,7 +441,11 @@ impl App {
     pub fn hotkeys_lost(&mut self, error: HotkeySystemError, now: Instant) -> Option<RuntimeEvent> {
         self.registered_hotkeys = None;
         self.registration_retry_at = Some(now);
-        self.hotkey_failed(error)
+        let event = self.hotkey_failed(error);
+        if let (Some(logger), Some(event)) = (&self.session_log, &event) {
+            logger.log(format_args!("{event}"));
+        }
+        event
     }
 
     pub fn dispatch_hotkey<W: WindowSystem>(
@@ -452,6 +473,16 @@ impl App {
             };
             self.log_dispatch(dispatch_ms, metrics);
         }
+        if let Some(logger) = &self.session_log {
+            let hotkey = self.last_dispatch_hotkey.as_deref().unwrap_or(hotkey);
+            match &self.dispatch_state {
+                DispatchState::Succeeded => logger.log(format_args!("dispatch {hotkey} succeeded")),
+                DispatchState::Error(error) => {
+                    logger.log(format_args!("dispatch {hotkey} failed: {error}"))
+                }
+                DispatchState::Idle => {}
+            }
+        }
         &self.dispatch_state
     }
 
@@ -469,8 +500,25 @@ impl App {
         Ok(Some(self.dispatch_hotkey(&hotkey, window_system)))
     }
 
-    fn load_config(&self) -> Option<Result<Option<AppConfig>, ConfigLoadError>> {
-        Some(load_and_normalize_config(self.config_path.as_deref()?))
+    fn log_events(&self, events: &[RuntimeEvent]) {
+        if let Some(logger) = &self.session_log {
+            for event in events {
+                logger.log(format_args!("{event}"));
+            }
+        }
+    }
+
+    fn load_config(&mut self) -> Option<Result<Option<AppConfig>, ConfigLoadError>> {
+        let path = self.config_path.as_deref()?;
+        let input = match read_config(path) {
+            Ok(input) => input,
+            Err(error) => {
+                self.last_config_signature = None;
+                return Some(Err(error));
+            }
+        };
+        self.last_config_signature = input.as_deref().map(config_signature);
+        Some(parse_config_input(path, input.as_deref()))
     }
 
     /// Returns a load result once a changed config file has been stable for the
@@ -481,17 +529,15 @@ impl App {
     ) -> Option<Result<Option<AppConfig>, ConfigLoadError>> {
         let path = self.config_path.as_deref()?;
 
-        let signature = match config_file_signature(path) {
-            Ok(signature) => signature,
-            Err(source) => {
-                // Once the file is readable again it reloads even if its content is unchanged.
+        let input = match read_config(path) {
+            Ok(input) => input,
+            Err(error) => {
+                // Recovery reloads even when the readable content is unchanged.
                 self.last_config_signature = None;
-                return Some(Err(ConfigLoadError::Read {
-                    path: path.to_owned(),
-                    source,
-                }));
+                return Some(Err(error));
             }
         };
+        let signature = input.as_deref().map(config_signature);
 
         if self.last_config_signature != signature {
             self.last_config_signature = signature;
@@ -503,7 +549,7 @@ impl App {
             return None;
         }
         self.reload_deadline = None;
-        self.load_config()
+        Some(parse_config_input(path, input.as_deref()))
     }
 
     fn apply_loaded_config<H: HotkeySystem>(
@@ -579,15 +625,22 @@ impl App {
         now: Instant,
         events: &mut Vec<RuntimeEvent>,
     ) {
-        let wanted = hotkeys_of(&self.config);
-        if self.registered_hotkeys.as_ref() == Some(&wanted)
-            || self.rejected_hotkeys.as_ref() == Some(&wanted)
+        if self
+            .registration_retry_at
+            .is_some_and(|retry_at| now < retry_at)
             || self
-                .registration_retry_at
-                .is_some_and(|retry_at| now < retry_at)
+                .registered_hotkeys
+                .iter()
+                .chain(self.rejected_hotkeys.iter())
+                .any(|hotkeys| {
+                    hotkeys
+                        .iter()
+                        .eq(self.config.bindings.iter().map(|binding| &binding.hotkey))
+                })
         {
             return;
         }
+        let wanted = hotkeys_of(&self.config);
 
         match hotkey_system.register_hotkeys(&wanted) {
             Ok(()) => self.hotkeys_registered_as(wanted, events),
@@ -678,16 +731,9 @@ impl App {
                 "Performance log write failed at {}: {error}; logging disabled.",
                 log.path.display()
             );
-            eprintln!("{diagnostic}");
+            crate::logging::diagnostic(format_args!("{diagnostic}"));
             self.perf_log_error = Some(diagnostic);
             self.perf_log = None;
-        }
-    }
-
-    fn register_config_watcher(&mut self) {
-        if let Some(path) = self.config_path.as_deref() {
-            self.last_config_signature = config_file_signature(path).ok().flatten();
-            self.reload_deadline = None;
         }
     }
 
@@ -709,6 +755,7 @@ impl App {
             reload_deadline: None,
             perf_log: None,
             perf_log_error: None,
+            session_log: None,
         }
     }
 }
@@ -721,19 +768,26 @@ fn hotkeys_of(config: &AppConfig) -> Vec<String> {
         .collect()
 }
 
-fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoadError> {
-    let input = match fs::read_to_string(path) {
-        Ok(input) => input,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ConfigLoadError::Read {
-                path: path.to_owned(),
-                source,
-            });
-        }
+fn read_config(path: &Path) -> Result<Option<String>, ConfigLoadError> {
+    match fs::read_to_string(path) {
+        Ok(input) => Ok(Some(input)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigLoadError::Read {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn parse_config_input(
+    path: &Path,
+    input: Option<&str>,
+) -> Result<Option<AppConfig>, ConfigLoadError> {
+    let Some(input) = input else {
+        return Ok(None);
     };
 
-    let config = parse_config(&input).map_err(|error| match error {
+    let config = parse_config(input).map_err(|error| match error {
         ConfigError::Validation(source) => ConfigLoadError::Validation {
             path: path.to_owned(),
             source,
@@ -746,16 +800,10 @@ fn load_and_normalize_config(path: &Path) -> Result<Option<AppConfig>, ConfigLoa
     Ok(Some(config))
 }
 
-fn config_file_signature(path: &Path) -> Result<Option<ConfigFileSignature>, io::Error> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-
+fn config_signature(input: &str) -> ConfigFileSignature {
     let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(Some(ConfigFileSignature(hasher.finish())))
+    input.hash(&mut hasher);
+    ConfigFileSignature(hasher.finish())
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {

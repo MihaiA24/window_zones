@@ -182,33 +182,55 @@ impl WindowSystem for WindowsWindowSystem {
             return Err(WindowSystemError::WindowGone(id.clone()));
         }
 
+        let before = Self::frame_rect(hwnd, id, true)?;
         let maximized = unsafe { IsZoomed(hwnd) }.as_bool();
         let minimized = unsafe { IsIconic(hwnd) }.as_bool();
-        if !maximized
-            && !minimized
-            && Self::fullscreen_like(hwnd, Self::frame_rect(hwnd, id, true)?)
-        {
+        if !maximized && !minimized && Self::fullscreen_like(hwnd, before) {
             return Err(WindowSystemError::Platform(
                 "fullscreen-like window cannot be moved; leave fullscreen first".to_string(),
             ));
         }
-        if maximized || minimized || unsafe { IsWindowArranged(hwnd) }.as_bool() {
-            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        if unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_THICKFRAME.0 == 0 {
+            return Err(WindowSystemError::Platform(
+                "cannot move a non-resizable Windows window".to_string(),
+            ));
         }
+        let result = (|| {
+            if maximized || minimized || unsafe { IsWindowArranged(hwnd) }.as_bool() {
+                let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+            }
 
-        let outer = Self::frame_rect(hwnd, id, false)?;
-        let visible = Self::frame_rect(hwnd, id, true)?;
-        let target = compensate_invisible_borders(window_move.target, outer, visible)?;
-        Self::set_frame(hwnd, id, target)?;
-
-        // Crossing DPI boundaries can change invisible borders during SetWindowPos.
-        let visible = Self::frame_rect(hwnd, id, true)?;
-        if visible != window_move.target {
             let outer = Self::frame_rect(hwnd, id, false)?;
+            let visible = Self::frame_rect(hwnd, id, true)?;
             let target = compensate_invisible_borders(window_move.target, outer, visible)?;
             Self::set_frame(hwnd, id, target)?;
-        }
-        Ok(())
+
+            // Crossing DPI boundaries can change invisible borders during SetWindowPos.
+            let mut visible = Self::frame_rect(hwnd, id, true)?;
+            if visible != window_move.target {
+                let outer = Self::frame_rect(hwnd, id, false)?;
+                let target = compensate_invisible_borders(window_move.target, outer, visible)?;
+                Self::set_frame(hwnd, id, target)?;
+                visible = Self::frame_rect(hwnd, id, true)?;
+            }
+            verify_placement(window_move.target, visible)
+        })();
+        result.map_err(|error| {
+            if matches!(
+                error,
+                WindowSystemError::WindowGone(_) | WindowSystemError::PartialMove { .. }
+            ) {
+                return error;
+            }
+            match Self::frame_rect(hwnd, id, true) {
+                Ok(observed) if observed != before => WindowSystemError::PartialMove {
+                    observed,
+                    message: error.to_string(),
+                },
+                Err(gone @ WindowSystemError::WindowGone(_)) => gone,
+                _ => error,
+            }
+        })
     }
 }
 
@@ -273,9 +295,32 @@ fn compensate_invisible_borders(
     ))
 }
 
+fn verify_placement(target: Rect, observed: Rect) -> Result<(), WindowSystemError> {
+    if observed != target {
+        return Err(WindowSystemError::PartialMove {
+            observed,
+            message: format!(
+                "window constrained placement: requested {target:?}, observed {observed:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constrained_placement_reports_observed_frame_instead_of_success() {
+        let target = Rect::new(-1920, 0, 480, 1080);
+        let observed = Rect::new(-1920, 0, 640, 1080);
+        assert!(matches!(
+            verify_placement(target, observed),
+            Err(WindowSystemError::PartialMove { observed: frame, .. }) if frame == observed
+        ));
+        assert_eq!(verify_placement(target, target), Ok(()));
+    }
 
     #[test]
     fn compensates_asymmetric_invisible_borders_on_negative_monitor() {

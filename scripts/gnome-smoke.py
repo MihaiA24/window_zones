@@ -219,7 +219,7 @@ def run(binary, keep_logs, output_dir=None):
         assert_frame(name + ' native and client geometry', expected, log)
     def rejected_dispatch(hotkey, name):
         result = subprocess.run([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkey], env=env, capture_output=True, text=True, timeout=8)
-        check(name + ' exits unsuccessfully', result.returncode != 0, result.stdout + result.stderr)
+        check(name + ' reports dispatch failure', result.returncode == 0 and 'Dispatch state: Error' in result.stdout, result.stdout + result.stderr)
         return result.stdout + result.stderr
     def maximize_dispatch(fixture, log, hotkey, expected, name):
         send(fixture, 'maximize')

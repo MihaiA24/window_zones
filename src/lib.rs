@@ -1,8 +1,7 @@
-//! Platform-neutral core for Window Zones.
+//! Window Zones' platform-neutral placement/runtime logic and native adapters.
 //!
-//! This crate intentionally contains no OS-specific window handles or APIs.
-//! Platform adapters are expected to provide focused-window geometry, display
-//! usable areas, hotkey registration, and move/resize execution.
+//! Geometry, actions, configuration, and history are independent of OS handles.
+//! Platform adapters provide identified windows, usable areas, moves, and hotkeys.
 
 pub mod actions;
 pub mod config;
@@ -15,6 +14,7 @@ pub mod gnome_integration;
 pub mod hotkey_system;
 #[cfg(target_os = "linux")]
 pub mod kwin_integration;
+pub mod logging;
 #[cfg(target_os = "macos")]
 pub mod macos_window_system;
 pub mod runtime;
@@ -41,7 +41,7 @@ pub use gnome_integration::{
     GNOME_INTERFACE, GNOME_OBJECT_PATH, GNOME_SERVICE_NAME, GnomeHotkeySystem,
     GnomeIntegrationError, GnomeWindowSystem,
 };
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use hotkey_system::RdevHotkeySystem;
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
 #[cfg(target_os = "linux")]

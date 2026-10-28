@@ -210,7 +210,7 @@ function publishState() {
     }
 }
 
-function moveWindow(windowId, x, y, width, height) {
+function moveWindow(windowId, x, y, width, height, callback) {
     if (width <= 0 || height <= 0)
         throw new Error('window target must have positive dimensions');
 
@@ -226,22 +226,86 @@ function moveWindow(windowId, x, y, width, height) {
         || window.moveable !== true || window.resizeable !== true)
         throw new Error('window does not allow moving and resizing');
 
-    const tile = window.tile;
-    if (tile) {
-        if (typeof tile.unmanage === 'function') {
-            // KWin 6.5: unmanage clears the requested quick/custom tile, including restore geometry.
-            tile.unmanage(window);
-        } else {
-            // Earlier KWin 6: tile=null only detaches the tile. A maximize transition also clears
-            // the non-scriptable quickTileMode; finish in the restored state before placement.
-            window.tile = null;
-            window.setMaximize(true, true);
+    const before = rectPayload(window.frameGeometry);
+    const target = [x, y, width, height];
+    const timer = new QTimer();
+    let finished = false;
+    let watching = false;
+    const finish = error => {
+        if (finished)
+            return;
+        finished = true;
+        timer.stop();
+        // KWin destroys a closed window's signal connections with its QObject.
+        if (watching && (!error || error.dbusError !== 'org.window_zones.KWin.Error.WindowGone'))
+            window.frameGeometryChanged.disconnect(changed);
+        try {
+            publishFocusedWindow();
+        } finally {
+            callback(error);
         }
+    };
+    const observe = (final, failure) => {
+        if (finished)
+            return;
+        try {
+            const current = typeof workspace.windowList === 'function'
+                ? workspace.windowList() : workspace.stackingOrder;
+            if (!Array.prototype.some.call(current,
+                candidate => !candidate.deleted && String(candidate.internalId) === windowId)
+                || window.deleted)
+                throw protocolError('WindowGone', windowId);
+            const observed = rectPayload(window.frameGeometry);
+            if (observed.some(value => !Number.isFinite(value))
+                || observed[2] <= 0 || observed[3] <= 0)
+                throw new Error('KWin reported an invalid window frame after placement');
+            if (!failure && observed.every((value, index) => value === target[index])) {
+                finish();
+            } else if (final) {
+                const message = failure ? errorMessage(failure)
+                    : 'KWin did not reach the requested frame before the observation deadline';
+                finish(observed.some((value, index) => value !== before[index])
+                    ? protocolError('PartialMove', JSON.stringify({
+                        window_id: windowId, observed, message,
+                    }))
+                    : failure || new Error(message));
+            }
+        } catch (error) {
+            finish(error);
+        }
+    };
+    const changed = () => observe(false);
+    try {
+        const tile = window.tile;
+        if (tile) {
+            if (typeof tile.unmanage === 'function') {
+                // KWin 6.5: unmanage also clears requested quick/custom tile restore geometry.
+                tile.unmanage(window);
+            } else {
+                // Earlier KWin 6: a maximize transition clears non-scriptable quickTileMode.
+                window.tile = null;
+                window.setMaximize(true, true);
+            }
+        }
+        window.setMaximize(false, false);
+        window.frameGeometry = {x, y, width, height};
+    } catch (error) {
+        observe(true, error);
+        return;
     }
-    window.setMaximize(false, false);
-
-    window.frameGeometry = {x, y, width, height};
-    publishFocusedWindow();
+    // Wayland clients commit size changes asynchronously. Observe, never retry the mutation;
+    // a bounded wait cannot prove that a slow client will not change its frame again later.
+    timer.interval = 750;
+    timer.singleShot = true;
+    timer.timeout.connect(() => observe(true));
+    if (window.frameGeometryChanged
+        && typeof window.frameGeometryChanged.connect === 'function'
+        && typeof window.frameGeometryChanged.disconnect === 'function') {
+        window.frameGeometryChanged.connect(changed);
+        watching = true;
+    }
+    timer.start();
+    observe(false);
 }
 
 function shortcutForHotkey(hotkey) {
@@ -392,7 +456,8 @@ function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJ
             throw new Error('KWin returned an invalid hotkey request payload');
 
         if (kind === REQUEST_MOVE) {
-            moveWindow(windowId, x, y, width, height);
+            moveWindow(windowId, x, y, width, height, finish);
+            return;
         } else if (kind === REQUEST_REFRESH_DISPLAYS) {
             // WorkspaceWrapper has no work-area/strut change signal. Query at the App's
             // display-read seam so panel reservations cannot stay stale until a screen change.

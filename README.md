@@ -7,11 +7,9 @@ V1 is a background utility, not a replacement window manager. It listens for con
 See:
 
 - `CONTEXT.md` for domain language.
-- `docs/adr/0001-v1-window-positioning-utility.md` for the V1 boundary and first implementation slice.
-- `docs/adr/0002-runtime-config-reload-atomicity.md` for runtime reload error and atomicity behavior.
-- `docs/adr/0003-wayland-compositor-integrations.md` for native Wayland routing and companion integration decisions.
-- `docs/adr/0007-v1-release-gates-and-verification.md` for V1 Release gates and Synthetic session verification.
-- `docs/adr/0009-identified-moves-window-history-and-transactional-hotkeys.md` for identified-window moves, restore/history, and transactional hotkey reloads.
+- `docs/adr/0001-v1-window-positioning-utility.md` for the utility's architectural scope.
+- `docs/adr/0003-wayland-compositor-integrations.md` for compositor ownership and native Wayland routing.
+- `docs/adr/0009-identified-moves-window-history-and-transactional-hotkeys.md` for window identity, history ownership, and transactional bindings.
 
 ## Quick start (GNOME Wayland)
 
@@ -41,6 +39,7 @@ The platform-neutral core and runtime paths currently include:
 - native KDE Plasma Wayland KWin script and protocol-3 companion integration;
 - exclusive global hotkeys on X11 (`XGrabKey`), Windows and macOS (grabbing hook), GNOME, and KDE companion paths;
 - CLI, stdlib ANSI TUI, optional Linux/Windows tray, single-instance `run`, and desktop notifications for background problems;
+- opt-in `--log-file PATH` timestamped session events, with nonfatal sink failures and restart-safe append; see [session logging](docs/runbooks/running.md#session-event-logging).
 - opt-in `--perf-log PATH` JSONL profiling for dispatch/transition timing and Linux process RSS/peak RSS; see [profiling commands and measurement scope](docs/runbooks/running.md#performance-logging).
 
 ## V1 verification
@@ -58,7 +57,7 @@ The platform-neutral core and runtime paths currently include:
 - Windows: `%APPDATA%\window_zones\config.toml` (the roaming application-data directory).
 - macOS: `~/Library/Application Support/window_zones/config.toml`.
 
-A missing file boots with empty bindings and `ConfigState::Missing`; `window_zones init` creates a starter config. Discovery, read, and TOML parse failures do not panic; the App keeps the last valid bindings and exposes an actionable `ConfigState::Error`. `App::start_at(path)` provides an explicit path for launchers and deterministic tests.
+A missing file boots with empty bindings and `ConfigState::Missing`; `window_zones init` creates a starter config. Discovery, read, and TOML parse failures do not panic and expose an actionable `ConfigState::Error`. Live reload retains the last valid bindings; cold startup and explicit runtime restart have no in-memory fallback. `App::start_at(path)` provides an explicit path for launchers and deterministic tests.
 
 ## Scripts and runbooks
 

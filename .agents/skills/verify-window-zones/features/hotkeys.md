@@ -29,11 +29,13 @@ Preconditions:
 - **Real accelerator.** `"$V" drive smoke x11` injects XTEST input into its isolated X11 server and independently asserts geometry and `last action`. `"$V" drive smoke kde-live` exercises the native KWin companion in a synthetic session. A dispatch command alone is not evidence of global input capture.
 - **Registration/config persistence.** `"$V" drive session --mode run --journey reload` observes replacement/retention/recovery; `drive tests` runs the repo's existing private-D-Bus contract tests as supplemental checks. Reopen with valid on-disk bindings and dispatch again.
 - **Cancel.** Exit with each affected `--quit` variant before accelerator injection; verify owned runtime/input listeners end and later accelerators do not dispatch through the exited app.
+- **GNOME controller isolation.** A second private-bus client may inspect but cannot replace another controller's grabs or receive its `HotkeyPressed` events. Disconnecting the controller releases its set; a new controller can then register.
+- **Compositor-bound dispatch.** On Sway/Hyprland, start a real `run`/`tui` with the same backend/config as its `dispatch` clients. Verify two clients share Restore history, mismatched identities fail, absent runtime fails without one-shot fallback, and an earlier pending action cannot delay accepting later requests past their execution deadline.
 
 ## Gotchas
 
-- Interactive app dry-run still constructs the global listener. The helper removes the seated display and bus, so dry-run sessions are not real hotkey-capture proof and must not be attached to the user's desktop.
-- Seatless GNOME rejects accelerators and has no focused window; its skips are failed preconditions for a global-hotkey journey. Seated GNOME needs an enabled companion and writable `/dev/uinput`; Xwayland XTEST is not equivalent to compositor accelerator input. Follow `docs/runbooks/gnome-wayland.md` on an explicitly controlled real target; the verifier refuses the shared-session `gnome-live` route.
+- App dry-run uses no-op hotkey capture, so its sessions do not prove global input. The verifier still isolates display/bus and HOME/XDG because tray, config and logging remain separate side effects.
+- The synthetic GNOME gate supplies native accelerators through Mutter's RemoteDesktop interface; it is not physical-input proof. Seated GNOME needs an enabled companion and authorized `/dev/uinput`; Xwayland XTEST is not equivalent. The verifier refuses the shared-session `gnome-live` route.
 - No GNOME conflict/disconnect, tray runtime, Windows or macOS proof follows from an X11 pass. If affected, obtain those actual environments and user paths; record what is missing instead of using internal signals/setters.
 - Dispatch/config error states may still exit 0. Match state and diagnostics, and observe side effects separately.
 - TUI `Last action` records the requested hotkey even when dispatch fails. The verifier checks the completed response's `Last error`, not the action label alone; custom negative dispatch journeys must explicitly expect `Last error: dispatch: …`. Native success still requires independent post-TUI geometry.

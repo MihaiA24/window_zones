@@ -35,9 +35,9 @@ Preconditions:
 ## Gotchas
 
 - The app debounces config changes; the helper polls for specific resulting state instead of sleeping once and trusting a stale Loaded label.
-- Reload uses the same mtime/length signature detection and debounce as watcher polling; it is not a forced reread. Same-length edits that preserve mtime are not detected. The fixtures deliberately change signatures.
+- Watcher polling hashes file content and debounces changes; same-length edits with preserved mtime are detected. Explicit `reload` reads immediately. The parsed config and recorded signature come from the same snapshot, including at startup and restart.
 - Invalid reload retains the last good bindings; invalid cold startup has no last-good state and starts empty. Do not weaken one expectation to match the other.
 - `restart` reconstructs the app and clears last-dispatch history. Persistence means reading the file again, not retaining an invalid runtime-only fallback forever.
 - The reload journey exercises explicit reload; the watcher journey independently waits for file-change transitions without sending reload. Keep their evidence distinct.
 - Permission/read-error, duplicate/unknown-zone validation, relative-XDG fallback and explicit-over-discovered precedence need their own real file/environment conditions when affected. The seeds provide TOML parse failure, not every validation/read failure. Missing such preconditions is a failure, not an alternate passing row.
-- Tray reload/restart requires a real tray host; the synthetic fixtures do not seed one. A CLI reload pass cannot close that menu entry point.
+- Tray reload/restart requires a real host: the GNOME synthetic smoke provides AppIndicator menu actions; the baseline CLI/PTY fixtures do not. CLI reload alone is not tray evidence.

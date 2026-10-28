@@ -15,6 +15,9 @@ What this verifies:
 - `node --check gnome-extension/extension.js`
 - `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
 - `node --check kwin-script/contents/code/main.js`
+- `bash scripts/test-install.sh` (isolated installer/service ownership and lifecycle)
+- `node kwin-script/tests/run.js` and `qmllint kwin-script/contents/code/main.js` when available (native Qt syntax)
+- Python parsing of `scripts/gnome-smoke.py`
 - Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
 
 The repository test script covers formatting, unit/integration/doc tests in one
@@ -108,7 +111,7 @@ The `x11`, `gnome-live`, and `kde-live` gates assert the ADR 0009 window contrac
 - A fullscreen window is rejected with `leave fullscreen first`, and its fullscreen state and frame do not change.
 - A hotkey replacement the platform refuses (X11: another client already grabs `Alt+Ctrl+F8`; GNOME: `Alt+Ctrl+Left` is reserved; KDE: the conflict incumbent holds `Alt+Ctrl+F24`) is reported as `were refused`, keeps the previous binding count and `hotkey state: Registered`, and the previous accelerator still moves the window.
 
-The X11 and GNOME checks build a small helper crate in `target/smoke-seam-helper` against the public `window_zones` API (`x11rb` from the repository lockfile), so the first run needs the crates available to `cargo`, from the network or a vendored source. It captures and moves windows through `X11WindowSystem`, sets EWMH states, and holds the competing X11 grab. The X11 gate also runs the ignored `x11_real_server_grabs_are_exclusive_atomic_and_released` test against its own Xvfb display. `kde-live` needs KWin 6 scripting with `workspace.slotWindowQuickTileLeft()` and the window `tile` property.
+The X11 and GNOME checks build a small helper crate against the public `window_zones` API (`x11rb` from the repository lockfile), so the first run needs the crates available to Cargo. It uses Cargo's resolved target directory, or isolated temporary storage with a pinned app binary. Repository builds are manifest-qualified and a pinned `WINDOW_ZONES_BINARY` is never rebuilt. The helper captures/moves windows, sets EWMH states and holds a competing grab. X11 also runs the ignored exclusive-grab test against its owned display; `kde-live` needs KWin 6 scripting with `workspace.slotWindowQuickTileLeft()` and the window `tile` property.
 
 The harness preserves the invoking user's `CARGO_HOME` and `RUSTUP_HOME` before
 isolating the App's `HOME`; helper builds and the ignored X11 test therefore

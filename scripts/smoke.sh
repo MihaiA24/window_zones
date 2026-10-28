@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-BIN_PATH="${WINDOW_ZONES_BINARY:-$PROJECT_ROOT/target/debug/window_zones}"
+BIN_PATH="${WINDOW_ZONES_BINARY:-}"
+TARGET_DIR=''
 # Keep the build toolchain available after gates isolate the application's HOME.
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 
@@ -32,6 +33,17 @@ done
 if [[ -z "$COMMAND" ]]; then
     printf 'Usage: %s [--keep-logs] {gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}" >&2
     exit 2
+fi
+
+if [[ -z "$BIN_PATH" ]]; then
+    # Let Cargo resolve relative environment/config paths from the same cwd as the build.
+    if ! TARGET_DIR=$(cargo metadata --locked --no-deps --format-version 1 \
+        --manifest-path "$PROJECT_ROOT/Cargo.toml" \
+        | /usr/bin/python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'); then
+        printf 'Failed to resolve Cargo target directory.\n' >&2
+        exit 1
+    fi
+    BIN_PATH="$TARGET_DIR/debug/window_zones"
 fi
 
 umask 077
@@ -106,6 +118,27 @@ skip_assert() {
     ASSERTIONS=$((ASSERTIONS + 1))
     SKIPPED=$((SKIPPED + 1))
     log "SKIP $name: $reason"
+}
+
+build_binaries() {
+    local gate=$1
+    shift
+    if [[ -n "${WINDOW_ZONES_BINARY:-}" ]]; then
+        assert_eq "$gate pinned binary is executable" executable \
+            "$([[ -x "$BIN_PATH" ]] && printf executable || printf missing)"
+        [[ -x "$BIN_PATH" ]]
+        return
+    fi
+    local output='' rc=0
+    if output=$(cargo build --locked --manifest-path "$PROJECT_ROOT/Cargo.toml" \
+        --bin window_zones "$@" 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf '%s\n' "$output" >>"$ASSERT_LOG"
+    assert_rc_zero "$gate cargo build" "$rc" "$BIN_PATH"
+    return "$rc"
 }
 
 file_contains() {
@@ -2927,10 +2960,10 @@ try {
         'Window Zones conflict incumbent',
         'Window Zones conflict incumbent',
         'Alt+Ctrl+F24',
-        () => print('KDE_CONFLICT_FIRED'));
-    print('KDE_CONFLICT_READY');
+        () => console.warn('KDE_CONFLICT_FIRED'));
+    console.warn('KDE_CONFLICT_READY');
 } catch (error) {
-    print(`KDE_CONFLICT_ERROR ${error}`);
+    console.warn(`KDE_CONFLICT_ERROR ${error}`);
 }
 EOF
     kde_live_load_script "$KDE_CONFLICT_JS" window-zones-conflict
@@ -3115,7 +3148,7 @@ run_kde_live() {
     KDE_LAUNCHER="$KDE_ROOT/launch-kwin.sh"
     KDE_PUBLISH_CLIENT_ENV="$KDE_ROOT/publish-client-env.sh"
     KDE_OBSERVER_JS="$KDE_ROOT/observer.js"
-    KDE_COMPANION_BIN="$PROJECT_ROOT/target/debug/window_zones_kwin"
+    KDE_COMPANION_BIN="$(dirname -- "$BIN_PATH")/window_zones_kwin"
     KDE_SOCKET="wayland-window-zones-kde-$$"
     KDE_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
     CONFIG_PATH="$KDE_ROOT/config.toml"
@@ -3139,16 +3172,7 @@ run_kde_live() {
 
     mkdir -p "$KDE_CONFIG" "$KDE_DATA" "$KDE_CACHE" "$KDE_STATE" "$KDE_RUNTIME" "$KDE_HOME"
     chmod 700 "$KDE_RUNTIME" "$KDE_HOME"
-    local build_output='' build_rc=0
-    if build_output=$(cargo build --locked --bin window_zones --bin window_zones_kwin 2>&1); then
-        build_rc=0
-    else
-        build_rc=$?
-    fi
-    printf '%s\n' "$build_output" >>"$ASSERT_LOG"
-    assert_rc_zero 'KDE cargo build' "$build_rc" \
-        'cargo build --locked --bin window_zones --bin window_zones_kwin'
-    if [[ "$build_rc" -ne 0 ]]; then
+    if ! build_binaries KDE --bin window_zones_kwin; then
         set -e
         return 0
     fi
@@ -3439,6 +3463,8 @@ PY
     assert_eq 'KDE App PID unchanged after script reload' 1 "$app_alive"
 
     local old_service_pid="$KDE_SERVICE_PID" service_stopped=0 restart_log="$KDE_ROOT/companion-restart.log"
+    local service_recovered_before
+    service_recovered_before=$(count_text "$run_log" 'Hotkey registration now recovered')
     # A killed child stays visible to kill -0 until it is reaped, and a service that ignores
     # SIGTERM would otherwise be reported as stopped only by timeout, so escalate and confirm the
     # bus name is actually gone.
@@ -3471,21 +3497,20 @@ PY
     kde_live_wait_companion_ready 30 && service_reload_ready=1
     assert_eq 'KDE service restart restores capabilities' 1 "$service_reload_ready"
     local service_app_recovered=0
-    wait_for_text "$run_log" 'Hotkey registration now recovered' 20 && service_app_recovered=1
+    wait_for_new_text "$run_log" 'Hotkey registration now recovered' "$service_recovered_before" 20 && service_app_recovered=1
     assert_eq 'KDE App hotkey registration recovers after service restart' 1 "$service_app_recovered"
     kill -0 "$app_pid_before" 2>/dev/null && app_alive=1 || app_alive=0
     assert_eq 'KDE App PID unchanged after service restart' 1 "$app_alive"
     send_app 'dispatch alt+ctrl+up'
+    kde_live_refresh_targets
+    kde_live_assert_zone 'KDE recovered-service baseline center-third' center-third A
     action_before=$(count_text "$run_log" 'last action: alt+ctrl+left')
     kde_live_inject_key ctrl+alt+Left >/dev/null 2>&1 || true
+    kde_live_assert_zone 'KDE recovered-service real hotkey moves window' left-half A
     send_app status
-    if wait_for_new_text "$run_log" 'last action: alt+ctrl+left' "$action_before" 10; then
-        assert_text 'KDE recovered-service real hotkey reports action' \
-            'last action: alt+ctrl+left' "$(<"$run_log")"
-    else
-        assert_text 'KDE recovered-service real hotkey reports action' \
-            'last action: alt+ctrl+left' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    local service_action_recovered=0
+    wait_for_new_text "$run_log" 'last action: alt+ctrl+left' "$action_before" 10 && service_action_recovered=1
+    assert_eq 'KDE recovered-service real hotkey reports action' 1 "$service_action_recovered"
 
     send_app 'dispatch alt+ctrl+up'
     kde_live_refresh_targets
@@ -3558,8 +3583,9 @@ EOF
     assert_eq 'KDE valid changed config recovers' 1 \
         "$(( $(count_text "$run_log" 'Config state: Loaded') > loaded_before ? 1 : 0 ))"
     send_app status
-    assert_text 'KDE valid changed config updates binding count' 'binding count: 1' \
-        "$(cat "$run_log" 2>/dev/null || true)"
+    wait_for_new_text "$run_log" 'binding count: 1' "$bindings_before" 10 || true
+    assert_eq 'KDE valid changed config updates binding count' 1 \
+        "$(( $(count_text "$run_log" 'binding count: 1') > bindings_before ? 1 : 0 ))"
     loaded_before=$(count_text "$run_log" 'Config state: Loaded')
     bindings_before=$(count_text "$run_log" 'binding count: 5')
     write_five_bindings_config
@@ -3615,7 +3641,7 @@ build_seam_helper() {
     # `dispatch` always acts on the focused window, so captured-id moves drive the X11 seam
     # directly; `state` sends the EWMH request a pager would to put a test window into
     # maximized or fullscreen state; `grab` holds an accelerator as another X client.
-    local dir="$TMP_DIR/seam-helper" target_dir="$PROJECT_ROOT/target/smoke-seam-helper"
+    local dir="$TMP_DIR/seam-helper" target_dir="${TARGET_DIR:-$TMP_DIR}/smoke-seam-helper"
     local output='' rc=0
     SEAM_HELPER=''
     mkdir -p "$dir/src"
@@ -4102,26 +4128,19 @@ main() {
         run_kde_live || true
     fi
     if [[ "$COMMAND" == gnome-live ]]; then
-        if ! cargo build --locked --bin window_zones; then
-            assert_rc_zero 'GNOME live cargo build' 1 'cargo build --locked --bin window_zones failed'
-        else
-            assert_rc_zero 'GNOME live cargo build' 0 ''
+        if build_binaries 'GNOME live'; then
             run_gnome_live || true
         fi
     fi
     if [[ "$COMMAND" == gnome || "$COMMAND" == all ]]; then
-        if ! cargo build --locked --bin window_zones; then
-            assert_rc_zero 'GNOME cargo build' 1 'cargo build --locked --bin window_zones failed'
-        else
-            assert_rc_zero 'GNOME cargo build' 0 ''
+        if build_binaries GNOME; then
             run_gnome || true
         fi
     fi
     if [[ "$COMMAND" == x11 || "$COMMAND" == all ]]; then
-        if ! cargo build --locked --bin window_zones; then
-            assert_rc_zero 'X11 cargo build' 1 'cargo build --locked --bin window_zones failed'
+        if build_binaries X11; then
+            run_x11 || true
         fi
-        run_x11 || true
     fi
     log "Smoke assertions ($COMMAND): $ASSERTIONS; passed: $((ASSERTIONS - FAILURES - SKIPPED)); failed: $FAILURES; skipped: $SKIPPED"
     log "Assertion log: $ASSERT_LOG"

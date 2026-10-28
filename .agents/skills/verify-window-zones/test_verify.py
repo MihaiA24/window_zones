@@ -16,7 +16,7 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 
 from wz_verify.checks import differences, measurement_summary
-from wz_verify.journeys import Terminal, session
+from wz_verify.journeys import Terminal, session, smoke_summary
 from wz_verify.runtime import Workspace, digest, process, save
 
 
@@ -27,6 +27,21 @@ def rejected(action, reason):
         assert reason in str(error), error
     else:
         raise AssertionError("Unsafe operation was accepted")
+
+
+assert smoke_summary("Smoke assertions (x11): 7; passed: 6; failed: 0; skipped: 1", "x11") == {
+    "assertions": 7, "passed": 6, "failed": 0, "skipped": 1,
+}
+assert smoke_summary("unrelated failures: 0\nSmoke assertions (gnome): 2; passed: 1; failed: 1; skipped: 0",
+                     "gnome")["failed"] == 1
+for text in (
+    "",
+    "Smoke assertions (gnome): 1; passed: 1; failed: 0; skipped: 0",
+    "Smoke assertions (x11): 1; passed: 1; failed: 0; skipped: 0\n" * 2,
+):
+    rejected(lambda: smoke_summary(text, "x11"), "Missing or ambiguous")
+rejected(lambda: smoke_summary("Smoke assertions (x11): 2; passed: 1; failed: 0; skipped: 0", "x11"),
+         "Inconsistent")
 
 
 with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as directory:

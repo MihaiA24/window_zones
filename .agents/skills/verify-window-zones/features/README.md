@@ -28,12 +28,13 @@ Maintained source for user-facing verification journeys. Read the index, then th
 - Bind every proof to feature ID, entry point, actual backend, flag/config variant, current build and artifacts. `actions.jsonl` records exact commands/options and results; annotate the handoff with feature IDs.
 - Include both input and result; confirm durable config from a new process and OS movement from an independent observer/screenshot. Exit 0 alone does not prove dispatch/config success.
 - Report attempted command and missing precondition for an unreachable journey. A different entry point's pass cannot close it. Existing SKIPs and failed screenshots are not successes.
+- Native summaries must name the selected gate and have consistent assertion/pass/fail/skip counts. Missing or ambiguous summaries fail verification; unrelated log text saying zero failures is not proof.
 - Cleanup removes scratch state/owned processes, never evidence. Run `logs --path-only` after cleanup and inspect the named files.
 
 ## Features
 
 - [Status and backend selection](status-backends.md): one-shot status, dashboard/status refresh, missing/error config, auto/explicit routing and dry-run alias.
-- [Window placement and display movement](placement.md): eight built-in zones, custom zones, next/previous display, dispatch and real accelerators, error/empty boundaries.
+- [Window placement and display movement](placement.md): fourteen built-in zones, custom zones, directional/cyclic displays, half crossing, center/restore, identified moves and partial failures.
 - [Configuration and atomic reload](configuration.md): discovery/explicit paths, valid replacement, invalid retention, empty/missing configs, restart and disk persistence.
-- [Global hotkeys and dispatch](hotkeys.md): physical accelerators, one-shot and interactive dispatch, aliases, registration failure/recovery and no-binding errors.
-- [Runtime controls](runtime-controls.md): CLI/TUI lifecycle, help/refresh, quit aliases/EOF and optional tray menu entry points.
+- [Global hotkeys and dispatch](hotkeys.md): physical accelerators, one-shot/interactive/compositor-bound dispatch, exclusive controller ownership, transactional registration and recovery.
+- [Runtime controls](runtime-controls.md): CLI/TUI/tray lifecycle, initialization, single-instance ownership, notifications, best-effort session logs and performance logging.

@@ -310,15 +310,34 @@ fn sway_displays(outputs: Vec<SwayOutput>, workspaces: &[SwayWorkspace]) -> Vec<
 }
 
 fn move_window_sway(window_move: &WindowMove) -> Result<(), WindowSystemError> {
-    let tree: SwayTree = run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree")?;
-    let command = sway_move_command(&tree, window_move)?;
-    run_sway_command(&command, &window_move.window)
+    move_window_sway_with(
+        window_move,
+        || run_wayland_json_command("swaymsg", &["-t", "get_tree"], "sway get_tree"),
+        run_sway_command,
+    )
+}
+
+fn move_window_sway_with(
+    window_move: &WindowMove,
+    mut read_tree: impl FnMut() -> Result<SwayTree, WindowSystemError>,
+    run_command: impl FnOnce(&str, &WindowId) -> Result<(), WindowSystemError>,
+) -> Result<(), WindowSystemError> {
+    let (command, initial) = sway_move_command(&read_tree()?, window_move)?;
+    let result = run_command(&command, &window_move.window);
+    let observed = read_tree().and_then(|tree| {
+        let id = window_move.window.as_str().parse::<i64>().unwrap();
+        let (window, _, _) = find_sway_window(&tree.nodes, id, false, false)
+            .or_else(|| find_sway_window(&tree.floating_nodes, id, true, false))
+            .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+        checked_scripted_frame(window.rect.to_rect(), &window_move.window)
+    });
+    finish_scripted_move(window_move, initial, result, observed)
 }
 
 fn sway_move_command(
     tree: &SwayTree,
     window_move: &WindowMove,
-) -> Result<String, WindowSystemError> {
+) -> Result<(String, Rect), WindowSystemError> {
     let id = window_move
         .window
         .as_str()
@@ -326,7 +345,7 @@ fn sway_move_command(
         .ok()
         .filter(|id| *id > 0)
         .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
-    let (_, floating, fullscreen) = find_sway_window(&tree.nodes, id, false, false)
+    let (window, floating, fullscreen) = find_sway_window(&tree.nodes, id, false, false)
         .or_else(|| find_sway_window(&tree.floating_nodes, id, true, false))
         .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
     if fullscreen {
@@ -334,6 +353,7 @@ fn sway_move_command(
             "Sway window is fullscreen; leave fullscreen first".to_string(),
         ));
     }
+    let initial = checked_scripted_frame(window.rect.to_rect(), &window_move.window)?;
 
     let mut command = String::new();
     if !floating {
@@ -352,7 +372,7 @@ fn sway_move_command(
         window_move.target.y
     )
     .unwrap();
-    Ok(command)
+    Ok((command, initial))
 }
 
 fn focused_window_hypr() -> Result<Option<FocusedWindow>, WindowSystemError> {
@@ -406,17 +426,38 @@ fn displays_hypr() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
 }
 
 fn move_window_hypr(window_move: &WindowMove) -> Result<(), WindowSystemError> {
-    let windows: Vec<HyprWindow> =
-        run_wayland_json_command("hyprctl", &["-j", "clients"], "hyprctl clients")?;
-    let command = hypr_move_command(&windows, window_move)?;
-    let reply = run_command_capture("hyprctl", &["--batch", &command], "hyprctl move/resize")?;
-    validate_hypr_batch_reply(&reply, command.split(';').count(), &window_move.window)
+    move_window_hypr_with(
+        window_move,
+        || run_wayland_json_command("hyprctl", &["-j", "clients"], "hyprctl clients"),
+        |command, window| {
+            let reply =
+                run_command_capture("hyprctl", &["--batch", command], "hyprctl move/resize")?;
+            validate_hypr_batch_reply(&reply, command.split(';').count(), window)
+        },
+    )
+}
+
+fn move_window_hypr_with(
+    window_move: &WindowMove,
+    mut read_clients: impl FnMut() -> Result<Vec<HyprWindow>, WindowSystemError>,
+    run_command: impl FnOnce(&str, &WindowId) -> Result<(), WindowSystemError>,
+) -> Result<(), WindowSystemError> {
+    let (command, initial) = hypr_move_command(&read_clients()?, window_move)?;
+    let result = run_command(&command, &window_move.window);
+    let observed = read_clients().and_then(|clients| {
+        let window = clients
+            .iter()
+            .find(|window| window.address == window_move.window.as_str())
+            .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+        checked_scripted_frame(window.geometry(), &window_move.window)
+    });
+    finish_scripted_move(window_move, initial, result, observed)
 }
 
 fn hypr_move_command(
     windows: &[HyprWindow],
     window_move: &WindowMove,
-) -> Result<String, WindowSystemError> {
+) -> Result<(String, Rect), WindowSystemError> {
     let address = window_move.window.as_str();
     let window = windows
         .iter()
@@ -436,6 +477,7 @@ fn hypr_move_command(
             "Hyprland window is fullscreen; leave fullscreen first".to_string(),
         ));
     }
+    let initial = checked_scripted_frame(window.geometry(), &window_move.window)?;
 
     let mut command = String::new();
     // setfloating is a no-op for an already-floating maximized window. A
@@ -460,7 +502,52 @@ fn hypr_move_command(
         window_move.target.y
     )
     .unwrap();
-    Ok(command)
+    Ok((command, initial))
+}
+
+fn checked_scripted_frame(frame: Rect, window: &WindowId) -> Result<Rect, WindowSystemError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(WindowSystemError::Platform(format!(
+            "compositor reported an empty frame for window {window}"
+        )));
+    }
+    Ok(frame)
+}
+
+fn finish_scripted_move(
+    window_move: &WindowMove,
+    initial: Rect,
+    result: Result<(), WindowSystemError>,
+    observed: Result<Rect, WindowSystemError>,
+) -> Result<(), WindowSystemError> {
+    let observed = match observed {
+        Ok(observed) => observed,
+        Err(error @ WindowSystemError::WindowGone(_)) => return Err(error),
+        Err(readback_error) => {
+            return Err(match result {
+                Err(error @ WindowSystemError::WindowGone(_)) => error,
+                Err(error) => WindowSystemError::Platform(format!(
+                    "{error}; window readback failed: {readback_error}"
+                )),
+                Ok(()) => readback_error,
+            });
+        }
+    };
+    match result {
+        Ok(()) if observed == window_move.target => Ok(()),
+        Ok(()) => Err(WindowSystemError::PartialMove {
+            observed,
+            message: format!(
+                "compositor constrained placement of window {}: requested {:?}, observed {observed:?}",
+                window_move.window, window_move.target
+            ),
+        }),
+        Err(error) if observed != initial => Err(WindowSystemError::PartialMove {
+            observed,
+            message: error.to_string(),
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 fn find_focused_sway_node(nodes: &[SwayTreeNode]) -> Option<&SwayTreeNode> {
@@ -1049,21 +1136,21 @@ mod tests {
         tree.nodes[0].nodes[1].nodes[0].focused = false;
         let window_move = WindowMove::new(WindowId::new("11"), Rect::new(-1920, -200, 960, 1080));
         assert_eq!(
-            sway_move_command(&tree, &window_move).unwrap(),
+            sway_move_command(&tree, &window_move).unwrap().0,
             "[con_id=11] floating enable; \
              [con_id=11] resize set width 960 px height 1080 px; \
              [con_id=11] move absolute position -1920 -200"
         );
         let floating_move = WindowMove::new(WindowId::new("9"), Rect::new(1920, 23, 800, 600));
         assert_eq!(
-            sway_move_command(&tree, &floating_move).unwrap(),
+            sway_move_command(&tree, &floating_move).unwrap().0,
             "[con_id=9] resize set width 800 px height 600 px; \
              [con_id=9] move absolute position 1920 23"
         );
         // Modern Sway also emits the floating reason for a con node.
         tree.nodes[0].nodes[1].nodes[0].floating = Some("user_on".to_string());
         assert_eq!(
-            sway_move_command(&tree, &window_move).unwrap(),
+            sway_move_command(&tree, &window_move).unwrap().0,
             "[con_id=11] resize set width 960 px height 1080 px; \
              [con_id=11] move absolute position -1920 -200"
         );
@@ -1147,6 +1234,92 @@ mod tests {
             assert!(validate_sway_reply(reply, 2, &window).is_err());
         }
     }
+    fn sway_move_from_replies(
+        window_move: &WindowMove,
+        after: &str,
+        command_reply: &str,
+    ) -> Result<(), WindowSystemError> {
+        let mut snapshots = [SWAY_TREE_JSON, after].into_iter();
+        move_window_sway_with(
+            window_move,
+            || {
+                serde_json::from_str(snapshots.next().expect("unexpected tree read"))
+                    .map_err(|error| WindowSystemError::Platform(error.to_string()))
+            },
+            |command, window| {
+                validate_sway_reply(command_reply, command.split(';').count(), window)
+            },
+        )
+    }
+
+    #[test]
+    fn sway_move_classifies_identified_readback_after_failed_and_constrained_placements() {
+        let target = WindowMove::new(WindowId::new("11"), Rect::new(-1920, -200, 960, 1080));
+        let observed = Rect::new(0, 48, 960, 1080);
+        let mut after: serde_json::Value = serde_json::from_str(SWAY_TREE_JSON).unwrap();
+        after["nodes"][0]["nodes"][0]["nodes"][0]["focused"] = true.into();
+        let window = &mut after["nodes"][0]["nodes"][1]["nodes"][0];
+        window["focused"] = false.into();
+        window["rect"] = serde_json::json!({"x":0,"y":48,"width":960,"height":1080});
+        let failure =
+            r#"[{"success":true},{"success":true},{"success":false,"error":"position rejected"}]"#;
+        let success = r#"[{"success":true},{"success":true},{"success":true}]"#;
+        for reply in [failure, success] {
+            let error = sway_move_from_replies(&target, &after.to_string(), reply).unwrap_err();
+            assert!(matches!(
+                &error,
+                WindowSystemError::PartialMove { observed: frame, .. } if *frame == observed
+            ));
+            if reply == failure {
+                assert!(error.to_string().contains("position rejected"));
+            }
+        }
+        after["nodes"][0]["nodes"][1]["nodes"][0]["rect"] =
+            serde_json::json!({"x":-1920,"y":-200,"width":960,"height":1080});
+        assert_eq!(
+            sway_move_from_replies(&target, &after.to_string(), success),
+            Ok(())
+        );
+        assert!(matches!(
+            sway_move_from_replies(&target, SWAY_TREE_JSON, failure),
+            Err(WindowSystemError::Platform(message)) if message.contains("position rejected")
+        ));
+    }
+
+    #[test]
+    fn sway_move_distinguishes_closed_targets_from_unavailable_readback() {
+        let target = WindowMove::new(WindowId::new("11"), Rect::new(0, 0, 800, 600));
+        let failure =
+            r#"[{"success":true},{"success":true},{"success":false,"error":"position rejected"}]"#;
+        let success = r#"[{"success":true},{"success":true},{"success":true}]"#;
+        for reply in [failure, success] {
+            assert_eq!(
+                sway_move_from_replies(&target, "{}", reply),
+                Err(WindowSystemError::WindowGone(target.window.clone()))
+            );
+            assert!(matches!(
+                sway_move_from_replies(&target, "not JSON", reply),
+                Err(WindowSystemError::Platform(message))
+                    if reply == success
+                        || (message.contains("position rejected") && message.contains("readback failed"))
+            ));
+        }
+        let mut after: serde_json::Value = serde_json::from_str(SWAY_TREE_JSON).unwrap();
+        after["nodes"][0]["nodes"][1]["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("rect");
+        assert!(matches!(
+            sway_move_from_replies(&target, &after.to_string(), failure),
+            Err(WindowSystemError::Platform(message))
+                if message.contains("position rejected") && message.contains("empty frame")
+        ));
+        let gone = r#"[{"success":false,"error":"No matching node."}]"#;
+        assert_eq!(
+            sway_move_from_replies(&target, "not JSON", gone),
+            Err(WindowSystemError::WindowGone(target.window.clone()))
+        );
+    }
 
     #[test]
     fn hypr_commands_target_client_address_restore_then_resize_and_move() {
@@ -1157,13 +1330,13 @@ mod tests {
             Rect::new(-2560, -100, 1280, 720),
         );
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap(),
+            hypr_move_command(&clients, &target).unwrap().0,
             "dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
              dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
         );
         clients[0].floating = false;
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap(),
+            hypr_move_command(&clients, &target).unwrap().0,
             "dispatch setfloating address:0x55e0ed70afc0; \
              dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
              dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
@@ -1171,7 +1344,7 @@ mod tests {
         clients[0].fullscreen = 1;
         clients[0].floating = true;
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap(),
+            hypr_move_command(&clients, &target).unwrap().0,
             "dispatch settiled address:0x55e0ed70afc0; \
              dispatch setfloating address:0x55e0ed70afc0; \
              dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
@@ -1185,7 +1358,7 @@ mod tests {
         other.address = "0x1234".to_string();
         clients.insert(0, other);
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap(),
+            hypr_move_command(&clients, &target).unwrap().0,
             "dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
              dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
         );
@@ -1249,5 +1422,92 @@ mod tests {
         for reply in ["", "ok", "ok\nok", "ok\n\n\nok\n\n\nunexpected", "OK"] {
             assert!(validate_hypr_batch_reply(reply, 2, &window).is_err());
         }
+    }
+
+    fn hypr_move_from_replies(
+        window_move: &WindowMove,
+        after: &str,
+        command_reply: &str,
+    ) -> Result<(), WindowSystemError> {
+        let initial = format!("[{}]", hypr_window_json());
+        let mut snapshots = [initial.as_str(), after].into_iter();
+        move_window_hypr_with(
+            window_move,
+            || {
+                serde_json::from_str(snapshots.next().expect("unexpected clients read"))
+                    .map_err(|error| WindowSystemError::Platform(error.to_string()))
+            },
+            |command, window| {
+                validate_hypr_batch_reply(command_reply, command.split(';').count(), window)
+            },
+        )
+    }
+
+    #[test]
+    fn hypr_move_classifies_identified_readback_after_failed_and_constrained_placements() {
+        let target = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(-2560, -100, 1280, 720),
+        );
+        let observed = Rect::new(20, 30, 1280, 720);
+        let mut window: serde_json::Value = serde_json::from_str(hypr_window_json()).unwrap();
+        let mut other = window.clone();
+        other["address"] = "0x1234".into();
+        other["at"] = serde_json::json!([-2560, -100]);
+        other["size"] = serde_json::json!([1280, 720]);
+        window["at"] = serde_json::json!([20, 30]);
+        window["size"] = serde_json::json!([1280, 720]);
+        let mut after = serde_json::json!([other, window]);
+        let failure = "ok\n\n\nposition rejected";
+        let success = "ok\n\n\nok";
+        for reply in [failure, success] {
+            let error = hypr_move_from_replies(&target, &after.to_string(), reply).unwrap_err();
+            assert!(matches!(
+                &error,
+                WindowSystemError::PartialMove { observed: frame, .. } if *frame == observed
+            ));
+            if reply == failure {
+                assert!(error.to_string().contains("position rejected"));
+            }
+        }
+        after[1]["at"] = serde_json::json!([-2560, -100]);
+        assert_eq!(
+            hypr_move_from_replies(&target, &after.to_string(), success),
+            Ok(())
+        );
+        assert!(matches!(
+            hypr_move_from_replies(&target, &format!("[{}]", hypr_window_json()), failure),
+            Err(WindowSystemError::Platform(message)) if message.contains("position rejected")
+        ));
+    }
+
+    #[test]
+    fn hypr_move_distinguishes_closed_targets_from_unavailable_readback() {
+        let target = WindowMove::new(WindowId::new("0x55e0ed70afc0"), Rect::new(0, 0, 800, 600));
+        let failure = "ok\n\n\nposition rejected";
+        let success = "ok\n\n\nok";
+        for reply in [failure, success] {
+            assert_eq!(
+                hypr_move_from_replies(&target, "[]", reply),
+                Err(WindowSystemError::WindowGone(target.window.clone()))
+            );
+            assert!(matches!(
+                hypr_move_from_replies(&target, "not JSON", reply),
+                Err(WindowSystemError::Platform(message))
+                    if reply == success
+                        || (message.contains("position rejected") && message.contains("readback failed"))
+            ));
+        }
+        let mut window: serde_json::Value = serde_json::from_str(hypr_window_json()).unwrap();
+        window.as_object_mut().unwrap().remove("size");
+        assert!(matches!(
+            hypr_move_from_replies(&target, &serde_json::json!([window]).to_string(), failure),
+            Err(WindowSystemError::Platform(message))
+                if message.contains("position rejected") && message.contains("readback failed")
+        ));
+        assert_eq!(
+            hypr_move_from_replies(&target, "not JSON", "ok\n\n\nWindow not found"),
+            Err(WindowSystemError::WindowGone(target.window.clone()))
+        );
     }
 }

@@ -4,10 +4,11 @@ Users place the focused OS window in a configured zone or move it to the next/pr
 
 ## Sub-features
 
-- `place-zone`: left/right halves, left/center/right thirds, left/right two-thirds and maximize.
+- `place-zone`: fourteen built-ins: left/right and top/bottom halves, four corners, thirds, two-thirds, and maximize.
 - `place-custom`: percentage-based user zones resolve inside the display's usable area.
-- `place-display`: next/previous display and wraparound preserve recognized zones or proportional geometry.
+- `place-display`: next/previous wrap; explicit directional display moves do not. Repeated matching left/right halves cross to the physical neighbour's opposite half without wrapping.
 - `place-boundaries`: unknown binding, no focused window, no usable displays or denied movement exposes an error without a false success.
+- `place-history`: center keeps size (shrinking to fit); restore returns to the original frame within one runtime. Partial moves retain history; manual moves and restart reset it. Restore does not require a successful display query.
 
 ## How to get to it (user POV)
 
@@ -28,10 +29,12 @@ Preconditions:
 - **Other built-in variants.** Use `"$V" drive config valid --zone right-third`, then dispatch Left and expect `x=1280 y=0 w=640 h=1080`. Repeat for every affected zone via `drive config --help`, including odd-edge cases in the existing `drive tests`; restore `drive config valid`.
 - **Custom zone.** `"$V" drive config custom`, then `"$V" drive cli --expect 'last move: x=192 y=108 w=960 h=540' -- dispatch Alt+Ctrl+Left`. A second CLI process must read the same custom config. Restore `drive config valid`.
 - **Display direction.** `"$V" drive cli --expect 'Dispatch state: Succeeded' -- dispatch Alt+Ctrl+Down` and `"$V" drive cli --expect 'Dispatch state: Succeeded' -- dispatch Alt+Ctrl+Shift+Right` exercise the next/previous actions; do not mistake computed output for OS geometry proof.
-- **Actual user movement.** `"$V" drive smoke x11` runs the existing two-logical-display fixture, dispatches left-half/center-third/two-thirds/next/previous once each, injects a real hotkey and checks exact geometry with xdotool plus screenshots. X11 configure requests are server-acknowledged before the connection closes; the gate does not retry dropped requests. Its TUI dispatch must move from the independently checked center-third baseline to left-half. Inspect each assertion and image. `drive smoke kde-live` covers a real nested KWin; `drive smoke gnome` cannot prove focused placement without a seat.
+- **Actual user movement.** `"$V" check e2e` owns the native X11 journey. `drive smoke kde-live` covers nested KWin; `drive smoke gnome` drives native Wayland/XWayland clients through Mutter virtual input, with independent client geometry and ScreenCast captures. These remain synthetic, not seated hardware evidence.
 - **Interactive entry.** `"$V" drive session --mode run --command 'dispatch Alt+Ctrl+Left' --expect 'Dispatch state: Succeeded'`; for TUI use `--mode tui` and expect `Last action: alt+ctrl+left`. Built-in and custom TUI dispatch success also requires the completed response/prompt without `Last error: dispatch:`. Bare `Alt+Ctrl+Left` is a separate line-input entry with the same success checks.
 - **Error/empty.** `"$V" drive cli --expect 'NoBindingForHotkey' -- dispatch Alt+Ctrl+F12`; then `drive config empty` and repeat Left with that error. For an intentional TUI failure, pair the dispatch command with `--expect 'Last error: dispatch: no binding configured'`, not a `Last action` label. Restore valid. Native no-focus/no-display/denied paths require those real conditions and an unchanged-window observer.
 - **Cancel/persistence.** Quit a runtime without dispatch and compare native geometry before/after when claiming no move. After a successful move, independently observe geometry before and after runtime exit; config survives a new process, but Window Zones does not persist/restore a dispatch history.
+- **Starter actions/history.** `"$V" drive cli -- init --force --chord Ctrl+Alt` seeds all fourteen zones plus center/restore and next/previous. In a single `drive session --mode run`, dispatch Right twice and Backspace: expect `last move: x=960 y=0 w=960 h=1080`, then `x=1920 y=0 w=640 h=1024`, then `x=40 y=40 w=640 h=480`. Use Up/Down/U/I/J/K for the six additional half/corner zones; these are outside the eight-zone fixed oracle. Restore `drive config valid` afterward.
+- **Native identity/constraints.** The native gates and adapter regressions cover captured IDs, fullscreen/non-resizable refusal, restoration and partial placement. On Windows, GNOME, KDE, Sway and Hyprland, constrain a disposable client's minimum size and require the observed partial frame plus a later Restore; also switch focus between different applications on macOS. Synthetic X11 or dry-run cannot close those platform checks.
 
 ## Gotchas
 

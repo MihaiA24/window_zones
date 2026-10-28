@@ -68,6 +68,21 @@ reduced motion are respected. Maximized/tiled restoration completes before
 the destination frame is requested, preventing a late Wayland restore
 acknowledgement from overwriting it.
 
+## Session event logging
+
+`--log-file PATH` appends human-readable session events; it is off unless explicitly requested:
+
+```bash
+window_zones --log-file "$HOME/window-zones-events.log" status
+window_zones --log-file "$HOME/window-zones-events.log" run
+```
+
+Records have RFC 3339 UTC timestamps and escaped control characters. They include command start/end, the App's configuration/hotkey transitions, dispatch successes/failures, and runtime restart. Normal exit or explicit `quit` closes the session record; forced termination cannot guarantee an end record. Separate processes append rather than truncate, and runtime `restart` keeps the open log.
+
+File open/write failures disable the file sink and warn best-effort; even unwritable stderr does not abort the command. Genuine CLI/startup errors retain their failure exit status. No default session file is created.
+
+This is distinct from `--perf-log` JSONL below. Both may be enabled with separate destinations. For full Sway/Hyprland runtime events, enable session logging on the persistent `run`/`tui`; an optional dispatch-client log contains that client's lifecycle and forwarded result.
+
 ## Performance logging
 
 Logging is opt-in for `dispatch`, `run` (including tray mode), and `tui`:
@@ -107,12 +122,14 @@ or companion timings are `null`, never fabricated zeroes.
 
 An unwritable destination fails startup visibly. A later write failure emits
 a diagnostic and disables logging without stopping window movement. Without
-`--perf-log`, no log file, process-memory sampling, or timing-retrieval RPC
-is performed.
+`--perf-log`, no performance log, process-memory sampling, or timing-retrieval RPC
+is performed; `--log-file` remains an independent opt-in sink.
 
 ## Running in the background
 
 Start the listener with `window_zones run`; it keeps serving hotkeys when stdin is closed. `./scripts/install.sh --autostart` installs the Linux `window-zones` systemd user service or the macOS `org.window_zones.run` LaunchAgent. Only one live `run`/`tui` session owns the hotkeys: a second exits with status `75` and names the owning pid. Do not stop someone else's session to run a smoke check.
+
+On Unix, the lock directory must be owned by the current effective UID, non-symlinked, and private (`0700`). Linux uses `XDG_RUNTIME_DIR` when set; otherwise Unix uses `<temporary-directory>/window_zones-<uid>/`. Lock/PID/dispatch files share that directory. PID sidecars are recreated without following stale symlinks.
 
 On Linux, manage the service with `systemctl --user status|stop|start|restart window-zones`; `systemctl --user disable --now window-zones` turns it off. Logs: `journalctl --user -u window-zones -f`. On macOS, use `launchctl print gui/$(id -u)/org.window_zones.run` and `launchctl kickstart -k gui/$(id -u)/org.window_zones.run`; logs are `~/Library/Logs/window_zones.log`. See [installation](installation.md#macos-launchagent) for loading, ownership, and permissions.
 
@@ -125,7 +142,7 @@ The App prints runtime events once per change, never per retry:
 - `Hotkey registration failed: ...; retrying` — the companion is absent or busy; retried every second.
 - `Dispatch failed for <hotkey>: ...` — once per press.
 
-With non-terminal stdout, Linux and macOS notify about background problems; `--backend dry-run` never does. Config errors and refused hotkeys notify at once; unavailable hotkeys notify only after 20 seconds without recovery. Linux updates the notification in place and clears it on matching recovery. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html). Actual problem and recovery banners and Notification Center content were observed in the incoming readiness work, attributed to Script Editor; enable notifications for that sender if needed.
+With non-terminal stdout, Linux and macOS notify about background problems, including tray mode; terminal and `--backend dry-run` sessions do not. Config errors and refused hotkeys notify at once; unavailable hotkeys notify after 20 seconds of continuous outage even if diagnostics change. Linux updates its notification in place, including a matching recovery notice. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
 
 One-shot `dispatch` prints its state and exits `0`, including dispatch errors (no binding, no focused window, adapter failure). Inspect `Dispatch state` and diagnostics rather than treating exit status as proof of movement. Sway/Hyprland dispatch clients still exit nonzero when their session-owned request fails.
 

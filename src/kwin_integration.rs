@@ -38,8 +38,6 @@ const KGLOBALACCEL_SERVICE: &str = "org.kde.kglobalaccel";
 const KGLOBALACCEL_PATH: &str = "/kglobalaccel";
 const KGLOBALACCEL_INTERFACE: &str = "org.kde.KGlobalAccel";
 const KGLOBALACCEL_COMPONENT: &str = "kwin";
-const ACCELERATOR_SETTLE_SAMPLES: u32 = 6;
-const ACCELERATOR_SETTLE_INTERVAL: Duration = Duration::from_millis(120);
 
 type DisplayPayload = (String, i32, i32, u32, u32);
 type NextRequestPayload = (u32, String, String, i32, i32, u32, u32, String);
@@ -70,6 +68,12 @@ pub enum KwinIntegrationError {
     Invalid { message: String },
     #[error("KWin window no longer exists: {window}")]
     WindowGone { window: WindowId },
+    #[error("KWin partially moved window {window}: {message}")]
+    PartialMove {
+        window: WindowId,
+        observed: Rect,
+        message: String,
+    },
     #[error("KWin companion operation failed: {message}; retry the operation")]
     Operation { message: String },
 }
@@ -239,7 +243,17 @@ impl WindowSystem for KwinWindowSystem {
             ),
         );
 
-        result.map_err(KwinIntegrationError::into_window_error)
+        result.map_err(|error| match error {
+            KwinIntegrationError::PartialMove {
+                window,
+                observed,
+                message,
+            } if window == window_move.window => WindowSystemError::PartialMove {
+                observed,
+                message: KwinIntegrationError::Operation { message }.to_string(),
+            },
+            error => error.into_window_error(),
+        })
     }
 }
 
@@ -338,9 +352,9 @@ impl KwinHotkeySystem {
             let (request_id,): (u32,) = proxy
                 .method_call(KWIN_INTERFACE, "RegisterHotkeys", (payload,))
                 .map_err(classify_dbus_error)?;
-            wait_for_request(connection, request_id)?;
-            // The script preflights replacements before committing; this post-check only reads.
-            verify_accelerators_assigned(connection, hotkeys)
+            // The script preflights owners and SetShortcut verifies assignment before commit.
+            // A later sampler could refuse an already committed set without rolling it back.
+            wait_for_request(connection, request_id)
         })();
 
         if let Err(error) = &result
@@ -462,123 +476,6 @@ fn wait_for_request(connection: &Connection, request_id: u32) -> Result<(), Kwin
     }
 }
 
-/// KWin's scripting `registerShortcut` reports success for any callable handler: it hands the
-/// sequence to KGlobalAccel and discards the result, so an accelerator another action already owns
-/// is accepted and then never fires. Ask KGlobalAccel which keys our actions actually hold.
-fn verify_accelerators_assigned(
-    connection: &Connection,
-    hotkeys: &[String],
-) -> Result<(), KwinIntegrationError> {
-    if hotkeys.is_empty() {
-        return Ok(());
-    }
-
-    let accel = connection.with_proxy(KGLOBALACCEL_SERVICE, KGLOBALACCEL_PATH, CALL_TIMEOUT);
-    // Without a reachable KGlobalAccel nothing can be verified and the Companion's own result
-    // stands; with one, an action it does not know about is an accelerator that was not assigned.
-    if accel
-        .method_call::<(Vec<Vec<String>>,), _, _, _>(
-            KGLOBALACCEL_INTERFACE,
-            "allMainComponents",
-            (),
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let actions: Vec<_> = hotkeys
-        .iter()
-        .map(|hotkey| {
-            (
-                hotkey,
-                vec![
-                    KGLOBALACCEL_COMPONENT.to_string(),
-                    format!("Window Zones Hotkey {hotkey}"),
-                    String::new(),
-                    String::new(),
-                ],
-            )
-        })
-        .collect();
-    verify_accelerator_samples(
-        &actions,
-        |(hotkey, action_id)| {
-            // shortcutKeys can report requested keys before dispatch has settled. action returns
-            // the actual dispatch winner; getGlobalShortcutsByKey has no useful ordering.
-            let competitor = {
-                let keys = accel
-                    .method_call::<(Vec<(Vec<i32>,)>,), _, _, _>(
-                        KGLOBALACCEL_INTERFACE,
-                        "shortcutKeys",
-                        (action_id,),
-                    )
-                    .map(|(keys,)| keys)
-                    .unwrap_or_default();
-                let key = keys
-                    .iter()
-                    .flat_map(|(sequence,)| sequence.iter())
-                    .copied()
-                    .find(|key| *key != 0);
-                let Some(key) = key else {
-                    return Err(accelerator_conflict(hotkey, ""));
-                };
-                let winner = accel
-                    .method_call::<(Vec<String>,), _, _, _>(
-                        KGLOBALACCEL_INTERFACE,
-                        "action",
-                        (key,),
-                    )
-                    .map(|(winner,)| winner)
-                    .unwrap_or_default();
-                if winner.first().map(String::as_str) != Some(KGLOBALACCEL_COMPONENT)
-                    || winner.get(1) != action_id.get(1)
-                {
-                    Some(winner.get(1).cloned().unwrap_or_default())
-                } else {
-                    None
-                }
-            };
-            if let Some(competitor) = competitor {
-                return Err(accelerator_conflict(hotkey, &competitor));
-            }
-            Ok(())
-        },
-        || thread::sleep(ACCELERATOR_SETTLE_INTERVAL),
-    )
-}
-
-fn verify_accelerator_samples<T>(
-    hotkeys: &[T],
-    mut verify: impl FnMut(&T) -> Result<(), KwinIntegrationError>,
-    mut settle: impl FnMut(),
-) -> Result<(), KwinIntegrationError> {
-    for attempt in 0..ACCELERATOR_SETTLE_SAMPLES {
-        if attempt > 0 {
-            settle();
-        }
-        for hotkey in hotkeys {
-            verify(hotkey)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn accelerator_conflict(hotkey: &str, competitor: &str) -> KwinIntegrationError {
-    KwinIntegrationError::Operation {
-        message: if competitor.is_empty() {
-            format!(
-                "KWin accepted '{hotkey}' but KGlobalAccel assigned it no keys; another shortcut already owns that accelerator"
-            )
-        } else {
-            format!(
-                "KWin accepted '{hotkey}' but the accelerator is also held by '{competitor}', which receives it instead; choose a different binding"
-            )
-        },
-    }
-}
-
 fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {
     let name = error.name().unwrap_or("org.freedesktop.DBus.Error.Failed");
     let message = error
@@ -608,6 +505,28 @@ fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {
         "org.window_zones.KWin.Error.WindowGone" => KwinIntegrationError::WindowGone {
             window: WindowId::new(message),
         },
+        "org.window_zones.KWin.Error.PartialMove" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct PartialMovePayload {
+                window_id: String,
+                observed: (i32, i32, u32, u32),
+                message: String,
+            }
+            match serde_json::from_str::<PartialMovePayload>(&message) {
+                Ok(payload) if payload.observed.2 > 0 && payload.observed.3 > 0 => {
+                    let (x, y, width, height) = payload.observed;
+                    KwinIntegrationError::PartialMove {
+                        window: WindowId::new(payload.window_id),
+                        observed: Rect::new(x, y, width, height),
+                        message: payload.message,
+                    }
+                }
+                _ => KwinIntegrationError::Operation {
+                    message: format!("invalid KWin partial-move result: {message}"),
+                },
+            }
+        }
         "org.window_zones.KWin.Error.Unsupported" => KwinIntegrationError::Unsupported {
             capability: "requested operation".to_string(),
             message,
@@ -1230,7 +1149,7 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                                     ))
                                 })?;
                             let (assigned,): (Vec<(Vec<i32>,)>,) = accel
-                                .method_call(KGLOBALACCEL_INTERFACE, "shortcutKeys", (action_id,))
+                                .method_call(KGLOBALACCEL_INTERFACE, "shortcutKeys", (&action_id,))
                                 .map_err(|error| {
                                     MethodErr::from((
                                         "org.window_zones.KWin.Error.Unavailable",
@@ -1244,6 +1163,29 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                                     "org.window_zones.KWin.Error.Unavailable",
                                     "KGlobalAccel did not apply the requested shortcut",
                                 ));
+                            }
+                            if key != 0 {
+                                let (winner,): (Vec<String>,) = accel
+                                    .method_call(KGLOBALACCEL_INTERFACE, "action", (key,))
+                                    .map_err(|error| {
+                                        MethodErr::from((
+                                            "org.window_zones.KWin.Error.Unavailable",
+                                            format!(
+                                                "KGlobalAccel could not verify the owner of '{hotkey}': {error}"
+                                            ),
+                                        ))
+                                    })?;
+                                if winner.first() != action_id.first()
+                                    || winner.get(1) != action_id.get(1)
+                                {
+                                    return Err(MethodErr::from((
+                                        "org.window_zones.KWin.Error.Unavailable",
+                                        format!(
+                                            "KGlobalAccel did not assign '{hotkey}' to Window Zones; current owner: {}",
+                                            winner.get(1).map(String::as_str).unwrap_or("none")
+                                        ),
+                                    )));
+                                }
                             }
                             Ok(vec![method.msg.method_return()])
                         }))
@@ -1413,6 +1355,9 @@ mod tests {
         capabilities: Vec<String>,
         capabilities_error: Option<(&'static str, String)>,
         request_error: Option<(&'static str, String)>,
+        move_error: Option<(&'static str, String)>,
+        move_observed: Option<Rect>,
+        expose_stale_accelerator: bool,
         focused: Option<(String, i32, i32, u32, u32)>,
         displays: Vec<DisplayPayload>,
         next_displays: Option<Vec<DisplayPayload>>,
@@ -1435,6 +1380,9 @@ mod tests {
                 ],
                 capabilities_error: None,
                 request_error: None,
+                move_error: None,
+                move_observed: None,
+                expose_stale_accelerator: false,
                 focused: Some(("window-1".to_string(), -300, -20, 801, 602)),
                 displays: vec![
                     ("monitor-0".to_string(), -1920, 0, 1920, 1080),
@@ -1511,6 +1459,13 @@ mod tests {
                     }
                 };
                 if let Err(error) = connection.request_name(KWIN_SERVICE_NAME, false, true, false) {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return;
+                }
+                if state.lock().expose_stale_accelerator
+                    && let Err(error) =
+                        connection.request_name(KGLOBALACCEL_SERVICE, false, true, false)
+                {
                     let _ = ready_tx.send(Err(error.to_string()));
                     return;
                 }
@@ -1683,7 +1638,29 @@ mod tests {
                                             .pending
                                             .remove(&request_id)
                                             .expect("pending KWin request exists");
-                                        if state.request_error.is_none() {
+                                        let request_error =
+                                            if matches!(request, FakeRequest::Move { .. }) {
+                                                state
+                                                    .move_error
+                                                    .clone()
+                                                    .or_else(|| state.request_error.clone())
+                                            } else {
+                                                state.request_error.clone()
+                                            };
+                                        if let FakeRequest::Move { window, .. } = &request
+                                            && let Some(observed) = state.move_observed
+                                            && let Some((id, x, y, width, height)) =
+                                                &mut state.focused
+                                            && id == window
+                                        {
+                                            (*x, *y, *width, *height) = (
+                                                observed.x,
+                                                observed.y,
+                                                observed.width,
+                                                observed.height,
+                                            );
+                                        }
+                                        if request_error.is_none() {
                                             match request {
                                                 FakeRequest::Move {
                                                     window,
@@ -1708,9 +1685,7 @@ mod tests {
                                             }
                                         }
                                         let mut reply = method.msg.method_return();
-                                        let (error_name, message) = state
-                                            .request_error
-                                            .clone()
+                                        let (error_name, message) = request_error
                                             .map(|(name, message)| (name.to_string(), message))
                                             .unwrap_or_default();
                                         reply.append_all((true, error_name, message));
@@ -1726,6 +1701,24 @@ mod tests {
                                         Ok(vec![reply])
                                     })),
                             ),
+                    )
+                    .add(
+                        factory.object_path(KGLOBALACCEL_PATH, ()).add(
+                            factory
+                                .interface(KGLOBALACCEL_INTERFACE, ())
+                                .add_m(factory.method("allMainComponents", (), move |method| {
+                                    Ok(vec![
+                                        method.msg.method_return().append1(vec![vec![
+                                            KGLOBALACCEL_COMPONENT.to_string(),
+                                        ]]),
+                                    ])
+                                }))
+                                .add_m(factory.method("shortcutKeys", (), move |method| {
+                                    // A later, stale sampler must not veto a committed request.
+                                    let keys: Vec<(Vec<i32>,)> = Vec::new();
+                                    Ok(vec![method.msg.method_return().append1(keys)])
+                                })),
+                        ),
                     )
                     .add(factory.object_path("/", ()).introspectable());
                 tree.start_receive(&connection);
@@ -1905,6 +1898,126 @@ mod tests {
             Err(WindowSystemError::WindowGone(WindowId::new("window-1")))
         );
         bus.update_state(|state| assert!(state.moves.is_empty()));
+    }
+
+    #[test]
+    fn constrained_moves_and_interrupted_restore_keep_the_original_restore_point() {
+        use crate::{Action, ExecuteActionError, WindowHistory, execute_action};
+        let original = Rect::new(90, 100, 700, 500);
+        let constrained = Rect::new(0, 40, 800, 860);
+        let interrupted_restore = Rect::new(20, 50, 650, 700);
+        let mut state = FakeServiceState::complete();
+        state.focused = Some(("window-1".to_string(), 90, 100, 700, 500));
+        state.displays = vec![("output-1".to_string(), 0, 40, 1200, 860)];
+        let bus = FakeBus::new(state);
+        let mut system = KwinWindowSystem::with_bus_address(bus.address.clone());
+        let mut history = WindowHistory::default();
+        let zones = std::collections::BTreeMap::new();
+        for (action, observed) in [
+            (
+                Action::MoveToZone {
+                    zone: "left-half".to_string(),
+                },
+                constrained,
+            ),
+            (Action::Restore {}, interrupted_restore),
+        ] {
+            bus.update_state(|state| {
+                state.move_observed = Some(observed);
+                state.move_error = Some((
+                    "org.window_zones.KWin.Error.PartialMove",
+                    serde_json::json!({
+                        "window_id": "window-1",
+                        "observed": [observed.x, observed.y, observed.width as i64, observed.height as i64],
+                        "message": "client constrained the frame",
+                    }).to_string(),
+                ));
+            });
+            assert!(matches!(
+                execute_action(&action, &zones, &mut history, &mut system),
+                Err(ExecuteActionError::WindowSystem(WindowSystemError::PartialMove {
+                    observed: actual, ..
+                })) if actual == observed
+            ));
+        }
+        bus.update_state(|state| {
+            state.move_error = None;
+            state.move_observed = Some(original);
+        });
+        execute_action(&Action::Restore {}, &zones, &mut history, &mut system).unwrap();
+        bus.update_state(|state| {
+            assert_eq!(
+                state.moves,
+                vec![("window-1".to_string(), 90, 100, 700, 500)]
+            );
+        });
+        assert_eq!(
+            execute_action(&Action::Restore {}, &zones, &mut history, &mut system),
+            Err(ExecuteActionError::NothingToRestore)
+        );
+    }
+
+    #[test]
+    fn partial_move_payloads_require_the_captured_identity_and_valid_frame() {
+        let bus = FakeBus::new(FakeServiceState::complete());
+        let mut system = KwinWindowSystem::with_bus_address(bus.address.clone());
+        let movement = WindowMove::new(WindowId::new("window-1"), Rect::new(0, 40, 600, 860));
+        let valid = serde_json::json!({
+            "window_id": "window-1",
+            "observed": [0, 40, 800, 860],
+            "message": "client minimum width",
+        });
+        bus.update_state(|state| {
+            state.focused = Some(("window-2".to_string(), 900, 100, 200, 300));
+            state.move_error = Some(("org.window_zones.KWin.Error.PartialMove", valid.to_string()));
+        });
+        assert!(matches!(
+            system.move_window(&movement),
+            Err(WindowSystemError::PartialMove { observed, .. })
+                if observed == Rect::new(0, 40, 800, 860)
+        ));
+        for (field, value) in [
+            ("window_id", serde_json::json!("window-2")),
+            ("window_id", serde_json::json!(1)),
+            ("observed", serde_json::json!([0, 40, 0, 860])),
+            ("observed", serde_json::json!([0, 40, 4294967296_u64, 860])),
+            ("observed", serde_json::json!([0.5, 40, 800, 860])),
+            ("message", serde_json::Value::Null),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut payload = valid.clone();
+            payload[field] = value;
+            bus.update_state(|state| {
+                state.move_error = Some((
+                    "org.window_zones.KWin.Error.PartialMove",
+                    payload.to_string(),
+                ));
+            });
+            assert!(
+                matches!(
+                    system.move_window(&movement),
+                    Err(WindowSystemError::Platform(_))
+                ),
+                "invalid payload must not change history: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_hotkey_replacement_is_not_vetoed_by_a_late_accelerator_sampler() {
+        let mut state = FakeServiceState::complete();
+        state.expose_stale_accelerator = true;
+        let bus = FakeBus::new(state);
+        let mut system = KwinHotkeySystem::with_bus_address(bus.address.clone());
+        system
+            .register_hotkeys(&["alt+ctrl+left".to_string()])
+            .unwrap();
+        system
+            .register_hotkeys(&["alt+ctrl+right".to_string()])
+            .unwrap();
+        bus.update_state(|state| {
+            assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+right"]);
+        });
     }
 
     #[test]
@@ -2192,13 +2305,13 @@ first.tile = {unmanage: value => {
     first.calls.push('untile');
     first.tile = null;
 }};
-vm.runInContext("moveWindow('window-1', -10, 20, 800, 600)", context);
+vm.runInContext("moveWindow('window-1', -10, 20, 800, 600, error => { if (error) throw error; })", context);
 assert.equal(JSON.stringify(first.frameGeometry), '{"x":-10,"y":20,"width":800,"height":600}');
 assert.deepEqual(first.calls, ['untile', [false, false], 'frame']);
 assert.equal(second.calls.length, 0);
 first.calls.length = 0;
 first.tile = {};
-vm.runInContext("moveWindow('window-1', 10, 20, 800, 600)", context);
+vm.runInContext("moveWindow('window-1', 10, 20, 800, 600, error => { if (error) throw error; })", context);
 assert.equal(first.tile, null);
 assert.deepEqual(first.calls, [[true, true], [false, false], 'frame']);
 first.fullScreen = true;
@@ -2260,49 +2373,6 @@ for (const hotkey of ['ctrl+alt+a', 'ALT+a', 'alt+ctrl+f25', 'alt++a', 'alt+ente
 
         assert!(matches!(error, KwinIntegrationError::Unsupported { .. }));
         assert!(error.to_string().contains("move-resize"));
-    }
-
-    #[test]
-    fn accelerator_settlement_samples_the_whole_set_before_each_sleep() {
-        let hotkeys: Vec<String> = (1..=18).map(|key| format!("alt+ctrl+f{key}")).collect();
-        let samples = std::cell::RefCell::new(Vec::new());
-        let mut settle_count = 0;
-        verify_accelerator_samples(
-            &hotkeys,
-            |hotkey| {
-                samples.borrow_mut().push(hotkey.to_string());
-                Ok(())
-            },
-            || {
-                settle_count += 1;
-                let samples = samples.borrow();
-                assert_eq!(samples.len() % hotkeys.len(), 0);
-                assert_eq!(&samples[samples.len() - hotkeys.len()..], hotkeys);
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            samples.borrow().len(),
-            hotkeys.len() * ACCELERATOR_SETTLE_SAMPLES as usize
-        );
-        assert_eq!(settle_count, ACCELERATOR_SETTLE_SAMPLES - 1);
-
-        let mut count = 0;
-        let mut sleeps = 0;
-        let result = verify_accelerator_samples(
-            &hotkeys,
-            |hotkey| {
-                count += 1;
-                if count == hotkeys.len() + 2 {
-                    Err(accelerator_conflict(hotkey, "incumbent"))
-                } else {
-                    Ok(())
-                }
-            },
-            || sleeps += 1,
-        );
-        assert!(result.unwrap_err().to_string().contains("incumbent"));
-        assert_eq!(sleeps, 1);
     }
 
     #[test]

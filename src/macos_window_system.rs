@@ -82,11 +82,6 @@ fn as_i32(field: &str, value: f64) -> Result<i32, WindowSystemError> {
     }
 
     let rounded = value.round();
-    if (value - rounded).abs() > 0.5 {
-        return Err(WindowSystemError::Platform(format!(
-            "{field} is not an integer: {value}"
-        )));
-    }
 
     let min = f64::from(i32::MIN);
     let max = f64::from(i32::MAX);
@@ -107,11 +102,6 @@ fn as_u32(field: &str, value: f64) -> Result<u32, WindowSystemError> {
     }
 
     let rounded = value.round();
-    if (value - rounded).abs() > 0.5 {
-        return Err(WindowSystemError::Platform(format!(
-            "{field} is not an integer: {value}"
-        )));
-    }
 
     if rounded < 0.0 {
         return Err(WindowSystemError::Platform(format!(
@@ -128,11 +118,9 @@ fn as_u32(field: &str, value: f64) -> Result<u32, WindowSystemError> {
 mod native {
     use super::*;
     use cocoa::appkit::NSScreen;
-    use cocoa::base::{id, nil};
+    use cocoa::base::nil;
     use cocoa::foundation::NSArray;
-    use objc::Message;
     use objc::rc::autoreleasepool;
-    use objc::runtime::{Class, Sel};
     use std::ffi::{CStr, c_void};
     use std::ptr::{self, NonNull};
 
@@ -146,7 +134,6 @@ mod native {
     unsafe extern "C" {
         fn AXIsProcessTrusted() -> u8;
         fn AXUIElementCreateSystemWide() -> Ref;
-        fn AXUIElementCreateApplication(pid: i32) -> Ref;
         fn AXUIElementSetMessagingTimeout(element: Ref, seconds: f32) -> i32;
         fn AXUIElementCopyAttributeValue(element: Ref, name: Ref, value: *mut Ref) -> i32;
         fn AXUIElementIsAttributeSettable(element: Ref, name: Ref, settable: *mut u8) -> i32;
@@ -209,6 +196,7 @@ mod native {
 
     #[derive(Clone, Copy)]
     enum Attribute {
+        Application,
         Window,
         Position,
         Size,
@@ -220,12 +208,13 @@ mod native {
     #[derive(Debug)]
     pub(super) struct Accessibility {
         system: Value,
-        attributes: [Value; 6],
+        attributes: [Value; 7],
     }
 
     impl Default for Accessibility {
         fn default() -> Self {
-            let names: [&CStr; 6] = [
+            let names: [&CStr; 7] = [
+                c"AXFocusedApplication",
                 c"AXFocusedWindow",
                 c"AXPosition",
                 c"AXSize",
@@ -375,28 +364,17 @@ mod native {
                 "set timeout",
                 None,
             )?;
-            let pid = autoreleasepool(|| unsafe {
-                // NSWorkspace is the native frontmost-application source.
-                let workspace: id = Class::get("NSWorkspace")
-                    .expect("AppKit NSWorkspace")
-                    .send_message(Sel::register("sharedWorkspace"), ())
-                    .expect("sharedWorkspace");
-                let application: id = (&*workspace)
-                    .send_message(Sel::register("frontmostApplication"), ())
-                    .expect("frontmostApplication");
-                if application == nil {
-                    return None;
-                }
-                let pid: i32 = (&*application)
-                    .send_message(Sel::register("processIdentifier"), ())
-                    .expect("processIdentifier");
-                (pid > 0).then_some(pid)
-            });
-            let Some(pid) = pid else {
+            // Query AX directly; Cocoa application state depends on a main run loop.
+            let Some(application) = self.attribute(&self.system, Attribute::Application, None)?
+            else {
                 return Ok(None);
             };
-            // SAFETY: Create returns a retained application Accessibility element.
-            let application = Value::owned(unsafe { AXUIElementCreateApplication(pid) });
+            // SAFETY: the Copy reference is retained; check its type before messaging it.
+            if unsafe { CFGetTypeID(application.raw()) != AXUIElementGetTypeID() } {
+                return Err(WindowSystemError::Platform(
+                    "invalid Accessibility application".into(),
+                ));
+            }
             let window = self.attribute(&application, Attribute::Window, None)?;
             if let Some(window) = &window
                 && unsafe { CFGetTypeID(window.raw()) != AXUIElementGetTypeID() }
@@ -656,6 +634,22 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometry_rounding_preserves_finite_and_range_validation() {
+        assert_eq!(as_i32("x", -1.5).unwrap(), -2);
+        assert_eq!(as_u32("width", 1.5).unwrap(), 2);
+        assert_eq!(as_i32("x", f64::from(i32::MIN)).unwrap(), i32::MIN);
+        assert_eq!(as_u32("width", f64::from(u32::MAX)).unwrap(), u32::MAX);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(as_i32("x", invalid).is_err());
+            assert!(as_u32("width", invalid).is_err());
+        }
+        assert!(as_i32("x", f64::from(i32::MIN) - 1.0).is_err());
+        assert!(as_i32("x", f64::from(i32::MAX) + 1.0).is_err());
+        assert!(as_u32("width", -1.0).is_err());
+        assert!(as_u32("width", f64::from(u32::MAX) + 1.0).is_err());
+    }
 
     #[test]
     fn unknown_window_identity_is_gone_without_accessing_another_window() {

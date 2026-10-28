@@ -12,22 +12,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{InstanceLock, RuntimeInstruction, RuntimeRequest};
+use super::{InstanceLock, RuntimeInstruction, RuntimeRequest, current_uid};
 
 const MAX_REQUEST: usize = 8192;
 const MAX_RESPONSE: usize = 65536;
 const IO_TIMEOUT: Duration = Duration::from_millis(100);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 static CLIENT_ID: AtomicU64 = AtomicU64::new(0);
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
-}
-
-fn current_uid() -> u32 {
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    unsafe { geteuid() }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +165,26 @@ impl Drop for OwnedSocket {
     }
 }
 
+struct PendingResponse {
+    client: PathBuf,
+    response: mpsc::Receiver<Response>,
+    deadline: Instant,
+}
+
+fn send_response(socket: &UnixDatagram, client: &Path, response: Response) {
+    let response = serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"success\":false,\"output\":\"Error: cannot encode dispatch response\\n\"}".to_vec()
+    });
+    if response.len() <= MAX_RESPONSE {
+        let _ = socket.send_to(&response, client);
+    } else {
+        let _ = socket.send_to(
+            b"{\"success\":false,\"output\":\"Error: dispatch report exceeds local response limit\\n\"}",
+            client,
+        );
+    }
+}
+
 pub(super) struct Server {
     stopping: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
@@ -186,7 +197,7 @@ impl Server {
         identity: Identity,
         instructions: mpsc::Sender<RuntimeRequest>,
     ) -> io::Result<Self> {
-        let dir = lock.pid_path.with_extension("dispatch");
+        let dir = directory(&lock.pid_path);
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -218,7 +229,22 @@ impl Server {
         let stop = stopping.clone();
         let worker = thread::Builder::new().name("session-dispatch".to_string()).spawn(move || {
             let mut bytes = [0; MAX_REQUEST + 1];
+            let mut pending: Vec<PendingResponse> = Vec::new();
             while !stop.load(Ordering::Acquire) {
+                // Receiving a new request must not wait for an earlier action:
+                // every queued action gets its deadline before the client times out.
+                pending.retain(|request| {
+                    let response = match request.response.try_recv() {
+                        Ok(response) => response,
+                        Err(mpsc::TryRecvError::Disconnected) => Response::error("running session stopped before dispatch"),
+                        Err(mpsc::TryRecvError::Empty) if Instant::now() >= request.deadline => {
+                            Response::error("dispatch timed out; an action already started may have run; inspect the window before retrying")
+                        }
+                        Err(mpsc::TryRecvError::Empty) => return true,
+                    };
+                    send_response(&owned.socket, &request.client, response);
+                    false
+                });
                 let (count, address) = match owned.socket.recv_from(&mut bytes) {
                     Ok(message) => message,
                     Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => continue,
@@ -248,27 +274,20 @@ impl Server {
                             if instructions.send(request).is_err() {
                                 Response::error("running session is shutting down; start `window_zones run`")
                             } else {
-                                loop {
-                                    if stop.load(Ordering::Acquire) {
-                                        break Response::error("running session is shutting down");
-                                    }
-                                    match response.recv_timeout(IO_TIMEOUT) {
-                                        Ok(response) => break response,
-                                        Err(mpsc::RecvTimeoutError::Disconnected) => break Response::error("running session stopped before dispatch"),
-                                        Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => break Response::error("dispatch timed out; an action already started may have run; inspect the window before retrying"),
-                                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                                    }
-                                }
+                                pending.push(PendingResponse {
+                                    client: client.to_path_buf(),
+                                    response,
+                                    deadline,
+                                });
+                                continue;
                             }
                         }
                     }
                 };
-                let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"success\":false,\"output\":\"Error: cannot encode dispatch response\\n\"}".to_vec());
-                if response.len() <= MAX_RESPONSE {
-                    let _ = owned.socket.send_to(&response, client);
-                } else {
-                    let _ = owned.socket.send_to(b"{\"success\":false,\"output\":\"Error: dispatch report exceeds local response limit\\n\"}", client);
-                }
+                send_response(&owned.socket, client, response);
+            }
+            for request in pending {
+                send_response(&owned.socket, &request.client, Response::error("running session is shutting down"));
             }
         })?;
         Ok(Self {
@@ -625,6 +644,34 @@ mod tests {
                 .is_symlink()
         );
         assert!(witness.is_dir());
+    }
+
+    #[test]
+    fn a_pending_action_does_not_delay_receiving_the_next_request() {
+        let dir = TestDirectory::new();
+        let lock_path = dir.0.join("instance.lock");
+        let lock = crate::acquire_instance_lock(&lock_path).unwrap();
+        let identity = Identity::new("sway", &dir.0.join("config.toml")).unwrap();
+        let (tx, receiver) = mpsc::channel();
+        let server = Server::start(&lock, identity.clone(), tx).unwrap();
+        let first_path = lock_path.clone();
+        let first_identity = identity.clone();
+        let first = thread::spawn(move || dispatch(&first_path, first_identity, "Ctrl+Alt+Left"));
+        let first_request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = thread::spawn(move || dispatch(&lock_path, identity, "Ctrl+Alt+Right"));
+        let second_request = receiver.recv_timeout(Duration::from_secs(2));
+        drop(server);
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        assert!(
+            second_request.is_ok(),
+            "a pending action blocked the next request"
+        );
+        assert!(matches!(
+            first_request.instruction,
+            RuntimeInstruction::Dispatch(_)
+        ));
     }
 
     #[test]
