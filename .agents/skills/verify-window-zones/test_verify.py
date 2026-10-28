@@ -175,13 +175,24 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
                 assert checkout.build_status().startswith("stale:"), f"removed {source.name} accepted as proof"
         finally:
             source.write_bytes(original)
-    added = checkout.skill / "wz_verify" / "new_journey.py"
-    try:
-        added.write_text("# newly added verification implementation\n")
-        assert checkout.build_status().startswith("stale:"), "new module accepted with old proof"
-    finally:
-        added.unlink()
-    assert checkout.build_status() == "current"
+    for relative in ("wz_verify/new_journey.py", "src/application/session/probe.rs",
+                     "scripts/smoke/native/probe.sh", "scripts/smoke/fixtures/probe.js"):
+        added = checkout.skill / relative if relative.startswith("wz_verify/") else checkout.root / relative
+        added.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            added.write_bytes(b"initial extracted input\n")
+            assert checkout.build_status().startswith("stale:"), f"new {relative} accepted with old proof"
+            recorded, _ = checkout.inputs()
+            save(checkout.stamp, {"inputs": recorded, "binaries": {checkout.binary.name: digest(checkout.binary)}})
+            assert checkout.build_status() == "current"
+            added.write_bytes(b"changed extracted input\n")
+            assert checkout.build_status().startswith("stale:"), f"changed {relative} accepted with old proof"
+            added.unlink()
+            assert checkout.build_status().startswith("stale:"), f"removed {relative} accepted with old proof"
+        finally:
+            added.unlink(missing_ok=True)
+            save(checkout.stamp, {"inputs": fingerprint, "binaries": {checkout.binary.name: digest(checkout.binary)}})
+        assert checkout.build_status() == "current"
 
     # Cleaning one workspace must not remove another workspace's profile or proof.
     other = Workspace(workspace.root, base=base / "other", scratch=base / "other-scratch")

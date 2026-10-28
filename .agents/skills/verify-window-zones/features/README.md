@@ -5,6 +5,7 @@ Maintained source for user-facing verification journeys. Read the index, then th
 ## Baseline preconditions
 
 - Complete the skill's [Launch](../SKILL.md#launch) and [Doctor](../SKILL.md#doctor) steps first; they define `V`, checkout ownership and build freshness.
+- New or moved modules and fixture assets under `src/` and `scripts/` are build-freshness inputs. Relaunch after extraction; old proof cannot verify the new layout.
 - The isolated TOML has Left → left-half, Up → center-third, Right → left-two-thirds, Down → next display, Shift+Right → previous display; each uses Alt+Ctrl.
 - Restore `"$V" drive config valid` before a baseline journey. Each CLI/PTY drive starts a new process; mutations persist in the profile's file, not runtime memory.
 - Dry-run's fixed display is 1920×1080 at (0,0), with a second 1280×1024 display at (1920,0); it does not move OS windows. Native smoke uses its own fixtures and observations.

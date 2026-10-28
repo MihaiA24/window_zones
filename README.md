@@ -42,6 +42,14 @@ The platform-neutral core and runtime paths currently include:
 - opt-in `--log-file PATH` timestamped session events, with nonfatal sink failures and restart-safe append; see [session logging](docs/runbooks/running.md#session-event-logging).
 - opt-in `--perf-log PATH` JSONL profiling for dispatch/transition timing and Linux process RSS/peak RSS; see [profiling commands and measurement scope](docs/runbooks/running.md#performance-logging).
 
+## Source layout
+
+- `src/main.rs` delegates to the binary-private `src/application/` composition root. CLI parsing, backend selection, session lifecycle, control surfaces, ownership and notifications have separate modules.
+- `src/kwin_integration.rs` preserves the public KWin interface; `src/kwin_integration/` separates client adapters, protocol, companion state, D-Bus dispatch and native shortcut handling.
+- `scripts/smoke.sh` remains the smoke entry point. `scripts/smoke/` holds shared helpers and platform journeys; `fixtures/` holds literal generated helper programs.
+
+The executable still owns one runtime, one library `App` and one instruction queue. Module boundaries do not add service layers or change public commands and library imports.
+
 ## V1 verification
 
 - Blocking Release gates: GNOME Wayland (`./scripts/smoke.sh gnome` in a Synthetic session plus `./scripts/smoke.sh gnome-live` on the seated session) and Linux X11 (`./scripts/smoke.sh x11`), each including the TUI lifecycle Smoke run.

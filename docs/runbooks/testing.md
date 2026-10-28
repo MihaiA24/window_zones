@@ -11,14 +11,15 @@ What this verifies:
 - `cargo fmt --all -- --check` (formatting)
 - `cargo test --locked` (unit + integration + doc tests)
 - `cargo clippy --locked --all-targets --all-features` (only if clippy is installed)
-- `bash -n scripts/*.sh` (shell syntax, including the Smoke harness)
+- `bash -n` for every `scripts/**/*.sh` file, including sourced smoke modules and shell fixtures
 - `node --check gnome-extension/extension.js`
 - `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
 - `node --check kwin-script/contents/code/main.js`
 - `bash scripts/test-install.sh` (isolated installer/service ownership and lifecycle)
 - `node kwin-script/tests/run.js` and `qmllint kwin-script/contents/code/main.js` when available (native Qt syntax)
-- Python parsing of `scripts/gnome-smoke.py`
-- Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
+- module-aware Node syntax checks for JavaScript fixtures under `scripts/` and `src/`
+- Python parsing of every `scripts/**/*.py` file, including extracted smoke fixtures
+- Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness after nested Rust/shell/fixture additions, edits and removals, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
 
 The GNOME and KDE adapter contract tests use fake compositor services on private
 `dbus-daemon` instances; KWin controller ownership is also checked through the real
@@ -28,6 +29,12 @@ Rust dispatcher. Neither requires a running compositor session.
 
 For checkout-owned launches, drives, fixed-oracle checks, performance measurement and evidence,
 follow the [verification skill](../../.agents/skills/verify-window-zones/SKILL.md) and [feature map](../../.agents/skills/verify-window-zones/features/README.md).
+
+`scripts/smoke.sh` is the public dispatcher. Its sourced modules under
+`scripts/smoke/` share the entry point's paths, process ownership and assertion
+state; do not execute them separately. Literal generated helpers live in
+`scripts/smoke/fixtures/`. The native gate builds the Rust seam helper against the
+public crate API using the repository lockfile.
 
 For direct smoke-runner integrations, `WINDOW_ZONES_BINARY` pins the app binary,
 `WINDOW_ZONES_SMOKE_ROOT` selects a new absolute scratch directory, and

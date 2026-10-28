@@ -5,7 +5,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
-bash -n "$PROJECT_ROOT"/scripts/*.sh
+find "$SCRIPT_DIR" -type f -name '*.sh' -print0 |
+  while IFS= read -r -d '' script; do
+    bash -n "$script"
+  done
 bash "$PROJECT_ROOT/scripts/test-install.sh"
 node --check "$PROJECT_ROOT/gnome-extension/extension.js"
 if command -v gjs >/dev/null 2>&1; then
@@ -13,7 +16,17 @@ if command -v gjs >/dev/null 2>&1; then
 fi
 node --check "$PROJECT_ROOT/kwin-script/contents/code/main.js"
 node "$PROJECT_ROOT/kwin-script/tests/run.js"
-/usr/bin/python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/gnome-smoke.py").read_text())'
+find "$SCRIPT_DIR" "$PROJECT_ROOT/src" -type f -name '*.js' -print0 |
+  while IFS= read -r -d '' fixture; do
+    node --input-type=module --check < "$fixture"
+  done
+/usr/bin/python3 - <<'PY'
+import ast
+from pathlib import Path
+
+for path in Path("scripts").rglob("*.py"):
+    ast.parse(path.read_text(), filename=str(path))
+PY
 # node accepts syntax QJSEngine rejects (object spread); qmllint is Qt's own parser.
 if command -v qmllint >/dev/null 2>&1; then
   qmllint "$PROJECT_ROOT/kwin-script/contents/code/main.js"
