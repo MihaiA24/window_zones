@@ -123,27 +123,6 @@ impl WindowsWindowSystem {
         }
         .map_err(|error| Self::window_error(hwnd, id, format!("SetWindowPos failed: {error}")))
     }
-
-    fn collect_displays() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-        let mut displays = Vec::<DisplayGeometry>::new();
-
-        let result = unsafe {
-            EnumDisplayMonitors(
-                HDC::default(),
-                None,
-                Some(monitor_enum_callback),
-                LPARAM(&mut displays as *mut _ as isize),
-            )
-        };
-
-        if !result.as_bool() {
-            return Err(WindowSystemError::Platform(
-                "EnumDisplayMonitors failed".to_string(),
-            ));
-        }
-
-        Ok(displays)
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -168,7 +147,24 @@ impl WindowSystem for WindowsWindowSystem {
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
         self.dpi_status()?;
-        Self::collect_displays()
+        let mut displays = Vec::<DisplayGeometry>::new();
+
+        let result = unsafe {
+            EnumDisplayMonitors(
+                HDC::default(),
+                None,
+                Some(monitor_enum_callback),
+                LPARAM(&mut displays as *mut _ as isize),
+            )
+        };
+
+        if !result.as_bool() {
+            return Err(WindowSystemError::Platform(
+                "EnumDisplayMonitors failed".to_string(),
+            ));
+        }
+
+        Ok(displays)
     }
 
     fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {

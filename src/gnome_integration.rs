@@ -84,7 +84,7 @@ struct WindowConnection {
     has_transition: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GnomeWindowSystem {
     bus_address: Option<String>,
     cache: Arc<Mutex<Option<WindowConnection>>>,
@@ -102,10 +102,7 @@ impl fmt::Debug for GnomeWindowSystem {
 
 impl GnomeWindowSystem {
     pub fn new() -> Self {
-        Self {
-            bus_address: None,
-            cache: Arc::new(Mutex::new(None)),
-        }
+        Self::default()
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, GnomeIntegrationError> {
@@ -168,12 +165,6 @@ impl GnomeWindowSystem {
                 .method_call(GNOME_INTERFACE, method, args)
                 .map_err(classify_dbus_error)
         })
-    }
-}
-
-impl Default for GnomeWindowSystem {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -304,6 +295,7 @@ impl WindowSystem for GnomeWindowSystem {
     }
 }
 
+#[derive(Default)]
 pub struct GnomeHotkeySystem {
     bus_address: Option<String>,
     connection: Option<Connection>,
@@ -326,23 +318,14 @@ impl fmt::Debug for GnomeHotkeySystem {
 
 impl GnomeHotkeySystem {
     pub fn new() -> Self {
-        Self {
-            bus_address: None,
-            connection: None,
-            capabilities: None,
-            events: Arc::new(Mutex::new(VecDeque::new())),
-            service_lost: Arc::new(AtomicBool::new(false)),
-        }
+        Self::default()
     }
 
     #[cfg(test)]
     fn with_bus_address(bus_address: impl Into<String>) -> Self {
         Self {
             bus_address: Some(bus_address.into()),
-            connection: None,
-            capabilities: None,
-            events: Arc::new(Mutex::new(VecDeque::new())),
-            service_lost: Arc::new(AtomicBool::new(false)),
+            ..Self::new()
         }
     }
 
@@ -397,14 +380,18 @@ impl GnomeHotkeySystem {
             self.connect()?;
         }
 
-        self.connection
-            .as_ref()
-            .ok_or_else(|| GnomeIntegrationError::Unavailable {
-                message: "D-Bus connection was not established".to_string(),
-            })
+        Ok(self.connection.as_ref().unwrap())
     }
 
-    fn call_register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), GnomeIntegrationError> {
+    fn reset_connection(&mut self) {
+        self.connection = None;
+        self.capabilities = None;
+        self.events.lock().clear();
+    }
+}
+
+impl HotkeySystem for GnomeHotkeySystem {
+    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         let result = (|| {
             self.ensure_connection()?;
             if self.capabilities.is_none() {
@@ -415,8 +402,11 @@ impl GnomeHotkeySystem {
 
             let proxy = connection.with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
             proxy
-                .method_call(GNOME_INTERFACE, "RegisterHotkeys", (hotkeys.to_vec(),))
-                .map(|(): ()| ())
+                .method_call::<(), _, _, _>(
+                    GNOME_INTERFACE,
+                    "RegisterHotkeys",
+                    (dbus::arg::Array::new(hotkeys),),
+                )
                 .map_err(classify_dbus_error)
         })();
 
@@ -428,25 +418,7 @@ impl GnomeHotkeySystem {
             }
         }
 
-        result
-    }
-    fn reset_connection(&mut self) {
-        self.connection = None;
-        self.capabilities = None;
-        self.events.lock().clear();
-    }
-}
-
-impl Default for GnomeHotkeySystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HotkeySystem for GnomeHotkeySystem {
-    fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        self.call_register_hotkeys(hotkeys)
-            .map_err(GnomeIntegrationError::into_hotkey_error)
+        result.map_err(GnomeIntegrationError::into_hotkey_error)
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {

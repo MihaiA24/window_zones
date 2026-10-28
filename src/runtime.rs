@@ -220,19 +220,6 @@ pub enum RuntimeEvent {
     },
 }
 
-impl RuntimeEvent {
-    /// Whether the event reports something the user has to act on.
-    pub fn is_problem(&self) -> bool {
-        matches!(
-            self,
-            Self::ConfigFailed { .. }
-                | Self::ConfigRejected { .. }
-                | Self::HotkeysRejected { .. }
-                | Self::HotkeysUnavailable { .. }
-        )
-    }
-}
-
 impl fmt::Display for RuntimeEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

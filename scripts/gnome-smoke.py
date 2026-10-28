@@ -62,8 +62,6 @@ def test_window(title):
             window.set_resizable(False)
             # Wayland size limits apply on surface commit; redraw this undecorated fixture.
             status.set_label('Resizing disabled')
-        elif line == 'present':
-            window.present()
         elif line == 'quit':
             loop.quit()
             return GLib.SOURCE_REMOVE

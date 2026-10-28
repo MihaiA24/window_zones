@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Integer pixel rectangle in global desktop coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

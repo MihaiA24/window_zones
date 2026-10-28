@@ -1,37 +1,24 @@
-#[cfg(target_os = "linux")]
 use crate::{
     DisplayGeometry, FocusedWindow, Rect, WindowId, WindowMove, WindowSystem, WindowSystemError,
 };
 
-#[cfg(target_os = "linux")]
 use std::convert::TryFrom;
 
-#[cfg(target_os = "linux")]
 mod hotkeys;
-#[cfg(target_os = "linux")]
 pub use hotkeys::X11HotkeySystem;
 
-#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
-#[cfg(target_os = "linux")]
 use x11rb::errors::ReplyError;
-#[cfg(target_os = "linux")]
 use x11rb::protocol::ErrorKind;
-#[cfg(target_os = "linux")]
 use x11rb::protocol::randr::{ConnectionExt as RandrConnectionExt, MonitorInfo};
-#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt as XProtoConnectionExt, Window};
-#[cfg(target_os = "linux")]
 use x11rb::rust_connection::RustConnection;
 
-#[cfg(target_os = "linux")]
 const ACTIVE_WINDOW_ATOM: &str = "_NET_ACTIVE_WINDOW";
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub struct X11WindowSystem;
 
-#[cfg(target_os = "linux")]
 impl X11WindowSystem {
     pub fn new() -> Self {
         Self
@@ -195,7 +182,6 @@ impl X11WindowSystem {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl WindowSystem for X11WindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
         let (conn, screen_index) = Self::connect()?;
@@ -347,7 +333,6 @@ impl WindowSystem for X11WindowSystem {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn frame_target_size(
     target: Rect,
     [left, right, top, bottom]: [u32; 4],
@@ -369,7 +354,6 @@ fn frame_target_size(
     Ok((width, height))
 }
 
-#[cfg(target_os = "linux")]
 fn is_fixed_size(hints: &[u32]) -> bool {
     const MIN_AND_MAX_SIZE: u32 = (1 << 4) | (1 << 5);
     hints.len() >= 9
@@ -380,7 +364,6 @@ fn is_fixed_size(hints: &[u32]) -> bool {
         && hints[6] == hints[8]
 }
 
-#[cfg(target_os = "linux")]
 /// RandR monitor usable areas, with EWMH dock/panel reservations removed.
 fn collect_displays(
     conn: &RustConnection,
@@ -427,7 +410,6 @@ fn collect_displays(
     Ok(displays)
 }
 
-#[cfg(target_os = "linux")]
 fn monitor_to_display(index: usize, monitor: MonitorInfo) -> DisplayGeometry {
     let id = monitor_id(monitor.name).unwrap_or_else(|| format!("x11-monitor-{index}"));
     DisplayGeometry::new(
@@ -441,7 +423,6 @@ fn monitor_to_display(index: usize, monitor: MonitorInfo) -> DisplayGeometry {
     )
 }
 
-#[cfg(target_os = "linux")]
 fn monitor_id(name_atom: x11rb::protocol::xproto::Atom) -> Option<String> {
     if name_atom == 0 {
         None
@@ -450,7 +431,6 @@ fn monitor_id(name_atom: x11rb::protocol::xproto::Atom) -> Option<String> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn intern_atom(conn: &RustConnection, name: &str) -> Result<u32, WindowSystemError> {
     conn.intern_atom(false, name.as_bytes())
         .map_err(|error| WindowSystemError::Platform(format!("failed to intern {name}: {error}")))?
@@ -461,7 +441,6 @@ fn intern_atom(conn: &RustConnection, name: &str) -> Result<u32, WindowSystemErr
         })
 }
 
-#[cfg(target_os = "linux")]
 fn window_reply_error(window: Window, operation: &str, error: ReplyError) -> WindowSystemError {
     if matches!(&error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Window) {
         WindowSystemError::WindowGone(WindowId::new(window.to_string()))
@@ -470,7 +449,6 @@ fn window_reply_error(window: Window, operation: &str, error: ReplyError) -> Win
     }
 }
 
-#[cfg(target_os = "linux")]
 fn property_values(
     conn: &RustConnection,
     window: Window,
@@ -490,7 +468,6 @@ fn property_values(
         .unwrap_or_default())
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct Strut {
     edges: [u32; 4],
@@ -498,7 +475,6 @@ struct Strut {
     ranges: [u32; 8],
 }
 
-#[cfg(target_os = "linux")]
 impl Strut {
     fn from_values(values: &[u32], root_width: u32, root_height: u32) -> Option<Self> {
         let edges = values.get(..4)?.try_into().ok()?;
@@ -520,7 +496,6 @@ impl Strut {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn collect_struts(
     conn: &RustConnection,
     root: Window,
@@ -559,26 +534,22 @@ fn collect_struts(
             Err(WindowSystemError::WindowGone(_)) => continue,
             Err(error) => return Err(error),
         };
-        if partial.len() == 12 {
-            if let Some(strut) = Strut::from_values(&partial, root_width, root_height) {
-                struts.push(strut);
-            }
+        let values = if partial.len() == 12 {
+            partial
         } else {
-            let legacy = match property_values(conn, window, "_NET_WM_STRUT", AtomEnum::CARDINAL, 4)
-            {
+            match property_values(conn, window, "_NET_WM_STRUT", AtomEnum::CARDINAL, 4) {
                 Ok(values) => values,
                 Err(WindowSystemError::WindowGone(_)) => continue,
                 Err(error) => return Err(error),
-            };
-            if let Some(strut) = Strut::from_values(&legacy, root_width, root_height) {
-                struts.push(strut);
             }
+        };
+        if let Some(strut) = Strut::from_values(&values, root_width, root_height) {
+            struts.push(strut);
         }
     }
     Ok(struts)
 }
 
-#[cfg(target_os = "linux")]
 fn usable_area(bounds: Rect, root_width: u32, root_height: u32, struts: &[Strut]) -> Rect {
     let x = i64::from(bounds.x);
     let y = i64::from(bounds.y);
@@ -614,7 +585,7 @@ fn usable_area(bounds: Rect, root_width: u32, root_height: u32, struts: &[Strut]
     )
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -701,7 +672,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 #[test]
 fn x11_frame_target_keeps_decoration_space_and_rejects_empty_content() {
     assert_eq!(

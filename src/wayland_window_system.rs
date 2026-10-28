@@ -12,7 +12,6 @@ use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -39,18 +38,6 @@ pub struct WaylandWindowSystem {
 impl WaylandWindowSystem {
     pub fn new(compositor: ScriptedCompositor) -> Self {
         Self { compositor }
-    }
-
-    fn session_error_for(is_wayland: bool) -> WindowSystemError {
-        if is_wayland {
-            WindowSystemError::Platform(
-                "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), KDE Plasma (KDE_FULL_SESSION/KDE_SESSION_VERSION or KDE desktop variables), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
-            )
-        } else {
-            WindowSystemError::Platform(
-                "Wayland adapter can only be used when XDG_SESSION_TYPE=wayland or WAYLAND_DISPLAY is set".to_string(),
-            )
-        }
     }
 }
 
@@ -102,33 +89,25 @@ struct SwayTreeNode {
     #[serde(default)]
     fullscreen_mode: u32,
     #[serde(default)]
-    rect: SwayRect,
+    rect: Rect,
     #[serde(default)]
     nodes: Vec<SwayTreeNode>,
     #[serde(default, rename = "floating_nodes")]
     floating_nodes: Vec<SwayTreeNode>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct SwayRect {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-}
-
 #[derive(Debug, Deserialize)]
 struct SwayOutput {
     name: String,
     active: bool,
-    rect: SwayRect,
+    rect: Rect,
 }
 
 #[derive(Debug, Deserialize)]
 struct SwayWorkspace {
     output: String,
     visible: bool,
-    rect: SwayRect,
+    rect: Rect,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,9 +152,10 @@ fn is_wayland_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsStr
 fn resolve_wayland_backend_with_env(
     get_env: impl for<'a> Fn(&'a str) -> Option<OsString>,
 ) -> Result<WaylandBackend, WindowSystemError> {
-    let is_wayland = is_wayland_session_with_env(&get_env);
-    if !is_wayland {
-        return Err(WaylandWindowSystem::session_error_for(is_wayland));
+    if !is_wayland_session_with_env(&get_env) {
+        return Err(WindowSystemError::Platform(
+            "Wayland adapter can only be used when XDG_SESSION_TYPE=wayland or WAYLAND_DISPLAY is set".to_string(),
+        ));
     }
 
     let gnome = is_gnome_session_with_env(&get_env);
@@ -220,7 +200,9 @@ fn resolve_wayland_backend_with_env(
         ));
     }
 
-    Err(WaylandWindowSystem::session_error_for(is_wayland))
+    Err(WindowSystemError::Platform(
+        "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), KDE Plasma (KDE_FULL_SESSION/KDE_SESSION_VERSION or KDE desktop variables), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
+    ))
 }
 
 fn is_gnome_session_with_env(get_env: impl for<'a> Fn(&'a str) -> Option<OsString>) -> bool {
@@ -275,7 +257,7 @@ fn sway_focused_window(tree: &SwayTree) -> Option<FocusedWindow> {
         .or_else(|| find_focused_sway_node(&tree.floating_nodes))?;
     Some(FocusedWindow::new(
         WindowId::new(focused.id?.to_string()),
-        focused.rect.to_rect(),
+        focused.rect,
     ))
 }
 
@@ -302,8 +284,7 @@ fn sway_displays(outputs: Vec<SwayOutput>, workspaces: &[SwayWorkspace]) -> Vec<
             let usable_area = workspaces
                 .iter()
                 .find(|workspace| workspace.visible && workspace.output == output.name)
-                .map_or(&output.rect, |workspace| &workspace.rect)
-                .to_rect();
+                .map_or(output.rect, |workspace| workspace.rect);
             DisplayGeometry::new(output.name, usable_area)
         })
         .collect()
@@ -329,7 +310,7 @@ fn move_window_sway_with(
         let (window, _, _) = find_sway_window(&tree.nodes, id, false, false)
             .or_else(|| find_sway_window(&tree.floating_nodes, id, true, false))
             .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
-        checked_scripted_frame(window.rect.to_rect(), &window_move.window)
+        checked_scripted_frame(window.rect, &window_move.window)
     });
     finish_scripted_move(window_move, initial, result, observed)
 }
@@ -353,7 +334,7 @@ fn sway_move_command(
             "Sway window is fullscreen; leave fullscreen first".to_string(),
         ));
     }
-    let initial = checked_scripted_frame(window.rect.to_rect(), &window_move.window)?;
+    let initial = checked_scripted_frame(window.rect, &window_move.window)?;
 
     let mut command = String::new();
     if !floating {
@@ -376,7 +357,8 @@ fn sway_move_command(
 }
 
 fn focused_window_hypr() -> Result<Option<FocusedWindow>, WindowSystemError> {
-    Ok(hypr_activewindow()?.and_then(hypr_focused_window))
+    let output = run_command_capture("hyprctl", &["activewindow", "-j"], "hyprctl activewindow")?;
+    Ok(parse_hypr_activewindow(&output)?.and_then(hypr_focused_window))
 }
 
 fn hypr_focused_window(window: HyprWindow) -> Option<FocusedWindow> {
@@ -385,11 +367,6 @@ fn hypr_focused_window(window: HyprWindow) -> Option<FocusedWindow> {
         return None;
     }
     Some(FocusedWindow::new(WindowId::new(window.address), geometry))
-}
-
-fn hypr_activewindow() -> Result<Option<HyprWindow>, WindowSystemError> {
-    let output = run_command_capture("hyprctl", &["activewindow", "-j"], "hyprctl activewindow")?;
-    parse_hypr_activewindow(&output)
 }
 
 fn parse_hypr_activewindow(output: &str) -> Result<Option<HyprWindow>, WindowSystemError> {
@@ -754,12 +731,6 @@ fn command_exists(command: &str) -> bool {
 
             metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0)
         })
-}
-
-impl SwayRect {
-    fn to_rect(&self) -> Rect {
-        Rect::new(self.x, self.y, self.width, self.height)
-    }
 }
 
 impl HyprWindow {

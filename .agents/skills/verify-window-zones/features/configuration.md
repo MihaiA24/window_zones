@@ -22,11 +22,10 @@ Preconditions:
 
 - Baseline profile/current build and valid seed. Only the private config may be edited.
 
-- **Maintained matrix first.** `"$V" check sessions` runs both modes, both reload/watch journeys and cancel through all backend-flag/config-entry combinations, checks in-process action reset and unchanged final config content, then compares a fresh-process dispatch against the fixed oracle. Use the individual recipes below only for uncovered paths or diagnosis.
+- **Maintained matrix first.** Start with [`check sessions`](../SKILL.md#checks) for the full mode × reload/watcher/cancel × backend-flag/config-entry matrix and fresh-process persistence checks. Use individual recipes below only for uncovered paths or diagnosis.
 - **Explicit-path TUI.** `"$V" drive session --mode tui --journey reload` loads five bindings, dispatches Left, edits to one right-half binding, waits for the displayed replacement, writes invalid TOML, waits for an Error while retaining right-half, dispatches the retained binding, then observes empty, missing, recovery and restart.
 - **CLI loop.** `"$V" drive session --mode run --journey reload` drives the same sequence with `config state`/`binding count` observations and successful retained dispatch.
 - **Watcher entry.** `"$V" drive session --mode run --journey watcher` and `"$V" drive session --mode tui --journey watcher` edit each file state and poll the resulting status without an explicit reload during those transitions.
-- **Discovery/flag matrix.** Run both recipes with each combination of default flags, `--discovery`, `--backend-flag alias`, and `--backend-flag alias --discovery` when affected. These are eight distinct mode × config-entry × backend-flag journeys; one is not evidence for another.
 - **Cold-start empty/error.** `"$V" drive config missing`, then `"$V" drive cli --discovery --expect 'config state: Missing' --expect 'binding count: 0' -- status`. Repeat with `empty` expecting Loaded/count 0; `invalid` expecting Error/count 0. Restore `drive config valid`.
 - **Persistence.** `"$V" drive config changed`, then `"$V" drive cli --expect 'last move: x=960 y=0 w=960 h=1080' -- dispatch Alt+Ctrl+Left` in a new process. Repeat status expecting count 1. This confirms disk contents, not only a live runtime cache. Restore valid afterward.
 - **Cancel.** `"$V" drive session --mode tui --command status --expect 'Config:' --quit eof` exits without an edit; compare the recorded config hashes. There is no config-edit dialog to cancel, so cancellation leaves the file unchanged.

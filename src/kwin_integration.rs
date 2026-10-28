@@ -317,14 +317,9 @@ impl KwinHotkeySystem {
         }
     }
 
-    fn connect(&mut self) -> Result<(), KwinIntegrationError> {
-        self.connection = Some(connect(self.bus_address.as_deref())?);
-        Ok(())
-    }
-
     fn ensure_connection(&mut self) -> Result<&Connection, KwinIntegrationError> {
         if self.connection.is_none() {
-            self.connect()?;
+            self.connection = Some(connect(self.bus_address.as_deref())?);
         }
 
         self.connection
@@ -332,10 +327,6 @@ impl KwinHotkeySystem {
             .ok_or_else(|| KwinIntegrationError::Unavailable {
                 message: "D-Bus connection was not established".to_string(),
             })
-    }
-
-    fn reset_connection(&mut self) {
-        self.connection = None;
     }
 
     fn call_register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), KwinIntegrationError> {
@@ -360,7 +351,7 @@ impl KwinHotkeySystem {
         if let Err(error) = &result
             && error.should_reconnect()
         {
-            self.reset_connection();
+            self.connection = None;
         }
 
         result
@@ -392,7 +383,7 @@ impl HotkeySystem for KwinHotkeySystem {
         })();
 
         if result.is_err() {
-            self.reset_connection();
+            self.connection = None;
         }
 
         result
@@ -536,7 +527,7 @@ fn classify_dbus_error(error: dbus::Error) -> KwinIntegrationError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum CompanionRequest {
     Move {
         id: u32,
@@ -579,9 +570,8 @@ struct PendingNextRequest {
     deadline: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct CompanionState {
-    script_ready: bool,
     script_sender: Option<String>,
     controller_sender: Option<String>,
     last_seen: Option<Instant>,
@@ -590,30 +580,10 @@ struct CompanionState {
     requests: VecDeque<CompanionRequest>,
     claimed_requests: HashSet<u32>,
     results: HashMap<u32, RequestResult>,
-    next_request_id: u32,
+    last_request_id: u32,
     pending_next_request: Option<PendingNextRequest>,
     registered_hotkeys: Vec<String>,
     events: VecDeque<String>,
-}
-
-impl Default for CompanionState {
-    fn default() -> Self {
-        Self {
-            script_ready: false,
-            script_sender: None,
-            controller_sender: None,
-            last_seen: None,
-            focused: None,
-            displays: Vec::new(),
-            requests: VecDeque::new(),
-            claimed_requests: HashSet::new(),
-            results: HashMap::new(),
-            next_request_id: 1,
-            pending_next_request: None,
-            registered_hotkeys: Vec::new(),
-            events: VecDeque::new(),
-        }
-    }
 }
 
 impl CompanionState {
@@ -629,26 +599,19 @@ impl CompanionState {
                 "unsupported KWin companion protocol major",
             ));
         }
-        if !reset_state
-            && self.script_ready
-            && self.script_sender.as_deref() == Some(script_sender.as_str())
-        {
+        if !reset_state && self.script_sender.as_deref() == Some(script_sender.as_str()) {
             self.touch();
             return Ok(());
         }
 
-        let previous_controller = self.controller_sender.clone();
-        let previous_hotkeys = self.registered_hotkeys.clone();
-        self.script_ready = true;
+        let previous_hotkeys = std::mem::take(&mut self.registered_hotkeys);
         self.script_sender = Some(script_sender);
-        self.controller_sender = previous_controller;
         self.last_seen = Some(Instant::now());
         self.focused = None;
         self.displays.clear();
         self.requests.clear();
         self.claimed_requests.clear();
         self.results.clear();
-        self.registered_hotkeys.clear();
         self.events.clear();
         // A reconnecting script may still own keys after the companion lost its state.
         if !previous_hotkeys.is_empty() || !reset_state {
@@ -658,7 +621,7 @@ impl CompanionState {
     }
 
     fn ensure_ready(&mut self) -> Result<(), MethodErr> {
-        if self.script_ready
+        if self.script_sender.is_some()
             && self
                 .last_seen
                 .is_some_and(|last_seen| last_seen.elapsed() <= COMPANION_HEARTBEAT_TIMEOUT)
@@ -666,7 +629,6 @@ impl CompanionState {
             return Ok(());
         }
 
-        self.script_ready = false;
         self.script_sender = None;
         self.requests.clear();
         self.claimed_requests.clear();
@@ -710,7 +672,6 @@ impl CompanionState {
 
     fn owner_lost(&mut self, owner: &str) {
         if self.script_sender.as_deref() == Some(owner) {
-            self.script_ready = false;
             self.script_sender = None;
             self.requests.clear();
             self.claimed_requests.clear();
@@ -725,7 +686,7 @@ impl CompanionState {
             self.results.clear();
             self.registered_hotkeys.clear();
             self.events.clear();
-            if self.script_ready {
+            if self.script_sender.is_some() {
                 self.enqueue_hotkeys(Vec::new());
             }
         }
@@ -736,9 +697,8 @@ impl CompanionState {
     }
 
     fn next_request_id(&mut self) -> u32 {
-        let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        id
+        self.last_request_id = self.last_request_id.wrapping_add(1).max(1);
+        self.last_request_id
     }
     fn enqueue_move(&mut self, window: String, x: i32, y: i32, width: u32, height: u32) -> u32 {
         let id = self.next_request_id();
@@ -778,7 +738,6 @@ impl CompanionState {
             .requests
             .iter()
             .find(|request| !self.claimed_requests.contains(&request.id()))
-            .cloned()
         else {
             return Ok((
                 0,
@@ -802,17 +761,17 @@ impl CompanionState {
                 width,
                 height,
             } => (
-                id,
+                *id,
                 REQUEST_MOVE.to_string(),
-                window,
-                x,
-                y,
-                width,
-                height,
+                window.clone(),
+                *x,
+                *y,
+                *width,
+                *height,
                 "[]".to_string(),
             ),
             CompanionRequest::RefreshDisplays { id } => (
-                id,
+                *id,
                 REQUEST_REFRESH_DISPLAYS.to_string(),
                 String::new(),
                 0,
@@ -822,14 +781,14 @@ impl CompanionState {
                 "[]".to_string(),
             ),
             CompanionRequest::RegisterHotkeys { id, hotkeys, .. } => (
-                id,
+                *id,
                 REQUEST_REGISTER_HOTKEYS.to_string(),
                 String::new(),
                 0,
                 0,
                 0,
                 0,
-                serde_json::to_string(&hotkeys).map_err(|_| {
+                serde_json::to_string(hotkeys).map_err(|_| {
                     method_error(
                         "org.window_zones.KWin.Error.Operation",
                         "failed to encode hotkey request payload",
@@ -1077,19 +1036,9 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                             let mut state = focused_state.lock();
                             state.ensure_ready()?;
                             let mut reply = method.msg.method_return();
-                            match &state.focused {
-                                Some((id, x, y, width, height)) => {
-                                    reply.append_all((true, id.clone(), *x, *y, *width, *height))
-                                }
-                                None => reply.append_all((
-                                    false,
-                                    String::new(),
-                                    0_i32,
-                                    0_i32,
-                                    0_u32,
-                                    0_u32,
-                                )),
-                            }
+                            let present = state.focused.is_some();
+                            let (id, x, y, width, height) = state.focused.clone().unwrap_or_default();
+                            reply.append_all((present, id, x, y, width, height));
                             Ok(vec![reply])
                         }))
                         .add_m(factory.method("GetDisplays", (), move |method| {
@@ -1295,10 +1244,7 @@ pub fn run_kwin_companion_service() -> Result<(), String> {
                                 None
                             };
                             let mut reply = method.msg.method_return();
-                            match event {
-                                Some(hotkey) => reply.append_all((true, hotkey)),
-                                None => reply.append_all((false, String::new())),
-                            }
+                            reply.append_all((event.is_some(), event.unwrap_or_default()));
                             Ok(vec![reply])
                         })),
                 ),
@@ -2522,6 +2468,32 @@ assert.deepEqual(JSON.parse(messages[0][1]), [['output-1', 0, 0, 1200, 900]]);
     }
 
     #[test]
+    fn request_ids_start_at_one_wrap_and_survive_reconnection() {
+        let mut state = CompanionState::default();
+        state
+            .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
+            .unwrap();
+        for expected in [1, u32::MAX, 1] {
+            if expected == u32::MAX {
+                state.last_request_id = u32::MAX - 1;
+            }
+            assert_eq!(state.enqueue_refresh_displays(), expected);
+            assert_eq!(state.next_request("kwin-script").unwrap().0, expected);
+            state
+                .complete_request(expected, true, String::new(), String::new())
+                .unwrap();
+            assert!(state.request_result(expected).0);
+        }
+
+        state
+            .mark_ready(KWIN_PROTOCOL_MAJOR, "replacement-script".to_string(), true)
+            .unwrap();
+        assert_eq!(state.enqueue_refresh_displays(), 2);
+        assert_eq!(state.next_request("replacement-script").unwrap().0, 2);
+        assert_eq!(state.next_request("replacement-script").unwrap().0, 0);
+    }
+
+    #[test]
     fn rejected_hotkey_registration_keeps_previous_set() {
         let mut state = CompanionState::default();
         state
@@ -2735,7 +2707,6 @@ assert.deepEqual(JSON.parse(messages[0][1]), [['output-1', 0, 0, 1200, 900]]);
             error.errorname().to_string(),
             "org.window_zones.KWin.Error.Incompatible"
         );
-        assert!(!state.script_ready);
     }
 
     #[test]

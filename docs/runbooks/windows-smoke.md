@@ -68,19 +68,11 @@ action = { type = "move-to-previous-display" }
 [System.IO.File]::WriteAllText($config, $configText, [System.Text.UTF8Encoding]::new($false))
 ```
 
-The exact CLI forms used below are:
+For a one-shot action, use `& $bin --backend windows --config $config dispatch "Ctrl+Alt+Left"`. The interactive and tray commands appear in their checks below.
 
-```powershell
-& $bin --backend auto --config $config status
-& $bin --backend windows --config $config dispatch "Ctrl+Alt+Left"
-& $bin --backend windows --config $config run
-& $bin --backend windows --config $config tui
-& $bin --backend windows --config $config --tray run
-```
-
-`dispatch` is useful for a one-shot action, but geometry evidence must be
-collected while the target window is actually focused. The interactive `run`
-session plus a physical key press is the primary zone/display and hotkey check.
+Geometry evidence must be collected while the target window is actually focused.
+The interactive `run` session plus a physical key press is the primary
+zone/display and hotkey check.
 
 ## Geometry observer
 
@@ -274,13 +266,7 @@ successful geometry check, outside the repository.
    rectangle; identify the target display from the new `Screen.FromHandle`
    work area and compare exact integers. Press `Ctrl+Alt+Up` to return and
    record the source/target displays and both expected/observed rectangles.
-   In the observer PowerShell, run the same two commands again to record the
-   target display and the observed frame:
-
-   ```powershell
-   Get-WzWindowWorkArea $target.MainWindowHandle
-   Get-WzWindowRect $target.MainWindowHandle
-   ```
+   Repeat the observer commands from check 3 to record the target display and frame.
 
    This proves display movement against two real monitor work areas, rather
    than relying on the companion's self-reported geometry.

@@ -130,12 +130,8 @@ build_binaries() {
         return
     fi
     local output='' rc=0
-    if output=$(cargo build --locked --manifest-path "$PROJECT_ROOT/Cargo.toml" \
-        --bin window_zones "$@" 2>&1); then
-        rc=0
-    else
-        rc=$?
-    fi
+    output=$(cargo build --locked --manifest-path "$PROJECT_ROOT/Cargo.toml" \
+        --bin window_zones "$@" 2>&1) || rc=$?
     printf '%s\n' "$output" >>"$ASSERT_LOG"
     assert_rc_zero "$gate cargo build" "$rc" "$BIN_PATH"
     return "$rc"
@@ -232,15 +228,6 @@ start_group() {
     printf '%s\n' "$child_pid" >>"$GROUP_PID_FILE"
 }
 
-start_plain() {
-    local log_file=$1
-    shift
-    "$@" >"$log_file" 2>&1 &
-    local pid=$!
-    printf '%s\n' "$pid" >>"$PID_FILE"
-    printf '%s\n' "$pid"
-}
-
 stop_pid() {
     local pid=$1
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
@@ -260,11 +247,7 @@ wait_pid() {
     fi
     # The initial KWin service is an owned descendant of the launcher, not our child.
     [[ "${3:-child}" == external ]] && return 0
-    if wait "$pid"; then
-        return 0
-    else
-        return "$?"
-    fi
+    wait "$pid"
 }
 
 cleanup() {
@@ -449,11 +432,7 @@ x11_geometry_stable() {
 
 x11_inject_hotkey() {
     local key=$1 output='' rc=0
-    if output=$(DISPLAY="$X11_DISPLAY" xdotool key --clearmodifiers "alt+ctrl+$key" 2>&1); then
-        rc=0
-    else
-        rc=$?
-    fi
+    output=$(DISPLAY="$X11_DISPLAY" xdotool key --clearmodifiers "alt+ctrl+$key" 2>&1) || rc=$?
     if [[ -n "$output" ]]; then
         log "X11 XTEST hotkey alt+ctrl+$key: exit $rc output '$output'"
     else
@@ -680,19 +659,6 @@ gnome_live_wait_companion() {
     return 1
 }
 
-gnome_live_wait_companion_gone() {
-    local timeout_s=${1:-10}
-    local deadline=$((SECONDS + timeout_s))
-    while (( SECONDS < deadline )); do
-        service_list=$(DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" busctl --user list 2>&1 || true)
-        if [[ "$service_list" != *'org.window_zones.Gnome'* ]]; then
-            return 0
-        fi
-        sleep 0.2
-    done
-    return 1
-}
-
 gtk_frame_geometry() {
     local display=$1 authority=$2
     local geometry='' key='' value='' x='' y='' width='' height=''
@@ -860,11 +826,7 @@ PY
 gnome_live_inject_hotkey() {
     local output='' rc=0
     write_uinput_injector
-    if output=$(python3 "$UINPUT_INJECTOR" "$GNOME_SAFE_UINPUT_KEY" 2>&1); then
-        rc=0
-    else
-        rc=$?
-    fi
+    output=$(python3 "$UINPUT_INJECTOR" "$GNOME_SAFE_UINPUT_KEY" 2>&1) || rc=$?
     log "GNOME live uinput hotkey $GNOME_SAFE_LEFT_HOTKEY: exit $rc${output:+ output '$output'}"
     return "$rc"
 }
@@ -992,15 +954,11 @@ run_gnome_live_dispatch() {
     local label=$1 hotkey=$2 rc=0
     local out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log"
     gnome_live_activate_window || true
-    if env XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+    env XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
         XDG_RUNTIME_DIR="$GNOME_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         XDG_CONFIG_HOME="$GNOME_CONFIG" XDG_DATA_HOME="$GNOME_DATA" \
         HOME="$GNOME_HOME" XDG_CURRENT_DESKTOP=GNOME GNOME_DESKTOP_SESSION_ID=smoke \
-        "$BIN_PATH" --backend wayland --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
+        "$BIN_PATH" --backend wayland --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1 || rc=$?
     cat "$out" >>"$ASSERT_LOG"
     assert_eq "$label dispatch exit" 0 "$rc"
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
@@ -1018,13 +976,9 @@ run_x11_dispatch() {
     local out="$TMP_DIR/${CURRENT_GATE}-dispatch-${label}.log"
     DISPLAY="$X11_DISPLAY" xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
     log "X11 dispatch $label precondition: active=$(DISPLAY="$X11_DISPLAY" xdotool getactivewindow 2>/dev/null || printf unavailable) geometry=$(x11_geometry)"
-    if env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 XDG_CONFIG_HOME="$X11_CONFIG" \
+    env DISPLAY="$X11_DISPLAY" XDG_SESSION_TYPE=x11 XDG_CONFIG_HOME="$X11_CONFIG" \
         XDG_DATA_HOME="$X11_DATA" HOME="$X11_HOME" "$BIN_PATH" --backend x11 \
-        --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
+        --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1 || rc=$?
     cat "$out" >>"$ASSERT_LOG"
     assert_eq "$label dispatch exit" 0 "$rc"
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(<"$out")"
@@ -1051,11 +1005,8 @@ EOF
 tui_begin() {
     local backend=$1 label=$2 tui_log=$3
     start_fifo_app tui "$backend" "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text "$label TUI starts" 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI starts" 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$tui_log" 'Window Zones TUI' 15 || true
+    assert_text "$label TUI starts" 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
 
     tui_control_checks "$tui_log" "$label"
 }
@@ -1071,27 +1022,19 @@ tui_end() {
     assert_rc_zero "$label TUI quit" "$rc" "tui log $tui_log"
 }
 
-run_tui_lifecycle() {
-    local backend=$1 label=$2
-    local tui_log="$TMP_DIR/${CURRENT_GATE}-${label}-tui.log"
-    tui_begin "$backend" "$label" "$tui_log"
+run_x11_tui_lifecycle() {
+    local tui_log="$TMP_DIR/${CURRENT_GATE}-x11-tui.log"
+    tui_begin x11 x11 "$tui_log"
 
-    if [[ "$backend" == x11 ]]; then
-        run_x11_dispatch tui-baseline alt+ctrl+up
-        x11_assert_geometry 'X11 TUI baseline' '640,0,640,1080'
-    fi
+    run_x11_dispatch tui-baseline alt+ctrl+up
+    x11_assert_geometry 'X11 TUI baseline' '640,0,640,1080'
 
     send_app 'dispatch alt+ctrl+left'
-    if wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8; then
-        assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(<"$tui_log")"
-    else
-        assert_text "$label TUI dispatch" 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
-    if [[ "$backend" == x11 ]]; then
-        x11_assert_geometry 'X11 TUI dispatch moves window' '0,0,960,1080'
-    fi
+    wait_for_text "$tui_log" 'Last action: alt+ctrl+left' 8 || true
+    assert_text 'x11 TUI dispatch' 'Last action: alt+ctrl+left' "$(cat "$tui_log" 2>/dev/null || true)"
+    x11_assert_geometry 'X11 TUI dispatch moves window' '0,0,960,1080'
 
-    tui_end "$label" "$tui_log"
+    tui_end x11 "$tui_log"
 }
 
 gnome_live_choose_hotkeys() {
@@ -1142,11 +1085,7 @@ gnome_live_choose_hotkeys() {
 
 run_gnome_live_conflicting_binding() {
     local output='' rc=0
-    if output=$(gnome_call RegisterHotkeys "['alt+ctrl+left']" 2>&1); then
-        rc=0
-    else
-        rc=$?
-    fi
+    output=$(gnome_call RegisterHotkeys "['alt+ctrl+left']" 2>&1) || rc=$?
     log "GNOME live conflicting RegisterHotkeys: exit $rc output '$output'"
     assert_rc_nonzero 'GNOME live conflicting binding is refused' "$rc" \
         'org.window_zones.Gnome.Error.Unsupported' "$output"
@@ -1222,12 +1161,9 @@ EOF
         --object-path /org/window_zones/Gnome
     start_group helper_pid "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper"
-    if wait_for_text "$helper_log" 'VALID_OK' 8; then
-        assert_text 'GNOME live atomic valid registration' 'VALID_OK' "$(<"$helper_log")"
-    else
-        assert_text 'GNOME live atomic valid registration' 'VALID_OK' \
-            "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$helper_log" 'VALID_OK' 8 || true
+    assert_text 'GNOME live atomic valid registration' 'VALID_OK' \
+        "$(cat "$helper_log" 2>/dev/null || true)"
 
     gnome_live_inject_hotkey || true
     if wait_for_text "$monitor_log" "$GNOME_SAFE_LEFT_HOTKEY" 5; then
@@ -1235,17 +1171,12 @@ EOF
     else
         log 'Harness limitation GNOME live atomic pre-error uinput signal was not observed'
     fi
-    if wait_for_text "$helper_log" 'INVALID_REJECTED' 8; then
-        assert_text 'GNOME live atomic invalid registration is refused' \
-            'INVALID_REJECTED org.window_zones.Gnome.Error.Unsupported' "$(<"$helper_log")"
-        assert_text 'GNOME live atomic invalid accelerator is named' 'f25' "$(<"$helper_log")"
-    else
-        assert_text 'GNOME live atomic invalid registration is refused' \
-            'INVALID_REJECTED org.window_zones.Gnome.Error.Unsupported' \
-            "$(cat "$helper_log" 2>/dev/null || true)"
-        assert_text 'GNOME live atomic invalid accelerator is named' 'f25' \
-            "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$helper_log" 'INVALID_REJECTED' 8 || true
+    assert_text 'GNOME live atomic invalid registration is refused' \
+        'INVALID_REJECTED org.window_zones.Gnome.Error.Unsupported' \
+        "$(cat "$helper_log" 2>/dev/null || true)"
+    assert_text 'GNOME live atomic invalid accelerator is named' 'f25' \
+        "$(cat "$helper_log" 2>/dev/null || true)"
     gnome_live_inject_hotkey || true
     sleep 0.5
     signal_count=$(gnome_live_signal_count "$monitor_log" "$GNOME_SAFE_LEFT_HOTKEY")
@@ -1532,15 +1463,12 @@ run_gnome_live_adr9_window_checks() {
 run_gnome_live_app_checks() {
     local run_log="$GNOME_ROOT/live-run.log"
     local registered=0 real_geometry='' real_ok=0 real_path='uinput'
-    local attempts=0 deadline=0 before_pid='' disable_out='' enable_out=''
+    local attempts=0 deadline=0 disable_out='' enable_out=''
     write_gnome_live_valid_config
     start_fifo_app run wayland "$run_log"
-    if wait_for_text "$run_log" 'Interactive session started' 15; then
-        assert_text 'GNOME live App starts' 'Interactive session started' "$(<"$run_log")"
-    else
-        assert_text 'GNOME live App starts' 'Interactive session started' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Interactive session started' 15 || true
+    assert_text 'GNOME live App starts' 'Interactive session started' \
+        "$(cat "$run_log" 2>/dev/null || true)"
 
     if [[ -n "${APP_FD:-}" ]]; then
         send_app status
@@ -1640,13 +1568,9 @@ run_gnome_live_app_checks() {
     send_app reload
     sleep 0.3
     send_app reload
-    if wait_for_text "$run_log" 'Config reload error' 10; then
-        assert_text 'GNOME live invalid config exposes actionable error' \
-            'Config reload error' "$(<"$run_log")"
-    else
-        assert_text 'GNOME live invalid config exposes actionable error' \
-            'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Config reload error' 10 || true
+    assert_text 'GNOME live invalid config exposes actionable error' \
+        'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
     local bindings_before hotkeys_before
     bindings_before=$(count_text "$run_log" 'binding count: 4')
     hotkeys_before=$(count_text "$run_log" 'hotkey state: Registered')
@@ -1707,12 +1631,9 @@ EOF
     send_app reload
     sleep 0.3
     send_app reload
-    if wait_for_text "$run_log" 'Config state: Loaded' 10; then
-        assert_text 'GNOME live valid config recovers' 'Config state: Loaded' "$(<"$run_log")"
-    else
-        assert_text 'GNOME live valid config recovers' 'Config state: Loaded' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Config state: Loaded' 10 || true
+    assert_text 'GNOME live valid config recovers' 'Config state: Loaded' \
+        "$(cat "$run_log" 2>/dev/null || true)"
     bindings_before=$(count_text "$run_log" 'binding count: 4')
     send_app status
     wait_for_new_text "$run_log" 'binding count: 4' "$bindings_before" 10 || true
@@ -1725,12 +1646,9 @@ run_gnome_live_tui_lifecycle() {
     local tui_log="$GNOME_ROOT/live-tui.log" rc=0
     write_gnome_live_valid_config
     start_fifo_app tui wayland "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text 'GNOME live TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text 'GNOME live TUI starts' 'Window Zones TUI' \
-            "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$tui_log" 'Window Zones TUI' 15 || true
+    assert_text 'GNOME live TUI starts' 'Window Zones TUI' \
+        "$(cat "$tui_log" 2>/dev/null || true)"
 
     tui_control_checks "$tui_log" 'GNOME live'
 
@@ -1867,7 +1785,6 @@ run_gnome_live() {
     GNOME_SAFE_CENTER_HOTKEY="${GNOME_SAFE_HOTKEYS[1]}"
     GNOME_SAFE_RIGHT_HOTKEY="${GNOME_SAFE_HOTKEYS[2]}"
     GNOME_SAFE_NEXT_HOTKEY="${GNOME_SAFE_HOTKEYS[3]}"
-    GNOME_SAFE_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY"
     GNOME_SAFE_UINPUT_KEY="$GNOME_SAFE_LEFT_HOTKEY"
 
     local line auth
@@ -1890,7 +1807,7 @@ run_gnome_live() {
     log "GNOME live Xwayland observer: DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
     assert_text 'GNOME live Xwayland auth discovered' '.mutter-Xwaylandauth.' "$GNOME_XAUTHORITY"
 
-    local displays_raw display_lines display_count first_display second_display
+    local displays_raw display_lines display_count first_display
     displays_raw=$(gnome_call GetDisplays 2>&1 || true)
     display_lines=$(parse_gnome_displays "$displays_raw" || true)
     display_count=$(printf '%s\n' "$display_lines" | sed '/^$/d' | wc -l | tr -d ' ')
@@ -2393,13 +2310,9 @@ EOF
         KDE_KWIN_PID=$(cat "$KDE_KWIN_PID_FILE")
         printf '%s\n' "$KDE_KWIN_PID" >>"$PID_FILE"
     fi
-    if ! wait_for_text "$KDE_SERVICE_LOG" 'KWin companion service started' 15; then
-        assert_text 'KDE companion service starts before KWin' \
-            'KWin companion service started' "$(cat "$KDE_SERVICE_LOG" 2>/dev/null || true)"
-    else
-        assert_text 'KDE companion service starts before KWin' \
-            'KWin companion service started' "$(<"$KDE_SERVICE_LOG")"
-    fi
+    wait_for_text "$KDE_SERVICE_LOG" 'KWin companion service started' 15 || true
+    assert_text 'KDE companion service starts before KWin' \
+        'KWin companion service started' "$(cat "$KDE_SERVICE_LOG" 2>/dev/null || true)"
     if wait_for_file "$KDE_XDISPLAY_FILE" 30; then
         KDE_XDISPLAY=$(cat "$KDE_XDISPLAY_FILE")
     else
@@ -2602,17 +2515,13 @@ kde_live_assert_zone() {
 
 kde_live_dispatch() {
     local label=$1 hotkey=$2 out="$KDE_ROOT/dispatch-$1.log" rc=0
-    if env DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
+    env DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
         XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
         XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
         XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
         KDE_SESSION_VERSION=6 "$BIN_PATH" --backend auto --config "$CONFIG_PATH" \
-        dispatch "$hotkey" >"$out" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
+        dispatch "$hotkey" >"$out" 2>&1 || rc=$?
     cat "$out" >>"$ASSERT_LOG"
     assert_eq "$label dispatch exit" 0 "$rc"
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(cat "$out" 2>/dev/null || true)"
@@ -2769,11 +2678,8 @@ kde_live_adr9_window_checks() {
     kde_live_activate_window || true
 }
 
-kde_live_atomic_registration() {
-    local helper="$KDE_ROOT/atomic-register.js"
-    local helper_log="$KDE_ROOT/atomic-register.log"
-    local helper_pid='' valid_events_before=0 invalid_events_before=0 invalid_events_after=0
-    cat >"$helper" <<'EOF'
+write_kde_hotkey_client() {
+    cat >"$1" <<'EOF'
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
@@ -2793,15 +2699,6 @@ const proxy = Gio.DBusProxy.new_sync(
     '/org/window_zones/KWin',
     'org.window_zones.KWin3',
     null);
-const accel = Gio.DBusProxy.new_sync(
-    connection, Gio.DBusProxyFlags.NONE, null,
-    'org.kde.kglobalaccel', '/kglobalaccel', 'org.kde.KGlobalAccel', null);
-function available() {
-    return accel.call_sync(
-        'isGlobalShortcutAvailable',
-        new GLib.Variant('(is)', [0x0d000012, '']),
-        Gio.DBusCallFlags.NONE, 5000, null).deep_unpack()[0];
-}
 
 function request(keys) {
     const reply = proxy.call_sync(
@@ -2823,21 +2720,6 @@ function requestResult(id) {
     return reply.deep_unpack();
 }
 
-function waitResult(id, label) {
-    let result = [false, '', ''];
-    for (let attempt = 0; attempt < 100; attempt++) {
-        try {
-            result = requestResult(id);
-            if (result[0])
-                break;
-        } catch (_) {
-        }
-        GLib.usleep(100000);
-    }
-    print(`${label}_RESULT ${result[0]} ${result[1]} ${result[2]}`);
-    return result;
-}
-
 function poll(seconds) {
     const deadline = Date.now() + seconds * 1000;
     while (Date.now() < deadline) {
@@ -2854,6 +2736,40 @@ function poll(seconds) {
         }
         GLib.usleep(100000);
     }
+}
+
+EOF
+}
+
+kde_live_atomic_registration() {
+    local helper="$KDE_ROOT/atomic-register.js"
+    local helper_log="$KDE_ROOT/atomic-register.log"
+    local helper_pid='' valid_events_before=0 invalid_events_before=0 invalid_events_after=0
+    write_kde_hotkey_client "$helper"
+    cat >>"$helper" <<'EOF'
+const accel = Gio.DBusProxy.new_sync(
+    connection, Gio.DBusProxyFlags.NONE, null,
+    'org.kde.kglobalaccel', '/kglobalaccel', 'org.kde.KGlobalAccel', null);
+function available() {
+    return accel.call_sync(
+        'isGlobalShortcutAvailable',
+        new GLib.Variant('(is)', [0x0d000012, '']),
+        Gio.DBusCallFlags.NONE, 5000, null).deep_unpack()[0];
+}
+
+function waitResult(id, label) {
+    let result = [false, '', ''];
+    for (let attempt = 0; attempt < 100; attempt++) {
+        try {
+            result = requestResult(id);
+            if (result[0])
+                break;
+        } catch (_) {
+        }
+        GLib.usleep(100000);
+    }
+    print(`${label}_RESULT ${result[0]} ${result[1]} ${result[2]}`);
+    return result;
 }
 
 const validId = request([valid]);
@@ -2884,36 +2800,21 @@ EOF
     start_group helper_pid "$helper_log" env \
         DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" KDE_VALID_HOTKEY="$KDE_SAFE_HOTKEY" \
         gjs -m "$helper"
-    if wait_for_text "$helper_log" 'VALID_READY' 12; then
-        assert_text 'KDE atomic valid registration completes' 'VALID_RESULT true' "$(<"$helper_log")"
-    else
-        assert_text 'KDE atomic valid registration completes' 'VALID_RESULT true' \
-            "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$helper_log" 'VALID_READY' 12 || true
+    assert_text 'KDE atomic valid registration completes' 'VALID_RESULT true' \
+        "$(cat "$helper_log" 2>/dev/null || true)"
     valid_events_before=$(count_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY")
     local inject_rc=0
-    if kde_live_inject_key ctrl+alt+Left; then
-        inject_rc=0
-    else
-        inject_rc=$?
-    fi
+    kde_live_inject_key ctrl+alt+Left || inject_rc=$?
     assert_rc_zero 'KDE atomic valid accelerator injection' "$inject_rc" 'xdotool XTEST'
-    if wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 8; then
-        assert_text 'KDE atomic valid accelerator reaches Companion' \
-            "EVENT $KDE_SAFE_HOTKEY" "$(<"$helper_log")"
-    else
-        assert_text 'KDE atomic valid accelerator reaches Companion' \
-            "EVENT $KDE_SAFE_HOTKEY" "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
-    if wait_for_text "$helper_log" 'INVALID_READY' 12; then
-        assert_text 'KDE atomic rejected accelerator completes' 'INVALID_RESULT true' "$(<"$helper_log")"
-        assert_text 'KDE atomic rejected accelerator names f25' 'f25' "$(<"$helper_log")"
-    else
-        local atomic_log=''
-        atomic_log=$(cat "$helper_log" 2>/dev/null || true)
-        assert_text 'KDE atomic rejected accelerator completes' 'INVALID_RESULT true' "$atomic_log"
-        assert_text 'KDE atomic rejected accelerator names f25' 'f25' "$atomic_log"
-    fi
+    wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 8 || true
+    assert_text 'KDE atomic valid accelerator reaches Companion' \
+        "EVENT $KDE_SAFE_HOTKEY" "$(cat "$helper_log" 2>/dev/null || true)"
+    wait_for_text "$helper_log" 'INVALID_READY' 12 || true
+    local atomic_log=''
+    atomic_log=$(cat "$helper_log" 2>/dev/null || true)
+    assert_text 'KDE atomic rejected accelerator completes' 'INVALID_RESULT true' "$atomic_log"
+    assert_text 'KDE atomic rejected accelerator names f25' 'f25' "$atomic_log"
     invalid_events_before=$(count_text "$helper_log" 'EVENT alt+ctrl+f25')
     kde_live_inject_key ctrl+alt+F25 >/dev/null 2>&1 || true
     sleep 0.5
@@ -2969,68 +2870,25 @@ EOF
     kde_live_load_script "$KDE_CONFLICT_JS" window-zones-conflict
     KDE_CONFLICT_SCRIPT_ID="$KDE_LAST_SCRIPT_ID"
     kde_live_run_script "$KDE_CONFLICT_SCRIPT_ID"
-    if wait_for_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_READY' 10; then
-        assert_text 'KDE conflict fixture registers incumbent' 'KDE_CONFLICT_READY' "$(<"$KDE_KWIN_LOG")"
-    else
-        assert_text 'KDE conflict fixture registers incumbent' 'KDE_CONFLICT_READY' \
-            "$(cat "$KDE_KWIN_LOG" 2>/dev/null || true)"
-    fi
+    wait_for_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_READY' 10 || true
+    assert_text 'KDE conflict fixture registers incumbent' 'KDE_CONFLICT_READY' \
+        "$(cat "$KDE_KWIN_LOG" 2>/dev/null || true)"
 
     local helper="$KDE_ROOT/conflict-register.js" helper_log="$KDE_ROOT/conflict-register.log"
     local helper_pid='' inject_rc=0 valid_events_before=0 previous_active=0
-    cat >"$helper" <<'EOF'
-import Gio from 'gi://Gio';
-import GLib from 'gi://GLib';
-const valid = GLib.getenv('KDE_VALID_HOTKEY');
-const address = GLib.getenv('DBUS_SESSION_BUS_ADDRESS');
-const connection = Gio.DBusConnection.new_for_address_sync(
-    address,
-    Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
-    Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
-    null,
-    null);
-const proxy = Gio.DBusProxy.new_sync(
-    connection, Gio.DBusProxyFlags.NONE, null,
-    'org.window_zones.KWin', '/org/window_zones/KWin', 'org.window_zones.KWin3', null);
+    write_kde_hotkey_client "$helper"
+    cat >>"$helper" <<'EOF'
 function register(keys, label) {
-    const request = proxy.call_sync(
-        'RegisterHotkeys',
-        new GLib.Variant('(s)', [JSON.stringify(keys)]),
-        Gio.DBusCallFlags.NONE,
-        5000,
-        null).deep_unpack()[0];
+    const id = request(keys);
     let result = [false, '', ''];
     for (let attempt = 0; attempt < 100; attempt++) {
-        result = proxy.call_sync(
-            'GetRequestResult',
-            new GLib.Variant('(s)', [String(request)]),
-            Gio.DBusCallFlags.NONE,
-            5000,
-            null).deep_unpack();
+        result = requestResult(id);
         if (result[0])
             break;
         GLib.usleep(100000);
     }
     print(`${label}_RESULT ${JSON.stringify(result)}`);
     print(`${label}_READY`);
-}
-
-function poll(seconds) {
-    const deadline = Date.now() + seconds * 1000;
-    while (Date.now() < deadline) {
-        try {
-            const event = proxy.call_sync(
-                'GetNextHotkey',
-                new GLib.Variant('()', []),
-                Gio.DBusCallFlags.NONE,
-                5000,
-                null).deep_unpack();
-            if (event[0])
-                print(`EVENT ${event[1]}`);
-        } catch (_) {
-        }
-        GLib.usleep(100000);
-    }
 }
 
 register([valid], 'VALID');
@@ -3050,13 +2908,9 @@ EOF
     wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 5 \
         && previous_active=1
     assert_eq 'KDE conflict previous set active before replacement' 1 "$previous_active"
-    if wait_for_text "$helper_log" 'CONFLICT_READY' 12; then
-        assert_text 'KDE conflicting accelerator result completes' \
-            'CONFLICT_RESULT [true,' "$(<"$helper_log")"
-    else
-        assert_text 'KDE conflicting accelerator result completes' 'CONFLICT_RESULT [true,' \
-            "$(cat "$helper_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$helper_log" 'CONFLICT_READY' 12 || true
+    assert_text 'KDE conflicting accelerator result completes' 'CONFLICT_RESULT [true,' \
+        "$(cat "$helper_log" 2>/dev/null || true)"
     assert_text 'KDE conflicting replacement reports conflict error' \
         "KWin rejected shortcut 'alt+ctrl+f24': accelerator is already held by 'Window Zones conflict incumbent'" \
         "$(cat "$helper_log" 2>/dev/null || true)"
@@ -3066,19 +2920,11 @@ EOF
     wait_for_new_text "$helper_log" "EVENT $KDE_SAFE_HOTKEY" "$valid_events_before" 5 \
         && previous_active=1
     assert_eq 'KDE conflicting replacement preserves previous set' 1 "$previous_active"
-    if kde_live_inject_key ctrl+alt+F24; then
-        inject_rc=0
-    else
-        inject_rc=$?
-    fi
+    kde_live_inject_key ctrl+alt+F24 || inject_rc=$?
     assert_rc_zero 'KDE conflicting accelerator injection' "$inject_rc" 'xdotool XTEST'
-    if wait_for_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_FIRED' 8; then
-        assert_text 'KDE conflict incumbent still receives accelerator' \
-            'KDE_CONFLICT_FIRED' "$(<"$KDE_KWIN_LOG")"
-    else
-        assert_text 'KDE conflict incumbent still receives accelerator' \
-            'KDE_CONFLICT_FIRED' "$(cat "$KDE_KWIN_LOG" 2>/dev/null || true)"
-    fi
+    wait_for_text "$KDE_KWIN_LOG" 'KDE_CONFLICT_FIRED' 8 || true
+    assert_text 'KDE conflict incumbent still receives accelerator' \
+        'KDE_CONFLICT_FIRED' "$(cat "$KDE_KWIN_LOG" 2>/dev/null || true)"
     local conflict_events=0
     conflict_events=$(count_text "$helper_log" 'EVENT alt+ctrl+f24')
     assert_eq 'KDE conflicting accelerator delivers no Companion event' 0 "$conflict_events"
@@ -3111,11 +2957,8 @@ kde_live_tui_lifecycle() {
     local tui_log="$KDE_ROOT/tui.log" rc=0
     write_five_bindings_config
     start_fifo_app tui auto "$tui_log"
-    if wait_for_text "$tui_log" 'Window Zones TUI' 15; then
-        assert_text 'KDE TUI starts' 'Window Zones TUI' "$(<"$tui_log")"
-    else
-        assert_text 'KDE TUI starts' 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$tui_log" 'Window Zones TUI' 15 || true
+    assert_text 'KDE TUI starts' 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
     tui_control_checks "$tui_log" 'KDE'
     kde_live_activate_window || true
     send_app 'dispatch alt+ctrl+left'
@@ -3178,23 +3021,15 @@ run_kde_live() {
     fi
 
     local install_output='' install_rc=0
-    if install_output=$(env -u KDEHOME HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" \
+    install_output=$(env -u KDEHOME HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" \
         XDG_DATA_HOME="$KDE_DATA" XDG_CACHE_HOME="$KDE_CACHE" XDG_STATE_HOME="$KDE_STATE" \
-        kpackagetool6 --type=KWin/Script --install "$PROJECT_ROOT/kwin-script" 2>&1); then
-        install_rc=0
-    else
-        install_rc=$?
-    fi
+        kpackagetool6 --type=KWin/Script --install "$PROJECT_ROOT/kwin-script" 2>&1) || install_rc=$?
     log "KDE package install: $install_output"
     assert_rc_zero 'KDE repository KWin package installs' "$install_rc" 'kpackagetool6'
 
     local config_output='' config_rc=0
-    if config_output=$(env -u KDEHOME HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" \
-        kwriteconfig6 --file kwinrc --group Plugins --key window-zonesEnabled true 2>&1); then
-        config_rc=0
-    else
-        config_rc=$?
-    fi
+    config_output=$(env -u KDEHOME HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" \
+        kwriteconfig6 --file kwinrc --group Plugins --key window-zonesEnabled true 2>&1) || config_rc=$?
     log "KDE plugin enable config: $config_output"
     assert_rc_zero 'KDE repository KWin script is enabled in private kwinrc' "$config_rc" 'kwriteconfig6 Plugins'
     if config_output=$(env -u KDEHOME HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" \
@@ -3294,12 +3129,9 @@ run_kde_live() {
     [[ "$KDE_OBSERVER_SCRIPT_ID" =~ ^[0-9]+$ ]] && observer_id_ok=1
     assert_eq 'KDE independent observer script loads' 1 "$observer_id_ok"
     kde_live_run_script "$KDE_OBSERVER_SCRIPT_ID"
-    if wait_for_text "$KDE_KWIN_LOG" 'KDE_OBSERVER ' 12; then
-        assert_text 'KDE independent observer reports screens' 'KDE_OBSERVER ' "$(<"$KDE_KWIN_LOG")"
-    else
-        assert_text 'KDE independent observer reports screens' 'KDE_OBSERVER ' \
-            "$(cat "$KDE_KWIN_LOG" 2>/dev/null || true)"
-    fi
+    wait_for_text "$KDE_KWIN_LOG" 'KDE_OBSERVER ' 12 || true
+    assert_text 'KDE independent observer reports screens' 'KDE_OBSERVER ' \
+        "$(cat "$KDE_KWIN_LOG" 2>/dev/null || true)"
     kde_live_observer_records "$KDE_KWIN_LOG" >"$KDE_ROOT/observer-records"
     log "KDE independent observer records: $(cat "$KDE_ROOT/observer-records" 2>/dev/null || true)"
     local observer_layout_ok=0 observer_display_count=0
@@ -3394,41 +3226,28 @@ PY
     kde_live_prepare_environment
     local run_log="$KDE_ROOT/run.log" app_bus=''
     start_fifo_app run auto "$run_log"
-    if wait_for_text "$run_log" 'Interactive session started' 15; then
-        assert_text 'KDE App starts' 'Interactive session started' "$(<"$run_log")"
-    else
-        assert_text 'KDE App starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Interactive session started' 15 || true
+    assert_text 'KDE App starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
     app_bus=$(tr '\0' '\n' <"/proc/$APP_PID/environ" 2>/dev/null \
         | sed -n '/^DBUS_SESSION_BUS_ADDRESS=/p' | sed -n '1p' || true)
     assert_eq 'KDE App uses private D-Bus session' "DBUS_SESSION_BUS_ADDRESS=$KDE_BUS" "$app_bus"
     send_app status
-    if wait_for_text "$run_log" 'hotkey state: Registered' 12; then
-        assert_text 'KDE App hotkeys initially register' 'hotkey state: Registered' "$(<"$run_log")"
-    else
-        assert_text 'KDE App hotkeys initially register' 'hotkey state: Registered' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'hotkey state: Registered' 12 || true
+    assert_text 'KDE App hotkeys initially register' 'hotkey state: Registered' \
+        "$(cat "$run_log" 2>/dev/null || true)"
 
     send_app 'dispatch alt+ctrl+up'
     kde_live_refresh_targets
     kde_live_assert_zone 'KDE real hotkey baseline center-third' center-third A
     local inject_rc=0 action_before=0
     action_before=$(count_text "$run_log" 'last action: alt+ctrl+left')
-    if kde_live_inject_key ctrl+alt+Left; then
-        inject_rc=0
-    else
-        inject_rc=$?
-    fi
+    kde_live_inject_key ctrl+alt+Left || inject_rc=$?
     assert_rc_zero 'KDE XTEST accelerator injection' "$inject_rc" 'xdotool key ctrl+alt+Left'
     kde_live_assert_zone 'KDE real XTEST-to-EIS hotkey' left-half A
     send_app status
-    if wait_for_new_text "$run_log" 'last action: alt+ctrl+left' "$action_before" 10; then
-        assert_text 'KDE real hotkey reports action' 'last action: alt+ctrl+left' "$(<"$run_log")"
-    else
-        assert_text 'KDE real hotkey reports action' 'last action: alt+ctrl+left' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_new_text "$run_log" 'last action: alt+ctrl+left' "$action_before" 10 || true
+    assert_text 'KDE real hotkey reports action' 'last action: alt+ctrl+left' \
+        "$(cat "$run_log" 2>/dev/null || true)"
     skip_assert 'KDE seated accelerator capture' \
         'nested KWin uses a Noop session and does not own the login seat; XTEST/EIS tests compositor dispatch, not physical-seat input or host shortcut arbitration'
 
@@ -3487,12 +3306,9 @@ PY
         HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" XDG_DATA_HOME="$KDE_DATA" \
         XDG_CACHE_HOME="$KDE_CACHE" XDG_STATE_HOME="$KDE_STATE" XDG_RUNTIME_DIR="$KDE_RUNTIME" \
         XDG_DATA_DIRS="$KDE_DATA_DIRS" "$KDE_COMPANION_BIN"
-    if wait_for_text "$restart_log" 'KWin companion service started' 12; then
-        assert_text 'KDE Rust service restarts' 'KWin companion service started' "$(<"$restart_log")"
-    else
-        assert_text 'KDE Rust service restarts' 'KWin companion service started' \
-            "$(cat "$restart_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$restart_log" 'KWin companion service started' 12 || true
+    assert_text 'KDE Rust service restarts' 'KWin companion service started' \
+        "$(cat "$restart_log" 2>/dev/null || true)"
     local service_reload_ready=0
     kde_live_wait_companion_ready 30 && service_reload_ready=1
     assert_eq 'KDE service restart restores capabilities' 1 "$service_reload_ready"
@@ -3520,12 +3336,9 @@ PY
     send_app reload
     sleep 0.3
     send_app reload
-    if wait_for_text "$run_log" 'Config reload error' 12; then
-        assert_text 'KDE invalid config exposes actionable error' 'Config reload error' "$(<"$run_log")"
-    else
-        assert_text 'KDE invalid config exposes actionable error' 'Config reload error' \
-            "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Config reload error' 12 || true
+    assert_text 'KDE invalid config exposes actionable error' 'Config reload error' \
+        "$(cat "$run_log" 2>/dev/null || true)"
     send_app status
     assert_text 'KDE invalid reload preserves previous binding count' 'binding count: 5' \
         "$(cat "$run_log" 2>/dev/null || true)"
@@ -3726,7 +3539,7 @@ fn main() {
         ["grab", hotkey] => {
             let hotkey = normalize_hotkey(hotkey).expect("hotkey");
             let mut hotkeys = X11HotkeySystem::new();
-            if let Err(error) = hotkeys.register_hotkeys(&[hotkey.clone()]) {
+            if let Err(error) = hotkeys.register_hotkeys(std::slice::from_ref(&hotkey)) {
                 println!("error: {error}");
                 process::exit(1);
             }
@@ -3743,11 +3556,7 @@ fn main() {
     }
 }
 EOF
-    if output=$(CARGO_TARGET_DIR="$target_dir" cargo build --manifest-path "$dir/Cargo.toml" 2>&1); then
-        rc=0
-    else
-        rc=$?
-    fi
+    output=$(CARGO_TARGET_DIR="$target_dir" cargo build --manifest-path "$dir/Cargo.toml" 2>&1) || rc=$?
     printf '%s\n' "$output" >>"$ASSERT_LOG"
     assert_rc_zero "$1 seam helper builds against the public API" "$rc" "cargo build $dir"
     if [[ "$rc" -eq 0 ]]; then
@@ -3844,13 +3653,9 @@ run_x11_adr9_window_checks() {
     # Transactional grabs at the adapter seam: the ignored real-server test against this
     # isolated display. The App-level replacement is checked in the run session below.
     local test_output='' test_rc=0
-    if test_output=$(WZ_X11_TEST_DISPLAY="$X11_DISPLAY" cargo test --locked \
+    test_output=$(WZ_X11_TEST_DISPLAY="$X11_DISPLAY" cargo test --locked \
         --manifest-path "$PROJECT_ROOT/Cargo.toml" --lib \
-        x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored 2>&1); then
-        test_rc=0
-    else
-        test_rc=$?
-    fi
+        x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored 2>&1) || test_rc=$?
     printf '%s\n' "$test_output" >>"$ASSERT_LOG"
     assert_rc_zero 'X11 real-server grabs are exclusive, atomic and released' "$test_rc" \
         'cargo test --lib x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored'
@@ -4002,17 +3807,11 @@ EOF
     # Exclusive XGrabKey accelerator capture, injected through XTEST.
     local run_log="$X11_ROOT/run.log"
     start_fifo_app run x11 "$run_log"
-    if wait_for_text "$run_log" 'Interactive session started' 15; then
-        assert_text 'X11 run starts' 'Interactive session started' "$(<"$run_log")"
-    else
-        assert_text 'X11 run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Interactive session started' 15 || true
+    assert_text 'X11 run starts' 'Interactive session started' "$(cat "$run_log" 2>/dev/null || true)"
     send_app status
-    if wait_for_text "$run_log" 'hotkey state: Registered' 8; then
-        assert_text 'X11 hotkeys initially register' 'hotkey state: Registered' "$(<"$run_log")"
-    else
-        assert_text 'X11 hotkeys initially register' 'hotkey state: Registered' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'hotkey state: Registered' 8 || true
+    assert_text 'X11 hotkeys initially register' 'hotkey state: Registered' "$(cat "$run_log" 2>/dev/null || true)"
     local app_display=''
     app_display=$(tr '\0' '\n' <"/proc/$APP_PID/environ" 2>/dev/null | sed -n '/^DISPLAY=/p' | sed -n '1p' || true)
     assert_eq 'X11 App DISPLAY' "DISPLAY=$X11_DISPLAY" "$app_display"
@@ -4048,11 +3847,8 @@ EOF
     send_app reload
     sleep 0.5
     send_app reload
-    if wait_for_text "$run_log" 'Config reload error' 8; then
-        assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(<"$run_log")"
-    else
-        assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
-    fi
+    wait_for_text "$run_log" 'Config reload error' 8 || true
+    assert_text 'X11 invalid config exposes actionable error' 'Config reload error' "$(cat "$run_log" 2>/dev/null || true)"
     send_app status
     sleep 0.3
     assert_text 'X11 invalid reload preserves previous bindings' 'binding count: 5' "$(<"$run_log")"
@@ -4117,7 +3913,7 @@ EOF
     fi
     stop_app_cleanly 'X11 run quits cleanly' "$run_log"
 
-    run_tui_lifecycle x11 'x11'
+    run_x11_tui_lifecycle
     stop_pid "$editor_pid"
     stop_pid "$openbox_pid"
     stop_pid "$xvfb_pid"

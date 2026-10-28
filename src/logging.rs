@@ -1,16 +1,11 @@
 //! Append-only session log: one timestamped line per event, written immediately.
 
 use std::cell::RefCell;
-use std::env;
-use std::ffi::OsString;
 use std::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const LOG_DIRECTORY: &str = "window_zones";
-const LOG_FILE: &str = "window_zones.log";
 
 /// Writes a diagnostic best-effort; an unavailable stderr must not panic or
 /// replace the operation's actual exit status.
@@ -18,49 +13,28 @@ pub fn diagnostic(message: fmt::Arguments<'_>) {
     let _ = writeln!(io::stderr().lock(), "{message}");
 }
 
-/// Session event sink. The file sink opens only when `enabled`; `verbose` echoes every
-/// record line to stderr. Sink failures warn once on stderr and never stop the app.
+/// Session event sink. Sink failures warn once on stderr and never stop the app.
 /// Creating a `Logger` records the session start; dropping it records the session end.
 #[derive(Debug)]
 pub struct Logger {
-    path: Option<PathBuf>,
     file: RefCell<Option<File>>,
-    verbose: bool,
     session: &'static str,
 }
 
 impl Logger {
-    /// `path_override: None` resolves [`default_log_path`], also when disabled.
-    pub fn new(
-        path_override: Option<PathBuf>,
-        enabled: bool,
-        verbose: bool,
-        session: &'static str,
-    ) -> Self {
-        let path = path_override.or_else(default_log_path);
-        let file = if enabled {
-            open_log_file(path.as_deref())
-        } else {
-            None
-        };
+    /// Opens an explicit append-only destination and records the session start.
+    pub fn new(path: &Path, session: &'static str) -> Self {
         let logger = Self {
-            path,
-            file: RefCell::new(file),
-            verbose,
+            file: RefCell::new(open_log_file(path)),
             session,
         };
         logger.log(format_args!("session start: {session}"));
         logger
     }
 
-    /// Resolved log file location, whether or not this session writes to it.
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
     /// Whether formatting a record can reach a sink.
     pub fn is_active(&self) -> bool {
-        self.verbose || self.file.borrow().is_some()
+        self.file.borrow().is_some()
     }
 
     /// Appends `<RFC 3339 UTC timestamp> <message>` as one line; control characters are
@@ -75,10 +49,6 @@ impl Logger {
         line.push(' ');
         let _ = EscapeControls(&mut line).write_fmt(message);
         line.push('\n');
-
-        if self.verbose {
-            let _ = io::stderr().write_all(line.as_bytes());
-        }
 
         let mut file = self.file.borrow_mut();
         if let Some(Err(error)) = file
@@ -100,35 +70,7 @@ impl Drop for Logger {
     }
 }
 
-/// Platform log file: Linux `$XDG_STATE_HOME` (absolute) or `$HOME/.local/state`, Windows
-/// `%LOCALAPPDATA%`, macOS `$HOME/Library/Logs`; each joined with `window_zones/window_zones.log`.
-pub fn default_log_path() -> Option<PathBuf> {
-    log_path_for(env::consts::OS, |name| env::var_os(name))
-}
-
-fn log_path_for(os: &str, get_env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let non_empty = |name: &str| get_env(name).filter(|value| !value.is_empty());
-    let root = match os {
-        "linux" => non_empty("XDG_STATE_HOME")
-            // XDG absoluteness is POSIX, not host-defined; see runtime config discovery.
-            .filter(|value| value.as_encoded_bytes().starts_with(b"/"))
-            .map(PathBuf::from)
-            .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".local/state")))?,
-        "windows" => PathBuf::from(non_empty("LOCALAPPDATA")?),
-        "macos" => PathBuf::from(non_empty("HOME")?).join("Library/Logs"),
-        _ => return None,
-    };
-    Some(root.join(LOG_DIRECTORY).join(LOG_FILE))
-}
-
-fn open_log_file(path: Option<&Path>) -> Option<File> {
-    let Some(path) = path else {
-        let _ = writeln!(
-            io::stderr(),
-            "No default log file location found; file logging disabled."
-        );
-        return None;
-    };
+fn open_log_file(path: &Path) -> Option<File> {
     let opened = path
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
@@ -199,22 +141,12 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Logger, default_log_path, log_path_for, write_timestamp};
+    use super::{Logger, write_timestamp};
     use std::env;
-    use std::ffi::OsString;
     use std::fmt;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
-
-    fn path_for(os: &str, entries: &[(&str, &str)]) -> Option<PathBuf> {
-        log_path_for(os, |name| {
-            entries
-                .iter()
-                .find(|(entry, _)| *entry == name)
-                .map(|(_, value)| OsString::from(value))
-        })
-    }
 
     fn test_directory(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!(
@@ -246,57 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn linux_prefers_absolute_xdg_state_home() {
-        let path = path_for(
-            "linux",
-            &[("XDG_STATE_HOME", "/state"), ("HOME", "/home/alice")],
-        );
-
-        assert_eq!(
-            path,
-            Some(PathBuf::from("/state/window_zones/window_zones.log"))
-        );
-    }
-
-    #[test]
-    fn linux_falls_back_to_home_for_relative_or_empty_xdg_state_home() {
-        let expected = Some(PathBuf::from(
-            "/home/alice/.local/state/window_zones/window_zones.log",
-        ));
-
-        for xdg in ["relative", ""] {
-            let path = path_for("linux", &[("XDG_STATE_HOME", xdg), ("HOME", "/home/alice")]);
-            assert_eq!(path, expected, "XDG_STATE_HOME={xdg:?}");
-        }
-        assert_eq!(path_for("linux", &[("HOME", "/home/alice")]), expected);
-    }
-
-    #[test]
-    fn other_platforms_use_their_log_roots() {
-        assert_eq!(
-            path_for("windows", &[("LOCALAPPDATA", "/local"), ("HOME", "/home")]),
-            Some(PathBuf::from("/local/window_zones/window_zones.log"))
-        );
-        assert_eq!(
-            path_for("macos", &[("HOME", "/users/bob")]),
-            Some(PathBuf::from(
-                "/users/bob/Library/Logs/window_zones/window_zones.log"
-            ))
-        );
-    }
-
-    #[test]
-    fn missing_environment_or_platform_has_no_default() {
-        assert_eq!(
-            path_for("linux", &[("XDG_STATE_HOME", "relative"), ("HOME", "")]),
-            None
-        );
-        assert_eq!(path_for("windows", &[("APPDATA", "/roaming")]), None);
-        assert_eq!(path_for("macos", &[]), None);
-        assert_eq!(path_for("plan9", &[("HOME", "/usr/glenda")]), None);
-    }
-
-    #[test]
     fn timestamps_are_rfc3339_utc_across_date_boundaries() {
         assert_eq!(timestamp(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(timestamp(951_868_799_999), "2000-02-29T23:59:59.999Z");
@@ -314,11 +195,10 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "existing\n").unwrap();
 
-        Logger::new(Some(path.clone()), true, false, "status").log(format_args!("first"));
-        let log = Logger::new(Some(path.clone()), true, false, "run");
+        Logger::new(&path, "status").log(format_args!("first"));
+        let log = Logger::new(&path, "run");
         log.log(format_args!("multi\nline\r\tbell\u{7} é"));
 
-        assert_eq!(log.path(), Some(path.as_path()));
         let contents = fs::read_to_string(&path).unwrap();
         let appended = contents.strip_prefix("existing\n").unwrap();
         assert_eq!(
@@ -341,7 +221,7 @@ mod tests {
         let directory = test_directory("lifecycle");
         let path = directory.join("window_zones.log");
 
-        let log = Logger::new(Some(path.clone()), true, false, "tray");
+        let log = Logger::new(&path, "tray");
         log.log(format_args!("dispatch alt+left ok"));
         assert_eq!(
             messages(&fs::read_to_string(&path).unwrap()),
@@ -362,41 +242,21 @@ mod tests {
     }
 
     #[test]
-    fn disabled_file_creates_nothing_and_skips_formatting() {
+    fn open_failure_disables_sink_and_skips_formatting() {
         struct PanicsWhenFormatted;
         impl fmt::Display for PanicsWhenFormatted {
             fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
                 panic!("formatted without an active sink");
             }
         }
-        let directory = test_directory("disabled");
-        let path = directory.join("window_zones.log");
-
-        let log = Logger::new(Some(path.clone()), false, false, "status");
-        log.log(format_args!("{}", PanicsWhenFormatted));
-
-        assert_eq!(log.path(), Some(path.as_path()));
-        drop(log);
-        // Verbose echoes records to stderr only; it never creates the file.
-        Logger::new(Some(path.clone()), false, true, "status").log(format_args!("echoed"));
-        assert!(!directory.exists());
-        assert_eq!(
-            Logger::new(None, false, false, "status").path(),
-            default_log_path().as_deref()
-        );
-    }
-
-    #[test]
-    fn open_failure_is_nonfatal() {
         let directory = test_directory("blocked");
         fs::create_dir_all(&directory).unwrap();
         let blocker = directory.join("not_a_directory");
         fs::write(&blocker, "").unwrap();
 
-        let log = Logger::new(Some(blocker.join("window_zones.log")), true, false, "run");
-        log.log(format_args!("dropped"));
+        let log = Logger::new(&blocker.join("window_zones.log"), "run");
+        log.log(format_args!("{}", PanicsWhenFormatted));
 
-        assert!(log.file.borrow().is_none());
         assert_eq!(fs::read_to_string(&blocker).unwrap(), "");
         let _ = fs::remove_dir_all(&directory);
     }
@@ -405,12 +265,12 @@ mod tests {
     #[test]
     fn write_failure_disables_file_sink() {
         let path = PathBuf::from("/dev/full");
-        assert!(super::open_log_file(Some(path.as_path())).is_some());
+        assert!(super::open_log_file(&path).is_some());
 
         // The session start record fails with ENOSPC and drops the file sink.
-        let log = Logger::new(Some(path), true, false, "run");
+        let log = Logger::new(&path, "run");
 
-        assert!(log.file.borrow().is_none());
+        assert!(!log.is_active());
         log.log(format_args!("ignored"));
     }
 }

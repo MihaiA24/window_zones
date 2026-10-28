@@ -112,17 +112,11 @@ target frame. On Shell 50, `get_maximize_flags()` reports edge tiling as vertica
 maximization, and `unmaximize()` takes **no flags argument** and clears both
 directions and tiling. Fullscreen and non-resizable windows remain explicit
 `InvalidWindowState` rejections; leave fullscreen first. Overview, lock-screen,
-desktop/dock, and other Shell surfaces are excluded. The extension declares the
-`user` and `unlock-dialog` session modes, so locking the screen keeps the
-companion and its registered hotkeys loaded (they only fire in normal mode)
-instead of disconnecting the App on every lock.
+desktop/dock, and other Shell surfaces are excluded.
 
-Inspect the wire contract without registering hotkeys:
+Also inspect the captured-window contract without registering hotkeys:
 
 ```bash
-gdbus call --session --dest org.window_zones.Gnome \
-  --object-path /org/window_zones/Gnome \
-  --method org.window_zones.Gnome2.GetCapabilities
 gdbus call --session --dest org.window_zones.Gnome \
   --object-path /org/window_zones/Gnome \
   --method org.window_zones.Gnome2.GetFocusedWindow
@@ -274,17 +268,14 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Restore desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
 12. On a disposable client with controllable minimum size, force a zone placement to apply only partially and confirm Restore still reaches its pre-placement frame. Also snap a small window to a larger zone, set a minimum width below that placement but above its original width, and Restore: after removing the constraint, retrying Restore must reach the original frame rather than the partially restored one.
 
-`gnome-live` checks item 4 and a refused replacement mechanically on test windows it starts itself: it captures one Text Editor's id, focuses a second, and moves the captured id over `MoveWindow`; closes the second and expects `WindowGone`; maximizes the first through EWMH, then edge-tiles it with a real Super+Left over `/dev/uinput`, and expects each move to clear the state and apply the frame; sets fullscreen and expects `leave fullscreen first` with state and frame unchanged. It then reloads a config adding the reserved `Alt+Ctrl+Left` and expects `were refused`, the previous four bindings, and the previous accelerator still moving the window. Setting EWMH states uses a helper crate the gate builds against the public `window_zones` API, so `cargo` needs the locked crates.
+The `gnome-live` gate mechanically runs the [identified-window and hotkey-rollback checks](testing.md#v1-verification-matrix) on disposable Text Editor windows; its refused replacement must retain four bindings and the previous accelerator.
 
-To verify the combined `Gnome2` companion, run the expanded Synthetic and seated
-checks on the exact GNOME 50 or 51 configuration being claimed, with the
-upgraded companion loaded after a fresh login, `disable-user-extensions=false`,
-and authorized writable `/dev/uinput` for `gnome-live`. Record GNOME/Mutter
-versions, display layout, assertion summary, limitations, and retained evidence
-paths in the PR description. Preserve proof with `--keep-logs`; verifier cleanup
-retains its evidence. Do not check artifacts in. Contract tests and Synthetic
-results do not replace seated evidence;
-see [testing prerequisites](testing.md#v1-verification-matrix).
+The blocking GNOME gate requires both [Synthetic and seated checks](testing.md#v1-verification-matrix)
+on the exact upgraded GNOME 50 or 51 configuration being claimed.
+Record GNOME/Mutter versions, display layout, assertion summary, limitations,
+and retained evidence paths in the PR description. Preserve proof with
+`--keep-logs`; verifier cleanup retains evidence. Do not check artifacts in.
+Contract tests and Synthetic results do not replace seated evidence.
 
 For isolated D-Bus client and real companion-dispatcher contract coverage, run:
 

@@ -147,10 +147,7 @@ fi
 
 # Record ownership so uninstall never guesses which other binaries/packages to remove.
 record_install() {
-  local item
-  for item in ${INSTALLED[@]+"${INSTALLED[@]}"}; do
-    [[ "$item" != "$1" ]] || return 0
-  done
+  recorded "$1" && return 0
   mkdir -p "$(dirname -- "$INSTALL_RECORD")"
   printf '%s\n' "$1" >>"$INSTALL_RECORD"
   INSTALLED+=("$1")
@@ -357,21 +354,19 @@ if [[ "$OS" == Linux ]]; then
 fi
 
 cd -- "$PROJECT_ROOT"
+BINARIES=("$BINARY_NAME")
 BUILD_ARGS=(build --locked --bin "$BINARY_NAME")
 if [[ "$BUILD_PROFILE" == release ]]; then
   BUILD_ARGS+=(--release)
 fi
 if [[ "$KWIN_SCRIPT" -eq 1 && "$BINARY_NAME" != window_zones_kwin ]]; then
   BUILD_ARGS+=(--bin window_zones_kwin)
+  BINARIES+=(window_zones_kwin)
 fi
 cargo "${BUILD_ARGS[@]}"
 TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
 mkdir -p "$INSTALL_DIR"
-BINARIES=("$BINARY_NAME")
-if [[ "$KWIN_SCRIPT" -eq 1 && "$BINARY_NAME" != window_zones_kwin ]]; then
-  BINARIES+=(window_zones_kwin)
-fi
 for name in "${BINARIES[@]}"; do
   SOURCE_BIN="$TARGET_DIR/$BUILD_PROFILE/$name"
   if [[ ! -x "$SOURCE_BIN" ]]; then

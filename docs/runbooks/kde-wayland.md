@@ -136,6 +136,8 @@ is script-invokable; `setQuickTileMode` is not.
 
 The script-facing `NextRequest` returns
 `(request_id, kind, window_id, x, y, width, height, hotkeys_json)`.
+IDs start at `1`, skip `0` on wrap, and retain their sequence across script
+reconnections; `0` identifies an idle reply.
 An idle call has a deferred reply for up to one second, not an immediate empty
 poll loop. Queued work wakes it on the companion's 25 ms service tick, without
 blocking other D-Bus requests. A three-second script watchdog retries a lost
@@ -157,6 +159,9 @@ Unavailable preflight or transport failures are retryable.
 `RegisterHotkeys` claims the active controller; a completed empty registration
 releases it. `GetNextHotkey` never claims ownership: an unowned poll returns no
 event, and a different active controller is rejected without consuming events.
+
+An absent Window is `(false, "", 0, 0, 0, 0)`; an absent hotkey event is
+`(false, "")`. Presence flags and their default payload fields remain on the wire.
 
 ## Manual smoke checklist
 
@@ -194,10 +199,10 @@ unload, but cleared actions hold no native accelerators.
 
 Before touching any QAction the script asks KGlobalAccel `action(int)` who
 would win each requested accelerator; if another action owns any key, the
-whole set is rejected and the previous set stays active. The companion checks
-the whole accepted set in each of six settlement rounds, with five 120 ms gaps
-(600 ms total explicit sleep regardless of binding count). Accelerator state
-is queried, not changed, during this verification.
+whole set is rejected and the previous set stays active. Each `SetShortcut`
+verifies the assigned key list and, for nonzero keys, the winning action.
+The script commits its active set only after all updates succeed; the App
+accepts that request result without a later settlement sampler.
 
 ## Nested KWin gate
 
@@ -217,10 +222,10 @@ description. Verification logs and screenshots are temporary artifacts and
 must not be checked in. Synthetic results do not replace native-Wayland client
 placement and seated Plasma checks.
 
-For ADR 0009 the gate also starts a second Text Editor and, through `MoveWindow` on the companion bus, moves the first window's captured id after focus changed, expects `WindowGone` once the second window is closed, and expects a quick-tiled (`slotWindowQuickTileLeft`) and a maximized window to be restored before the frame is applied and a fullscreen window to be rejected unchanged. It reads KWin's own `tile`, `maximizeMode`, `fullScreen`, and `frameGeometry` through throwaway scripts and `_NET_WM_STATE` through `xprop`. It then reloads a config adding the incumbent's `Alt+Ctrl+F24` and expects `were refused` naming the owner, the previous five bindings, and `Alt+Ctrl+Left` still moving the window. These checks require KWin 6 scripting with the `tile` property.
+The gate also runs the [identified-window and hotkey-rollback checks](testing.md#v1-verification-matrix) on disposable Text Editor windows. Its refused replacement must name the incumbent, retain five bindings and keep `Alt+Ctrl+Left` working. KWin state is independently observed through its scripting API and `xprop`.
 
 ### KWin API constraints
 
 - `workspace.clientArea(KWin.WorkArea, output, desktop)` ignores the output and returns the desktop-wide union, not a per-output work area. Use `KWin.MaximizeArea` for per-output placement.
-- KWin's scripting `registerShortcut` returns success for any callable handler: it hands the sequence to KGlobalAccel and discards the result, so an accelerator another action already owns can be accepted without firing. The script preflights every accelerator through KGlobalAccel `action(int)` (the dispatch winner, unlike the unordered `getGlobalShortcutsByKey`) before any registration and the companion re-verifies the winner read-only.
+- KWin's scripting `registerShortcut` returns success for any callable handler and discards KGlobalAccel's result, so it cannot prove assignment. `getGlobalShortcutsByKey` is unordered; the preflight and per-`SetShortcut` winner checks use `action(int)`.
 

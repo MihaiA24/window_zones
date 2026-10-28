@@ -91,10 +91,6 @@ pub fn built_in_zone_from_name(name: &str) -> Option<BuiltInZone> {
     }
 }
 
-pub fn is_built_in_zone_name(name: &str) -> bool {
-    built_in_zone_from_name(name).is_some()
-}
-
 /// Calculates a zone rectangle inside a display usable area.
 ///
 /// Rounding is deterministic and edge-preserving: right/bottom anchored zones
@@ -115,34 +111,29 @@ pub fn rect_for_zone(
 
 pub fn rect_for_built_in_zone(zone: BuiltInZone, usable_area: Rect) -> Rect {
     match zone {
-        BuiltInZone::LeftHalf => left_fraction(usable_area, 2, 1),
-        BuiltInZone::RightHalf => right_fraction(usable_area, 2, 1),
+        BuiltInZone::LeftHalf => left_fraction(usable_area, 2),
+        BuiltInZone::RightHalf => right_fraction(usable_area, 2),
         BuiltInZone::TopHalf => top_half(usable_area),
         BuiltInZone::BottomHalf => bottom_half(usable_area),
-        BuiltInZone::TopLeft => top_half(left_fraction(usable_area, 2, 1)),
-        BuiltInZone::TopRight => top_half(right_fraction(usable_area, 2, 1)),
-        BuiltInZone::BottomLeft => bottom_half(left_fraction(usable_area, 2, 1)),
-        BuiltInZone::BottomRight => bottom_half(right_fraction(usable_area, 2, 1)),
-        BuiltInZone::LeftThird => left_fraction(usable_area, 3, 1),
+        BuiltInZone::TopLeft => top_half(left_fraction(usable_area, 2)),
+        BuiltInZone::TopRight => top_half(right_fraction(usable_area, 2)),
+        BuiltInZone::BottomLeft => bottom_half(left_fraction(usable_area, 2)),
+        BuiltInZone::BottomRight => bottom_half(right_fraction(usable_area, 2)),
+        BuiltInZone::LeftThird => left_fraction(usable_area, 3),
         BuiltInZone::CenterThird => center_third(usable_area),
-        BuiltInZone::RightThird => right_fraction(usable_area, 3, 1),
+        BuiltInZone::RightThird => right_fraction(usable_area, 3),
         BuiltInZone::LeftTwoThirds => left_two_thirds(usable_area),
         BuiltInZone::RightTwoThirds => right_two_thirds(usable_area),
         BuiltInZone::Maximize => usable_area,
     }
 }
 
-fn left_fraction(area: Rect, denominator: u32, numerator: u32) -> Rect {
-    Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_mul(numerator) / denominator,
-        area.height,
-    )
+fn left_fraction(area: Rect, denominator: u32) -> Rect {
+    Rect::new(area.x, area.y, area.width / denominator, area.height)
 }
 
-fn right_fraction(area: Rect, denominator: u32, numerator: u32) -> Rect {
-    let width = area.width.saturating_mul(numerator) / denominator;
+fn right_fraction(area: Rect, denominator: u32) -> Rect {
+    let width = area.width / denominator;
     Rect::new(area.right() - width as i32, area.y, width, area.height)
 }
 

@@ -224,7 +224,7 @@ impl CallbackContext {
             } else {
                 EventType::KeyRelease(key)
             };
-            return state.handle_event(event, true);
+            return state.handle_event(event);
         }
         // Event flags are authoritative if a modifier changed while the tap
         // was unavailable, or was already down when this listener started.
@@ -250,14 +250,11 @@ impl CallbackContext {
             // A repeat without an observed initial press never creates an action.
             return state.swallowed.contains(&key);
         }
-        state.handle_event(
-            if event_type == KEY_DOWN {
-                EventType::KeyPress(key)
-            } else {
-                EventType::KeyRelease(key)
-            },
-            true,
-        )
+        state.handle_event(if event_type == KEY_DOWN {
+            EventType::KeyPress(key)
+        } else {
+            EventType::KeyRelease(key)
+        })
     }
 }
 

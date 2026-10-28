@@ -94,7 +94,7 @@ def main():
         if options.action == "cleanup" and options.dry_run:
             workspace.cleanup(True)
             return 0
-        if getattr(options, "dry_run", False) and options.action != "cleanup":
+        if getattr(options, "dry_run", False):
             workspace.state(False)
             print(json.dumps({"plan": vars(options), "checkout": str(workspace.root), "profile": workspace.profile,
                               "scratch": str(workspace.scratch), "display": f":{workspace.display}", "tcp_ports": [],

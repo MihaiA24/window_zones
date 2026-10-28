@@ -93,7 +93,6 @@ def check_behaviors(workspace, prefix):
                 check_seed(workspace, seed, zone)
                 code, text = workspace.run(workspace.app_args(options, ["dispatch", hotkey]), f"{prefix}/{variant}-{name}")
                 result[variant][name] = dispatch_observation(code, text, workspace.config)
-    check_seed(workspace, "valid")
     return result
 
 
@@ -163,9 +162,10 @@ def check_e2e(workspace, prefix):
 
 
 def measurement_summary(samples):
+    minimum, maximum = min(samples), max(samples)
     return {"runs": len(samples), "median_ms": statistics.median(samples) / 1_000_000,
-            "min_ms": min(samples) / 1_000_000, "max_ms": max(samples) / 1_000_000,
-            "spread_ms": (max(samples) - min(samples)) / 1_000_000}
+            "min_ms": minimum / 1_000_000, "max_ms": maximum / 1_000_000,
+            "spread_ms": (maximum - minimum) / 1_000_000}
 
 
 def check_performance(workspace, options, prefix, golden):
@@ -227,8 +227,9 @@ def check_performance(workspace, options, prefix, golden):
     if candidate_median > maximum:
         delta.append({"path": "$.candidate.median_ms", "expected": {"maximum": maximum / 1_000_000},
                       "actual": candidate_median / 1_000_000})
-    if digest(baseline_binary) != baseline_hash:
-        delta.append({"path": "$.baseline.binary_sha256", "expected": baseline_hash, "actual": digest(baseline_binary)})
+    actual_hash = digest(baseline_binary)
+    if actual_hash != baseline_hash:
+        delta.append({"path": "$.baseline.binary_sha256", "expected": baseline_hash, "actual": actual_hash})
     return {"dispatch": golden["dispatch"], "runs_per_side": options.runs,
             "max_regression_percent": options.max_regression_percent}, {
                 "baseline_ref": options.baseline_ref, "baseline_commit": commit, "baseline_binary_sha256": baseline_hash,
@@ -285,8 +286,9 @@ def check_command(workspace, options):
                     delta.append({"path": "$.confirmed_fixed_work", "expected": True,
                                   "actual": observed["work_confirmed"] and observed["fixed_input_unchanged"]})
             report.update(expected=expected, actual=observed, difference=delta)
-            if workspace.build_status() != "current":
-                report["difference"].append({"path": "$.build", "expected": "current", "actual": workspace.build_status()})
+            status = workspace.build_status()
+            if status != "current":
+                report["difference"].append({"path": "$.build", "expected": "current", "actual": status})
             report["status"] = "fail" if report["difference"] else "pass"
             workspace.event("check-result", scenario=options.scenario, status=report["status"], report=str(folder / "report.json"))
     except (Exception, KeyboardInterrupt) as error:

@@ -81,7 +81,7 @@ class Terminal:
         observed = self.wait(expected, offset)
         if expected != "Session closed.":
             end = offset + observed.index(expected) + len(expected)
-            observed = self.wait(self.prompt, end)
+            self.wait(self.prompt, end)
             observed = self.text[offset:]
         self.workspace.event("terminal-result", command=command, observed=observed)
         return observed

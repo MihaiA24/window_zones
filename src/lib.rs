@@ -65,6 +65,5 @@ pub use windows_window_system::WindowsWindowSystem;
 #[cfg(target_os = "linux")]
 pub use x11_window_system::{X11HotkeySystem, X11WindowSystem};
 pub use zones::{
-    BuiltInZone, ZoneDefinition, built_in_zone_from_name, is_built_in_zone_name,
-    rect_for_built_in_zone, rect_for_zone,
+    BuiltInZone, ZoneDefinition, built_in_zone_from_name, rect_for_built_in_zone, rect_for_zone,
 };

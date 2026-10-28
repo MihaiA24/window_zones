@@ -40,7 +40,7 @@ pub struct WindowHistory {
     next_sequence: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct WindowRecord {
     /// Geometry before the first App move since the user last placed the window.
     restore: Rect,
@@ -55,11 +55,10 @@ impl WindowHistory {
     }
 
     fn remember(&mut self, window: &FocusedWindow, applied: Rect) {
-        let restore = self
-            .record(&window.id)
-            .map_or(window.geometry, |record| record.restore);
+        let previous = self.record(&window.id);
+        let restore = previous.map_or(window.geometry, |record| record.restore);
 
-        if !self.records.contains_key(&window.id) && self.records.len() >= HISTORY_CAPACITY {
+        if previous.is_none() && self.records.len() >= HISTORY_CAPACITY {
             let oldest = self
                 .records
                 .iter()
@@ -195,7 +194,6 @@ fn horizontal_neighbour(
 ) -> Option<&DisplayGeometry> {
     let source = displays[current_index].usable_area;
     let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
     let source_center_y = 2 * i64::from(source.y) + i64::from(source.height);
 
     displays
@@ -203,8 +201,7 @@ fn horizontal_neighbour(
         .filter_map(|display| {
             let area = display.usable_area;
             let right = i64::from(area.x) + i64::from(area.width);
-            let bottom = i64::from(area.y) + i64::from(area.height);
-            if source_bottom.min(bottom) <= i64::from(source.y).max(i64::from(area.y)) {
+            if !spans_overlap_y(source, area) {
                 return None;
             }
             let gap = if left {
@@ -311,14 +308,8 @@ fn overlap_area(a: Rect, b: Rect) -> i64 {
 fn distance_squared(area: Rect, x: i64, y: i64) -> i64 {
     let axis = |value: i64, start: i32, length: u32| {
         let start = i64::from(start);
-        let end = start + i64::from(length);
-        if value < start {
-            start - value
-        } else if value >= end {
-            value - end + 1
-        } else {
-            0
-        }
+        let end = start + i64::from(length) - 1;
+        (value - value.clamp(start, end)).abs()
     };
     let dx = axis(x, area.x, area.width);
     let dy = axis(y, area.y, area.height);
@@ -401,10 +392,6 @@ mod tests {
     use crate::window_system::FakeWindowSystem;
     use crate::{DisplayGeometry, ZoneDefinition};
 
-    fn move_to_left_half_action() -> (String, BTreeMap<String, ZoneDefinition>) {
-        ("left-half".to_string(), BTreeMap::new())
-    }
-
     fn window_id() -> WindowId {
         WindowId::new("window")
     }
@@ -443,14 +430,7 @@ mod tests {
     fn moves_focused_window_to_zone_on_current_display() {
         let mut fake = FakeWindowSystem::with_focus(Rect::new(100, 100, 800, 600));
 
-        let (zone, zones) = move_to_left_half_action();
-        execute_action(
-            &Action::MoveToZone { zone },
-            &zones,
-            &mut WindowHistory::default(),
-            &mut fake,
-        )
-        .unwrap();
+        execute(&mut fake, &zone("left-half")).unwrap();
 
         assert_eq!(fake.moves, vec![moved_to(Rect::new(0, 0, 960, 1080))]);
     }

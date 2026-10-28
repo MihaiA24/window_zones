@@ -411,12 +411,6 @@ mod tests {
                     Some(&runtime_log),
                 )
                 .unwrap();
-                #[cfg(target_os = "linux")]
-                {
-                    runtime.hotkey_system = crate::RuntimeHotkeySystem::CompositorBound(
-                        crate::CompositorBoundHotkeySystem,
-                    );
-                }
                 run_runtime(
                     &mut runtime,
                     &mut CliSurface {

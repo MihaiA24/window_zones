@@ -131,7 +131,7 @@ Start the listener with `window_zones run`; it keeps serving hotkeys when stdin 
 
 On Unix, the lock directory must be owned by the current effective UID, non-symlinked, and private (`0700`). Linux uses `XDG_RUNTIME_DIR` when set; otherwise Unix uses `<temporary-directory>/window_zones-<uid>/`. Lock/PID/dispatch files share that directory. PID sidecars are recreated without following stale symlinks.
 
-On Linux, manage the service with `systemctl --user status|stop|start|restart window-zones`; `systemctl --user disable --now window-zones` turns it off. Logs: `journalctl --user -u window-zones -f`. On macOS, use `launchctl print gui/$(id -u)/org.window_zones.run` and `launchctl kickstart -k gui/$(id -u)/org.window_zones.run`; logs are `~/Library/Logs/window_zones.log`. See [installation](installation.md#macos-launchagent) for loading, ownership, and permissions.
+See [Linux supervision](installation.md#linux-systemd-user-unit) and [macOS LaunchAgent](installation.md#macos-launchagent) for service commands, logs, ownership, and permissions.
 
 The App prints runtime events once per change, never per retry:
 

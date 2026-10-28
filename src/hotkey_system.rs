@@ -98,7 +98,7 @@ impl RdevListener {
     }
 
     /// Return true only when the native event should be consumed.
-    fn handle_event(&mut self, event: EventType, exclusive: bool) -> bool {
+    fn handle_event(&mut self, event: EventType) -> bool {
         match event {
             EventType::KeyPress(key) => {
                 if !self.pressed.insert(key) {
@@ -127,10 +127,8 @@ impl RdevListener {
                     self.clear_registration();
                     return false;
                 }
-                if exclusive {
-                    self.swallowed.insert(key);
-                }
-                exclusive
+                self.swallowed.insert(key);
+                true
             }
             EventType::KeyRelease(key) => {
                 self.pressed.remove(&key);
@@ -194,7 +192,7 @@ impl RdevHotkeySystem {
             let result = std::panic::catch_unwind(move || {
                 #[cfg(target_os = "windows")]
                 let result = grab(move |event: Event| {
-                    let consume = listener.lock().map(|mut state| state.handle_event(event.event_type, true))
+                    let consume = listener.lock().map(|mut state| state.handle_event(event.event_type))
                         .unwrap_or(false);
                     if consume { None } else { Some(event) }
                 }).map_err(|error| format!("{error:?}"));
@@ -321,11 +319,6 @@ fn canonical_binding(raw: &str) -> Result<((u8, Key), String), HotkeySystemError
             "hotkey `{raw}` is not canonical; use `{canonical}`"
         )));
     }
-    Ok((binding_code(&canonical)?, canonical))
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn binding_code(canonical: &str) -> Result<(u8, Key), HotkeySystemError> {
     let mut tokens = canonical.split('+');
     let key_token = tokens.next_back().unwrap_or_default();
     let modifiers = tokens.fold(0, |mask, token| {
@@ -342,7 +335,7 @@ fn binding_code(canonical: &str) -> Result<(u8, Key), HotkeySystemError> {
             "unsupported hotkey key `{key_token}` in `{canonical}`"
         ))
     })?;
-    Ok((modifiers, key))
+    Ok(((modifiers, key), canonical))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -474,12 +467,12 @@ mod tests {
         state
     }
 
-    fn press(system: &RdevHotkeySystem, key: Key, exclusive: bool) -> bool {
-        listener_state(system).handle_event(EventType::KeyPress(key), exclusive)
+    fn press(system: &RdevHotkeySystem, key: Key) -> bool {
+        listener_state(system).handle_event(EventType::KeyPress(key))
     }
 
-    fn release(system: &RdevHotkeySystem, key: Key, exclusive: bool) -> bool {
-        listener_state(system).handle_event(EventType::KeyRelease(key), exclusive)
+    fn release(system: &RdevHotkeySystem, key: Key) -> bool {
+        listener_state(system).handle_event(EventType::KeyRelease(key))
     }
 
     #[test]
@@ -599,9 +592,9 @@ mod tests {
             system.register_hotkeys(&["ctrl+b".to_string(), "ctrl+bad".to_string()]),
             Err(HotkeySystemError::Rejected(_))
         ));
-        press(&system, Key::ControlLeft, true);
-        assert!(!press(&system, Key::KeyB, true));
-        assert!(press(&system, Key::KeyA, true));
+        press(&system, Key::ControlLeft);
+        assert!(!press(&system, Key::KeyB));
+        assert!(press(&system, Key::KeyA));
         assert_eq!(
             system.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -615,10 +608,10 @@ mod tests {
     fn replacing_bindings_keeps_already_queued_presses() {
         let mut system = system_without_native_listener();
         system.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(press(&system, Key::KeyA, true));
-        release(&system, Key::KeyA, true);
+        assert!(press(&system, Key::KeyA));
+        release(&system, Key::KeyA);
         system.register_hotkeys(&["b".to_string()]).unwrap();
-        assert!(press(&system, Key::KeyB, true));
+        assert!(press(&system, Key::KeyB));
         for key in ["a", "b"] {
             assert_eq!(
                 system.next_hotkey().unwrap(),
@@ -634,11 +627,11 @@ mod tests {
     fn exclusive_combo_consumes_repeat_and_release_even_after_modifiers_and_registration_change() {
         let mut system = system_without_native_listener();
         system.register_hotkeys(&["ctrl+a".to_string()]).unwrap();
-        assert!(!press(&system, Key::ControlLeft, true));
-        assert!(press(&system, Key::KeyA, true));
-        assert!(press(&system, Key::KeyA, true));
-        assert!(!press(&system, Key::KeyB, true));
-        assert!(!release(&system, Key::ControlLeft, true));
+        assert!(!press(&system, Key::ControlLeft));
+        assert!(press(&system, Key::KeyA));
+        assert!(press(&system, Key::KeyA));
+        assert!(!press(&system, Key::KeyB));
+        assert!(!release(&system, Key::ControlLeft));
         assert_eq!(
             system.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -647,33 +640,19 @@ mod tests {
         );
         assert_eq!(system.next_hotkey().unwrap(), None);
         system.register_hotkeys(&[]).unwrap();
-        assert!(release(&system, Key::KeyA, true));
-        assert!(!release(&system, Key::KeyB, true));
-        assert!(!press(&system, Key::KeyA, true));
+        assert!(release(&system, Key::KeyA));
+        assert!(!release(&system, Key::KeyB));
+        assert!(!press(&system, Key::KeyA));
     }
 
     #[test]
     fn both_modifier_sides_are_tracked_independently() {
         let mut system = system_without_native_listener();
         system.register_hotkeys(&["ctrl+a".to_string()]).unwrap();
-        press(&system, Key::ControlLeft, true);
-        press(&system, Key::ControlRight, true);
-        release(&system, Key::ControlLeft, true);
-        assert!(press(&system, Key::KeyA, true));
-    }
-
-    #[test]
-    fn linux_style_listener_delivers_without_consuming() {
-        let mut system = system_without_native_listener();
-        system.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(!press(&system, Key::KeyA, false));
-        assert!(!release(&system, Key::KeyA, false));
-        assert_eq!(
-            system.next_hotkey().unwrap(),
-            Some(HotkeyEvent::Pressed {
-                hotkey: "a".to_string()
-            })
-        );
+        press(&system, Key::ControlLeft);
+        press(&system, Key::ControlRight);
+        release(&system, Key::ControlLeft);
+        assert!(press(&system, Key::KeyA));
     }
 
     #[test]
@@ -681,11 +660,11 @@ mod tests {
         let mut first = system_without_native_listener();
         let mut second = RdevHotkeySystem::with_listener(Arc::clone(&first.listener));
         first.register_hotkeys(&["a".to_string()]).unwrap();
-        press(&first, Key::KeyA, true);
+        press(&first, Key::KeyA);
         second.register_hotkeys(&["b".to_string()]).unwrap();
         assert_eq!(first.next_hotkey().unwrap(), None);
         drop(first);
-        assert!(press(&second, Key::KeyB, true));
+        assert!(press(&second, Key::KeyB));
         assert_eq!(
             second.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -699,8 +678,8 @@ mod tests {
         };
         assert!(state.bindings.is_empty());
         assert!(state.event_tx.is_none());
-        assert!(state.handle_event(EventType::KeyRelease(Key::KeyB), true));
-        assert!(!state.handle_event(EventType::KeyPress(Key::KeyB), true));
+        assert!(state.handle_event(EventType::KeyRelease(Key::KeyB)));
+        assert!(!state.handle_event(EventType::KeyPress(Key::KeyB)));
     }
 
     #[test]
@@ -729,7 +708,7 @@ mod tests {
         let first = shared();
         let mut second = shared();
         second.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(press(&second, Key::KeyA, true));
+        assert!(press(&second, Key::KeyA));
         listener_state(&second).stop("EventTapError".to_string());
         drop(first);
         let mut restarted = shared();
@@ -737,8 +716,8 @@ mod tests {
         assert_eq!(spawned, 2);
 
         restarted.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(!release(&restarted, Key::KeyA, true));
-        assert!(press(&restarted, Key::KeyA, true));
+        assert!(!release(&restarted, Key::KeyA));
+        assert!(press(&restarted, Key::KeyA));
         assert_eq!(
             restarted.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {

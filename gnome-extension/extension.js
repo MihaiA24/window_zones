@@ -224,20 +224,16 @@ export class WindowZonesService {
     _methodCall(_connection, sender, _objectPath, _interfaceName, methodName, parameters, invocation) {
         try {
             switch (methodName) {
-            case 'GetCapabilities': {
-                const capabilities = this.GetCapabilities();
-                invocation.return_value(new GLib.Variant('(as)', [capabilities]));
+            case 'GetCapabilities':
+                invocation.return_value(new GLib.Variant('(as)', [CAPABILITIES]));
                 return;
-            }
             case 'GetFocusedWindow':
                 invocation.return_value(
                     new GLib.Variant('(btiiuu)', this.GetFocusedWindow()));
                 return;
-            case 'GetDisplays': {
-                const displays = this.GetDisplays();
-                invocation.return_value(new GLib.Variant('(a(siiuu))', [displays]));
+            case 'GetDisplays':
+                invocation.return_value(new GLib.Variant('(a(siiuu))', [this.GetDisplays()]));
                 return;
-            }
             case 'MoveWindow': {
                 const [id, x, y, width, height] = parameters.deep_unpack();
                 this.MoveWindow(sender, id, x, y, width, height).then(
@@ -276,12 +272,8 @@ export class WindowZonesService {
         invocation.return_dbus_error(name, error?.message ?? String(error));
     }
 
-    GetCapabilities() {
-        return CAPABILITIES;
-    }
-
     GetFocusedWindow() {
-        const window = this._focusedWindow();
+        const window = this._applicationWindow(global.display.get_focus_window());
         if (!window)
             return [false, 0, 0, 0, 0, 0];
 
@@ -290,13 +282,22 @@ export class WindowZonesService {
     }
 
     GetDisplays() {
-        return this._displayData().map(item => [
-            item.id,
-            item.rect.x,
-            item.rect.y,
-            item.rect.width,
-            item.rect.height,
-        ]);
+        const monitors = Main.layoutManager.monitors ?? [];
+        if (monitors.length === 0)
+            throw new Error('GNOME reported no active displays');
+
+        const activeDisplayIds = new Map();
+        const displays = monitors.map((_monitor, index) => {
+            const rect = Main.layoutManager.getWorkAreaForMonitor(index);
+            const key = [rect.x, rect.y, rect.width, rect.height].join(':');
+            let id = this._displayIds.get(key);
+            if (!id)
+                id = `display-${this._nextDisplayId++}`;
+            activeDisplayIds.set(key, id);
+            return [id, rect.x, rect.y, rect.width, rect.height];
+        });
+        this._displayIds = activeDisplayIds;
+        return displays;
     }
 
     MoveWindow(sender, id, x, y, width, height) {
@@ -434,9 +435,9 @@ export class WindowZonesService {
             const requestFrame = () => {
                 const centerX = x + Math.floor(width / 2);
                 const centerY = y + Math.floor(height / 2);
-                const targetMonitor = this._displayData().findIndex(({rect}) =>
-                    centerX >= rect.x && centerX < rect.x + rect.width
-                    && centerY >= rect.y && centerY < rect.y + rect.height);
+                const targetMonitor = this.GetDisplays().findIndex(([, left, top, monitorWidth, monitorHeight]) =>
+                    centerX >= left && centerX < left + monitorWidth
+                    && centerY >= top && centerY < top + monitorHeight);
                 if (targetMonitor >= 0 && window.get_monitor() !== targetMonitor) {
                     // The restore configure is acknowledged before changing monitor bounds.
                     window.move_to_monitor(targetMonitor);
@@ -601,10 +602,6 @@ export class WindowZonesService {
         }
     }
 
-    _focusedWindow() {
-        return this._applicationWindow(global.display.get_focus_window());
-    }
-
     _applicationWindow(window) {
         if (
             Main.overview?.visible === true
@@ -625,25 +622,6 @@ export class WindowZonesService {
             return null;
 
         return window;
-    }
-
-    _displayData() {
-        const monitors = Main.layoutManager.monitors ?? [];
-        if (monitors.length === 0)
-            throw new Error('GNOME reported no active displays');
-
-        const activeDisplayIds = new Map();
-        const displays = monitors.map((_monitor, index) => {
-            const rect = Main.layoutManager.getWorkAreaForMonitor(index);
-            const key = [rect.x, rect.y, rect.width, rect.height].join(':');
-            let id = this._displayIds.get(key);
-            if (!id)
-                id = `display-${this._nextDisplayId++}`;
-            activeDisplayIds.set(key, id);
-            return {id, rect};
-        });
-        this._displayIds = activeDisplayIds;
-        return displays;
     }
 }
 

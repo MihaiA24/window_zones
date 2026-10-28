@@ -562,26 +562,8 @@ impl HotkeySystem for NoopHotkeySystem {
     }
 }
 
-/// Hotkeys on compositors whose own config binds keys to `window_zones dispatch`.
-#[cfg(target_os = "linux")]
-struct CompositorBoundHotkeySystem;
-
-#[cfg(target_os = "linux")]
-impl HotkeySystem for CompositorBoundHotkeySystem {
-    fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        // The compositor owns key capture; the persistent runtime owns bindings and history.
-        Ok(())
-    }
-
-    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        Ok(None)
-    }
-}
-
 enum RuntimeHotkeySystem {
     Noop(NoopHotkeySystem),
-    #[cfg(target_os = "linux")]
-    CompositorBound(CompositorBoundHotkeySystem),
     #[cfg(target_os = "linux")]
     X11(X11HotkeySystem),
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -597,8 +579,6 @@ macro_rules! with_hotkey_system {
     ($runtime_system:expr, $system:ident => $body:expr) => {
         match $runtime_system {
             RuntimeHotkeySystem::Noop($system) => $body,
-            #[cfg(target_os = "linux")]
-            RuntimeHotkeySystem::CompositorBound($system) => $body,
             #[cfg(target_os = "linux")]
             RuntimeHotkeySystem::X11($system) => $body,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -616,7 +596,7 @@ impl RuntimeHotkeySystem {
         match backend {
             RuntimeBackend::DryRun => Self::Noop(NoopHotkeySystem),
             #[cfg(target_os = "linux")]
-            RuntimeBackend::Wayland(_) => Self::CompositorBound(CompositorBoundHotkeySystem),
+            RuntimeBackend::Wayland(_) => Self::Noop(NoopHotkeySystem),
             #[cfg(target_os = "linux")]
             RuntimeBackend::X11 => Self::X11(X11HotkeySystem::new()),
             #[cfg(target_os = "linux")]
@@ -2057,7 +2037,7 @@ fn main() -> ExitCode {
             Command::Tui => "tui",
             Command::Init => "init",
         };
-        Logger::new(Some(path.clone()), true, false, session)
+        Logger::new(path, session)
     });
 
     if matches!(args.command, Command::Init) {

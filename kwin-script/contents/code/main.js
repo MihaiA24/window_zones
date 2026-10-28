@@ -86,11 +86,6 @@ function invoke(method, args, callback) {
     }
 }
 
-function displayId(output, index) {
-    const name = output && typeof output.name === 'string' ? output.name : '';
-    return name || `kwin-output-${index}`;
-}
-
 function rectPayload(rect) {
     return [
         Math.round(rect.x),
@@ -120,39 +115,33 @@ function displayData() {
             output,
             workspace.currentDesktop);
         const [x, y, width, height] = rectPayload(workArea);
+        const id = output && typeof output.name === 'string' && output.name
+            || `kwin-output-${index}`;
         if (width <= 0 || height <= 0)
-            throw new Error(`KWin reported an invalid work area for output ${displayId(output, index)}`);
-        displays.push({
-            id: displayId(output, index),
-            x,
-            y,
-            width,
-            height,
-        });
+            throw new Error(`KWin reported an invalid work area for output ${id}`);
+        displays.push([id, x, y, width, height]);
     });
     if (displays.length === 0)
         throw new Error('KWin reported no active outputs');
     return displays;
 }
 
-function focusedWindow() {
-    if (typeof workspace === 'undefined' || !workspace)
-        return null;
-
-    const window = workspace.activeWindow;
+function focusedPayload() {
+    const window = typeof workspace !== 'undefined' && workspace
+        ? workspace.activeWindow : null;
     if (!window
         || window.deleted
         || window.specialWindow
         || window.managed === false
         || window.normalWindow !== true
         || !window.frameGeometry)
-        return null;
+        return [false, '', 0, 0, 0, 0];
 
     const [x, y, width, height] = rectPayload(window.frameGeometry);
     if (width <= 0 || height <= 0)
-        return null;
+        return [false, '', 0, 0, 0, 0];
 
-    return {window, x, y, width, height};
+    return [true, String(window.internalId), x, y, width, height];
 }
 function trackFocusedWindow(window) {
     if (!window
@@ -171,33 +160,12 @@ function trackFocusedWindow(window) {
     window.frameGeometryChanged.connect(handler);
 }
 
-function focusedPayload() {
-    const focused = focusedWindow();
-    if (!focused)
-        return [false, '', 0, 0, 0, 0];
-
-    return [
-        true,
-        String(focused.window.internalId),
-        focused.x,
-        focused.y,
-        focused.width,
-        focused.height,
-    ];
-}
 function publishFocusedWindow() {
     invoke('UpdateFocusedWindow', [JSON.stringify(focusedPayload())], () => {});
 }
 
 function publishDisplays(callback = () => {}) {
-    const displays = displayData().map(item => [
-        item.id,
-        item.x,
-        item.y,
-        item.width,
-        item.height,
-    ]);
-    if (!invoke('UpdateDisplays', [JSON.stringify(displays)], callback))
+    if (!invoke('UpdateDisplays', [JSON.stringify(displayData())], callback))
         throw protocolError('Unavailable', 'KWin could not publish current work areas');
 }
 
@@ -405,20 +373,19 @@ function registerHotkeys(hotkeys, callback) {
             const desired = new Set(hotkeys);
             // Delivery state cannot prove native assignment after a lost update reply.
             // Reapplying the desired keys lets a retry restore partially cleared grabs.
-            const updates = next;
             registeredShortcuts.forEach(hotkey => {
                 if (!desired.has(hotkey))
-                    updates.push({hotkey, key: 0});
+                    next.push({hotkey, key: 0});
             });
             function configure(index) {
                 if (finished)
                     return;
-                if (index === updates.length) {
+                if (index === next.length) {
                     activeHotkeys = desired;
                     finish();
                     return;
                 }
-                const entry = updates[index];
+                const entry = next[index];
                 // Rust supplies the typed a(ai) payload that QJSEngine cannot marshal.
                 // Clearing the native keys also updates KWin's cached QAction shortcuts.
                 if (!invoke('SetShortcut', [entry.hotkey, entry.key], () => configure(index + 1)))
@@ -432,10 +399,6 @@ function registerHotkeys(hotkeys, callback) {
     preflight(0);
 }
 
-function complete(requestId, ok, errorName, message) {
-    invoke('CompleteRequest', [String(requestId), ok, errorName, message], () => {});
-}
-
 function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJson, callback) {
     let finished = false;
     let timer = null;
@@ -445,8 +408,9 @@ function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJ
         finished = true;
         if (timer)
             timer.stop();
-        complete(requestId, !error, error ? (error.dbusError || 'org.window_zones.KWin.Error.Operation') : '',
-            error ? errorMessage(error) : '');
+        invoke('CompleteRequest', [String(requestId), !error,
+            error ? (error.dbusError || 'org.window_zones.KWin.Error.Operation') : '',
+            error ? errorMessage(error) : ''], () => {});
         callback();
     };
     try {
@@ -475,7 +439,6 @@ function processRequest(requestId, kind, windowId, x, y, width, height, hotkeysJ
         } else {
             throw new Error(`unknown KWin request kind '${kind}'`);
         }
-        finish();
     } catch (error) {
         finish(error);
     }

@@ -20,18 +20,9 @@ What this verifies:
 - Python parsing of `scripts/gnome-smoke.py`
 - Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
 
-The repository test script covers formatting, unit/integration/doc tests in one
-Cargo test invocation, and clippy when installed. The GNOME and KDE adapter
-contract tests use fake compositor services on private `dbus-daemon` instances;
-KWin controller ownership is also checked through the real Rust dispatcher.
-Neither requires a running compositor session.
-
-The compositor scripts can be syntax-checked with:
-
-```bash
-node --check gnome-extension/extension.js
-node --check kwin-script/contents/code/main.js
-```
+The GNOME and KDE adapter contract tests use fake compositor services on private
+`dbus-daemon` instances; KWin controller ownership is also checked through the real
+Rust dispatcher. Neither requires a running compositor session.
 
 ## Agent-driven verification
 

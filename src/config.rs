@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,10 +47,10 @@ pub fn parse_config(input: &str) -> Result<AppConfig, ConfigError> {
 }
 
 pub fn validate_and_normalize_app_config(
-    mut config: AppConfig,
+    config: AppConfig,
 ) -> Result<AppConfig, BindingValidationError> {
     let mut normalized_zones = BTreeMap::new();
-    for (name, zone) in std::mem::take(&mut config.zones) {
+    for (name, zone) in config.zones {
         let normalized_name = normalize_zone_name_name(&name)?;
         if built_in_zone_from_name(&normalized_name).is_some() {
             return Err(BindingValidationError::BuiltInZoneConflict {
@@ -69,7 +70,7 @@ pub fn validate_and_normalize_app_config(
         }
     }
 
-    let mut bindings = validate_and_normalize_bindings(std::mem::take(&mut config.bindings))?;
+    let mut bindings = validate_and_normalize_bindings(config.bindings)?;
 
     for binding in bindings.iter_mut() {
         if let Action::MoveToZone { zone } = &mut binding.action {
@@ -101,9 +102,7 @@ pub fn validate_and_normalize_bindings(
     for binding in bindings.iter_mut() {
         let normalized = normalize_hotkey(&binding.hotkey)?;
         if !seen.insert(normalized.clone()) {
-            return Err(BindingValidationError::DuplicateHotkey {
-                hotkey: normalized.clone(),
-            });
+            return Err(BindingValidationError::DuplicateHotkey { hotkey: normalized });
         }
         binding.hotkey = normalized;
     }
@@ -144,18 +143,8 @@ pub fn normalize_hotkey(input: &str) -> Result<String, BindingValidationError> {
     modifiers.sort_by_key(|token| modifier_sort_key(token.as_str()));
     modifiers.dedup();
 
-    let mut normalized = String::new();
-    if !modifiers.is_empty() {
-        for modifier in modifiers {
-            if !normalized.is_empty() {
-                normalized.push('+');
-            }
-            normalized.push_str(&modifier);
-        }
-        normalized.push('+');
-    }
-    normalized.push_str(&key);
-    Ok(normalized)
+    modifiers.push(key);
+    Ok(modifiers.join("+"))
 }
 
 fn normalize_zone_name_name(raw: &str) -> Result<String, BindingValidationError> {
@@ -269,16 +258,6 @@ fn modifier_sort_key(token: &str) -> u8 {
 /// A commented starter config for zones, center, restore, and next/previous display,
 /// under one modifier chord. Directional display bindings can be added by the user.
 pub fn starter_config(chord: &str) -> String {
-    let binding = |key: &str, action: &str| {
-        format!("[[bindings]]\nhotkey = \"{chord}+{key}\"\naction = {action}\n\n")
-    };
-    let zone = |key: &str, zone: &str| {
-        binding(
-            key,
-            &format!("{{ type = \"move-to-zone\", zone = \"{zone}\" }}"),
-        )
-    };
-
     let mut config = String::from(
         "# Window Zones config. Changes are picked up while the App runs.\n\
          #\n\
@@ -312,18 +291,24 @@ pub fn starter_config(chord: &str) -> String {
         ("T", "right-two-thirds"),
         ("Return", "maximize"),
     ] {
-        config.push_str(&zone(key, name));
+        writeln!(
+            config,
+            "[[bindings]]\nhotkey = \"{chord}+{key}\"\naction = {{ type = \"move-to-zone\", zone = \"{name}\" }}\n"
+        )
+        .unwrap();
     }
-    config.push_str(&binding("C", "{ type = \"center\" }"));
-    config.push_str(&binding("Backspace", "{ type = \"restore\" }"));
-    config.push_str(&binding(
-        "Shift+Right",
-        "{ type = \"move-to-next-display\" }",
-    ));
-    config.push_str(&binding(
-        "Shift+Left",
-        "{ type = \"move-to-previous-display\" }",
-    ));
+    for (key, action) in [
+        ("C", "center"),
+        ("Backspace", "restore"),
+        ("Shift+Right", "move-to-next-display"),
+        ("Shift+Left", "move-to-previous-display"),
+    ] {
+        writeln!(
+            config,
+            "[[bindings]]\nhotkey = \"{chord}+{key}\"\naction = {{ type = \"{action}\" }}\n"
+        )
+        .unwrap();
+    }
     config.truncate(config.trim_end().len());
     config.push('\n');
     config

@@ -213,9 +213,7 @@ graphical logout. Stop the App first when deliberately shutting down both.
 While the service runs, problems also appear as one desktop notification that is
 updated in place: config errors and refused hotkeys at once, and an unavailable
 companion only after it has been unreachable for 20 seconds, so the login race
-and companion restarts stay silent. The GNOME companion declares the
-`unlock-dialog` session mode, so locking the screen does not unload it; its
-hotkeys only act in normal mode.
+and companion restarts stay silent.
 
 The App's single-instance lock rejects a second listener with exit status **75**
 (`EX_TEMPFAIL`). `RestartPreventExitStatus=75` stops systemd retrying that exit,
