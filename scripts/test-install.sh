@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$(uname -s)" != Linux ]]; then
+  printf 'SKIP installer fixture: Linux /proc and GNU stat are required.\n'
+  exit 0
+fi
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 exec python3 - "$PROJECT_ROOT" <<'PY'
 import configparser
@@ -10,6 +14,7 @@ from pathlib import Path
 import plistlib
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -296,8 +301,8 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
             time.sleep(0.05)
         raise AssertionError(description)
 
-    def command(arguments):
-        result = subprocess.run(arguments, env=env, text=True, capture_output=True)
+    def command(arguments, *, environment=None):
+        result = subprocess.run(arguments, env=env if environment is None else environment, text=True, capture_output=True)
         if result.returncode:
             raise AssertionError(f'{arguments!r}: exit {result.returncode}\n{result.stdout}\n{result.stderr}')
         return result
@@ -334,6 +339,28 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
             return ''
 
     try:
+        path_prefix = base / r'''PATH $cash "quoted" 'single' \back`printf injected`'''
+        for shell, options in (('bash', ('--noprofile', '--norc')), ('zsh', ('-f',)), ('fish', ())):
+            shell_path = shutil.which(shell)
+            if shell_path is None:
+                print(f'SKIP {shell} PATH suggestion: shell is not installed')
+                continue
+            shell_home = base / ('path-home-' + shell)
+            shell_home.mkdir()
+            path_env = dict(env, HOME=str(shell_home), XDG_CONFIG_HOME=str(shell_home / '.config'),
+                            SHELL=shell_path, XDG_CURRENT_DESKTOP='', cash='expanded-value')
+            result = command(['/bin/bash', str(root / 'scripts/install.sh'), '--prefix', str(path_prefix)],
+                             environment=path_env)
+            marker = f'{path_prefix / "bin"} is not on PATH. Add it once, then open a new terminal:\n'
+            assert marker in result.stdout, f'{shell} installation did not print a PATH suggestion'
+            instruction = result.stdout.split(marker, 1)[1].splitlines()[0].strip()
+            command([shell_path, *options, '-c', instruction], environment=path_env)
+            check_path = ('printf "%s\\n" $PATH[1]' if shell == 'fish'
+                          else f'source "$HOME/.{shell}rc"; printf "%s\\n" "${{PATH%%:*}}"')
+            literal_path = command([shell_path, *options, '-c', check_path], environment=path_env).stdout.rstrip('\n')
+            assert literal_path == str(path_prefix / 'bin'), f'{shell} PATH suggestion changed the prefix: {literal_path!r}'
+            print(f'PASS {shell} printed PATH suggestion preserves literal prefix across shell evaluations')
+
         env['XDG_CURRENT_DESKTOP'] = 'GNOME'
         gnome_id = 'window-zones@mihai-a24'
         gnome_dir = Path(env['XDG_DATA_HOME']) / 'gnome-shell/extensions' / gnome_id
@@ -439,14 +466,11 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         env['WZI_GRAPHICAL'] = '0'
         env['WZI_VERSION'] = 'three'
         install(fallback, '--kwin-script')
-        legacy = fallback / 'share/window-zones/kde-session-running'
-        legacy.mkdir(mode=0o700)
         offset = len(events())
         result = install(fallback, '--autostart')
         assert 'XDG login supervision' in result.stdout, 'inactive graphical target did not select XDG'
         assert not any(item['kind'] == 'systemctl' and item['args'][0] in ('enable', 'start', 'restart')
                        for item in events()[offset:]), 'inactive graphical target started systemd units'
-        assert not legacy.exists(), 'abandoned empty legacy state was not removed'
         desktop = config / 'autostart/window_zones_kwin.desktop'
         assert desktop.exists() and not (config / 'autostart/window_zones.desktop').exists()
         state_dir = runtime_state(fallback)
@@ -503,7 +527,6 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
                  'XDG logout/uninstall left supervised binaries running')
         assert not desktop.exists()
         assert not (fallback / 'share/window-zones/kde-session').exists()
-        assert not (fallback / 'share/window-zones/kde-session-running').exists()
         assert not (fallback / 'bin/window_zones_kwin').exists()
         assert witness.read_text() == 'user config witness\n'
         print('PASS XDG ordering, companion/App recovery, duplicate-owner exit, reinstall, uninstall')
@@ -538,13 +561,7 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         install(fallback, '--uninstall')
         wait_for(lambda: orphan_pids <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
                  'uninstall after launcher crash left supervised binaries alive')
-        legacy.mkdir(mode=0o700)
-        legacy_witness = legacy / 'foreign-witness'
-        legacy_witness.write_text('do not remove\n')
-        install(fallback, '--kwin-script', '--autostart')
-        install(fallback, '--uninstall')
-        assert legacy_witness.read_text() == 'do not remove\n', 'nonempty legacy state was removed'
-        print('PASS inactive-target/unreachable fallback, stale identity, launcher crash, timezone, companion duplicate, legacy preservation')
+        print('PASS inactive-target/unreachable fallback, stale identity, launcher crash, timezone, companion duplicate')
 
         # A reachable manager with a failed dbus service must not claim it is running.
         env['WZI_SYSTEMD'] = env['WZI_GRAPHICAL'] = '1'

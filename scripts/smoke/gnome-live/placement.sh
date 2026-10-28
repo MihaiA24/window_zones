@@ -22,7 +22,6 @@ run_gnome_live_adr9_window_checks() {
     local a="$WINDOW_ID" b='' b_pid='' a_id='' b_id='' out='' before='' b_before='' observed=''
     XON_DISPLAY="$GNOME_XDISPLAY"
     XON_XAUTHORITY="$GNOME_XAUTHORITY"
-    write_uinput_injector
     build_seam_helper 'GNOME live'
     gnome_live_activate_window || true
     a_id=$(gnome_live_focused_id)
@@ -86,7 +85,7 @@ run_gnome_live_adr9_window_checks() {
         "$(wait_observed gnome_live_geometry "$GNOME_LIVE_CENTER_THIRD")"
 
     gnome_live_activate_window || true
-    out=$(python3 "$UINPUT_INJECTOR" super+left 2>&1) || log "GNOME live uinput super+left: $out"
+    out=$(python3 "$SCRIPT_DIR/smoke/fixtures/uinput_key.py" super+left 2>&1) || log "GNOME live uinput super+left: $out"
     assert_eq 'GNOME live Super+Left edge-tiles the test window' "$GNOME_LIVE_LEFT_HALF" \
         "$(wait_observed gnome_live_geometry "$GNOME_LIVE_LEFT_HALF")"
     assert_wm_state 'GNOME live edge-tiled precondition' "$a" _NET_WM_STATE_MAXIMIZED_VERT 1

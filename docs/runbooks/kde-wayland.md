@@ -160,6 +160,12 @@ Unavailable preflight or transport failures are retryable.
 releases it. `GetNextHotkey` never claims ownership: an unowned poll returns no
 event, and a different active controller is rejected without consuming events.
 
+If a script reset interrupts hotkey capture, the owning controller's
+`GetNextHotkey` returns `Unavailable` until a registration completes successfully,
+including while automatic restoration is pending or after it fails. The App
+invalidates its registered-key cache and uses its existing registration recovery;
+a refused normal replacement still keeps the previous active set.
+
 An absent Window is `(false, "", 0, 0, 0, 0)`; an absent hotkey event is
 `(false, "")`. Presence flags and their default payload fields remain on the wire.
 
@@ -185,6 +191,10 @@ An absent Window is `(false, "", 0, 0, 0, 0)`; an absent hotkey event is
 8. Stop or disable the companion and confirm status/TUI show an in-band
    unavailable diagnostic rather than using X11.
 9. Re-enable/reload the KWin script and restart the companion; verify recovery.
+   Also reload only the script while the App remains running. If restoring a
+   shortcut fails, status/TUI must report unavailable capture rather than retain
+   a registered state; remove the conflict, run `reload`, and verify registration
+   and dispatch recover without restarting the App.
 
 After every accelerator passes preflight, the script creates any missing
 QActions and uses the companion's script-only `SetShortcut(hotkey, qt_key)`

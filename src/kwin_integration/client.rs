@@ -17,6 +17,7 @@ use super::protocol::{
     MOVE_RESIZE_CAPABILITY, classify_dbus_error,
 };
 
+#[derive(Default)]
 pub struct KwinWindowSystem {
     bus_address: Option<String>,
     connection: Mutex<Option<Connection>>,
@@ -34,10 +35,7 @@ impl fmt::Debug for KwinWindowSystem {
 
 impl KwinWindowSystem {
     pub fn new() -> Self {
-        Self {
-            bus_address: None,
-            connection: Mutex::new(None),
-        }
+        Self::default()
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, KwinIntegrationError> {
@@ -103,12 +101,6 @@ impl KwinWindowSystem {
             *connection_slot = None;
         }
         result
-    }
-}
-
-impl Default for KwinWindowSystem {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -201,6 +193,7 @@ impl KwinWindowSystem {
     }
 }
 
+#[derive(Default)]
 pub struct KwinHotkeySystem {
     bus_address: Option<String>,
     connection: Option<Connection>,
@@ -218,10 +211,7 @@ impl fmt::Debug for KwinHotkeySystem {
 
 impl KwinHotkeySystem {
     pub fn new() -> Self {
-        Self {
-            bus_address: None,
-            connection: None,
-        }
+        Self::default()
     }
 
     #[cfg(test)]
@@ -270,12 +260,6 @@ impl KwinHotkeySystem {
         }
 
         result
-    }
-}
-
-impl Default for KwinHotkeySystem {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

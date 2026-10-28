@@ -281,7 +281,8 @@ pub struct App {
     rejected_hotkeys: Option<Vec<String>>,
     registration_retry_at: Option<Instant>,
     last_config_error: Option<String>,
-    last_config_signature: Option<ConfigFileSignature>,
+    /// Unknown after a read failure; Some(None) records an observed missing file.
+    last_config_signature: Option<Option<ConfigFileSignature>>,
     reload_deadline: Option<Instant>,
     perf_log: Option<PerfLog>,
     perf_log_error: Option<String>,
@@ -511,7 +512,7 @@ impl App {
                 return Some(Err(error));
             }
         };
-        self.last_config_signature = input.as_deref().map(config_signature);
+        self.last_config_signature = Some(input.as_deref().map(config_signature));
         Some(parse_config_input(path, input.as_deref()))
     }
 
@@ -531,7 +532,7 @@ impl App {
                 return Some(Err(error));
             }
         };
-        let signature = input.as_deref().map(config_signature);
+        let signature = Some(input.as_deref().map(config_signature));
 
         if self.last_config_signature != signature {
             self.last_config_signature = signature;
@@ -900,10 +901,10 @@ mod tests {
         DispatchHotkeyError, DispatchState, HOTKEY_RETRY_INTERVAL, HotkeyRegistrationState,
         Platform, RuntimeEvent, resolve_config_path_for,
     };
+    use crate::window_system::FakeWindowSystem;
     use crate::{
-        Action, Binding, DisplayGeometry, ExecuteActionError, FocusedWindow, HotkeyEvent,
-        HotkeySystem, HotkeySystemError, Rect, WindowId, WindowMove, WindowSystem,
-        WindowSystemError, ZoneDefinition,
+        Action, Binding, ExecuteActionError, FocusedWindow, HotkeyEvent, HotkeySystem,
+        HotkeySystemError, Rect, WindowId, ZoneDefinition,
     };
     use std::collections::VecDeque;
     use std::env;
@@ -1024,43 +1025,12 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct FakeWindowSystem {
-        focused_window: Option<FocusedWindow>,
-        moves: Vec<WindowMove>,
-    }
-
     impl FakeWindowSystem {
-        fn with_focus(geometry: Rect) -> Self {
-            Self {
-                focused_window: Some(FocusedWindow::new(WindowId::new("window"), geometry)),
-                moves: Vec::new(),
-            }
-        }
-
         fn targets(&self) -> Vec<Rect> {
             self.moves
                 .iter()
                 .map(|window_move| window_move.target)
                 .collect()
-        }
-    }
-
-    impl WindowSystem for FakeWindowSystem {
-        fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-            Ok(self.focused_window.clone())
-        }
-
-        fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-            Ok(vec![
-                DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
-                DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
-            ])
-        }
-
-        fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
-            self.moves.push(window_move.clone());
-            Ok(())
         }
     }
 
@@ -1156,16 +1126,16 @@ action = { type = "move-to-zone", zone = "left-half" }
             app.dispatch_hotkey("Ctrl+Alt+Right", &mut window_system),
             DispatchState::Error(_)
         ));
-        window_system.focused_window = None;
+        window_system.focused_window = Ok(None);
         assert!(matches!(
             app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system),
             DispatchState::Error(_)
         ));
         app.restart();
-        window_system.focused_window = Some(FocusedWindow::new(
+        window_system.focused_window = Ok(Some(FocusedWindow::new(
             WindowId::new("window"),
             Rect::new(200, 200, 800, 600),
-        ));
+        )));
         assert_eq!(
             app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system),
             &DispatchState::Succeeded
@@ -2104,10 +2074,8 @@ action = { type = "move-to-zone", zone = "left-half" }
         let config = TestConfig::new("no_focus");
         config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
         let mut app = App::start_at(&config.path);
-        let mut window_system = FakeWindowSystem {
-            focused_window: None,
-            moves: Vec::new(),
-        };
+        let mut window_system = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+        window_system.focused_window = Ok(None);
 
         let state = app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
 
@@ -2131,10 +2099,6 @@ action = { type = "move-to-zone", zone = "left-half" }
         let mut window_system = FakeWindowSystem::with_focus(original);
 
         app.dispatch_hotkey("Ctrl+Alt+Left", &mut window_system);
-        window_system.focused_window = Some(FocusedWindow::new(
-            WindowId::new("window"),
-            Rect::new(0, 0, 960, 1080),
-        ));
         let state = app.dispatch_hotkey("Ctrl+Alt+Backspace", &mut window_system);
 
         assert_eq!(state, &DispatchState::Succeeded);
@@ -2160,5 +2124,39 @@ action = { type = "move-to-zone", zone = "left-half" }
             events.last(),
             Some(RuntimeEvent::ConfigMissing { path }) if path == Path::new(&config.path)
         ));
+    }
+
+    #[test]
+    fn unreadable_config_becoming_missing_unregisters_previous_bindings() {
+        let config = TestConfig::new("read_error_then_missing");
+        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
+        let mut app = App::start_at(&config.path);
+        let mut hotkeys = FakeHotkeySystem::default();
+        let mut windows = FakeWindowSystem::with_focus(Rect::new(200, 200, 800, 600));
+        let start = Instant::now();
+        app.tick(&mut hotkeys, start);
+
+        fs::remove_file(&config.path).unwrap();
+        fs::create_dir(&config.path).unwrap();
+        settle(&mut app, &mut hotkeys, start);
+        assert!(matches!(
+            app.config_state(),
+            ConfigState::Error(ConfigLoadError::Read { .. })
+        ));
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Succeeded
+        );
+
+        fs::remove_dir(&config.path).unwrap();
+        settle(&mut app, &mut hotkeys, start + Duration::from_secs(1));
+        assert!(matches!(app.config_state(), ConfigState::Missing));
+        assert!(hotkeys.registered.is_empty());
+        assert_eq!(
+            app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
+            &DispatchState::Error(DispatchHotkeyError::NoBindingForHotkey {
+                hotkey: "Ctrl+Alt+Left".to_string(),
+            })
+        );
     }
 }

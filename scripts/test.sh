@@ -9,7 +9,11 @@ find "$SCRIPT_DIR" -type f -name '*.sh' -print0 |
   while IFS= read -r -d '' script; do
     bash -n "$script"
   done
-bash "$PROJECT_ROOT/scripts/test-install.sh"
+if [[ "$(uname -s)" == Linux ]]; then
+  bash "$PROJECT_ROOT/scripts/test-install.sh"
+else
+  echo "Skipping Linux-host installer fixtures on $(uname -s)."
+fi
 node --check "$PROJECT_ROOT/gnome-extension/extension.js"
 if command -v gjs >/dev/null 2>&1; then
   gjs -m "$PROJECT_ROOT/gnome-extension/tests/run.js"

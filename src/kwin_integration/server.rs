@@ -251,6 +251,12 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             let mut state = next_hotkey_state.lock();
                             state.ensure_ready()?;
                             let event = if state.is_controller(&sender)? {
+                                if state.registered_hotkeys.is_empty() {
+                                    return Err(method_error(
+                                        "org.window_zones.KWin.Error.Unavailable",
+                                        "KWin hotkeys are not registered after a reset or failed registration; retry registration",
+                                    ));
+                                }
                                 state.events.pop_front()
                             } else {
                                 None

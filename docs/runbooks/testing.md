@@ -14,7 +14,7 @@ What this verifies:
 - `bash -n` for every `scripts/**/*.sh` file, including sourced smoke modules and shell fixtures
 - `node --check gnome-extension/extension.js`
 - `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
-- `bash scripts/test-install.sh` (isolated installer/service ownership and lifecycle)
+- Linux only: `bash scripts/test-install.sh` (isolated installer/service ownership and lifecycle, plus literal-prefix PATH suggestions for installed bash/zsh/fish). Other hosts explicitly skip this `/proc`-dependent fixture and continue the remaining checks; native macOS installation remains a separate verification path.
 - `node kwin-script/tests/run.js` and `qmllint kwin-script/contents/code/main.js` when available (native Qt syntax)
 - module-aware Node syntax checks for JavaScript fixtures under `scripts/` and `src/`
 - Python parsing of every `scripts/**/*.py` file, including extracted smoke fixtures

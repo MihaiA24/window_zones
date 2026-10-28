@@ -101,16 +101,7 @@ impl X11WindowSystem {
     }
 
     fn frame_extents(conn: &RustConnection, window: Window) -> Result<[u32; 4], WindowSystemError> {
-        let atom = conn
-            .intern_atom(false, b"_NET_FRAME_EXTENTS")
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to intern frame extents atom: {error}"))
-            })?
-            .reply()
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to read frame extents atom: {error}"))
-            })?
-            .atom;
+        let atom = intern_atom(conn, "_NET_FRAME_EXTENTS")?;
         let reply = conn
             .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 4)
             .map_err(|error| {

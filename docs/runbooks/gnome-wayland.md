@@ -276,6 +276,13 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 
 The `gnome-live` gate mechanically runs the [identified-window and hotkey-rollback checks](testing.md#v1-verification-matrix) on disposable Text Editor windows; its refused replacement must retain four bindings and the previous accelerator.
 
+The atomic-registration fixture receives `HotkeyPressed` on the same private
+D-Bus connection that registers the binding; the companion intentionally
+unicasts signals only to its controller. The gate requires separate receiver
+events before and after the invalid replacement, at least two events total,
+and retains them in `atomic-helper.log`. An independent bus monitor cannot
+prove delivery to this controller.
+
 The blocking GNOME gate requires both [Synthetic and seated checks](testing.md#v1-verification-matrix)
 on the exact upgraded GNOME 50 or 51 configuration being claimed.
 Record GNOME/Mutter versions, display layout, assertion summary, limitations,

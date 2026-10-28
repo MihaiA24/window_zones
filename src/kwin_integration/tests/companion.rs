@@ -131,6 +131,60 @@ fn real_service_hotkey_polling_never_claims_controller() {
         register(&new, &["alt+ctrl+right"]).unwrap_err().name(),
         Some("org.window_zones.KWin.Error.Busy")
     );
+    proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "RegisterCompanion",
+            (KWIN_PROTOCOL_MAJOR.to_string(), true),
+        )
+        .unwrap();
+    let assert_registration_lost = || {
+        let error = classify_dbus_error(poll(&old).unwrap_err()).into_hotkey_error();
+        assert!(
+            matches!(&error, HotkeySystemError::Unavailable(message)
+                if message.contains("retry registration")),
+            "pending or failed restoration must invalidate the App's registered cache: {error}"
+        );
+        assert_eq!(
+            poll(&new).unwrap_err().name(),
+            Some("org.window_zones.KWin.Error.Busy"),
+            "an unrelated poller must not consume recovery or acquire the controller"
+        );
+    };
+    assert_registration_lost();
+    let restore: NextRequestPayload = proxy
+        .method_call(KWIN_INTERFACE, "NextRequest", ())
+        .unwrap();
+    assert_eq!(restore.1, REQUEST_REGISTER_HOTKEYS);
+    assert_eq!(restore.7, r#"["alt+ctrl+left"]"#);
+    proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "CompleteRequest",
+            (
+                restore.0.to_string(),
+                false,
+                "org.window_zones.KWin.Error.Unsupported".to_string(),
+                "another action owns the shortcut after script reset".to_string(),
+            ),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        assert_registration_lost();
+    }
+    complete_registration(
+        register(&old, &["alt+ctrl+left"]).unwrap(),
+        &["alt+ctrl+left"],
+    );
+    proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "HotkeyPressed",
+            ("alt+ctrl+left".to_string(),),
+        )
+        .unwrap();
+    assert_eq!(poll(&old).unwrap(), (true, "alt+ctrl+left".to_string()));
+    assert_eq!(poll(&old).unwrap(), (false, String::new()));
     complete_registration(register(&old, &[]).unwrap(), &[]);
     for _ in 0..2 {
         assert_eq!(poll(&old).unwrap(), (false, String::new()));

@@ -30,8 +30,9 @@ The default installs a release build of the App to `~/.local/bin/window_zones`:
 The installer ends by checking that typing `window_zones` runs the binary it just
 installed: it prints `Ready: run window_zones from any terminal` when it does,
 a warning naming the other copy when an earlier `PATH` entry shadows it, or the
-command that adds `<prefix>/bin` to `PATH` for your login shell (for example
-`fish_add_path "$HOME/.local/bin"`).
+command that adds `<prefix>/bin` to `PATH` for your login shell. Copy the printed
+command as-is: it preserves literal spaces, dollar signs, quotes, backslashes,
+and backticks in the prefix for bash, zsh, and fish.
 
 `--init-config` runs the installed `window_zones init`. It writes a starter config
 to `$XDG_CONFIG_HOME/window_zones/config.toml` when that variable is absolute,
@@ -237,8 +238,11 @@ KDE launcher state lives in an owned private runtime directory. `flock` releases
 ownership on a crash; the lock inode remains so competing launchers cannot
 lock different files. PID/start-tick and boot identities are timezone-independent,
 and guarded cleanup handles orphaned supervisors before replacement/removal.
-Stopping the launcher stops its supervised App and companion. An abandoned
-empty legacy lock directory is removable; foreign/nonempty state is preserved.
+Stopping the launcher stops its supervised App and companion.
+
+Installs from earlier commits of this unpublished branch must be stopped and
+uninstalled with that revision before reinstalling; legacy KDE state is not
+migrated.
 
 To switch from XDG to systemd later, re-run `--autostart` inside a desktop with
 an active graphical target. The installer stops the owned KDE launcher, removes

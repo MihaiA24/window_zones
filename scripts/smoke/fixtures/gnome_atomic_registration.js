@@ -17,6 +17,28 @@ const proxy = Gio.DBusProxy.new_sync(
     '/org/window_zones/Gnome',
     'org.window_zones.Gnome2',
     null);
+const loop = new GLib.MainLoop(null, false);
+let phase = 'BEFORE';
+proxy.connect('g-signal', (_proxy, _sender, name, parameters) => {
+    if (name !== 'HotkeyPressed' || parameters.deep_unpack()[0] !== valid)
+        return;
+    print(`EVENT ${valid} ${phase}`);
+    loop.quit();
+});
+
+function waitForHotkey() {
+    const timeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10000, () => {
+        expired = true;
+        print(`HOTKEY_TIMEOUT ${phase}`);
+        loop.quit();
+        return GLib.SOURCE_REMOVE;
+    });
+    let expired = false;
+    loop.run();
+    if (!expired)
+        GLib.source_remove(timeout);
+}
+
 try {
     proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [[valid]]),
         Gio.DBusCallFlags.NONE, 5000, null);
@@ -24,7 +46,7 @@ try {
 } catch (error) {
     print(`VALID_FAILED ${Gio.DBusError.get_remote_error(error)} ${error.message}`);
 }
-GLib.usleep(3000000);
+waitForHotkey();
 try {
     proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [[valid, 'f25']]),
         Gio.DBusCallFlags.NONE, 5000, null);
@@ -32,7 +54,8 @@ try {
 } catch (error) {
     print(`INVALID_REJECTED ${Gio.DBusError.get_remote_error(error)} ${error.message}`);
 }
-GLib.usleep(10000000);
+phase = 'AFTER';
+waitForHotkey();
 try {
     proxy.call_sync('RegisterHotkeys', new GLib.Variant('(as)', [[]]),
         Gio.DBusCallFlags.NONE, 5000, null);

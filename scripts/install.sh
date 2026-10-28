@@ -126,7 +126,6 @@ AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones.desktop"
 KWIN_UNIT_FILE="$UNIT_DIR/window-zones-kwin.service"
 KWIN_AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones_kwin.desktop"
 KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
-KDE_LEGACY_STATE="$INSTALL_PREFIX/share/window-zones/kde-session-running"
 KDE_SESSION_KEY=''
 if [[ "$OS" == Linux ]]; then
   KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
@@ -228,30 +227,6 @@ kde_runtime_state() {
     && "$(stat -c %a -- "$KDE_SESSION_STATE")" == 700 ]]
 }
 
-legacy_kde_session_running() {
-  local pid argument
-  [[ -d "$KDE_LEGACY_STATE" && ! -L "$KDE_LEGACY_STATE" && -O "$KDE_LEGACY_STATE" \
-    && -f "$KDE_LEGACY_STATE/owner" && ! -L "$KDE_LEGACY_STATE/owner" ]] || return 1
-  IFS= read -r pid <"$KDE_LEGACY_STATE/owner" || return 1
-  process_identity "$pid" || return 1
-  # Old records used timezone-sensitive ps text. Never trust it to signal a PID:
-  # require the exact owned launcher as an argv entry, then pin its current identity.
-  while IFS= read -r -d '' argument; do
-    if [[ "$argument" == "$KDE_LAUNCHER" ]]; then
-      KDE_SESSION_PID="$pid"
-      KDE_SESSION_IDENTITY="$PROCESS_IDENTITY"
-      return 0
-    fi
-  done <"/proc/$pid/cmdline"
-  return 1
-}
-
-cleanup_empty_legacy_state() {
-  if [[ -d "$KDE_LEGACY_STATE" && ! -L "$KDE_LEGACY_STATE" && -O "$KDE_LEGACY_STATE" ]]; then
-    rmdir -- "$KDE_LEGACY_STATE" 2>/dev/null || true
-  fi
-}
-
 stop_recorded_kde_supervisors() {
   local file pid started attempt
   for file in companion app; do
@@ -286,7 +261,7 @@ kde_session_running() {
       return 0
     fi
   fi
-  legacy_kde_session_running
+  return 1
 }
 
 stop_kde_session() {
@@ -315,7 +290,6 @@ stop_kde_session() {
       rm -f -- "$KDE_SESSION_STATE/owner"
     ) || { echo 'Could not stop the owned KDE session safely; leaving its binaries installed.' >&2; exit 1; }
   fi
-  if kde_launcher_owned; then cleanup_empty_legacy_state; fi
 }
 
 remove_unit() {
@@ -699,9 +673,8 @@ EOF
     if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
       {
         printf '#!/usr/bin/env bash\n# Window Zones KDE login: %s\n' "$INSTALL_DIR"
-        printf 'INSTALL_DIR=%q\nKDE_LAUNCHER=%q\nKDE_LEGACY_STATE=%q\nKDE_SESSION_KEY=%q\n' \
-          "$INSTALL_DIR" "$KDE_LAUNCHER" "$KDE_LEGACY_STATE" "$KDE_SESSION_KEY"
-        declare -f process_identity process_matches kde_runtime_state legacy_kde_session_running cleanup_empty_legacy_state stop_recorded_kde_supervisors
+        printf 'INSTALL_DIR=%q\nKDE_SESSION_KEY=%q\n' "$INSTALL_DIR" "$KDE_SESSION_KEY"
+        declare -f process_identity process_matches kde_runtime_state stop_recorded_kde_supervisors
         cat <<'EOF'
 set -u
 umask 077
@@ -713,8 +686,6 @@ for file in lock owner companion app; do
 done
 exec 9>"$KDE_SESSION_STATE/lock"
 flock -n 9 || exit 75
-if legacy_kde_session_running && [[ "$KDE_SESSION_PID" != "$$" ]]; then exit 75; fi
-cleanup_empty_legacy_state
 # Never unlink the lock: another launcher may already have opened this inode.
 # Supervisors and native children close fd 9 and stop when this shell's identity dies.
 stop_recorded_kde_supervisors || exit 1
@@ -832,7 +803,6 @@ EOF
       if kde_session_running; then
         kill -USR1 "$KDE_SESSION_PID"
       fi
-      cleanup_empty_legacy_state
       printf 'Graphical user systemd is unavailable; KDE companion and App use XDG login supervision: %s\n' "$KWIN_AUTOSTART_FILE"
     else
       cat >"$AUTOSTART_FILE" <<EOF
@@ -890,9 +860,17 @@ elif [[ -n "$RESOLVED_BIN" ]]; then
 else
   printf '%s is not on PATH. Add it once, then open a new terminal:\n' "$INSTALL_DIR"
   case "${SHELL##*/}" in
-    fish) printf '  fish_add_path "%s"\n' "$INSTALL_DIR" ;;
-    zsh) printf "  echo 'export PATH=\"%s:\$PATH\"' >> ~/.zshrc\n" "$INSTALL_DIR" ;;
-    *) printf "  echo 'export PATH=\"%s:\$PATH\"' >> ~/.bashrc\n" "$INSTALL_DIR" ;;
+    fish)
+      FISH_INSTALL_DIR="${INSTALL_DIR//\\/\\\\}"
+      FISH_INSTALL_DIR="${FISH_INSTALL_DIR//\'/\\\'}"
+      printf "  fish_add_path '%s'\n" "$FISH_INSTALL_DIR"
+      ;;
+    *)
+      SHELL_RC='.bashrc'
+      if [[ "${SHELL##*/}" == zsh ]]; then SHELL_RC='.zshrc'; fi
+      PATH_EXPORT="$(printf 'export PATH=%q:"$PATH"' "$INSTALL_DIR")"
+      printf "  printf '%%s\\\\n' %q >> ~/%s\n" "$PATH_EXPORT" "$SHELL_RC"
+      ;;
   esac
 fi
 

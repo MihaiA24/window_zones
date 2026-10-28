@@ -1,13 +1,6 @@
-write_uinput_injector() {
-    UINPUT_INJECTOR="$TMP_DIR/uinput_key.py"
-    [[ -s "$UINPUT_INJECTOR" ]] && return 0
-    cp "$SCRIPT_DIR/smoke/fixtures/uinput_key.py" "$UINPUT_INJECTOR"
-}
-
 gnome_live_inject_hotkey() {
     local output='' rc=0
-    write_uinput_injector
-    output=$(python3 "$UINPUT_INJECTOR" "$GNOME_SAFE_UINPUT_KEY" 2>&1) || rc=$?
+    output=$(python3 "$SCRIPT_DIR/smoke/fixtures/uinput_key.py" "$GNOME_SAFE_UINPUT_KEY" 2>&1) || rc=$?
     log "GNOME live uinput hotkey $GNOME_SAFE_LEFT_HOTKEY: exit $rc${output:+ output '$output'}"
     return "$rc"
 }
@@ -70,29 +63,11 @@ run_gnome_live_conflicting_binding() {
         'alt+ctrl+left' "$output"
 }
 
-gnome_live_signal_count() {
-    python - "$1" "$2" <<'PY'
-import sys
-path, needle = sys.argv[1:]
-try:
-    text = open(path, encoding="utf-8").read()
-except OSError:
-    text = ""
-print(text.count(needle))
-PY
-}
-
 run_gnome_live_atomic_registration() {
-    local helper="$GNOME_ROOT/atomic-register.js"
-    local monitor_log="$GNOME_ROOT/atomic-monitor.log"
+    local helper="$SCRIPT_DIR/smoke/fixtures/gnome_atomic_registration.js"
     local helper_log="$GNOME_ROOT/atomic-helper.log"
-    local monitor_pid='' helper_pid='' signal_count=0
-    cp "$SCRIPT_DIR/smoke/fixtures/gnome_atomic_registration.js" "$helper"
-    : >"$monitor_log"
+    local helper_pid='' signal_count=0 before_count=0 after_count=0
     : >"$helper_log"
-    start_group monitor_pid "$monitor_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
-        gdbus monitor --session --dest org.window_zones.Gnome \
-        --object-path /org/window_zones/Gnome
     start_group helper_pid "$helper_log" env DBUS_SESSION_BUS_ADDRESS="$GNOME_BUS" \
         LIVE_VALID_HOTKEY="$GNOME_SAFE_LEFT_HOTKEY" gjs -m "$helper"
     wait_for_text "$helper_log" 'VALID_OK' 8 || true
@@ -100,11 +75,7 @@ run_gnome_live_atomic_registration() {
         "$(cat "$helper_log" 2>/dev/null || true)"
 
     gnome_live_inject_hotkey || true
-    if wait_for_text "$monitor_log" "$GNOME_SAFE_LEFT_HOTKEY" 5; then
-        log "GNOME live atomic pre-error signal: $GNOME_SAFE_LEFT_HOTKEY"
-    else
-        log 'Harness limitation GNOME live atomic pre-error uinput signal was not observed'
-    fi
+    wait_for_text "$helper_log" "EVENT $GNOME_SAFE_LEFT_HOTKEY BEFORE" 8 || true
     wait_for_text "$helper_log" 'INVALID_REJECTED' 8 || true
     assert_text 'GNOME live atomic invalid registration is refused' \
         'INVALID_REJECTED org.window_zones.Gnome.Error.Unsupported' \
@@ -112,12 +83,13 @@ run_gnome_live_atomic_registration() {
     assert_text 'GNOME live atomic invalid accelerator is named' 'f25' \
         "$(cat "$helper_log" 2>/dev/null || true)"
     gnome_live_inject_hotkey || true
-    sleep 0.5
-    signal_count=$(gnome_live_signal_count "$monitor_log" "$GNOME_SAFE_LEFT_HOTKEY")
-    log "GNOME live atomic signal count for $GNOME_SAFE_LEFT_HOTKEY: $signal_count"
+    wait_for_text "$helper_log" "EVENT $GNOME_SAFE_LEFT_HOTKEY AFTER" 8 || true
+    before_count=$(count_text "$helper_log" "EVENT $GNOME_SAFE_LEFT_HOTKEY BEFORE")
+    after_count=$(count_text "$helper_log" "EVENT $GNOME_SAFE_LEFT_HOTKEY AFTER")
+    signal_count=$((before_count + after_count))
+    log "GNOME live atomic receiver signals for $GNOME_SAFE_LEFT_HOTKEY: before=$before_count after=$after_count total=$signal_count"
     assert_eq 'GNOME live atomic registration preserves previous set' 1 \
-        "$(( signal_count >= 2 ? 1 : 0 ))"
+        "$(( before_count >= 1 && after_count >= 1 && signal_count >= 2 ? 1 : 0 ))"
     stop_pid "$helper_pid"
-    stop_pid "$monitor_pid"
     sleep 0.3
 }
