@@ -429,7 +429,9 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
         "    if command in ('quit', 'q', 'exit'):\n"
         "        print('Session closed.', flush=True)\n"
         "        break\n"
-        "    if command.endswith('f12'):\n"
+        "    if command == 'dispatch':\n"
+        "        render('<none>', 'none')\n"
+        "    elif command.endswith('f12'):\n"
         "        render('alt+ctrl+f12', 'dispatch: no binding configured for hotkey alt+ctrl+f12')\n"
         "    else:\n"
         "        render('alt+ctrl+left', 'none')\n"
@@ -437,6 +439,8 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
     tui_options = argparse.Namespace(mode="tui", journey="lifecycle", backend_flag="backend", discovery=False,
                                      command=[], expect=[], quit="quit")
     with patch.object(workspace, "app_args", return_value=[sys.executable, "-u", "-c", tui_responder]):
+        tui_options.command, tui_options.expect = ["dispatch"], ["Last action: <none>"]
+        session(workspace, tui_options)  # Missing argument reports a control error, not a failed action.
         for command in ("dispatch Alt+Ctrl+F12", "Alt+Ctrl+F12"):
             for expected in ("Last action: alt+ctrl+f12", "Last error:", "Last error: dispatch:"):
                 tui_options.command, tui_options.expect = [command], [expected]

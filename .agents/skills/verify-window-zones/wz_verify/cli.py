@@ -39,9 +39,11 @@ def parser(workspace):
                                     epilog="Default lifecycle: status, TUI refresh, dispatch, reload, restart, quit. "
                                     "--journey reload edits valid/invalid/empty/missing configs and verifies retention/recovery; "
                                     "--journey watcher performs those edits without explicit reload. "
+                                    "--journey starter verifies all 18 starter bindings and window history in run mode; "
+                                    "--journey read-error verifies directory-read errors, identical recovery and missing-file recovery. "
                                     "Custom: --command 'dispatch Alt+Ctrl+Left' --expect 'Last action: alt+ctrl+left'.")
     interactive.add_argument("--mode", choices=("run", "tui"), default="tui")
-    interactive.add_argument("--journey", choices=("lifecycle", "reload", "watcher"), default="lifecycle")
+    interactive.add_argument("--journey", choices=("lifecycle", "reload", "watcher", "starter", "read-error"), default="lifecycle")
     interactive.add_argument("--command", action="append", default=[], help="Literal user line; pair each with --expect. Overrides the built-in journey.")
     interactive.add_argument("--expect", action="append", default=[],
                              help="Literal result for the paired command. TUI dispatch also requires completed success; "
@@ -60,7 +62,7 @@ def parser(workspace):
         child.add_argument("--discovery", action="store_true", help="Exercise XDG config discovery instead of explicit --config.")
     checks = commands.add_parser("check", help="Fixed-input behavioral and native end-to-end checks; JSON differences and retained proof.")
     scenarios = checks.add_subparsers(dest="scenario", required=True)
-    for name, help_text in (("behaviors", "Compare all built-in/custom zones, display moves and error states through both CLI flag/config variants."),
+    for name, help_text in (("behaviors", "Compare eight built-in zones, a custom zone, next/previous display moves and error states through both CLI flag/config variants."),
                             ("sessions", "Run the fixed CLI/TUI reload, watcher and cancel matrix with all flag/config and quit variants."),
                             ("e2e", "Reuse the native X11 smoke gate; compare observed geometry, real hotkey, reload, persistence and cancel."),
                             ("performance", "Alternate baseline/candidate startup+dispatch samples; compare confirmed work and a median regression budget.")):

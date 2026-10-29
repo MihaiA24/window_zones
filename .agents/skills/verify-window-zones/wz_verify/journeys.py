@@ -106,10 +106,58 @@ class Terminal:
 def session(workspace, options):
     prompt = "window-zones tui> " if options.mode == "tui" else "window-zones> "
     heading = "Window Zones TUI" if options.mode == "tui" else "Runtime status:"
+    starter = options.journey == "starter" and not options.command
+    if starter:
+        if options.mode != "run":
+            fail("The starter journey requires --mode run: TUI does not expose exact dry-run geometry.")
+        code, text = workspace.run(workspace.app_args(options, ["init", "--force", "--chord", "Ctrl+Alt"]),
+                                   f"starter-init-{time.time_ns()}")
+        if code or "Wrote starter config to " not in text:
+            fail("Starter initialization failed. Inspect the recorded init result.")
+    elif options.journey == "read-error" and not options.command:
+        workspace.set_config("valid")
     terminal = Terminal(workspace, workspace.app_args(options, [options.mode]), f"session-{time.time_ns()}", prompt)
     try:
         terminal.wait(prompt)
-        if options.command:
+        if starter:
+            observed = terminal.status("binding count: 18", options.mode)
+            if "config state: Loaded" not in observed:
+                fail("Starter configuration did not load.")
+            terminal.send("Ctrl+Alt+C", "last move: x=640 y=300 w=640 h=480")
+            for key, target in (
+                ("Up", "x=0 y=0 w=1920 h=540"),
+                ("Down", "x=0 y=540 w=1920 h=540"),
+                ("U", "x=0 y=0 w=960 h=540"),
+                ("I", "x=960 y=0 w=960 h=540"),
+                ("J", "x=0 y=540 w=960 h=540"),
+                ("K", "x=960 y=540 w=960 h=540"),
+                ("D", "x=0 y=0 w=640 h=1080"),
+                ("F", "x=640 y=0 w=640 h=1080"),
+                ("G", "x=1280 y=0 w=640 h=1080"),
+                ("E", "x=0 y=0 w=1280 h=1080"),
+                ("T", "x=640 y=0 w=1280 h=1080"),
+                ("Return", "x=0 y=0 w=1920 h=1080"),
+                ("Left", "x=0 y=0 w=960 h=1080"),
+                ("Right", "x=960 y=0 w=960 h=1080"),
+                ("Right", "x=1920 y=0 w=640 h=1024"),
+                ("Right", "x=2560 y=0 w=640 h=1024"),
+                ("Right", "x=2560 y=0 w=640 h=1024"),
+                ("Left", "x=1920 y=0 w=640 h=1024"),
+                ("Left", "x=960 y=0 w=960 h=1080"),
+                ("Left", "x=0 y=0 w=960 h=1080"),
+                ("Left", "x=0 y=0 w=960 h=1080"),
+                ("Backspace", "x=40 y=40 w=640 h=480"),
+                ("Left", "x=0 y=0 w=960 h=1080"),
+                ("Shift+Right", "x=1920 y=0 w=640 h=1024"),
+                ("Shift+Left", "x=0 y=0 w=960 h=1080"),
+                ("Backspace", "x=40 y=40 w=640 h=480"),
+            ):
+                terminal.send("dispatch Ctrl+Alt+" + key, "last move: " + target)
+            terminal.send("dispatch Ctrl+Alt+Backspace", "Dispatch state: Error(ExecuteAction(NothingToRestore))")
+            terminal.send("dispatch Ctrl+Alt+Left", "last move: x=0 y=0 w=960 h=1080")
+            terminal.send("restart", "Runtime restarted.")
+            terminal.send("dispatch Ctrl+Alt+Backspace", "Dispatch state: Error(ExecuteAction(NothingToRestore))")
+        elif options.command:
             if len(options.command) != len(options.expect):
                 fail("Pair each --command with one --expect observable result; see drive session --help.")
             for command, expected in zip(options.command, options.expect):
@@ -118,6 +166,7 @@ def session(workspace, options):
                 observed = terminal.send(command, expected)
                 control = command.strip().split(" ", 1)[0].lower()
                 if (options.mode == "tui" and control not in ("", "status", "refresh", "reload", "restart", "help", "?")
+                        and command.strip().lower() != "dispatch"
                         and not re.match(r"Last error: dispatch:\s*\S", expected)):
                     tui_dispatch_action(observed)
         else:
@@ -146,6 +195,39 @@ def session(workspace, options):
                                                  else "Dispatch state: Succeeded")
                         if options.mode == "tui":
                             tui_dispatch_action(observed)
+            elif options.journey == "read-error":
+                for recovery in ("identical", "missing"):
+                    original = workspace.config.read_bytes()
+                    workspace.config.unlink()
+                    workspace.config.mkdir()
+                    workspace.event("config-edit", seed="read-error", path=str(workspace.config),
+                                    before=original.decode(), after={"type": "directory"})
+                    observed = terminal.status("(Error" if options.mode == "tui" else "config state: Error", options.mode)
+                    if ("left-half" if options.mode == "tui" else "binding count: 5") not in observed:
+                        fail("A config read error discarded the active bindings.")
+                    observed = terminal.send("dispatch Alt+Ctrl+Left", "Last action: alt+ctrl+left" if options.mode == "tui"
+                                             else "last move: x=0 y=0 w=960 h=1080")
+                    if options.mode == "tui":
+                        tui_dispatch_action(observed)
+                    workspace.config.rmdir()
+                    workspace.event("config-edit", seed="missing", path=str(workspace.config),
+                                    before={"type": "directory"}, after=None)
+                    if recovery == "missing":
+                        observed = terminal.status("(Missing)" if options.mode == "tui" else "config state: Missing", options.mode)
+                        if ("Bindings:\n  <none>" if options.mode == "tui" else "binding count: 0") not in observed:
+                            fail("A missing config retained bindings after a read error.")
+                        terminal.send("dispatch Alt+Ctrl+Left", "Last error: dispatch: no binding configured" if options.mode == "tui"
+                                      else "Dispatch state: Error(NoBindingForHotkey")
+                    workspace.config.write_bytes(original)
+                    workspace.event("config-edit", seed="identical-recovery", path=str(workspace.config),
+                                    before=None, after=original.decode())
+                    observed = terminal.status("(Loaded)" if options.mode == "tui" else "config state: Loaded", options.mode)
+                    if ("left-half" if options.mode == "tui" else "binding count: 5") not in observed:
+                        fail("Config read-error recovery did not reload the original bindings.")
+                    observed = terminal.send("dispatch Alt+Ctrl+Left", "Last action: alt+ctrl+left" if options.mode == "tui"
+                                             else "last move: x=0 y=0 w=960 h=1080")
+                    if options.mode == "tui":
+                        tui_dispatch_action(observed)
             terminal.send("reload", heading if options.mode == "tui" else "Reload requested.")
             terminal.send("restart", heading if options.mode == "tui" else "Runtime restarted.")
             observed = terminal.status("Loaded", options.mode)
@@ -164,6 +246,12 @@ def session(workspace, options):
             fail(f"Session exited {rc}. Inspect the transcript.")
     finally:
         terminal.close()
+    if starter:
+        code, text = workspace.run(workspace.app_args(options, ["status"]), f"starter-persisted-{time.time_ns()}")
+        if code or any(value not in text for value in
+                       ("config state: Loaded", "binding count: 18", "last action: <none>", "dispatch state: Idle")):
+            fail("A fresh process did not load the persisted starter configuration with clear action history.")
+        workspace.set_config("valid")
 
 
 def smoke_summary(text, gate):
