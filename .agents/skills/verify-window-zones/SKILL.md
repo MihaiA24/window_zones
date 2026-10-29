@@ -58,6 +58,10 @@ Freshness compares content hashes of Rust/Cargo inputs, compositor code, scripts
 
 `drive smoke` delegates to `scripts/smoke.sh --keep-logs`, not a second compositor framework. It selects checkout-derived X11/private state and preserves proof before cleanup; helper Cargo builds stay outside evidence. GNOME starts with its companion pre-enabled in private keyfile settings and version validation enabled. Before isolation, the verifier records original XDG resource roots and the PipeWire endpoint; the driver copies a compatible AppIndicator privately and receives only those explicit capture inputs. App HOME/config/data/runtime and D-Bus stay private. `gnome` is seatless; `kde-live` uses KWin's private virtual framebuffer. Require observed geometry, completed responses and captures; pacing pauses or screenshots alone are not end-state proof.
 
+GNOME capture also requires `pw-dump` and `pw-link`. Each capture links only the exact Mutter stream from the private session to a uniquely named consumer, verifies both owning PIDs, and retains the graph and separate `*-capture.log`; it must never truncate the GTK fixture's state log. It does not change host PipeWire policy or adopt generic streams. All fourteen built-ins run through one-shot dispatch and actual accelerators; center/Restore share history through input to the same runtime, not a new GNOME dispatch process. GNOME 50 omits only the unavailable reduced-motion preference; enabled/disabled animation checks remain required, and GNOME 51 requires its preference API.
+
+The seated gate normalizes Xwayland pixels using independent Mutter monitor modes/layout and X server desktop dimensions, never a ratio inferred from the window/expected target. It refuses nonintegral frame discrepancies and unsupported nonuniform mappings. Its screenshots come from an owned Mutter ScreenCast stream on the fixture's monitor; a black Xwayland-root image is not capture proof. Each placement accelerator also needs a fresh successful App status, alongside observed geometry; post-input focus and Overview state remain in the log.
+
 ## Checks
 
 ```sh
@@ -105,6 +109,8 @@ Cleanup validates UID, checkout/PID start identity and private-runtime markers, 
 ## Helpers
 
 `verify` and `test_verify.py` are executable. Use `"$V" --help`, `"$V" drive --help`, and each subcommand's `--help`; destructive operations accept `--dry-run`. Run the safety regression directly with `python3 .agents/skills/verify-window-zones/test_verify.py` or through the existing `scripts/test.sh` (`drive tests` preserves its output).
+
+`scripts/gnome-smoke.py` also owns the seated observation helpers: `/usr/bin/python3 scripts/gnome-smoke.py --xwayland-transform NEW.json` records layout metadata and prints scale/origin; `--capture NEW.png --capture-window OWNED_XID` captures the actual compositor monitor containing that owned Xwayland fixture. These attach to the current desktop, require its session/PipeWire access, and must only be used for authorized seated verification. Captures retain producer/consumer identities and logs, refuse overwriting evidence, and close only their own stream/processes. They do not inject input or replace the `/dev/uinput` gate.
 
 `verify` is only the executable entry point. Its `wz_verify/` package contains `runtime.py` (workspace, ownership, freshness, evidence and process lifecycle), `journeys.py` (PTY/config/native driving), `checks.py` (observations, scenarios and reports), and `cli.py` (argument parsing and dispatch). Pass one `runtime.Workspace` explicitly to journeys/checks; independent workspaces carry their own paths instead of mutable module globals. Dependencies flow from CLI to checks/journeys to runtime. The safety regression imports these modules normally and checks workspace isolation and freshness after module additions, edits and removals. Keep the package with the launcher; command syntax, evidence locations and approved `expected.json` are unchanged.
 

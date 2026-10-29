@@ -117,3 +117,121 @@ run_gnome_live_adr9_window_checks() {
     wait_observed gnome_live_geometry "$GNOME_LIVE_TWO_THIRDS" >/dev/null
     gnome_live_activate_window || true
 }
+
+gnome_live_placement_action() {
+    local run_log=$1 action=$2 loaded_before
+    loaded_before=$(count_text "$run_log" 'Config state: Loaded')
+    write_gnome_live_valid_config "$action" || return 1
+    send_app reload || return 1
+    if ! wait_for_new_text "$run_log" 'Config state: Loaded' "$loaded_before" 10; then
+        assert_eq 'GNOME live placement reload completes' Loaded 'no fresh successful reload'
+        return 1
+    fi
+}
+
+gnome_live_placement_press() {
+    local expected_id=$1 focused_id active
+    gnome_live_activate_window || return 1
+    focused_id=$(gnome_live_focused_id)
+    active=$(gnome_live_active_window)
+    if [[ "$focused_id" != "$expected_id" || "$active" != "$WINDOW_ID" ]]; then
+        assert_eq 'GNOME live placement input remains on its owned window' \
+            "$expected_id|$WINDOW_ID" "$focused_id|$active"
+        return 1
+    fi
+    local rc=0
+    gnome_live_inject_hotkey || rc=$?
+    if (( rc != 0 )); then
+        assert_rc_zero 'GNOME live placement accelerator injection' "$rc" "$GNOME_SAFE_LEFT_HOTKEY"
+        return 1
+    fi
+    local overview
+    overview=$(gnome_shell_call /org/gnome/Shell org.freedesktop.DBus.Properties.Get \
+        org.gnome.Shell OverviewActive 2>&1 || true)
+    log "OBSERVED GNOME live after input: focused='$(get_gnome_focused)' active='$(gnome_live_active_window)' overview='$overview'"
+}
+
+gnome_live_placement_result() {
+    local run_log=$1 label=$2 deadline=$((SECONDS + 5)) action_before success_before seen=0
+    local error_before
+    while (( SECONDS < deadline )); do
+        action_before=$(count_text "$run_log" "last action: $GNOME_SAFE_LEFT_HOTKEY")
+        success_before=$(count_text "$run_log" 'dispatch state: Succeeded')
+        error_before=$(count_text "$run_log" 'dispatch state: Error')
+        send_app status || return 1
+        if wait_for_new_text "$run_log" "last action: $GNOME_SAFE_LEFT_HOTKEY" "$action_before" 1 \
+            && (( $(count_text "$run_log" 'dispatch state: Succeeded') > success_before )); then
+            seen=1
+            break
+        fi
+        (( $(count_text "$run_log" 'dispatch state: Error') > error_before )) && break
+        sleep 0.05
+    done
+    assert_eq "$label reaches the App successfully" 1 "$seen"
+    (( seen == 1 ))
+}
+
+run_gnome_live_zone_checks() {
+    # Reuse one unreserved accelerator; reload its action without changing the four-key fixture.
+    local run_log="$GNOME_ROOT/live-zones-run.log" owned_id baseline zone expected row
+    local x=$GNOME_LIVE_X y=$GNOME_LIVE_Y w=$GNOME_LIVE_W h=$GNOME_LIVE_H
+    local succeeded_before error_before failures_before=$FAILURES
+    baseline=$(gnome_live_geometry)
+    owned_id=$(gnome_live_focused_id) || return 1
+    [[ -n "$owned_id" ]] || return 1
+    write_gnome_live_valid_config || return 1
+    start_fifo_app run wayland "$run_log" || return 1
+    if ! wait_for_text "$run_log" 'Hotkeys registered: 4' 15; then
+        assert_text 'GNOME live zone runtime registers its safe accelerators' \
+            'Hotkeys registered: 4' "$(<"$run_log")"
+        return 1
+    fi
+    local -a cases=(
+        "left-half|$x,$y,$((w / 2)),$h"
+        "right-half|$((x + w - w / 2)),$y,$((w / 2)),$h"
+        "left-third|$x,$y,$((w / 3)),$h"
+        "center-third|$((x + w / 3)),$y,$((w - 2 * (w / 3))),$h"
+        "right-third|$((x + w - w / 3)),$y,$((w / 3)),$h"
+        "left-two-thirds|$x,$y,$((w - w / 3)),$h"
+        "right-two-thirds|$((x + w / 3)),$y,$((w - w / 3)),$h"
+        "maximize|$x,$y,$w,$h"
+        "top-half|$x,$y,$w,$((h / 2))"
+        "bottom-half|$x,$((y + h - h / 2)),$w,$((h / 2))"
+        "top-left|$x,$y,$((w / 2)),$((h / 2))"
+        "top-right|$((x + w - w / 2)),$y,$((w / 2)),$((h / 2))"
+        "bottom-left|$x,$((y + h - h / 2)),$((w / 2)),$((h / 2))"
+        "bottom-right|$((x + w - w / 2)),$((y + h - h / 2)),$((w / 2)),$((h / 2))"
+    )
+    for row in "${cases[@]}"; do
+        IFS='|' read -r zone expected <<<"$row"
+        gnome_live_placement_action "$run_log" "{ type = \"move-to-zone\", zone = \"$zone\" }" || return 1
+        gnome_live_placement_press "$owned_id" || return 1
+        gnome_live_placement_result "$run_log" "GNOME live accelerator $zone" || return 1
+        gnome_live_assert_geometry "GNOME live accelerator $zone" "$expected"
+        (( FAILURES == failures_before )) || return 1
+    done
+    gnome_live_placement_action "$run_log" '{ type = "center" }' || return 1
+    gnome_live_placement_press "$owned_id" || return 1
+    gnome_live_placement_result "$run_log" 'GNOME live accelerator center' || return 1
+    gnome_live_assert_geometry 'GNOME live accelerator center keeps size' \
+        "$((x + (w - w / 2) / 2)),$((y + (h - h / 2) / 2)),$((w / 2)),$((h / 2))"
+    (( FAILURES == failures_before )) || return 1
+    gnome_live_placement_action "$run_log" '{ type = "restore" }' || return 1
+    succeeded_before=$(count_text "$run_log" 'Dispatch state: Succeeded')
+    send_app "dispatch $GNOME_SAFE_LEFT_HOTKEY" || return 1
+    wait_for_new_text "$run_log" 'Dispatch state: Succeeded' "$succeeded_before" 10 || true
+    assert_eq 'GNOME live interactive Restore shares accelerator history' 1 \
+        "$(( $(count_text "$run_log" 'Dispatch state: Succeeded') > succeeded_before ? 1 : 0 ))"
+    gnome_live_assert_geometry 'GNOME live Restore returns to the first original frame' "$baseline"
+    (( FAILURES == failures_before )) || return 1
+    error_before=$(count_text "$run_log" 'nothing to restore')
+    gnome_live_placement_press "$owned_id" || return 1
+    send_app status || return 1
+    wait_for_new_text "$run_log" 'nothing to restore' "$error_before" 10 || true
+    assert_eq 'GNOME live Restore consumes its history' 1 \
+        "$(( $(count_text "$run_log" 'nothing to restore') > error_before ? 1 : 0 ))"
+    gnome_live_assert_geometry 'GNOME live consumed Restore keeps its frame' "$baseline"
+    stop_app_cleanly 'GNOME live zone runtime quits cleanly' "$run_log"
+    write_gnome_live_valid_config || return 1
+    (( FAILURES == failures_before ))
+}

@@ -1,8 +1,10 @@
 write_gnome_live_valid_config() {
+    local first_action="${1:-}"
+    [[ -n "$first_action" ]] || first_action='{ type = "move-to-zone", zone = "left-half" }'
     cat >"$CONFIG_PATH" <<EOF
 [[bindings]]
 hotkey = "${GNOME_SAFE_LEFT_HOTKEY}"
-action = { type = "move-to-zone", zone = "left-half" }
+action = ${first_action}
 
 [[bindings]]
 hotkey = "${GNOME_SAFE_CENTER_HOTKEY}"
@@ -149,7 +151,7 @@ run_gnome_live_app_checks() {
     gnome_live_inject_hotkey || true
     deadline=$((SECONDS + 10))
     while (( SECONDS < deadline )); do
-        real_geometry=$(gtk_frame_geometry "$GNOME_XDISPLAY" "$GNOME_XAUTHORITY")
+        real_geometry=$(gnome_live_geometry)
         [[ "$real_geometry" == "$GNOME_LIVE_LEFT_HALF" ]] && break
         sleep 0.2
     done

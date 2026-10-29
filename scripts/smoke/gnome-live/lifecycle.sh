@@ -332,6 +332,15 @@ run_gnome_live() {
     export DISPLAY="$GNOME_XDISPLAY" XAUTHORITY="$GNOME_XAUTHORITY"
     log "GNOME live Xwayland observer: DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
     assert_text 'GNOME live Xwayland auth discovered' '.mutter-Xwaylandauth.' "$GNOME_XAUTHORITY"
+    local transform
+    if ! transform=$(/usr/bin/python3 "$SCRIPT_DIR/gnome-smoke.py" \
+        --xwayland-transform "$GNOME_ROOT/xwayland-layout.json"); then
+        assert_eq 'GNOME live independent coordinate transform' available unavailable
+        gnome_live_finish
+        return 0
+    fi
+    read -r GNOME_XWAYLAND_SCALE GNOME_XWAYLAND_ORIGIN_X GNOME_XWAYLAND_ORIGIN_Y <<<"$transform"
+    log "GNOME live independent Xwayland transform: scale=$GNOME_XWAYLAND_SCALE origin=$GNOME_XWAYLAND_ORIGIN_X,$GNOME_XWAYLAND_ORIGIN_Y"
 
     local displays_raw display_lines display_count first_display
     displays_raw=$(gnome_call GetDisplays 2>&1 || true)
@@ -369,7 +378,12 @@ run_gnome_live() {
     gnome_live_find_window || true
     log "OBSERVED GNOME live editor X11 window: ${WINDOW_ID:-unavailable}"
     gnome_live_activate_window || true
-    gnome_live_focus_baseline 10 || true
+    if ! gnome_live_focus_baseline 10; then
+        gnome_live_assert_focus
+        stop_pid "$EDITOR_PID"
+        gnome_live_finish
+        return 0
+    fi
     gnome_live_assert_focus
     gnome_live_zone_targets
     local editor_backend=''
@@ -388,6 +402,13 @@ run_gnome_live() {
     gnome_live_assert_geometry 'GNOME live center-third' "$GNOME_LIVE_CENTER_THIRD"
     run_gnome_live_dispatch left-two-thirds "$GNOME_SAFE_RIGHT_HOTKEY"
     gnome_live_assert_geometry 'GNOME live left-two-thirds' "$GNOME_LIVE_TWO_THIRDS"
+    if ! run_gnome_live_zone_checks; then
+        assert_eq 'GNOME live zone/history journey completes' complete aborted
+        stop_app_cleanly 'GNOME live failed zone runtime is stopped' "$GNOME_ROOT/live-zones-run.log"
+        stop_pid "$EDITOR_PID"
+        gnome_live_finish
+        return 0
+    fi
     if [[ -n "$GNOME_LIVE_NEXT_TWO_THIRDS" ]]; then
         run_gnome_live_dispatch next-display "$GNOME_SAFE_NEXT_HOTKEY"
         gnome_live_assert_geometry 'GNOME live cross-display move' \

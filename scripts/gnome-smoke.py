@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise real GNOME windows and accelerators on a private session bus."""
+"""Exercise native GNOME windows/input and observe authorized desktop sessions."""
 import argparse
 import json
 import os
@@ -11,6 +11,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+
+# importlib-based verifier regressions do not put scripts/ on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke import owned_process
 
 
 INDICATOR_UUID = 'appindicatorsupport@rgcjonas.gmail.com'
@@ -91,6 +96,210 @@ def completed_tui_frame(output, *, first=False):
     frame = 'Window Zones TUI' + output.rsplit('Window Zones TUI', 1)[1]
     return frame if re.search(r'^Last action: [^\n]+\nLast error: [^\n]*\nLast event: [^\n]*\n'
                               r'[\s\S]*window-zones tui> $', frame, re.M) else ''
+
+
+def register_child(process, registry, owner):
+    owned_process.register(registry, owner, os.getpid(), process.pid)
+    # An already-reaped child retains its real status even when /proc is gone.
+    if process.poll() is None and process.pid not in owned_process.records(registry):
+        process.terminate()
+        process.wait(timeout=5)
+        raise RuntimeError('Cannot capture stable identity of live smoke child ' + str(process.pid))
+
+
+def reduced_motion_supported(shell_major, schema):
+    # Shell 50 predates St.ReducedMotion, even with newer desktop schemas installed.
+    if shell_major < 51:
+        return False
+    if schema is None or not schema.has_key('reduced-motion'):
+        raise RuntimeError('GNOME 51 requires org.gnome.desktop.a11y.interface reduced-motion')
+    return True
+
+
+def capture_endpoints(graph, source_id, source_pid, consumer_name, consumer_pid):
+    nodes = [item for item in graph if item['type'] == 'PipeWire:Interface:Node']
+    source = [item for item in nodes if item['id'] == source_id]
+    consumer = [item for item in nodes
+                if item.get('info', {}).get('props', {}).get('node.name') == consumer_name]
+    if not source or not consumer:
+        return None
+    if len(source) != 1 or len(consumer) != 1:
+        raise RuntimeError('Ambiguous private PipeWire capture nodes')
+    clients = {item['id']: item for item in graph if item['type'] == 'PipeWire:Interface:Client'}
+    for node, pid in ((source[0], source_pid), (consumer[0], consumer_pid)):
+        client = clients.get(node['info']['props'].get('client.id'))
+        if client is None:
+            return None
+        props = client['info']['props']
+        if str(props.get('pipewire.sec.pid', props.get('application.process.id'))) != str(pid):
+            raise RuntimeError('PipeWire capture node does not belong to its owned process')
+    ports = []
+    for node, direction in ((source[0], 'output'), (consumer[0], 'input')):
+        matches = [item for item in graph if item['type'] == 'PipeWire:Interface:Port'
+                   and item.get('info', {}).get('props', {}).get('node.id') == node['id']
+                   and item['info'].get('direction') == direction]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError('Ambiguous private PipeWire capture ports')
+        ports.append(matches[0]['id'])
+    return source_id, consumer[0]['id'], *ports
+
+
+def monitor_rectangles(state):
+    layout = state[3].get('layout-mode')
+    if layout not in (1, 2):
+        raise RuntimeError('Unknown Mutter monitor coordinate layout')
+    modes = {tuple(spec): next((mode for mode in available if mode[-1].get('is-current')), None)
+             for spec, available, _properties in state[1]}
+    rectangles = []
+    for x, y, scale, transform, primary, specs, _properties in state[2]:
+        mode = modes.get(tuple(specs[0]))
+        if mode is None or scale <= 0:
+            raise RuntimeError('Logical monitor has no current physical mode')
+        width, height = mode[1:3]
+        if transform in (1, 3, 5, 7):
+            width, height = height, width
+        divisor = scale if layout == 1 else 1
+        rectangles.append(dict(x=x, y=y, width=round(width / divisor), height=round(height / divisor),
+                               primary=primary, connector=specs[0][0]))
+    if not rectangles:
+        raise RuntimeError('Mutter reports no logical monitors')
+    return rectangles
+
+
+def xwayland_transform(rectangles, size):
+    # Use independent desktop metadata, never the window/target being checked.
+    origin_x = min(rectangle['x'] for rectangle in rectangles)
+    origin_y = min(rectangle['y'] for rectangle in rectangles)
+    width = max(rectangle['x'] + rectangle['width'] for rectangle in rectangles) - origin_x
+    height = max(rectangle['y'] + rectangle['height'] for rectangle in rectangles) - origin_y
+    if (width <= 0 or height <= 0 or size[0] % width or size[1] % height
+            or size[0] // width != size[1] // height or size[0] // width < 1):
+        raise RuntimeError('Xwayland desktop lacks a uniform integral logical scale: '
+                           + str(size) + ' versus ' + str((origin_x, origin_y, width, height)))
+    return size[0] // width, origin_x, origin_y
+
+
+def observe_xwayland(record):
+    from gi.repository import Gio
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    state = bus.call_sync('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                          'org.gnome.Mutter.DisplayConfig', 'GetCurrentState', None, None,
+                          Gio.DBusCallFlags.NONE, 3000, None).unpack()
+    rectangles = monitor_rectangles(state)
+    size = tuple(map(int, subprocess.check_output(
+        ['xdotool', 'getdisplaygeometry'], text=True, timeout=3).split()))
+    transform = xwayland_transform(rectangles, size)
+    record.write_text(json.dumps(dict(monitors=rectangles, x11_size=size, transform=transform),
+                                 indent=2) + '\n')
+    print(*transform)
+
+
+def capture_current_monitor(output, window_id=None):
+    from gi.repository import Gio, GLib
+    if output.exists():
+        raise FileExistsError('Refusing to overwrite capture evidence: ' + str(output))
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    def call(destination, path, interface, method, params=None):
+        return bus.call_sync(destination, path, interface, method, params, None,
+                             Gio.DBusCallFlags.NONE, 3000, None).unpack()
+    state = call('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                 'org.gnome.Mutter.DisplayConfig', 'GetCurrentState')
+    rectangles = monitor_rectangles(state)
+    if window_id is None:
+        selected = next((rectangle for rectangle in rectangles if rectangle['primary']), None)
+    else:
+        size = tuple(map(int, subprocess.check_output(
+            ['xdotool', 'getdisplaygeometry'], text=True, timeout=3).split()))
+        scale, origin_x, origin_y = xwayland_transform(rectangles, size)
+        fields = dict(line.split('=', 1) for line in subprocess.check_output(
+            ['xdotool', 'getwindowgeometry', '--shell', str(window_id)],
+            text=True, timeout=3).splitlines())
+        center_x = origin_x + (int(fields['X']) + int(fields['WIDTH']) / 2) / scale
+        center_y = origin_y + (int(fields['Y']) + int(fields['HEIGHT']) / 2) / scale
+        selected = next((rectangle for rectangle in rectangles
+                         if rectangle['x'] <= center_x < rectangle['x'] + rectangle['width']
+                         and rectangle['y'] <= center_y < rectangle['y'] + rectangle['height']), None)
+    if selected is None:
+        raise RuntimeError('No compositor monitor contains the capture target')
+    registry = output.with_suffix('.capture-pids')
+    registry.open('x').close()
+    owner = str(output) + '-capture-' + uuid.uuid4().hex
+    session, consumer = None, None
+    destination = 'org.gnome.Mutter.ScreenCast'
+    try:
+        session = call(destination, '/org/gnome/Mutter/ScreenCast', destination,
+                       'CreateSession', GLib.Variant('(a{sv})', ({},)))[0]
+        stream = call(destination, session, destination + '.Session', 'RecordMonitor',
+                      GLib.Variant('(sa{sv})', (selected['connector'], {})))[0]
+        nodes = []
+        bus.signal_subscribe(destination, destination + '.Stream', 'PipeWireStreamAdded', stream,
+                             None, Gio.DBusSignalFlags.NONE,
+                             lambda _c, _s, _p, _i, _n, value: nodes.append(value.unpack()[0]))
+        source_pid = call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                          'org.freedesktop.DBus', 'GetConnectionUnixProcessID',
+                          GLib.Variant('(s)', (destination,)))[0]
+        call(destination, session, destination + '.Session', 'Start')
+        deadline = time.monotonic() + 15
+        while not nodes and time.monotonic() < deadline:
+            while GLib.MainContext.default().pending():
+                GLib.MainContext.default().iteration(False)
+            time.sleep(0.05)
+        if not nodes:
+            raise RuntimeError('No PipeWire stream from the seated compositor')
+        name = 'window-zones-seated-capture-' + uuid.uuid4().hex
+        log_path = output.with_suffix('.capture.log')
+        pending_signal = None
+        def defer_termination(signum, _frame):
+            nonlocal pending_signal
+            pending_signal = signum
+        previous = {signum: signal.signal(signum, defer_termination)
+                    for signum in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            with log_path.open('w') as log:
+                consumer = subprocess.Popen([
+                    'gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]),
+                    'autoconnect=false', 'stream-properties=props,node.name=(string)' + name,
+                    'num-buffers=1', '!', 'videoconvert', '!', 'pngenc', '!', 'filesink',
+                    'location=' + str(output)],
+                    env=dict(os.environ, WINDOW_ZONES_SMOKE_PRIVATE_OWNER=owner),
+                    stdout=log, stderr=subprocess.STDOUT)
+                register_child(consumer, registry, owner)
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            if pending_signal:
+                os.kill(os.getpid(), pending_signal)
+        endpoints = None
+        while time.monotonic() < deadline:
+            if consumer.poll() is not None:
+                raise RuntimeError('Capture exited before linking; see ' + str(log_path))
+            graph = json.loads(subprocess.check_output(
+                ['pw-dump'], text=True, timeout=max(0.01, min(3, deadline - time.monotonic()))))
+            endpoints = capture_endpoints(graph, nodes[0], source_pid, name, consumer.pid)
+            if endpoints is not None:
+                break
+            time.sleep(0.05)
+        if endpoints is None:
+            raise RuntimeError('Owned seated PipeWire ports did not appear; see ' + str(log_path))
+        output.with_suffix('.capture.json').write_text(json.dumps(
+            dict(monitor=selected, window_id=window_id, source_pid=source_pid,
+                 consumer_pid=consumer.pid, endpoints=endpoints), indent=2) + '\n')
+        subprocess.run(['pw-link', '-w', str(endpoints[2]), str(endpoints[3])],
+                       check=True, timeout=max(0.01, min(3, deadline - time.monotonic())))
+        consumer.wait(timeout=max(0.01, deadline - time.monotonic()))
+        if consumer.returncode or not output.is_file() or output.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n':
+            raise RuntimeError('No completed compositor PNG; see ' + str(log_path))
+        print('Mutter ScreenCast monitor ' + selected['connector'] + ': ' + str(output))
+    finally:
+        try:
+            if session:
+                call(destination, session, destination + '.Session', 'Stop')
+        finally:
+            owned_process.cleanup(registry, owner, os.getpid())
+            if consumer is not None:
+                consumer.wait(timeout=5)
 
 
 def test_window(title):
@@ -175,7 +384,9 @@ def run(binary, keep_logs, output_dir=None):
         work.mkdir(parents=True, exist_ok=False)
     print('EVIDENCE', work, flush=True)
     processes = []
-    session_starts = {}
+    registry = work / 'owned-pids'
+    registry.touch()
+    owner = str(work)
     checks = []
     remote_path = None
     connection = None
@@ -214,30 +425,6 @@ def run(binary, keep_logs, output_dir=None):
                 pass
             time.sleep(0.05)
         return False
-    def process_state(pid):
-        return Path('/proc/' + str(pid) + '/stat').read_text(errors='replace').rsplit(')', 1)[1].split()
-    def owned_groups():
-        sessions = set()
-        for process in processes:
-            try:
-                if process_state(process.pid)[19] != session_starts[process.pid]:
-                    continue
-            except (FileNotFoundError, ProcessLookupError):
-                pass  # A session can outlive its leader.
-            except PermissionError:
-                continue
-            sessions.add(process.pid)
-        groups = set()
-        for entry in Path('/proc').iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                state = process_state(entry.name)
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                continue
-            if int(state[3]) in sessions and state[0] != 'Z':
-                groups.add(int(state[2]))
-        return groups
     def start(args, name, child_env=None):
         log_path = work / (name + '.log')
         log = open(log_path, 'w')
@@ -248,9 +435,10 @@ def run(binary, keep_logs, output_dir=None):
         previous = {signum: signal.signal(signum, defer_termination)
                     for signum in (signal.SIGINT, signal.SIGTERM)}
         try:
-            process = subprocess.Popen(args, env=env if child_env is None else child_env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            child_env = dict(env if child_env is None else child_env, WINDOW_ZONES_SMOKE_PRIVATE_OWNER=owner)
+            process = subprocess.Popen(args, env=child_env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
             processes.append(process)
-            session_starts[process.pid] = process_state(process.pid)[19]
+            register_child(process, registry, owner)
         finally:
             log.close()
             for signum, handler in previous.items():
@@ -315,6 +503,13 @@ def run(binary, keep_logs, output_dir=None):
         (work / (name + '-dispatch.log')).write_text(result.stdout + result.stderr)
         check(name + ' dispatch', result.returncode == 0 and 'Dispatch state: Succeeded' in result.stdout, result.stdout.strip() + result.stderr)
         assert_frame(name + ' native and client geometry', expected, log)
+    def runtime_dispatch(hotkey, expected, name, log):
+        checkpoint = len(text(runtime_log))
+        send(runtime, 'dispatch ' + hotkey)
+        check(name + ' dispatch',
+              wait_for(lambda: 'Dispatch state: Succeeded' in text(runtime_log)[checkpoint:]),
+              text(runtime_log)[checkpoint:])
+        assert_frame(name + ' native and client geometry', expected, log)
     def rejected_dispatch(hotkey, name):
         result = subprocess.run([str(binary), '--backend', 'auto', '--config', str(config), 'dispatch', hotkey], env=env, capture_output=True, text=True, timeout=8)
         check(name + ' reports dispatch failure', result.returncode == 0 and 'Dispatch state: Error' in result.stdout, result.stdout + result.stderr)
@@ -330,24 +525,34 @@ def run(binary, keep_logs, output_dir=None):
         check(name + ' reports native tiling', window_state(log)[6], window_state(log))
         dispatch(hotkey, expected, name, log)
         check(name + ' clears native tiling', wait_for(lambda: not window_state(log)[6]), window_state(log))
-    zones = ['left-half', 'right-half', 'left-third', 'center-third', 'right-third', 'left-two-thirds', 'right-two-thirds', 'maximize']
-    keycodes = [30, 48, 46, 32, 18, 33, 34, 35]
-    hotkeys = ['Alt+Ctrl+Cmd+' + key for key in 'abcdefgh']
+    # Keep the original a-h indices and the custom/next/previous i/n/p bindings.
+    zones = ['left-half', 'right-half', 'left-third', 'center-third', 'right-third',
+             'left-two-thirds', 'right-two-thirds', 'maximize', 'top-half', 'bottom-half',
+             'top-left', 'top-right', 'bottom-left', 'bottom-right']
+    keycodes = [30, 48, 46, 32, 18, 33, 34, 35, 36, 37, 38, 50, 24, 16]
+    hotkeys = ['Alt+Ctrl+Cmd+' + key for key in 'abcdefghjklmoq']
     canonical_hotkeys = [hotkey.lower() for hotkey in hotkeys]
+    binding_count = len(hotkeys) + 5
     def valid_config(first_zone='left-half'):
         result = '[zones.custom-center]\nx = 20\ny = 20\nwidth = 60\nheight = 60\n\n'
         for hotkey, zone in zip(hotkeys, [first_zone] + zones[1:]):
             result += f'[[bindings]]\nhotkey = "{hotkey}"\naction = {{ type = "move-to-zone", zone = "{zone}" }}\n\n'
         result += '[[bindings]]\nhotkey = "Alt+Ctrl+Cmd+i"\naction = { type = "move-to-zone", zone = "custom-center" }\n\n'
         result += '[[bindings]]\nhotkey = "Alt+Ctrl+Cmd+n"\naction = { type = "move-to-next-display" }\n\n'
-        result += '[[bindings]]\nhotkey = "Alt+Ctrl+Cmd+p"\naction = { type = "move-to-previous-display" }\n'
+        result += '[[bindings]]\nhotkey = "Alt+Ctrl+Cmd+p"\naction = { type = "move-to-previous-display" }\n\n'
+        result += '[[bindings]]\nhotkey = "Alt+Ctrl+Cmd+r"\naction = { type = "center" }\n\n'
+        result += '[[bindings]]\nhotkey = "Alt+Ctrl+Cmd+s"\naction = { type = "restore" }\n'
         return result
     def targets(area):
         x, y, w, h = area
         return [(x, y, w // 2, h), (x + w - w // 2, y, w // 2, h),
                 (x, y, w // 3, h), (x + w // 3, y, w - 2 * (w // 3), h),
                 (x + w - w // 3, y, w // 3, h), (x, y, w - w // 3, h),
-                (x + w // 3, y, w - w // 3, h), (x, y, w, h)]
+                (x + w // 3, y, w - w // 3, h), (x, y, w, h),
+                (x, y, w, h // 2), (x, y + h - h // 2, w, h // 2),
+                (x, y, w // 2, h // 2), (x + w - w // 2, y, w // 2, h // 2),
+                (x, y + h - h // 2, w // 2, h // 2),
+                (x + w - w // 2, y + h - h // 2, w // 2, h // 2)]
     def tray_items():
         items = call('org.kde.StatusNotifierWatcher', '/StatusNotifierWatcher', 'org.freedesktop.DBus.Properties', 'Get', GLib.Variant('(ss)', ('org.kde.StatusNotifierWatcher', 'RegisteredStatusNotifierItems'))).unpack()[0]
         matching = []
@@ -380,12 +585,61 @@ def run(binary, keep_logs, output_dir=None):
         if identifier is None:
             raise RuntimeError('Tray control missing: ' + label)
         call(destination, menu, 'com.canonical.dbusmenu', 'Event', GLib.Variant('(isvu)', (identifier, 'clicked', GLib.Variant('i', 0), 0)))
+    def start_capture(name, tail, *, timeout=15, wait_active=False):
+        deadline = time.monotonic() + timeout
+        node_name = 'window-zones-capture-' + str(os.getpid()) + '-' + name + '-' + uuid.uuid4().hex
+        # Capture labels also name GTK fixtures; keep their state logs intact.
+        process, log = start(['gst-launch-1.0', '--quiet', 'pipewiresrc',
+                              'path=' + str(nodes[0]), 'autoconnect=false',
+                              'stream-properties=props,node.name=(string)' + node_name, *tail], name + '-capture')
+        endpoints = None
+        def graph():
+            result = subprocess.run(['pw-dump'], env=env, capture_output=True, text=True,
+                                    timeout=max(0.01, min(3, deadline - time.monotonic())))
+            (work / (name + '-pw-dump.log')).write_text(result.stderr)
+            if result.returncode != 0:
+                raise RuntimeError('Cannot inspect private capture graph: ' + result.stderr)
+            snapshot = json.loads(result.stdout)
+            (work / (name + '-pipewire.json')).write_text(json.dumps(snapshot, indent=2) + '\n')
+            return snapshot
+        def ports_ready():
+            nonlocal endpoints
+            if process.poll() is not None:
+                raise RuntimeError('Capture exited before linking; see ' + str(log) + ': ' + text(log))
+            endpoints = capture_endpoints(graph(), nodes[0], shell.pid, node_name, process.pid)
+            return endpoints is not None
+        if not wait_for(ports_ready, min(8, max(0, deadline - time.monotonic()))):
+            raise RuntimeError('Private capture ports did not appear; see ' + str(log))
+        link, link_log = start(['pw-link', '-w', str(endpoints[2]), str(endpoints[3])], name + '-link')
+        link.wait(timeout=max(0.01, min(5, deadline - time.monotonic())))
+        if link.returncode != 0:
+            raise RuntimeError('Private capture link failed; see ' + str(link_log) + ': ' + text(link_log))
+        if wait_active:
+            def active():
+                if process.poll() is not None:
+                    raise RuntimeError('Capture ended before animation input; see ' + str(log))
+                snapshot = graph()
+                if capture_endpoints(snapshot, nodes[0], shell.pid, node_name, process.pid) != endpoints:
+                    raise RuntimeError('Private capture endpoints changed after linking')
+                return any(item['type'] == 'PipeWire:Interface:Link'
+                           and item.get('info', {}).get('output-node-id') == endpoints[0]
+                           and item['info'].get('input-node-id') == endpoints[1]
+                           and item['info'].get('state') == 'active' for item in snapshot)
+            if not wait_for(active, max(0, deadline - time.monotonic())):
+                raise RuntimeError('Private capture link never became active; see ' + str(log))
+        return process, log, deadline
     def capture_screen(name):
         # Frame geometry settles before Shell's monitor-move animation finishes.
         time.sleep(0.3)
         screenshot = work / (name + '.png')
-        capture = subprocess.run(['gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]), 'num-buffers=1', '!', 'videoconvert', '!', 'pngenc', '!', 'filesink', 'location=' + str(screenshot)], env=env, capture_output=True, text=True, timeout=15)
-        check(name + ' real compositor screenshot', capture.returncode == 0 and screenshot.is_file() and screenshot.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n', capture.stdout + capture.stderr + str(screenshot))
+        capture, capture_log, deadline = start_capture(
+            name, ['num-buffers=1', '!', 'videoconvert', '!', 'pngenc', '!', 'filesink',
+                   'location=' + str(screenshot)])
+        try:
+            capture.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError('Compositor screenshot timed out; see ' + str(capture_log)) from error
+        check(name + ' real compositor screenshot', capture.returncode == 0 and screenshot.is_file() and screenshot.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n', text(capture_log) + str(screenshot))
     try:
         import gi
         gi.require_version('Gtk', '4.0')
@@ -395,7 +649,15 @@ def run(binary, keep_logs, output_dir=None):
         shell_version = subprocess.check_output(['gnome-shell', '--version'], text=True).strip()
         version_match = re.search(r'GNOME Shell (\d+)(?:\.\d+)*', shell_version)
         check('Installed GNOME version is supported', version_match and version_match[1] in ('50', '51'), shell_version)
-        for plugin in ('pipewiresrc', 'videoconvert', 'pngenc', 'filesink', 'fakesink', 'multifilesink'):
+        schemas = Gio.SettingsSchemaSource.get_default()
+        reduced_motion = reduced_motion_supported(
+            int(version_match[1]), schemas.lookup('org.gnome.desktop.a11y.interface', True) if schemas else None)
+        print('CAPABILITY reduced-motion:', 'required GNOME 51 preference' if reduced_motion
+              else 'not applicable: GNOME 50 predates St.ReducedMotion; animation checks remain enabled',
+              flush=True)
+        for tool in ('pw-dump', 'pw-link'):
+            check('PipeWire ' + tool + ' tool is installed', shutil.which(tool) is not None, shutil.which(tool))
+        for plugin in ('pipewiresrc', 'videoconvert', 'pngenc', 'filesink', 'multifilesink'):
             result = subprocess.run(['gst-inspect-1.0', plugin], capture_output=True, text=True, timeout=8)
             (work / ('gstreamer-' + plugin + '.log')).write_text(result.stdout + result.stderr)
             check('GStreamer ' + plugin + ' capture plugin is installed', result.returncode == 0, result.stderr)
@@ -411,6 +673,7 @@ def run(binary, keep_logs, output_dir=None):
         for name in ('metadata.json', 'extension.js'):
             shutil.copy2(root / 'gnome-extension' / name, work / 'data/gnome-shell/extensions/window-zones@mihai-a24' / name)
         env = isolated_environment(work, pipewire_runtime, pipewire_remote, os.environ)
+        env['WINDOW_ZONES_SMOKE_PRIVATE_OWNER'] = owner
         bus, bus_log = start(['dbus-daemon', '--session', '--nofork', '--print-address=1'], 'session-bus')
         if not wait_for(lambda: text(bus_log).strip() or bus.poll() is not None):
             raise RuntimeError('Private session bus did not start')
@@ -435,7 +698,6 @@ def run(binary, keep_logs, output_dir=None):
         connection.signal_subscribe('org.gnome.Mutter.ScreenCast', 'org.gnome.Mutter.ScreenCast.Stream', 'PipeWireStreamAdded', stream, None, Gio.DBusSignalFlags.NONE, lambda _c, _s, _p, _i, _n, value: nodes.append(value.unpack()[0]))
         remote('Start')
         check('Native compositor capture stream starts', wait_for(lambda: nodes), nodes)
-        video, video_log = start(['gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]), '!', 'videoconvert', '!', 'fakesink', 'sync=false'], 'live-compositor-video')
         window, window_log = start([sys.executable, str(Path(__file__).resolve()), '--test-window', 'native Wayland'], 'native-window')
         check('Native Wayland GTK window mapped', wait_for(lambda: window_state(window_log) and window_state(window_log)[:2] == [720, 480]), text(window_log))
         remote('NotifyPointerMotionRelative', GLib.Variant('(dd)', (500.0, 400.0)))
@@ -449,7 +711,7 @@ def run(binary, keep_logs, output_dir=None):
         config = work / 'config.toml'
         config.write_text(valid_config())
         status = subprocess.check_output([str(binary), '--backend', 'auto', '--config', str(config), 'status'], env=env, text=True)
-        check('Auto selects GNOME with configured bindings', 'Using runtime window backend: gnome-wayland' in status and 'binding count: 11' in status, status.strip())
+        check('Auto selects GNOME with configured bindings', 'Using runtime window backend: gnome-wayland' in status and 'binding count: ' + str(binding_count) in status, status.strip())
         for zone, hotkey, expected in zip(zones, hotkeys, expected_zones):
             dispatch(hotkey, expected, zone, window_log)
         x, y, w, h = area
@@ -476,7 +738,7 @@ def run(binary, keep_logs, output_dir=None):
         returned = (x + round((proportional[0] - sx) * w / sw), y + round((proportional[1] - sy) * h / sh), round(proportional[2] * w / sw), round(proportional[3] * h / sh))
         dispatch('Alt+Ctrl+Cmd+p', returned, 'proportional-monitor-return', window_log)
         runtime, runtime_log = start([str(binary), '--backend', 'auto', '--config', str(config), 'run'], 'auto-run')
-        check('Auto run registers its actual accelerator set', wait_for(lambda: 'Hotkeys registered: 11' in text(runtime_log)), text(runtime_log))
+        check('Auto run registers its actual accelerator set', wait_for(lambda: 'Hotkeys registered: ' + str(binding_count) in text(runtime_log)), text(runtime_log))
         try:
             companion('RegisterHotkeys', GLib.Variant('(as)', ([canonical_hotkeys[0]],)))
             raise AssertionError('Another controller replaced the runtime accelerator set')
@@ -486,7 +748,25 @@ def run(binary, keep_logs, output_dir=None):
             shortcut(code)
             assert_frame('Auto run global hotkey ' + zone, expected, window_log)
         send(runtime, 'status')
-        check('Auto run reports the hotkey action', wait_for(lambda: re.search(r'last action: .*\bh\b', text(runtime_log)) is not None), text(runtime_log))
+        check('Auto run reports the hotkey action', wait_for(lambda: 'last action: ' + canonical_hotkeys[-1] in text(runtime_log)), text(runtime_log))
+        quarter_width, quarter_height = w // 2, h // 2
+        centered_quarter = (x + (w - quarter_width) // 2, y + (h - quarter_height) // 2,
+                            quarter_width, quarter_height)
+        runtime_dispatch('Alt+Ctrl+Cmd+r', centered_quarter, 'Interactive center shares accelerator history', window_log)
+        shortcut(31)
+        assert_frame('Global Restore returns to before the first runtime move', returned, window_log)
+        checkpoint = len(text(runtime_log))
+        send(runtime, 'dispatch Alt+Ctrl+Cmd+s')
+        check('Restore consumes the same-runtime restore point',
+              wait_for(lambda: 'nothing to restore' in text(runtime_log)[checkpoint:]),
+              text(runtime_log)[checkpoint:])
+        assert_frame('Consumed Restore leaves geometry unchanged', returned, window_log)
+        shortcut(keycodes[0])
+        assert_frame('Global center starts from an off-center half', expected_zones[0], window_log)
+        centered_half = (x + (w - w // 2) // 2, y, w // 2, h)
+        shortcut(19)
+        assert_frame('Global center keeps the native window size', centered_half, window_log)
+        runtime_dispatch('Alt+Ctrl+Cmd+s', returned, 'Interactive Restore shares accelerator history', window_log)
         shortcut(23)
         assert_frame('Global custom-zone hotkey', custom, window_log)
         shortcut(49)
@@ -539,6 +819,12 @@ def run(binary, keep_logs, output_dir=None):
         assert_frame('Hotkey works after companion recovery', expected_zones[1], window_log)
         send(runtime, 'restart')
         check('CLI restart remains usable', wait_for(lambda: 'Runtime restarted' in text(runtime_log)), text(runtime_log))
+        checkpoint = len(text(runtime_log))
+        send(runtime, 'dispatch Alt+Ctrl+Cmd+s')
+        check('CLI restart clears native restore history',
+              wait_for(lambda: 'nothing to restore' in text(runtime_log)[checkpoint:]),
+              text(runtime_log)[checkpoint:])
+        assert_frame('Restore after restart leaves native geometry unchanged', expected_zones[1], window_log)
         shortcut(keycodes[0])
         assert_frame('Hotkey works after CLI restart', expected_zones[0], window_log)
         stop(runtime)
@@ -734,8 +1020,11 @@ action = { type = "move-to-previous-display" }
         check('Performance TUI registers arrow bindings', wait_for(lambda: 'Hotkey state: Registered' in text(runtime_log)), text(runtime_log))
         def perf_rows():
             return [json.loads(line) for line in perf_path.read_text().splitlines()] if perf_path.exists() else []
+        def transition_rows():
+            return [row for row in perf_rows() if row['event'] == 'dispatch']
         session = perf_rows()[0]
         check('Logger records actual process memory before moving', session['pid'] == runtime.pid and session['rss_kib'] > 0 and session['peak_rss_kib'] >= session['rss_kib'], session)
+        transition_count = len(transition_rows())
         for _ in range(2):
             for code in (29, 125, 106):
                 remote('NotifyKeyboardKeycode', GLib.Variant('(ub)', (code, True)))
@@ -743,8 +1032,8 @@ action = { type = "move-to-previous-display" }
                 remote('NotifyKeyboardKeycode', GLib.Variant('(ub)', (code, False)))
             time.sleep(0.03)
         assert_frame('Rapid Right twice lands on next display nearest half', targets(second_area)[0], window_log)
-        check('Logger retains both rapid transitions', wait_for(lambda: len([row for row in perf_rows() if row['event'] == 'dispatch']) == 2), perf_rows())
-        rows = [row for row in perf_rows() if row['event'] == 'dispatch']
+        check('Logger retains both rapid transitions', wait_for(lambda: len(transition_rows()) == transition_count + 2), perf_rows())
+        rows = transition_rows()[transition_count:]
         check('Transition completion includes real animation rather than request acknowledgment', all(row['result'] == 'ok' and row['metrics_error'] is None and 0 <= row['request_ms'] < 100 and 200 <= row['completion_ms'] <= row['dispatch_ms'] and row['rss_kib'] > 0 for row in rows), rows)
         metrics_isolated = False
         try:
@@ -756,39 +1045,55 @@ action = { type = "move-to-previous-display" }
         send(runtime, 'restart')
         assert_tui_frame('Performance TUI restarts without losing logger', runtime_log, checkpoint,
                          action='<none>', first=True)
+        transition_count = len(transition_rows())
         inject([29, 125, 105])
         assert_frame('Left returns to previous display nearest half after restart', expected_zones[1], window_log)
-        check('Transition after restart appends to the same log', wait_for(lambda: len([row for row in perf_rows() if row['event'] == 'dispatch']) == 3), perf_rows())
+        check('Transition after restart appends to the same log', wait_for(lambda: len(transition_rows()) == transition_count + 1), perf_rows())
         send(window, 'maximize')
         check('Performance fixture enters maximized state', wait_for(lambda: window_state(window_log)[3]), window_state(window_log))
+        transition_count = len(transition_rows())
         inject([29, 125, 106])
         assert_frame('Maximized transition reaches right half', expected_zones[1], window_log)
-        check('Maximized completion includes the finished visual transition', wait_for(lambda: len(perf_rows()) == 5) and perf_rows()[-1]['result'] == 'ok' and 200 <= perf_rows()[-1]['completion_ms'] <= perf_rows()[-1]['dispatch_ms'], perf_rows()[-1])
+        check('Maximized completion includes the finished visual transition', wait_for(lambda: len(transition_rows()) == transition_count + 1) and transition_rows()[-1]['result'] == 'ok' and 200 <= transition_rows()[-1]['completion_ms'] <= transition_rows()[-1]['dispatch_ms'], transition_rows()[-1])
         subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'false'], env=env, check=True)
         time.sleep(0.1)
+        transition_count = len(transition_rows())
         inject([29, 125, 105])
         assert_frame('Disabled animation still places window correctly', expected_zones[0], window_log)
-        check('Disabled animation logs completion without animation delay', wait_for(lambda: len(perf_rows()) == 6) and perf_rows()[-1]['result'] == 'ok' and perf_rows()[-1]['completion_ms'] < 200, perf_rows()[-1])
+        check('Disabled animation logs completion without animation delay', wait_for(lambda: len(transition_rows()) == transition_count + 1) and transition_rows()[-1]['result'] == 'ok' and transition_rows()[-1]['completion_ms'] < 200, transition_rows()[-1])
         subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'true'], env=env, check=True)
-        subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'reduce'], env=env, check=True)
-        time.sleep(0.1)
-        inject([29, 125, 106])
-        assert_frame('Reduced motion still places window correctly', expected_zones[1], window_log)
-        check('Reduced motion avoids custom movement animation', wait_for(lambda: len(perf_rows()) == 7) and perf_rows()[-1]['result'] == 'ok' and perf_rows()[-1]['completion_ms'] < 200, perf_rows()[-1])
-        subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'no-preference'], env=env, check=True)
+        if reduced_motion:
+            subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'reduce'], env=env, check=True)
+            time.sleep(0.1)
+            transition_count = len(transition_rows())
+            inject([29, 125, 106])
+            assert_frame('Reduced motion still places window correctly', expected_zones[1], window_log)
+            check('Reduced motion avoids custom movement animation', wait_for(lambda: len(transition_rows()) == transition_count + 1) and transition_rows()[-1]['result'] == 'ok' and transition_rows()[-1]['completion_ms'] < 200, transition_rows()[-1])
+            subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'no-preference'], env=env, check=True)
         send(window, 'fullscreen')
         check('Performance fixture enters fullscreen', wait_for(lambda: window_state(window_log)[4]), window_state(window_log))
+        transition_count = len(transition_rows())
         inject([29, 125, 106])
-        check('Rejected transition is logged without stale success timings', wait_for(lambda: perf_rows()[-1]['result'] == 'error') and perf_rows()[-1]['request_ms'] is None and perf_rows()[-1]['completion_ms'] is None and 'fullscreen' in perf_rows()[-1]['error'], perf_rows()[-1])
+        check('Rejected transition is logged without stale success timings', wait_for(lambda: len(transition_rows()) == transition_count + 1 and transition_rows()[-1]['result'] == 'error') and transition_rows()[-1]['request_ms'] is None and transition_rows()[-1]['completion_ms'] is None and 'fullscreen' in transition_rows()[-1]['error'], transition_rows()[-1])
         send(window, 'restore')
         check('Performance fixture restores after rejection', wait_for(lambda: not window_state(window_log)[4]), window_state(window_log))
         # Capture real compositor frames while moving, for visual proof of intermediate placement.
         dispatch('Alt+Ctrl+Cmd+i', custom, 'animation-capture-baseline', window_log)
-        recording, recording_log = start(['gst-launch-1.0', '--quiet', 'pipewiresrc', 'path=' + str(nodes[0]), 'num-buffers=16', '!', 'videoconvert', '!', 'pngenc', '!', 'multifilesink', 'location=' + str(work / 'animation-%02d.png')], 'animation-frames')
+        recording, recording_log, recording_deadline = start_capture(
+            'animation-frames', ['num-buffers=16', '!', 'videoconvert', '!', 'pngenc',
+                                 '!', 'multifilesink', 'location=' + str(work / 'animation-%02d.png')],
+            timeout=8, wait_active=True)
         inject([29, 125, 105])
-        recording.wait(timeout=8)
+        try:
+            recording.wait(timeout=max(0.01, recording_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError('Compositor animation capture timed out; see ' + str(recording_log)) from error
         assert_frame('Animated move ends at requested geometry', expected_zones[0], window_log)
-        check('Compositor transition capture finishes successfully', recording.returncode == 0, text(recording_log))
+        frames = sorted(work.glob('animation-*.png'))
+        check('Compositor transition capture finishes with sixteen real PNG frames',
+              recording.returncode == 0 and len(frames) == 16
+              and all(frame.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n' for frame in frames),
+              text(recording_log) + str(frames))
         inject([29, 125, 106])
         assert_frame('Default auto TUI handles real Ctrl+Super+Right', expected_zones[1], window_log)
         stop(runtime)
@@ -822,7 +1127,7 @@ action = { type = "move-to-previous-display" }
         rejected = rejected_dispatch(hotkeys[0], 'No-focused-window dispatch')
         check('No-focused-window dispatch is explicit', 'Dispatch state: Error' in rejected and 'NoFocusedWindow' in rejected, rejected.strip())
         print('NATIVE_GNOME_SMOKE_COMPLETE', flush=True)
-    except Exception as error:
+    except BaseException as error:
         if not checks or checks[-1]['passed']:
             checks.append({'name': 'Smoke execution error', 'passed': False, 'detail': str(error)})
         raise
@@ -832,34 +1137,20 @@ action = { type = "move-to-previous-display" }
                 remote('Stop')
             except GLib.Error:
                 pass
-        # Sessions, not just live leaders: Xwayland and other grandchildren can
-        # have their own process groups after the process we started has exited.
-        for signum in (signal.SIGTERM, signal.SIGKILL):
-            deadline = time.monotonic() + 5
-            signalled = set()
-            while True:
-                for process in processes:
-                    process.poll()
-                groups = owned_groups()
-                if not groups:
-                    break
-                for group in groups - signalled:
-                    try:
-                        os.killpg(group, signum)
-                    except ProcessLookupError:
-                        pass
-                signalled.update(groups)
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.05)
-        for process in reversed(processes):
-            process.wait(timeout=5)
-        (work / 'results.json').write_text(json.dumps(checks, indent=2) + '\n')
-        print('Smoke checks:', len(checks), 'failures:', sum(not row['passed'] for row in checks), flush=True)
-        if keep_logs:
-            print('Logs retained:', work, flush=True)
-        else:
-            shutil.rmtree(work)
+        try:
+            owned_process.cleanup(registry, owner, os.getpid())
+            for process in reversed(processes):
+                process.wait(timeout=5)
+        except Exception as error:
+            checks.append({'name': 'Owned process cleanup', 'passed': False, 'detail': str(error)})
+            raise
+        finally:
+            (work / 'results.json').write_text(json.dumps(checks, indent=2) + '\n')
+            print('Smoke checks:', len(checks), 'failures:', sum(not row['passed'] for row in checks), flush=True)
+            if keep_logs or any(not row['passed'] for row in checks):
+                print('Logs retained:', work, flush=True)
+            else:
+                shutil.rmtree(work)
 
 
 if __name__ == '__main__':
@@ -868,6 +1159,10 @@ if __name__ == '__main__':
     parser.add_argument('--keep-logs', action='store_true')
     parser.add_argument('--output-dir', type=Path, help='Create this evidence directory instead of a temporary one')
     parser.add_argument('--test-window', metavar='TITLE')
+    parser.add_argument('--xwayland-transform', type=Path,
+                        help='Record current Mutter/Xwayland layout and print scale and logical origin')
+    parser.add_argument('--capture', type=Path, help='Capture the current GNOME compositor without input')
+    parser.add_argument('--capture-window', type=int, help='Choose the captured monitor by this Xwayland window')
     args = parser.parse_args()
     if args.test_window:
         test_window(args.test_window)
@@ -882,7 +1177,12 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, terminate)
         signal.signal(signal.SIGINT, terminate)
         try:
-            run(args.binary.resolve(), args.keep_logs, args.output_dir)
+            if args.xwayland_transform:
+                observe_xwayland(args.xwayland_transform)
+            elif args.capture:
+                capture_current_monitor(args.capture, args.capture_window)
+            else:
+                run(args.binary.resolve(), args.keep_logs, args.output_dir)
         finally:
             if interrupted_signal:
                 signal.signal(interrupted_signal, signal.SIG_DFL)

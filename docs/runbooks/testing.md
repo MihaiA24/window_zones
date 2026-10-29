@@ -74,11 +74,12 @@ Run the GNOME Wayland or Linux X11 Smoke run with:
 The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit in each corresponding Synthetic or seated session.
 
 Native smoke helpers require Python 3.9+ and Linux pidfd support for safe process
-signaling. The isolated GNOME gate requires `gnome-shell`, `dbus-daemon`,
+signaling. The GNOME gates require `gnome-shell`, `dbus-daemon`,
 `gsettings`, Xwayland, `/usr/bin/python3` with PyGObject/GTK 4, and
-`gst-launch-1.0`/`gst-inspect-1.0` with PipeWire, video-conversion and PNG plugins.
-A running user PipeWire daemon/session manager and an installed AppIndicator
-compatible with the tested Shell version are required.
+`gst-launch-1.0`/`gst-inspect-1.0` with PipeWire, video-conversion and PNG plugins,
+plus `pw-dump` and `pw-link` from the PipeWire tools package.
+A running user PipeWire daemon/session manager is required. The isolated gate
+also needs an installed AppIndicator compatible with the tested Shell version.
 
 Before isolation the verifier records the original user/system XDG data roots
 and PipeWire endpoint. The driver copies AppIndicator privately; it does not
@@ -99,10 +100,16 @@ sudo pacman -S --needed xorg-server-xvfb openbox xdotool xorg-xrandr xorg-xdpyin
 
 Mutter's RemoteDesktop API supplies compositor-native keyboard and mouse
 input; its linked ScreenCast stream supplies actual rendered screenshots.
+The driver explicitly links the exact owned Mutter output to its uniquely
+named GStreamer consumer after checking both owning PIDs and ports. The
+PipeWire graph and consumer logs are retained; no host session-manager policy
+is changed and no generic or foreign stream is adopted.
 This gate does not require `/dev/uinput` or alter seated extension settings.
 The owned Shell uses `--force-animations` so software rendering does not silently
-bypass the enabled-animation path; disabled animations and reduced motion are
-checked separately. Overview uses Shell's public `OverviewActive` property with
+bypass the enabled-animation path. Disabled animations are checked on both
+supported Shell versions; reduced motion is additionally required on GNOME 51.
+GNOME 50 predates that API and skips only that preference-specific case.
+Overview uses Shell's public `OverviewActive` property with
 an observed-state wait, followed by captured-window identity and frame checks.
 The virtual pointer is created before leaving startup Overview because creating
 that device can reopen it.
@@ -117,8 +124,16 @@ and observes exact Restore before restoring the original hints and baseline.
 
 `gnome-live` has two prerequisites on the seated session:
 
-- The Companion must be active: `window-zones@mihai-a24` in `org.gnome.shell enabled-extensions` **and** `org.gnome.shell disable-user-extensions` set to `false`. The master switch suppresses the extension even when it is listed, which reads exactly like an extension that refuses to load.
+- The Companion must match the checkout and be active: `window-zones@mihai-a24` in `org.gnome.shell enabled-extensions` **and** `org.gnome.shell disable-user-extensions` set to `false`. After replacing source/metadata, a fresh login is required to load it; matching disk files plus an ACTIVE cached extension are not upgrade proof. The master switch suppresses the extension even when it is listed, which reads exactly like an extension that refuses to load.
 - `/dev/uinput` must be writable by the user running the automated gate. `gnome-live` fails immediately without authorized virtual-keyboard access and has no XTEST or physical-key fallback. Never grant world-writable access. An administrator can authorize a temporary per-user ACL using the saved/restored procedure in [the GNOME runbook](gnome-wayland.md#manual-smoke-checklist). Physical presses can provide separate manual evidence, not a pass of the automated gate.
+
+The seated observer records independent Mutter monitor layout/modes and Xwayland
+desktop dimensions before comparing frames in logical units. It never derives
+scale from the target window and fails unsupported nonuniform mappings instead
+of rounding away discrepancies. Captures use an owned Mutter ScreenCast stream
+on the fixture's monitor; Xwayland-root `x11grab` can be black on Wayland and is
+not accepted as compositor proof. Each accelerator also needs fresh successful
+App status, with post-input focus and Overview state retained for diagnosis.
 
 `kde-live` needs the `kwin` package (`kwin_wayland`, `kpackagetool6`, `kwriteconfig6`), `dbus-update-activation-environment`, and working Xwayland XTEST-to-EIS delivery. It builds its own private bus, XDG tree, KWin configuration, and compositor. KWin runs on its `--virtual` framebuffer backend with two 1200x900 outputs; a nested windowed backend was rejected because the outer compositor resizes those output windows mid-run. This is Synthetic session evidence: KWin uses `Session::Type::Noop` and never owns the login seat, so even a passing run cannot close the seated KDE Release gate.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Desktop-free regressions for the native smoke runner's safety/proof seams."""
 
+import importlib.util
 import os
 from pathlib import Path
 import signal
@@ -8,12 +9,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import owned_process
 import tui_frame
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+GNOME_SPEC = importlib.util.spec_from_file_location("gnome_smoke", SCRIPTS / "gnome-smoke.py")
+gnome = importlib.util.module_from_spec(GNOME_SPEC)
+GNOME_SPEC.loader.exec_module(gnome)
 
 
 class SmokeHelpersTest(unittest.TestCase):
@@ -100,6 +105,125 @@ pathlib.Path(sys.argv[1]).write_text(str(replacement.pid))
                     owned_process.signal_identity(restarted, start, signal.SIGKILL)
                 owned_process.signal_identity(foreign.pid, foreign_start, signal.SIGKILL)
                 foreign.wait(timeout=5)
+
+    def test_nested_cleanup_preserves_outer_owner_and_rescues_private_orphans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outer, inner = str(root / "outer"), str(root / "private")
+            outer_registry, inner_registry = root / "outer-pids", root / "inner-pids"
+            outer_registry.touch()
+            inner_registry.touch()
+            outer_env = {**os.environ, "WINDOW_ZONES_SMOKE_OWNER": outer}
+            outer_env.pop("WINDOW_ZONES_SMOKE_PRIVATE_OWNER", None)
+            outer_only = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"], env=outer_env)
+            outer_start = owned_process.process(outer_only.pid)[0]
+            orphans = []
+            def orphan(name):
+                pid_file = root / name
+                launcher = subprocess.Popen(
+                    [sys.executable, "-c", '''
+import os, pathlib, signal, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+pathlib.Path(sys.argv[1]).write_text(str(child.pid))
+os.kill(os.getpid(), signal.SIGKILL)
+''', str(pid_file)],
+                    env={**outer_env, "WINDOW_ZONES_SMOKE_PRIVATE_OWNER": inner})
+                self.assertEqual(launcher.wait(timeout=5), -signal.SIGKILL)
+                pid = int(pid_file.read_text())
+                start = owned_process.process(pid)[0]
+                orphans.append((pid, start))
+                return pid, start
+            try:
+                first, first_start = orphan("inner-child")
+                self.assertTrue(owned_process.has_owner(first, inner))
+                self.assertTrue(owned_process.has_owner(first, outer))
+                self.assertFalse(owned_process.has_owner(first, str(root)))
+                self.assertFalse(owned_process.has_owner(first, inner + "-sibling"))
+                owned_process.cleanup(inner_registry, inner, os.getpid())
+                self.assertFalse(owned_process.is_alive(first, first_start))
+                self.assertIsNone(outer_only.poll())
+                second, second_start = orphan("outer-rescued-child")
+                # No inner teardown runs after this driver's SIGKILL.
+                owned_process.cleanup(outer_registry, outer, os.getpid())
+                self.assertFalse(owned_process.is_alive(second, second_start))
+                self.assertEqual(outer_only.wait(timeout=5), -signal.SIGTERM)
+            finally:
+                for pid, start in orphans:
+                    owned_process.signal_identity(pid, start, signal.SIGKILL)
+                owned_process.signal_identity(outer_only.pid, outer_start, signal.SIGKILL)
+                outer_only.wait(timeout=5)
+
+    def test_gnome_registration_keeps_an_already_exited_child_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "pids"
+            registry.touch()
+            child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(23)"])
+            self.assertEqual(child.wait(timeout=5), 23)
+            gnome.register_child(child, registry, directory)
+            self.assertEqual(child.returncode, 23)
+            self.assertEqual(gnome.owned_process.records(registry), {})
+
+    def test_gnome_registration_stops_a_live_child_without_stable_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "pids"
+            registry.touch()
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                with mock.patch.object(gnome.owned_process, "process", return_value=None):
+                    with self.assertRaisesRegex(RuntimeError, "stable identity"):
+                        gnome.register_child(child, registry, directory)
+                self.assertEqual(child.returncode, -signal.SIGTERM)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
+    def test_gnome_reduced_motion_is_optional_only_before_shell_51(self):
+        schema = mock.Mock()
+        schema.has_key.return_value = False
+        self.assertFalse(gnome.reduced_motion_supported(50, None))
+        self.assertFalse(gnome.reduced_motion_supported(50, schema))
+        with self.assertRaisesRegex(RuntimeError, "GNOME 51 requires"):
+            gnome.reduced_motion_supported(51, schema)
+        with self.assertRaisesRegex(RuntimeError, "GNOME 51 requires"):
+            gnome.reduced_motion_supported(51, None)
+        schema.has_key.return_value = True
+        self.assertTrue(gnome.reduced_motion_supported(51, schema))
+
+    def test_gnome_capture_links_only_exact_owned_process_ports(self):
+        graph = [
+            {"id": 1, "type": "PipeWire:Interface:Client",
+             "info": {"props": {"application.process.id": 111}}},
+            {"id": 2, "type": "PipeWire:Interface:Client",
+             "info": {"props": {"application.process.id": "222"}}},
+            {"id": 3, "type": "PipeWire:Interface:Client",
+             "info": {"props": {"application.process.id": 333}}},
+            {"id": 10, "type": "PipeWire:Interface:Node",
+             "info": {"props": {"client.id": 1, "node.name": "gnome-shell"}}},
+            {"id": 11, "type": "PipeWire:Interface:Node",
+             "info": {"props": {"client.id": 2, "node.name": "private-capture"}}},
+            {"id": 12, "type": "PipeWire:Interface:Node",
+             "info": {"props": {"client.id": 3, "node.name": "gst-launch-1.0"}}},
+            {"id": 20, "type": "PipeWire:Interface:Port",
+             "info": {"direction": "output", "props": {"node.id": 10}}},
+            {"id": 21, "type": "PipeWire:Interface:Port",
+             "info": {"direction": "input", "props": {"node.id": 11}}},
+            {"id": 22, "type": "PipeWire:Interface:Port",
+             "info": {"direction": "input", "props": {"node.id": 12}}},
+        ]
+        self.assertEqual(gnome.capture_endpoints(graph, 10, 111, "private-capture", 222),
+                         (10, 11, 20, 21))
+        self.assertIsNone(gnome.capture_endpoints(graph, 99, 111, "private-capture", 222))
+        self.assertIsNone(gnome.capture_endpoints(graph, 10, 111, "missing-capture", 222))
+        with self.assertRaisesRegex(RuntimeError, "owned process"):
+            gnome.capture_endpoints(graph, 10, 999, "private-capture", 222)
+        with self.assertRaisesRegex(RuntimeError, "owned process"):
+            gnome.capture_endpoints(graph, 10, 111, "private-capture", 999)
+        duplicate = {"id": 23, "type": "PipeWire:Interface:Port",
+                     "info": {"direction": "input", "props": {"node.id": 11}}}
+        with self.assertRaisesRegex(RuntimeError, "Ambiguous.*ports"):
+            gnome.capture_endpoints(graph + [duplicate], 10, 111, "private-capture", 222)
 
     def test_signal_exits_instead_of_resuming_the_gate(self):
         for signame, code in (("INT", 130), ("TERM", 143)):

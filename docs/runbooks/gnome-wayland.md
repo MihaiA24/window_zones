@@ -276,6 +276,18 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 
 The `gnome-live` gate mechanically runs the [identified-window and hotkey-rollback checks](testing.md#v1-verification-matrix) on disposable Text Editor windows; its refused replacement must retain four bindings and the previous accelerator.
 
+Its placement runtime also reloads one of those safe bindings through all
+fourteen built-in zones and center, injecting each accelerator with the test
+window's identity and focus checked before input. Each key needs fresh successful
+App status and independent Xwayland/companion frame observations. Xwayland pixels
+are normalized using independent monitor/X server layout metadata; target
+rectangles remain in Mutter logical units. Captures come from the actual
+compositor monitor, not the black Xwayland root. Post-input focus and Overview
+state are recorded. Interactive Restore then returns to
+the frame before the first accelerator move; a second physical Restore must
+report consumed history without changing the frame. The original four-binding
+fixture is restored before the remaining lifecycle/rollback checks.
+
 The atomic-registration fixture receives `HotkeyPressed` on the same private
 D-Bus connection that registers the binding; the companion intentionally
 unicasts signals only to its controller. The gate requires separate receiver
@@ -306,11 +318,15 @@ compositor, run:
 ./scripts/smoke.sh --keep-logs gnome
 ```
 
-This exercises native keyboard and mouse input, every zone, monitor moves,
-config rollback, CLI/TUI/tray lifecycle, companion recovery, and compositor
-screenshots through Mutter's RemoteDesktop and ScreenCast APIs. It does not
-need `/dev/uinput`, change the seated extension settings, or bypass Shell
-security. See [testing prerequisites](testing.md#v1-verification-matrix).
+This exercises native keyboard and mouse input, all fourteen built-ins through
+CLI dispatch and actual accelerators, same-runtime center/Restore and restart
+reset, monitor moves, config rollback, CLI/TUI/tray lifecycle, companion recovery,
+and compositor screenshots through Mutter's RemoteDesktop and ScreenCast APIs.
+Capture explicitly links only the private stream and owned consumer; it does
+not depend on automatic session-manager linking. It does not need `/dev/uinput`,
+change the seated extension settings, or bypass Shell security.
+GNOME 50 skips only its unavailable reduced-motion preference, not the
+enabled/disabled animation cases. See [testing prerequisites](testing.md#v1-verification-matrix).
 
 ## Compatibility and lifecycle sources
 

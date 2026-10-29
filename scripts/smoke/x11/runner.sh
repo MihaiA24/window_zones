@@ -1,7 +1,7 @@
 record_versions_x11() {
     record_versions_common
-    log "VERSION Xorg: $(/usr/lib/Xorg -version 2>&1 | sed -n '/X.Org X Server/p' | sed -n '1p')"
-    log "VERSION Xvfb: $(pacman -Qi xorg-server 2>/dev/null | sed -n '/^Version/p' | sed 's/^ *//')"
+    log "VERSION Xvfb executable: $(command -v Xvfb)"
+    log "VERSION Xvfb package: $(pacman -Q xorg-server-xvfb 2>/dev/null || true)"
     log "VERSION openbox: $(openbox --version 2>&1 | sed -n '1p')"
     log "VERSION xdotool: $(xdotool --version 2>&1 | sed -n '1p')"
 }

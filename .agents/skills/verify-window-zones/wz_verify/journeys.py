@@ -268,9 +268,9 @@ def smoke_summary(text, gate):
 
 
 def smoke(workspace, options):
-    required = {"x11": ["Xvfb", "openbox", "xdotool", "xrandr", "xprop", "xdpyinfo", "gnome-text-editor", "ffmpeg", "dbus-run-session"],
+    required = {"x11": ["Xvfb", "openbox", "xdotool", "xrandr", "xprop", "xdpyinfo", "xkbcomp", "gnome-text-editor", "ffmpeg", "dbus-run-session"],
                 "gnome": ["gnome-shell", "dbus-daemon", "/usr/bin/python3", "gst-launch-1.0",
-                          "gst-inspect-1.0", "gsettings", "Xwayland"],
+                          "gst-inspect-1.0", "pw-dump", "pw-link", "gsettings", "Xwayland"],
                 "kde-live": ["kwin_wayland", "kpackagetool6", "kwriteconfig6", "busctl", "gjs", "xdotool",
                              "xprop", "dbus-run-session", "python", "setsid", "gnome-text-editor"]}
     missing = [tool for tool in required[options.gate] if not shutil.which(tool)]

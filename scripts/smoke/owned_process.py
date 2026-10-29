@@ -50,9 +50,9 @@ def signal_identity(pid, start, signum):
 
 def has_owner(pid, owner):
     try:
-        return f"WINDOW_ZONES_SMOKE_OWNER={owner}".encode() in (
-            Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-        )
+        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        return any(f"{name}={owner}".encode() in environment for name in (
+            "WINDOW_ZONES_SMOKE_OWNER", "WINDOW_ZONES_SMOKE_PRIVATE_OWNER"))
     except OSError:
         return False
 
@@ -81,8 +81,8 @@ def discover(known, owner, runner):
             if current is not None:
                 snapshot[pid] = current
     owned = {pid: start for pid, start in known.items() if is_alive(pid, start)}
-    # Every launched process inherits this private run marker. This also finds
-    # re-execed/orphaned helpers after their original registered parent exited.
+    # The inherited outer marker rescues orphaned helpers if a nested driver is
+    # killed; its private marker lets inner cleanup leave that outer runner alone.
     for pid, (start, _, state) in snapshot.items():
         if state != "Z" and has_owner(pid, owner):
             owned[pid] = start
