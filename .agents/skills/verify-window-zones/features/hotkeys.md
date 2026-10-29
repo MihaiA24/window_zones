@@ -38,6 +38,7 @@ Preconditions:
 - **X11 mapping/work areas.** `check e2e` runs the ignored `x11_real_server*` regressions on its owned display. Move Alt/Super and NumLock to different modifier slots, switch US/German keyboard groups with distinct Y/Z bindings, and exercise shifted symbols only there; require intended accelerators and no stale exclusive grabs. A refused remap must release capture and report unavailability.
 - **KWin reset/ownership.** On a private bus, reset the script during pending registration and require retry/recovery, not permanent rejection. Failed automatic restoration must report unavailable capture to the owning controller until registration succeeds; unrelated clients cannot claim ownership or consume recovery. A second companion must exit 75 without queueing for the service name.
 - **Windows typing/recovery.** Follow the Windows native runbook: Polish/German AltGr input, secure-desktop return, ordinary editing keys, held-key release order and real hook removal followed by `restart`. Cross-target checks and synthetic event delivery do not prove these paths.
+- **Native keycode contract.** Windows/macOS map canonical tokens directly to OS keycodes. Keep the full supported-key mapping, both modifier sides, unknown-key passthrough and macOS rejection of F21–F24/PC-only keys covered. Cross-target compilation or a portable logic probe does not replace native keyboard/tap/hook verification.
 
 ## Gotchas
 

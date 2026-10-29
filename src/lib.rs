@@ -42,7 +42,7 @@ pub use gnome_integration::{
     GnomeIntegrationError, GnomeWindowSystem,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-pub use hotkey_system::RdevHotkeySystem;
+pub use hotkey_system::NativeHotkeySystem;
 pub use hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
 #[cfg(target_os = "linux")]
 pub use kwin_integration::{

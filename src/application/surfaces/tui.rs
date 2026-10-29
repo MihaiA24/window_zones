@@ -91,8 +91,6 @@ fn tui_hotkey_mode(backend: RuntimeBackend) -> &'static str {
         RuntimeBackend::Kde => "kwin-companion",
         #[cfg(target_os = "linux")]
         RuntimeBackend::Wayland(_) => "compositor-bound dispatch",
-        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-        RuntimeBackend::Unsupported => "cli",
         #[allow(unreachable_patterns)]
         _ => "global",
     }

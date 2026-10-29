@@ -4,15 +4,11 @@ kde_live_inject_key() {
         xdotool key --clearmodifiers "$sequence"
 }
 
-write_kde_hotkey_client() {
-    cp "$SCRIPT_DIR/smoke/fixtures/kwin_hotkey_client.js" "$1"
-}
-
 kde_live_atomic_registration() {
     local helper="$KDE_ROOT/atomic-register.js"
     local helper_log="$KDE_ROOT/atomic-register.log"
     local helper_pid='' valid_events_before=0 invalid_events_before=0 invalid_events_after=0
-    write_kde_hotkey_client "$helper"
+    cp "$SCRIPT_DIR/smoke/fixtures/kwin_hotkey_client.js" "$helper"
     cat "$SCRIPT_DIR/smoke/fixtures/kwin_atomic_registration.js" >>"$helper"
     : >"$helper_log"
     start_group helper_pid "$helper_log" env \
@@ -81,7 +77,7 @@ kde_live_conflict_registration() {
 
     local helper="$KDE_ROOT/conflict-register.js" helper_log="$KDE_ROOT/conflict-register.log"
     local helper_pid='' inject_rc=0 valid_events_before=0 previous_active=0
-    write_kde_hotkey_client "$helper"
+    cp "$SCRIPT_DIR/smoke/fixtures/kwin_hotkey_client.js" "$helper"
     cat "$SCRIPT_DIR/smoke/fixtures/kwin_conflict_registration.js" >>"$helper"
     : >"$helper_log"
     start_group helper_pid "$helper_log" env \

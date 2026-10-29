@@ -60,10 +60,6 @@ kde_live_compare_displays() {
         <"$SCRIPT_DIR/smoke/fixtures/kwin_compare_displays.py"
 }
 
-kde_live_observer_script() {
-    cp "$SCRIPT_DIR/smoke/fixtures/kwin_observer.js" "$KDE_OBSERVER_JS"
-}
-
 kde_live_x11_active_window() {
     DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
         xdotool getactivewindow 2>/dev/null || printf 'unavailable'
@@ -74,22 +70,6 @@ kde_live_activate_window() {
     DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
         xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
     sleep 0.3
-}
-
-kde_live_find_window() {
-    WINDOW_ID=''
-    local id='' pid=''
-    while read -r id; do
-        [[ -n "$id" ]] || continue
-        pid=$(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-            xdotool getwindowpid "$id" 2>/dev/null || true)
-        if [[ "$pid" == "$KDE_EDITOR_PID" ]]; then
-            WINDOW_ID="$id"
-            return 0
-        fi
-    done < <(DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        xdotool search --name 'Text Editor' 2>/dev/null || true)
-    return 1
 }
 
 kde_live_x11_geometry() {

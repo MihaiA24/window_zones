@@ -1,8 +1,6 @@
 use thiserror::Error;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use rdev::{EventType, Key};
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "macos")]
 use std::sync::PoisonError;
@@ -50,13 +48,13 @@ pub trait HotkeySystem {
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError>;
 }
 
-/// Native keyboard capture for Windows/macOS, using rdev's key vocabulary.
+/// Native keyboard capture for Windows/macOS using platform key codes.
 /// Windows owns and joins its hook thread on replacement/drop; macOS reuses
 /// its event tap while it remains live. Registration waits for native readiness.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug)]
-pub struct RdevHotkeySystem {
-    listener: Arc<Mutex<RdevListener>>,
+pub struct NativeHotkeySystem {
+    listener: Arc<Mutex<NativeListenerState>>,
     owner: Arc<()>,
     event_tx: mpsc::Sender<HotkeyEvent>,
     events: mpsc::Receiver<HotkeyEvent>,
@@ -65,18 +63,25 @@ pub struct RdevHotkeySystem {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-#[derive(Debug, Default)]
-struct RdevListener {
-    bindings: HashMap<(u8, Key), String>,
-    owner: Option<Arc<()>>,
-    event_tx: Option<mpsc::Sender<HotkeyEvent>>,
-    error: Option<String>,
-    pressed: HashSet<Key>,
-    swallowed: HashSet<Key>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyEvent {
+    KeyPress(u32),
+    KeyRelease(u32),
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-impl RdevListener {
+#[derive(Debug, Default)]
+struct NativeListenerState {
+    bindings: HashMap<(u8, u32), String>,
+    owner: Option<Arc<()>>,
+    event_tx: Option<mpsc::Sender<HotkeyEvent>>,
+    error: Option<String>,
+    pressed: HashSet<u32>,
+    swallowed: HashSet<u32>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl NativeListenerState {
     fn status(&self) -> Result<(), HotkeySystemError> {
         match &self.error {
             Some(error) => Err(HotkeySystemError::Unavailable(error.clone())),
@@ -97,9 +102,9 @@ impl RdevListener {
     }
 
     /// Return true only when the native event should be consumed.
-    fn handle_event(&mut self, event: EventType) -> bool {
+    fn handle_event(&mut self, event: KeyEvent) -> bool {
         match event {
-            EventType::KeyPress(key) => {
+            KeyEvent::KeyPress(key) => {
                 if !self.pressed.insert(key) {
                     return self.swallowed.contains(&key);
                 }
@@ -107,7 +112,7 @@ impl RdevListener {
                     return false;
                 }
                 #[cfg(target_os = "windows")]
-                if self.pressed.contains(&Key::AltGr) && self.pressed.contains(&Key::ControlLeft) {
+                if self.pressed.contains(&0xa5) && self.pressed.contains(&0xa2) {
                     // AltGr synthesizes left Ctrl + right Alt on Windows.
                     // Reserve that chord for typing, not Ctrl+Alt bindings.
                     return false;
@@ -135,17 +140,16 @@ impl RdevListener {
                 self.swallowed.insert(key);
                 true
             }
-            EventType::KeyRelease(key) => {
+            KeyEvent::KeyRelease(key) => {
                 self.pressed.remove(&key);
                 self.swallowed.remove(&key)
             }
-            _ => false,
         }
     }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-impl RdevHotkeySystem {
+impl NativeHotkeySystem {
     pub fn new() -> Self {
         #[cfg(target_os = "windows")]
         {
@@ -156,7 +160,7 @@ impl RdevHotkeySystem {
         }
         #[cfg(target_os = "macos")]
         {
-            static LISTENER: Mutex<Option<Arc<Mutex<RdevListener>>>> = Mutex::new(None);
+            static LISTENER: Mutex<Option<Arc<Mutex<NativeListenerState>>>> = Mutex::new(None);
             Self::with_listener(Self::shared_listener(&LISTENER, Self::spawn_listener))
         }
     }
@@ -165,9 +169,9 @@ impl RdevHotkeySystem {
     /// Reuse the shared listener while its native hook may still run; build a
     /// new one only after the old hook stopped, so a single hook stays live.
     fn shared_listener(
-        slot: &Mutex<Option<Arc<Mutex<RdevListener>>>>,
-        spawn: impl FnOnce(Arc<Mutex<RdevListener>>),
-    ) -> Arc<Mutex<RdevListener>> {
+        slot: &Mutex<Option<Arc<Mutex<NativeListenerState>>>>,
+        spawn: impl FnOnce(Arc<Mutex<NativeListenerState>>),
+    ) -> Arc<Mutex<NativeListenerState>> {
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(listener) = slot.as_ref() {
             let running = listener
@@ -185,13 +189,13 @@ impl RdevHotkeySystem {
                 return Arc::clone(listener);
             }
         }
-        let listener = Arc::new(Mutex::new(RdevListener::default()));
+        let listener = Arc::new(Mutex::new(NativeListenerState::default()));
         spawn(Arc::clone(&listener));
         *slot = Some(Arc::clone(&listener));
         listener
     }
 
-    fn with_listener(listener: Arc<Mutex<RdevListener>>) -> Self {
+    fn with_listener(listener: Arc<Mutex<NativeListenerState>>) -> Self {
         let (event_tx, events) = mpsc::channel();
         Self {
             listener,
@@ -204,7 +208,7 @@ impl RdevHotkeySystem {
     }
 
     #[cfg(target_os = "macos")]
-    fn spawn_listener(listener: Arc<Mutex<RdevListener>>) {
+    fn spawn_listener(listener: Arc<Mutex<NativeListenerState>>) {
         let error_state = Arc::clone(&listener);
         let spawn_error_state = Arc::clone(&listener);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -243,14 +247,14 @@ impl RdevHotkeySystem {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-impl Default for RdevHotkeySystem {
+impl Default for NativeHotkeySystem {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-impl HotkeySystem for RdevHotkeySystem {
+impl HotkeySystem for NativeHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
         let mut next = HashMap::with_capacity(hotkeys.len());
         for hotkey in hotkeys {
@@ -294,7 +298,7 @@ impl HotkeySystem for RdevHotkeySystem {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-impl Drop for RdevHotkeySystem {
+impl Drop for NativeHotkeySystem {
     fn drop(&mut self) {
         if let Ok(mut state) = self.listener.lock()
             && state
@@ -320,19 +324,30 @@ const MOD_SHIFT: u8 = 0b0100;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const MOD_CMD: u8 = 0b1000;
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn modifier_mask(key: &Key) -> Option<u8> {
+#[cfg(target_os = "windows")]
+fn modifier_mask(key: &u32) -> Option<u8> {
     Some(match key {
-        Key::Alt | Key::AltGr => MOD_ALT,
-        Key::ControlLeft | Key::ControlRight => MOD_CTRL,
-        Key::ShiftLeft | Key::ShiftRight => MOD_SHIFT,
-        Key::MetaLeft | Key::MetaRight => MOD_CMD,
+        0xa4 | 0xa5 => MOD_ALT,
+        0xa2 | 0xa3 => MOD_CTRL,
+        0xa0 | 0xa1 => MOD_SHIFT,
+        0x5b | 0x5c => MOD_CMD,
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn modifier_mask(key: &u32) -> Option<u8> {
+    Some(match key {
+        58 | 61 => MOD_ALT,
+        59 | 62 => MOD_CTRL,
+        56 | 60 => MOD_SHIFT,
+        55 | 54 => MOD_CMD,
         _ => return None,
     })
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn canonical_binding(raw: &str) -> Result<((u8, Key), String), HotkeySystemError> {
+fn canonical_binding(raw: &str) -> Result<((u8, u32), String), HotkeySystemError> {
     let canonical = crate::config::normalize_hotkey(raw)
         .map_err(|error| HotkeySystemError::Rejected(format!("invalid hotkey `{raw}`: {error}")))?;
     if canonical != raw {
@@ -360,140 +375,152 @@ fn canonical_binding(raw: &str) -> Result<((u8, Key), String), HotkeySystemError
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn key_token_to_code(token: &str) -> Option<Key> {
+fn key_token_to_code(token: &str) -> Option<u32> {
+    // Win32 virtual keys and Carbon HIToolbox virtual keycodes, respectively.
+    let codes: (u32, Option<u32>) = match token {
+        "a" => (0x41, Some(0)),
+        "b" => (0x42, Some(11)),
+        "c" => (0x43, Some(8)),
+        "d" => (0x44, Some(2)),
+        "e" => (0x45, Some(14)),
+        "f" => (0x46, Some(3)),
+        "g" => (0x47, Some(5)),
+        "h" => (0x48, Some(4)),
+        "i" => (0x49, Some(34)),
+        "j" => (0x4a, Some(38)),
+        "k" => (0x4b, Some(40)),
+        "l" => (0x4c, Some(37)),
+        "m" => (0x4d, Some(46)),
+        "n" => (0x4e, Some(45)),
+        "o" => (0x4f, Some(31)),
+        "p" => (0x50, Some(35)),
+        "q" => (0x51, Some(12)),
+        "r" => (0x52, Some(15)),
+        "s" => (0x53, Some(1)),
+        "t" => (0x54, Some(17)),
+        "u" => (0x55, Some(32)),
+        "v" => (0x56, Some(9)),
+        "w" => (0x57, Some(13)),
+        "x" => (0x58, Some(7)),
+        "y" => (0x59, Some(16)),
+        "z" => (0x5a, Some(6)),
+        "0" => (0x30, Some(29)),
+        "1" => (0x31, Some(18)),
+        "2" => (0x32, Some(19)),
+        "3" => (0x33, Some(20)),
+        "4" => (0x34, Some(21)),
+        "5" => (0x35, Some(23)),
+        "6" => (0x36, Some(22)),
+        "7" => (0x37, Some(26)),
+        "8" => (0x38, Some(28)),
+        "9" => (0x39, Some(25)),
+        "f1" => (0x70, Some(122)),
+        "f2" => (0x71, Some(120)),
+        "f3" => (0x72, Some(99)),
+        "f4" => (0x73, Some(118)),
+        "f5" => (0x74, Some(96)),
+        "f6" => (0x75, Some(97)),
+        "f7" => (0x76, Some(98)),
+        "f8" => (0x77, Some(100)),
+        "f9" => (0x78, Some(101)),
+        "f10" => (0x79, Some(109)),
+        "f11" => (0x7a, Some(103)),
+        "f12" => (0x7b, Some(111)),
+        "f13" => (0x7c, Some(105)),
+        "f14" => (0x7d, Some(107)),
+        "f15" => (0x7e, Some(113)),
+        "f16" => (0x7f, Some(106)),
+        "f17" => (0x80, Some(64)),
+        "f18" => (0x81, Some(79)),
+        "f19" => (0x82, Some(80)),
+        "f20" => (0x83, Some(90)),
+        "f21" => (0x84, None),
+        "f22" => (0x85, None),
+        "f23" => (0x86, None),
+        "f24" => (0x87, None),
+        "space" => (0x20, Some(49)),
+        "tab" => (0x09, Some(48)),
+        "backspace" => (0x08, Some(51)),
+        "escape" => (0x1b, Some(53)),
+        "insert" => (0x2d, Some(114)),
+        "home" => (0x24, Some(115)),
+        "end" => (0x23, Some(119)),
+        "pageup" => (0x21, Some(116)),
+        "pagedown" => (0x22, Some(121)),
+        "delete" => (0x2e, Some(117)),
+        "left" => (0x25, Some(123)),
+        "right" => (0x27, Some(124)),
+        "up" => (0x26, Some(126)),
+        "down" => (0x28, Some(125)),
+        "minus" => (0xbd, Some(27)),
+        "equal" => (0xbb, Some(24)),
+        "comma" => (0xbc, Some(43)),
+        "dot" => (0xbe, Some(47)),
+        "slash" => (0xbf, Some(44)),
+        "quote" => (0xde, Some(39)),
+        "semicolon" => (0xba, Some(41)),
+        "leftbracket" => (0xdb, Some(33)),
+        "rightbracket" => (0xdd, Some(30)),
+        "backslash" => (0xdc, Some(42)),
+        "backquote" => (0xc0, Some(50)),
+        "return" => (0x0d, Some(36)),
+        "printscreen" => (0x2c, None),
+        "scrolllock" => (0x91, None),
+        "pause" => (0x13, None),
+        "capslock" => (0x14, Some(57)),
+        "numlock" => (0x90, None),
+        _ => return None,
+    };
     #[cfg(target_os = "windows")]
-    if let Some(number) = token
-        .strip_prefix('f')
-        .and_then(|number| number.parse::<u32>().ok())
-        && (13..=24).contains(&number)
     {
-        return Some(Key::Unknown(111 + number));
+        Some(codes.0)
     }
     #[cfg(target_os = "macos")]
-    match token {
-        "f13" => return Some(Key::Unknown(105)),
-        "f14" => return Some(Key::Unknown(107)),
-        "f15" => return Some(Key::Unknown(113)),
-        "f16" => return Some(Key::Unknown(106)),
-        "f17" => return Some(Key::Unknown(64)),
-        "f18" => return Some(Key::Unknown(79)),
-        "f19" => return Some(Key::Unknown(80)),
-        "f20" => return Some(Key::Unknown(90)),
-        "delete" => return Some(Key::Unknown(117)),
-        "insert" => return Some(Key::Unknown(114)),
-        "home" => return Some(Key::Unknown(115)),
-        "end" => return Some(Key::Unknown(119)),
-        "pageup" => return Some(Key::Unknown(116)),
-        "pagedown" => return Some(Key::Unknown(121)),
-        // No distinct macOS hardware keys exist for these PC-only key names.
-        "printscreen" | "scrolllock" | "pause" | "numlock" => return None,
-        _ => {}
+    {
+        codes.1
     }
-    Some(match token {
-        "a" => Key::KeyA,
-        "b" => Key::KeyB,
-        "c" => Key::KeyC,
-        "d" => Key::KeyD,
-        "e" => Key::KeyE,
-        "f" => Key::KeyF,
-        "g" => Key::KeyG,
-        "h" => Key::KeyH,
-        "i" => Key::KeyI,
-        "j" => Key::KeyJ,
-        "k" => Key::KeyK,
-        "l" => Key::KeyL,
-        "m" => Key::KeyM,
-        "n" => Key::KeyN,
-        "o" => Key::KeyO,
-        "p" => Key::KeyP,
-        "q" => Key::KeyQ,
-        "r" => Key::KeyR,
-        "s" => Key::KeyS,
-        "t" => Key::KeyT,
-        "u" => Key::KeyU,
-        "v" => Key::KeyV,
-        "w" => Key::KeyW,
-        "x" => Key::KeyX,
-        "y" => Key::KeyY,
-        "z" => Key::KeyZ,
-        "0" => Key::Num0,
-        "1" => Key::Num1,
-        "2" => Key::Num2,
-        "3" => Key::Num3,
-        "4" => Key::Num4,
-        "5" => Key::Num5,
-        "6" => Key::Num6,
-        "7" => Key::Num7,
-        "8" => Key::Num8,
-        "9" => Key::Num9,
-        "f1" => Key::F1,
-        "f2" => Key::F2,
-        "f3" => Key::F3,
-        "f4" => Key::F4,
-        "f5" => Key::F5,
-        "f6" => Key::F6,
-        "f7" => Key::F7,
-        "f8" => Key::F8,
-        "f9" => Key::F9,
-        "f10" => Key::F10,
-        "f11" => Key::F11,
-        "f12" => Key::F12,
-        "space" => Key::Space,
-        "tab" => Key::Tab,
-        "backspace" => Key::Backspace,
-        "escape" => Key::Escape,
-        "insert" => Key::Insert,
-        "home" => Key::Home,
-        "end" => Key::End,
-        "pageup" => Key::PageUp,
-        "pagedown" => Key::PageDown,
-        "delete" => Key::Delete,
-        "left" => Key::LeftArrow,
-        "right" => Key::RightArrow,
-        "up" => Key::UpArrow,
-        "down" => Key::DownArrow,
-        "minus" => Key::Minus,
-        "equal" => Key::Equal,
-        "comma" => Key::Comma,
-        "dot" => Key::Dot,
-        "slash" => Key::Slash,
-        "quote" => Key::Quote,
-        "semicolon" => Key::SemiColon,
-        "leftbracket" => Key::LeftBracket,
-        "rightbracket" => Key::RightBracket,
-        "backslash" => Key::BackSlash,
-        "backquote" => Key::BackQuote,
-        "return" => Key::Return,
-        "printscreen" => Key::PrintScreen,
-        "scrolllock" => Key::ScrollLock,
-        "pause" => Key::Pause,
-        "capslock" => Key::CapsLock,
-        "numlock" => Key::NumLock,
-        _ => return None,
-    })
 }
 
 #[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 mod tests {
     use super::*;
 
-    fn system_without_native_listener() -> RdevHotkeySystem {
-        RdevHotkeySystem::with_listener(Arc::new(Mutex::new(RdevListener::default())))
+    #[cfg(target_os = "windows")]
+    const A: u32 = 0x41;
+    #[cfg(target_os = "macos")]
+    const A: u32 = 0;
+    #[cfg(target_os = "windows")]
+    const B: u32 = 0x42;
+    #[cfg(target_os = "macos")]
+    const B: u32 = 11;
+    #[cfg(target_os = "windows")]
+    const CONTROL_LEFT: u32 = 0xa2;
+    #[cfg(target_os = "macos")]
+    const CONTROL_LEFT: u32 = 59;
+    #[cfg(target_os = "windows")]
+    const CONTROL_RIGHT: u32 = 0xa3;
+    #[cfg(target_os = "macos")]
+    const CONTROL_RIGHT: u32 = 62;
+
+    fn system_without_native_listener() -> NativeHotkeySystem {
+        NativeHotkeySystem::with_listener(Arc::new(Mutex::new(NativeListenerState::default())))
     }
 
-    fn listener_state(system: &RdevHotkeySystem) -> std::sync::MutexGuard<'_, RdevListener> {
+    fn listener_state(
+        system: &NativeHotkeySystem,
+    ) -> std::sync::MutexGuard<'_, NativeListenerState> {
         let Ok(state) = system.listener.lock() else {
             panic!("test listener lock was poisoned");
         };
         state
     }
 
-    fn press(system: &RdevHotkeySystem, key: Key) -> bool {
-        listener_state(system).handle_event(EventType::KeyPress(key))
+    fn press(system: &NativeHotkeySystem, key: u32) -> bool {
+        listener_state(system).handle_event(KeyEvent::KeyPress(key))
     }
 
-    fn release(system: &RdevHotkeySystem, key: Key) -> bool {
-        listener_state(system).handle_event(EventType::KeyRelease(key))
+    fn release(system: &NativeHotkeySystem, key: u32) -> bool {
+        listener_state(system).handle_event(KeyEvent::KeyRelease(key))
     }
 
     #[test]
@@ -525,60 +552,141 @@ mod tests {
 
     #[test]
     fn maps_every_letter_digit_and_function_key() {
-        for (token, key) in [
-            ("a", Key::KeyA),
-            ("b", Key::KeyB),
-            ("c", Key::KeyC),
-            ("d", Key::KeyD),
-            ("e", Key::KeyE),
-            ("f", Key::KeyF),
-            ("g", Key::KeyG),
-            ("h", Key::KeyH),
-            ("i", Key::KeyI),
-            ("j", Key::KeyJ),
-            ("k", Key::KeyK),
-            ("l", Key::KeyL),
-            ("m", Key::KeyM),
-            ("n", Key::KeyN),
-            ("o", Key::KeyO),
-            ("p", Key::KeyP),
-            ("q", Key::KeyQ),
-            ("r", Key::KeyR),
-            ("s", Key::KeyS),
-            ("t", Key::KeyT),
-            ("u", Key::KeyU),
-            ("v", Key::KeyV),
-            ("w", Key::KeyW),
-            ("x", Key::KeyX),
-            ("y", Key::KeyY),
-            ("z", Key::KeyZ),
-            ("0", Key::Num0),
-            ("1", Key::Num1),
-            ("2", Key::Num2),
-            ("3", Key::Num3),
-            ("4", Key::Num4),
-            ("5", Key::Num5),
-            ("6", Key::Num6),
-            ("7", Key::Num7),
-            ("8", Key::Num8),
-            ("9", Key::Num9),
-            ("f1", Key::F1),
-            ("f2", Key::F2),
-            ("f3", Key::F3),
-            ("f4", Key::F4),
-            ("f5", Key::F5),
-            ("f6", Key::F6),
-            ("f7", Key::F7),
-            ("f8", Key::F8),
-            ("f9", Key::F9),
-            ("f10", Key::F10),
-            ("f11", Key::F11),
-            ("f12", Key::F12),
+        for (token, _windows, _macos) in [
+            ("a", 65, Some(0)),
+            ("b", 66, Some(11)),
+            ("c", 67, Some(8)),
+            ("d", 68, Some(2)),
+            ("e", 69, Some(14)),
+            ("f", 70, Some(3)),
+            ("g", 71, Some(5)),
+            ("h", 72, Some(4)),
+            ("i", 73, Some(34)),
+            ("j", 74, Some(38)),
+            ("k", 75, Some(40)),
+            ("l", 76, Some(37)),
+            ("m", 77, Some(46)),
+            ("n", 78, Some(45)),
+            ("o", 79, Some(31)),
+            ("p", 80, Some(35)),
+            ("q", 81, Some(12)),
+            ("r", 82, Some(15)),
+            ("s", 83, Some(1)),
+            ("t", 84, Some(17)),
+            ("u", 85, Some(32)),
+            ("v", 86, Some(9)),
+            ("w", 87, Some(13)),
+            ("x", 88, Some(7)),
+            ("y", 89, Some(16)),
+            ("z", 90, Some(6)),
+            ("0", 48, Some(29)),
+            ("1", 49, Some(18)),
+            ("2", 50, Some(19)),
+            ("3", 51, Some(20)),
+            ("4", 52, Some(21)),
+            ("5", 53, Some(23)),
+            ("6", 54, Some(22)),
+            ("7", 55, Some(26)),
+            ("8", 56, Some(28)),
+            ("9", 57, Some(25)),
+            ("f1", 112, Some(122)),
+            ("f2", 113, Some(120)),
+            ("f3", 114, Some(99)),
+            ("f4", 115, Some(118)),
+            ("f5", 116, Some(96)),
+            ("f6", 117, Some(97)),
+            ("f7", 118, Some(98)),
+            ("f8", 119, Some(100)),
+            ("f9", 120, Some(101)),
+            ("f10", 121, Some(109)),
+            ("f11", 122, Some(103)),
+            ("f12", 123, Some(111)),
+            ("f13", 124, Some(105)),
+            ("f14", 125, Some(107)),
+            ("f15", 126, Some(113)),
+            ("f16", 127, Some(106)),
+            ("f17", 128, Some(64)),
+            ("f18", 129, Some(79)),
+            ("f19", 130, Some(80)),
+            ("f20", 131, Some(90)),
+            ("f21", 132, None),
+            ("f22", 133, None),
+            ("f23", 134, None),
+            ("f24", 135, None),
         ] {
-            assert_eq!(canonical_binding(token).unwrap().0, (0, key), "{token}");
+            #[cfg(target_os = "windows")]
+            let expected = Some(_windows);
+            #[cfg(target_os = "macos")]
+            let expected = _macos;
+            assert_eq!(key_token_to_code(token), expected, "{token}");
+            if let Some(code) = expected {
+                assert_eq!(canonical_binding(token).unwrap().0, (0, code), "{token}");
+            } else {
+                assert!(
+                    matches!(
+                        canonical_binding(token),
+                        Err(HotkeySystemError::Rejected(_))
+                    ),
+                    "{token}"
+                );
+            }
         }
         for token in ["", "A", "aa", "00", "f0", "f01", "f25"] {
             assert_eq!(key_token_to_code(token), None, "{token}");
+        }
+    }
+
+    #[test]
+    fn maps_named_keys_to_native_codes() {
+        for (token, _windows, _macos) in [
+            ("space", 32, Some(49)),
+            ("tab", 9, Some(48)),
+            ("backspace", 8, Some(51)),
+            ("escape", 27, Some(53)),
+            ("insert", 45, Some(114)),
+            ("home", 36, Some(115)),
+            ("end", 35, Some(119)),
+            ("pageup", 33, Some(116)),
+            ("pagedown", 34, Some(121)),
+            ("delete", 46, Some(117)),
+            ("left", 37, Some(123)),
+            ("right", 39, Some(124)),
+            ("up", 38, Some(126)),
+            ("down", 40, Some(125)),
+            ("minus", 189, Some(27)),
+            ("equal", 187, Some(24)),
+            ("comma", 188, Some(43)),
+            ("dot", 190, Some(47)),
+            ("slash", 191, Some(44)),
+            ("quote", 222, Some(39)),
+            ("semicolon", 186, Some(41)),
+            ("leftbracket", 219, Some(33)),
+            ("rightbracket", 221, Some(30)),
+            ("backslash", 220, Some(42)),
+            ("backquote", 192, Some(50)),
+            ("return", 13, Some(36)),
+            ("printscreen", 44, None),
+            ("scrolllock", 145, None),
+            ("pause", 19, None),
+            ("capslock", 20, Some(57)),
+            ("numlock", 144, None),
+        ] {
+            #[cfg(target_os = "windows")]
+            let expected = Some(_windows);
+            #[cfg(target_os = "macos")]
+            let expected = _macos;
+            assert_eq!(key_token_to_code(token), expected, "{token}");
+            if let Some(code) = expected {
+                assert_eq!(canonical_binding(token).unwrap().0, (0, code), "{token}");
+            } else {
+                assert!(
+                    matches!(
+                        canonical_binding(token),
+                        Err(HotkeySystemError::Rejected(_))
+                    ),
+                    "{token}"
+                );
+            }
         }
     }
 
@@ -613,9 +721,9 @@ mod tests {
             system.register_hotkeys(&["ctrl+b".to_string(), "ctrl+bad".to_string()]),
             Err(HotkeySystemError::Rejected(_))
         ));
-        press(&system, Key::ControlLeft);
-        assert!(!press(&system, Key::KeyB));
-        assert!(press(&system, Key::KeyA));
+        press(&system, CONTROL_LEFT);
+        assert!(!press(&system, B));
+        assert!(press(&system, A));
         assert_eq!(
             system.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -629,10 +737,10 @@ mod tests {
     fn replacing_bindings_keeps_already_queued_presses() {
         let mut system = system_without_native_listener();
         system.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(press(&system, Key::KeyA));
-        release(&system, Key::KeyA);
+        assert!(press(&system, A));
+        release(&system, A);
         system.register_hotkeys(&["b".to_string()]).unwrap();
-        assert!(press(&system, Key::KeyB));
+        assert!(press(&system, B));
         for key in ["a", "b"] {
             assert_eq!(
                 system.next_hotkey().unwrap(),
@@ -648,11 +756,11 @@ mod tests {
     fn exclusive_combo_consumes_repeat_and_release_even_after_modifiers_and_registration_change() {
         let mut system = system_without_native_listener();
         system.register_hotkeys(&["ctrl+a".to_string()]).unwrap();
-        assert!(!press(&system, Key::ControlLeft));
-        assert!(press(&system, Key::KeyA));
-        assert!(press(&system, Key::KeyA));
-        assert!(!press(&system, Key::KeyB));
-        assert!(!release(&system, Key::ControlLeft));
+        assert!(!press(&system, CONTROL_LEFT));
+        assert!(press(&system, A));
+        assert!(press(&system, A));
+        assert!(!press(&system, B));
+        assert!(!release(&system, CONTROL_LEFT));
         assert_eq!(
             system.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -661,31 +769,31 @@ mod tests {
         );
         assert_eq!(system.next_hotkey().unwrap(), None);
         system.register_hotkeys(&[]).unwrap();
-        assert!(release(&system, Key::KeyA));
-        assert!(!release(&system, Key::KeyB));
-        assert!(!press(&system, Key::KeyA));
+        assert!(release(&system, A));
+        assert!(!release(&system, B));
+        assert!(!press(&system, A));
     }
 
     #[test]
     fn both_modifier_sides_are_tracked_independently() {
         let mut system = system_without_native_listener();
         system.register_hotkeys(&["ctrl+a".to_string()]).unwrap();
-        press(&system, Key::ControlLeft);
-        press(&system, Key::ControlRight);
-        release(&system, Key::ControlLeft);
-        assert!(press(&system, Key::KeyA));
+        press(&system, CONTROL_LEFT);
+        press(&system, CONTROL_RIGHT);
+        release(&system, CONTROL_LEFT);
+        assert!(press(&system, A));
     }
 
     #[test]
     fn shared_registration_and_drop_do_not_leave_duplicate_delivery() {
         let mut first = system_without_native_listener();
-        let mut second = RdevHotkeySystem::with_listener(Arc::clone(&first.listener));
+        let mut second = NativeHotkeySystem::with_listener(Arc::clone(&first.listener));
         first.register_hotkeys(&["a".to_string()]).unwrap();
-        press(&first, Key::KeyA);
+        press(&first, A);
         second.register_hotkeys(&["b".to_string()]).unwrap();
         assert_eq!(first.next_hotkey().unwrap(), None);
         drop(first);
-        assert!(press(&second, Key::KeyB));
+        assert!(press(&second, B));
         assert_eq!(
             second.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -699,8 +807,8 @@ mod tests {
         };
         assert!(state.bindings.is_empty());
         assert!(state.event_tx.is_none());
-        assert!(state.handle_event(EventType::KeyRelease(Key::KeyB)));
-        assert!(!state.handle_event(EventType::KeyPress(Key::KeyB)));
+        assert!(state.handle_event(KeyEvent::KeyRelease(B)));
+        assert!(!state.handle_event(KeyEvent::KeyPress(B)));
     }
 
     #[test]
@@ -723,14 +831,14 @@ mod tests {
         let slot = Mutex::new(None);
         let mut spawned = 0;
         let mut shared = || {
-            RdevHotkeySystem::with_listener(RdevHotkeySystem::shared_listener(&slot, |_| {
+            NativeHotkeySystem::with_listener(NativeHotkeySystem::shared_listener(&slot, |_| {
                 spawned += 1
             }))
         };
         let first = shared();
         let mut second = shared();
         second.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(press(&second, Key::KeyA));
+        assert!(press(&second, A));
         listener_state(&second).stop("EventTapError".to_string());
         drop(first);
         let mut restarted = shared();
@@ -738,8 +846,8 @@ mod tests {
         assert_eq!(spawned, 2);
 
         restarted.register_hotkeys(&["a".to_string()]).unwrap();
-        assert!(!release(&restarted, Key::KeyA));
-        assert!(press(&restarted, Key::KeyA));
+        assert!(!release(&restarted, A));
+        assert!(press(&restarted, A));
         assert_eq!(
             restarted.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -755,21 +863,15 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_function_keys_above_f12_use_native_virtual_key_codes() {
-        assert_eq!(
-            canonical_binding("ctrl+f13").unwrap().0,
-            (MOD_CTRL, Key::Unknown(124))
-        );
-        assert_eq!(canonical_binding("f24").unwrap().0, (0, Key::Unknown(135)));
+        assert_eq!(canonical_binding("ctrl+f13").unwrap().0, (MOD_CTRL, 124));
+        assert_eq!(canonical_binding("f24").unwrap().0, (0, 135));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_keys_missing_from_rdev_enum_use_native_key_codes() {
-        assert_eq!(canonical_binding("f20").unwrap().0, (0, Key::Unknown(90)));
-        assert_eq!(
-            canonical_binding("delete").unwrap().0,
-            (0, Key::Unknown(117))
-        );
+    fn macos_extended_keys_use_native_key_codes() {
+        assert_eq!(canonical_binding("f20").unwrap().0, (0, 90));
+        assert_eq!(canonical_binding("delete").unwrap().0, (0, 117));
         assert!(matches!(
             canonical_binding("f24"),
             Err(HotkeySystemError::Rejected(_))

@@ -1,41 +1,28 @@
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use window_zones::RdevHotkeySystem;
+use window_zones::NativeHotkeySystem;
 #[cfg(target_os = "linux")]
 use window_zones::{GnomeHotkeySystem, KwinHotkeySystem, X11HotkeySystem};
 use window_zones::{HotkeyEvent, HotkeySystem, HotkeySystemError};
 
 use super::RuntimeBackend;
 
-#[derive(Debug, Default)]
-pub(in crate::application) struct NoopHotkeySystem;
-
-impl HotkeySystem for NoopHotkeySystem {
-    fn register_hotkeys(&mut self, _hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        Ok(())
-    }
-
-    fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        Ok(None)
-    }
-}
-
 pub(in crate::application) enum RuntimeHotkeySystem {
-    Noop(NoopHotkeySystem),
+    Noop,
     #[cfg(target_os = "linux")]
     X11(X11HotkeySystem),
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    Global(RdevHotkeySystem),
+    Global(NativeHotkeySystem),
     #[cfg(target_os = "linux")]
     Gnome(GnomeHotkeySystem),
     #[cfg(target_os = "linux")]
     Kde(KwinHotkeySystem),
 }
 
-/// Runs `$body` with `$system` bound to whichever hotkey system is active.
+/// Runs `$body` with `$system` bound to the active adapter, or evaluates `$noop`.
 macro_rules! with_hotkey_system {
-    ($runtime_system:expr, $system:ident => $body:expr) => {
+    ($runtime_system:expr, $noop:expr, $system:ident => $body:expr) => {
         match $runtime_system {
-            RuntimeHotkeySystem::Noop($system) => $body,
+            RuntimeHotkeySystem::Noop => $noop,
             #[cfg(target_os = "linux")]
             RuntimeHotkeySystem::X11($system) => $body,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -51,9 +38,9 @@ macro_rules! with_hotkey_system {
 impl RuntimeHotkeySystem {
     pub(in crate::application) fn new(backend: RuntimeBackend) -> Self {
         match backend {
-            RuntimeBackend::DryRun => Self::Noop(NoopHotkeySystem),
+            RuntimeBackend::DryRun => Self::Noop,
             #[cfg(target_os = "linux")]
-            RuntimeBackend::Wayland(_) => Self::Noop(NoopHotkeySystem),
+            RuntimeBackend::Wayland(_) => Self::Noop,
             #[cfg(target_os = "linux")]
             RuntimeBackend::X11 => Self::X11(X11HotkeySystem::new()),
             #[cfg(target_os = "linux")]
@@ -61,22 +48,20 @@ impl RuntimeHotkeySystem {
             #[cfg(target_os = "linux")]
             RuntimeBackend::Kde => Self::Kde(KwinHotkeySystem::new()),
             #[cfg(target_os = "windows")]
-            RuntimeBackend::Windows => Self::Global(RdevHotkeySystem::new()),
+            RuntimeBackend::Windows => Self::Global(NativeHotkeySystem::new()),
             #[cfg(target_os = "macos")]
-            RuntimeBackend::MacOS => Self::Global(RdevHotkeySystem::new()),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeBackend::Unsupported => Self::Noop(NoopHotkeySystem),
+            RuntimeBackend::MacOS => Self::Global(NativeHotkeySystem::new()),
         }
     }
 }
 
 impl HotkeySystem for RuntimeHotkeySystem {
     fn register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), HotkeySystemError> {
-        with_hotkey_system!(self, system => system.register_hotkeys(hotkeys))
+        with_hotkey_system!(self, Ok(()), system => system.register_hotkeys(hotkeys))
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        with_hotkey_system!(self, system => system.next_hotkey())
+        with_hotkey_system!(self, Ok(None), system => system.next_hotkey())
     }
 }
 
@@ -89,10 +74,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sway_hyprland_accept_compositor_owned_hotkeys() {
-        let mut hotkeys =
-            RuntimeHotkeySystem::new(RuntimeBackend::Wayland(ScriptedCompositor::Hyprland));
-        assert_eq!(hotkeys.register_hotkeys(&[]), Ok(()));
-        assert_eq!(hotkeys.register_hotkeys(&["ctrl+a".to_string()]), Ok(()));
-        assert_eq!(hotkeys.next_hotkey(), Ok(None));
+        for compositor in [ScriptedCompositor::Sway, ScriptedCompositor::Hyprland] {
+            let mut hotkeys = RuntimeHotkeySystem::new(RuntimeBackend::Wayland(compositor));
+            assert_eq!(hotkeys.register_hotkeys(&[]), Ok(()));
+            assert_eq!(hotkeys.register_hotkeys(&["ctrl+a".to_string()]), Ok(()));
+            assert_eq!(hotkeys.next_hotkey(), Ok(None));
+        }
     }
 }

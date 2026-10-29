@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use window_zones::{App, DispatchState, RuntimeEvent};
 
-use super::backends::{NoopHotkeySystem, RuntimeBackend, RuntimeHotkeySystem, RuntimeWindowSystem};
+use super::backends::{RuntimeBackend, RuntimeHotkeySystem, RuntimeWindowSystem};
 use super::surfaces::DispatchReport;
 
 /// How often the config file and hotkey registration are reconciled.
@@ -105,7 +105,7 @@ impl Runtime {
 
     /// Rebuilds the App and adapters from scratch, releasing the old grabs first.
     fn restart(&mut self, now: Instant) -> Vec<RuntimeEvent> {
-        self.hotkey_system = RuntimeHotkeySystem::Noop(NoopHotkeySystem);
+        self.hotkey_system = RuntimeHotkeySystem::Noop;
         self.app.restart();
         self.window_system = RuntimeWindowSystem::with_backend(self.backend);
         self.hotkey_system = RuntimeHotkeySystem::new(self.backend);

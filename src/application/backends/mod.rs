@@ -3,7 +3,7 @@ mod hotkeys;
 mod selection;
 mod window_system;
 
-pub(super) use hotkeys::{NoopHotkeySystem, RuntimeHotkeySystem};
+pub(super) use hotkeys::RuntimeHotkeySystem;
 pub(super) use selection::resolve_runtime_backend;
 pub(super) use window_system::RuntimeWindowSystem;
 
@@ -39,6 +39,4 @@ pub(super) enum RuntimeBackend {
     Windows,
     #[cfg(target_os = "macos")]
     MacOS,
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    Unsupported,
 }

@@ -1,12 +1,3 @@
-find_last_window() {
-    local id
-    WINDOW_ID=''
-    while read -r id; do
-        [[ -n "$id" ]] && WINDOW_ID="$id"
-    done < <(xdotool search --name 'Text Editor' 2>/dev/null || true)
-    [[ -n "$WINDOW_ID" ]]
-}
-
 x11_geometry() {
     local geometry key value x='' y='' width='' height=''
     local extents left=0 right=0 top=0 bottom=0

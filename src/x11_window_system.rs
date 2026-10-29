@@ -48,16 +48,7 @@ impl X11WindowSystem {
         conn: &RustConnection,
         root: Window,
     ) -> Result<Option<Window>, WindowSystemError> {
-        let atom = conn
-            .intern_atom(false, ACTIVE_WINDOW_ATOM.as_bytes())
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to intern atom: {error}"))
-            })?
-            .reply()
-            .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to resolve atom reply: {error}"))
-            })?
-            .atom;
+        let atom = intern_atom(conn, ACTIVE_WINDOW_ATOM)?;
 
         let reply = conn
             .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)

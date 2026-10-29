@@ -45,6 +45,10 @@ For direct smoke-runner integrations, `WINDOW_ZONES_BINARY` pins the app binary,
 `WINDOW_ZONES_SMOKE_DISPLAY` selects a free X11 display number. An occupied
 display is rejected rather than attached to; retain proof with `--keep-logs`.
 
+X11 and KDE discover visible editor windows through the shared PID-owned lookup;
+a matching title alone is not enough. Fixture copies retain their original paths
+and permissions without separate copy-only wrappers.
+
 X11 one-shot movement waits for the server acknowledgement and the WM's observed
 frame before its connection closes. The smoke runner dispatches each placement once,
 without retrying a reported success, then independently checks geometry. Its TUI
@@ -126,6 +130,11 @@ and observes exact Restore before restoring the original hints and baseline.
 
 - The Companion must match the checkout and be active: `window-zones@mihai-a24` in `org.gnome.shell enabled-extensions` **and** `org.gnome.shell disable-user-extensions` set to `false`. After replacing source/metadata, a fresh login is required to load it; matching disk files plus an ACTIVE cached extension are not upgrade proof. The master switch suppresses the extension even when it is listed, which reads exactly like an extension that refuses to load.
 - `/dev/uinput` must be writable by the user running the automated gate. `gnome-live` fails immediately without authorized virtual-keyboard access and has no XTEST or physical-key fallback. Never grant world-writable access. An administrator can authorize a temporary per-user ACL using the saved/restored procedure in [the GNOME runbook](gnome-wayland.md#manual-smoke-checklist). Physical presses can provide separate manual evidence, not a pass of the automated gate.
+
+If a companion-dependent seated phase is blocked, it emits one phase-level
+`SKIP` with the prerequisite reason rather than duplicating every unreachable
+check label. Failed prerequisite assertions remain failures; the skip is not
+evidence that any dependent check ran.
 
 The seated observer records independent Mutter monitor layout/modes and Xwayland
 desktop dimensions before comparing frames in logical units. It never derives

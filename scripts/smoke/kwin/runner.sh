@@ -168,7 +168,7 @@ run_kde_live() {
         'Using runtime window backend: kde-wayland' "$auto_backend_output"
 
 
-    kde_live_observer_script
+    cp "$SCRIPT_DIR/smoke/fixtures/kwin_observer.js" "$KDE_OBSERVER_JS"
     kde_live_load_script "$KDE_OBSERVER_JS" window-zones-observer
     KDE_OBSERVER_SCRIPT_ID="$KDE_LAST_SCRIPT_ID"
     local observer_id_ok=0
@@ -212,7 +212,7 @@ PY
         'bare nested KWin runs no plasmashell/panel; this run verifies panel-free per-output areas, not Plasma reserved-area behavior'
 
 
-    local editor_log="$KDE_ROOT/editor.log" editor_deadline=0 editor_alive=0 window_found=0
+    local editor_log="$KDE_ROOT/editor.log" editor_alive=0 window_found=0
     start_group KDE_EDITOR_PID "$editor_log" env \
         DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
         XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
@@ -222,14 +222,11 @@ PY
         KDE_SESSION_VERSION=6 gnome-text-editor --standalone
     kill -0 "$KDE_EDITOR_PID" 2>/dev/null && editor_alive=1
     assert_eq 'KDE test editor process starts' 1 "$editor_alive"
-    editor_deadline=$((SECONDS + 25))
-    while (( SECONDS < editor_deadline )); do
-        if kde_live_find_window; then
-            window_found=1
-            break
-        fi
-        sleep 0.2
-    done
+    XON_DISPLAY="$KDE_XDISPLAY"
+    XON_XAUTHORITY="$KDE_XAUTHORITY"
+    if WINDOW_ID=$(xwindow_for_pid "$KDE_EDITOR_PID" 25); then
+        window_found=1
+    fi
     assert_eq 'KDE test editor window is observable through Xwayland' 1 "$window_found"
     kde_live_activate_window || true
     kde_live_wait_focus 15 || true

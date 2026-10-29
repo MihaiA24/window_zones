@@ -1,6 +1,6 @@
-//! Keyboard-only event tap owned by the listener thread, not rdev's global callback.
+//! Keyboard-only event tap owned by the listener thread.
 
-use super::{EventType, Key, RdevListener};
+use super::{KeyEvent, NativeListenerState};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::null_mut;
@@ -17,11 +17,11 @@ const AUTOREPEAT_FIELD: u32 = 8;
 const CAPS_LOCK_FLAG: u64 = 0x10000;
 
 // CGEventTypes.h and IOKit/hidsystem/IOLLEvent.h: aggregate and per-device flags.
-const MODIFIERS: [(Key, Key, u64, u64, u64); 4] = [
-    (Key::ControlLeft, Key::ControlRight, 0x40000, 0x1, 0x2000),
-    (Key::ShiftLeft, Key::ShiftRight, 0x20000, 0x2, 0x4),
-    (Key::MetaLeft, Key::MetaRight, 0x100000, 0x8, 0x10),
-    (Key::Alt, Key::AltGr, 0x80000, 0x20, 0x40),
+const MODIFIERS: [(u32, u32, u64, u64, u64); 4] = [
+    (59, 62, 0x40000, 0x1, 0x2000),
+    (56, 60, 0x20000, 0x2, 0x4),
+    (55, 54, 0x100000, 0x8, 0x10),
+    (58, 61, 0x80000, 0x20, 0x40),
 ];
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -126,14 +126,14 @@ impl Drop for NativeTap {
 }
 
 struct CallbackContext {
-    listener: Arc<Mutex<RdevListener>>,
+    listener: Arc<Mutex<NativeListenerState>>,
     tap: NativeRef,
     run_loop: NativeRef,
     failure: Option<&'static str>,
 }
 
 impl CallbackContext {
-    fn new(listener: Arc<Mutex<RdevListener>>) -> Self {
+    fn new(listener: Arc<Mutex<NativeListenerState>>) -> Self {
         Self {
             listener,
             tap: null_mut(),
@@ -216,13 +216,13 @@ impl CallbackContext {
                 set_pressed(&mut state, key, down);
                 return false;
             }
-            if key != Key::CapsLock {
+            if key != 57 {
                 return false;
             }
             let event = if flags & CAPS_LOCK_FLAG != 0 {
-                EventType::KeyPress(key)
+                KeyEvent::KeyPress(key)
             } else {
-                EventType::KeyRelease(key)
+                KeyEvent::KeyRelease(key)
             };
             return state.handle_event(event);
         }
@@ -251,14 +251,14 @@ impl CallbackContext {
             return state.swallowed.contains(&key);
         }
         state.handle_event(if event_type == KEY_DOWN {
-            EventType::KeyPress(key)
+            KeyEvent::KeyPress(key)
         } else {
-            EventType::KeyRelease(key)
+            KeyEvent::KeyRelease(key)
         })
     }
 }
 
-fn set_pressed(state: &mut RdevListener, key: Key, down: bool) {
+fn set_pressed(state: &mut NativeListenerState, key: u32, down: bool) {
     if down {
         state.pressed.insert(key);
     } else {
@@ -288,7 +288,7 @@ unsafe extern "C" fn tap_callback(
 }
 
 pub(super) fn listen(
-    listener: Arc<Mutex<RdevListener>>,
+    listener: Arc<Mutex<NativeListenerState>>,
     ready: std::sync::mpsc::SyncSender<()>,
 ) -> Result<(), String> {
     let mut context = CallbackContext::new(listener);
@@ -304,98 +304,21 @@ pub(super) fn listen(
     }
 }
 
-// Carbon HIToolbox/Events.h virtual keycodes. Keep native codes for the keys
-// absent from rdev::Key, matching key_token_to_code in the parent module.
-fn key_from_code(code: u16) -> Option<Key> {
-    Some(match code {
-        0 => Key::KeyA,
-        1 => Key::KeyS,
-        2 => Key::KeyD,
-        3 => Key::KeyF,
-        4 => Key::KeyH,
-        5 => Key::KeyG,
-        6 => Key::KeyZ,
-        7 => Key::KeyX,
-        8 => Key::KeyC,
-        9 => Key::KeyV,
-        11 => Key::KeyB,
-        12 => Key::KeyQ,
-        13 => Key::KeyW,
-        14 => Key::KeyE,
-        15 => Key::KeyR,
-        16 => Key::KeyY,
-        17 => Key::KeyT,
-        18 => Key::Num1,
-        19 => Key::Num2,
-        20 => Key::Num3,
-        21 => Key::Num4,
-        22 => Key::Num6,
-        23 => Key::Num5,
-        24 => Key::Equal,
-        25 => Key::Num9,
-        26 => Key::Num7,
-        27 => Key::Minus,
-        28 => Key::Num8,
-        29 => Key::Num0,
-        30 => Key::RightBracket,
-        31 => Key::KeyO,
-        32 => Key::KeyU,
-        33 => Key::LeftBracket,
-        34 => Key::KeyI,
-        35 => Key::KeyP,
-        36 => Key::Return,
-        37 => Key::KeyL,
-        38 => Key::KeyJ,
-        39 => Key::Quote,
-        40 => Key::KeyK,
-        41 => Key::SemiColon,
-        42 => Key::BackSlash,
-        43 => Key::Comma,
-        44 => Key::Slash,
-        45 => Key::KeyN,
-        46 => Key::KeyM,
-        47 => Key::Dot,
-        48 => Key::Tab,
-        49 => Key::Space,
-        50 => Key::BackQuote,
-        51 => Key::Backspace,
-        53 => Key::Escape,
-        54 => Key::MetaRight,
-        55 => Key::MetaLeft,
-        56 => Key::ShiftLeft,
-        57 => Key::CapsLock,
-        58 => Key::Alt,
-        59 => Key::ControlLeft,
-        60 => Key::ShiftRight,
-        61 => Key::AltGr,
-        62 => Key::ControlRight,
-        96 => Key::F5,
-        97 => Key::F6,
-        98 => Key::F7,
-        99 => Key::F3,
-        100 => Key::F8,
-        101 => Key::F9,
-        103 => Key::F11,
-        109 => Key::F10,
-        111 => Key::F12,
-        118 => Key::F4,
-        120 => Key::F2,
-        122 => Key::F1,
-        123 => Key::LeftArrow,
-        124 => Key::RightArrow,
-        125 => Key::DownArrow,
-        126 => Key::UpArrow,
-        64 | 79 | 80 | 90 | 105 | 106 | 107 | 113 | 114 | 115 | 116 | 117 | 119 | 121 => {
-            Key::Unknown(u32::from(code))
-        }
-        _ => return None,
-    })
+// Carbon HIToolbox/Events.h virtual keycodes admitted by the keyboard listener.
+fn key_from_code(code: u16) -> Option<u32> {
+    matches!(
+        code,
+        0..=9 | 11..=51 | 53..=62 | 64 | 79 | 80 | 90
+            | 96..=101 | 103 | 105..=107 | 109 | 111
+            | 113..=126
+    )
+    .then_some(u32::from(code))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hotkey_system::{HotkeyEvent, HotkeySystem, RdevHotkeySystem};
+    use crate::hotkey_system::{HotkeyEvent, HotkeySystem, NativeHotkeySystem};
 
     unsafe extern "C" {
         fn CGEventCreateKeyboardEvent(source: NativeRef, keycode: u16, down: bool) -> NativeRef;
@@ -429,10 +352,28 @@ mod tests {
         result.is_null()
     }
 
-    fn system() -> (RdevHotkeySystem, Box<CallbackContext>) {
-        let listener = Arc::new(Mutex::new(RdevListener::default()));
+    fn system() -> (NativeHotkeySystem, Box<CallbackContext>) {
+        let listener = Arc::new(Mutex::new(NativeListenerState::default()));
         let context = Box::new(CallbackContext::new(Arc::clone(&listener)));
-        (RdevHotkeySystem::with_listener(listener), context)
+        (NativeHotkeySystem::with_listener(listener), context)
+    }
+
+    #[test]
+    fn native_key_filter_preserves_the_supported_set() {
+        let admitted = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 64, 79, 80, 90, 96, 97, 98,
+            99, 100, 101, 103, 105, 106, 107, 109, 111, 113, 114, 115, 116, 117, 118, 119, 120,
+            121, 122, 123, 124, 125, 126,
+        ];
+        for code in 0..=u16::MAX {
+            assert_eq!(
+                key_from_code(code),
+                admitted.contains(&code).then_some(u32::from(code)),
+                "{code}"
+            );
+        }
     }
 
     #[test]
@@ -535,15 +476,15 @@ mod tests {
             assert!(unsafe { CGEventTapIsEnabled(tap.port) });
             assert!(context.failure.is_none());
             let state = context.listener.lock().unwrap();
-            assert!(!state.pressed.contains(&Key::ControlRight));
-            assert!(!state.pressed.contains(&Key::F8));
+            assert!(!state.pressed.contains(&62));
+            assert!(!state.pressed.contains(&100));
             assert!(state.swallowed.is_empty());
             drop(state);
             // A release missed during the disabled interval cannot leave a
             // stale consumed release or block the next activation.
             assert!(!key(&mut context, KEY_UP, 100, 0, false));
             drop(system);
-            system = RdevHotkeySystem::with_listener(Arc::clone(&context.listener));
+            system = NativeHotkeySystem::with_listener(Arc::clone(&context.listener));
             system.register_hotkeys(&["ctrl+f8".to_string()]).unwrap();
             assert!(!key(&mut context, FLAGS_CHANGED, 62, 0x42000, false));
             assert!(key(&mut context, KEY_DOWN, 100, 0x42000, false));

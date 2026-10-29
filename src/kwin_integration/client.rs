@@ -39,6 +39,21 @@ impl KwinWindowSystem {
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, KwinIntegrationError> {
+        self.with_connection(get_capabilities)
+    }
+
+    #[cfg(test)]
+    fn with_bus_address(bus_address: impl Into<String>) -> Self {
+        Self {
+            bus_address: Some(bus_address.into()),
+            connection: Mutex::new(None),
+        }
+    }
+
+    fn with_connection<R>(
+        &self,
+        call: impl FnOnce(&Connection) -> Result<R, KwinIntegrationError>,
+    ) -> Result<R, KwinIntegrationError> {
         let mut connection_slot = self.connection.lock();
         if connection_slot.is_none() {
             *connection_slot = Some(connect(self.bus_address.as_deref())?);
@@ -49,21 +64,13 @@ impl KwinWindowSystem {
                 .ok_or_else(|| KwinIntegrationError::Unavailable {
                     message: "D-Bus connection was not established".to_string(),
                 })?;
-        let result = get_capabilities(connection);
+        let result = call(connection);
         if let Err(error) = &result
             && error.should_reconnect()
         {
             *connection_slot = None;
         }
         result
-    }
-
-    #[cfg(test)]
-    fn with_bus_address(bus_address: impl Into<String>) -> Self {
-        Self {
-            bus_address: Some(bus_address.into()),
-            connection: Mutex::new(None),
-        }
     }
 
     fn call_with_capability<R, A>(
@@ -76,17 +83,7 @@ impl KwinWindowSystem {
         R: ReadAll,
         A: AppendAll,
     {
-        let mut connection_slot = self.connection.lock();
-        if connection_slot.is_none() {
-            *connection_slot = Some(connect(self.bus_address.as_deref())?);
-        }
-        let connection =
-            connection_slot
-                .as_ref()
-                .ok_or_else(|| KwinIntegrationError::Unavailable {
-                    message: "D-Bus connection was not established".to_string(),
-                })?;
-        let result = (|| {
+        self.with_connection(|connection| {
             let capabilities = get_capabilities(connection)?;
             require_capability(&capabilities, capability)?;
 
@@ -94,13 +91,7 @@ impl KwinWindowSystem {
             proxy
                 .method_call(KWIN_INTERFACE, method, args)
                 .map_err(classify_dbus_error)
-        })();
-        if let Err(error) = &result
-            && error.should_reconnect()
-        {
-            *connection_slot = None;
-        }
-        result
+        })
     }
 }
 

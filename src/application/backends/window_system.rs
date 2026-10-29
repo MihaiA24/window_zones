@@ -24,8 +24,6 @@ pub(in crate::application) enum RuntimeWindowSystem {
     Windows(WindowsWindowSystem),
     #[cfg(target_os = "macos")]
     MacOS(MacOSWindowSystem),
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    Unsupported,
 }
 
 /// Runs `$body` with `$system` bound to whichever adapter is active.
@@ -45,10 +43,6 @@ macro_rules! with_window_system {
             RuntimeWindowSystem::Windows($system) => $body,
             #[cfg(target_os = "macos")]
             RuntimeWindowSystem::MacOS($system) => $body,
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeWindowSystem::Unsupported => Err(WindowSystemError::Platform(
-                "window-system adapter is unsupported on this platform".to_string(),
-            )),
         }
     };
 }
@@ -71,8 +65,6 @@ impl RuntimeWindowSystem {
             RuntimeBackend::Windows => Self::Windows(WindowsWindowSystem::new()),
             #[cfg(target_os = "macos")]
             RuntimeBackend::MacOS => Self::MacOS(MacOSWindowSystem::new()),
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            RuntimeBackend::Unsupported => Self::Unsupported,
         }
     }
 
@@ -99,8 +91,6 @@ impl RuntimeWindowSystem {
             Self::Windows(_) => "windows",
             #[cfg(target_os = "macos")]
             Self::MacOS(_) => "macos",
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            Self::Unsupported => "unsupported",
         }
     }
 

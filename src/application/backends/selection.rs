@@ -34,7 +34,9 @@ pub(in crate::application) fn resolve_runtime_backend(
     {
         match preference {
             BackendPreference::DryRun => Ok(RuntimeBackend::DryRun),
-            BackendPreference::Auto => Ok(RuntimeBackend::Unsupported),
+            BackendPreference::Auto => Err(
+                "Unsupported host OS for live window-system actions. Use --dry-run.".to_string(),
+            ),
         }
     }
 }
@@ -236,4 +238,20 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(all(
+    test,
+    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+))]
+#[test]
+fn unsupported_hosts_require_dry_run() {
+    assert_eq!(
+        resolve_runtime_backend(BackendPreference::Auto),
+        Err("Unsupported host OS for live window-system actions. Use --dry-run.".to_string())
+    );
+    assert_eq!(
+        resolve_runtime_backend(BackendPreference::DryRun),
+        Ok(RuntimeBackend::DryRun)
+    );
 }

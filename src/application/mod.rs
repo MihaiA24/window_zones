@@ -12,8 +12,6 @@ use std::process::ExitCode;
 
 use window_zones::logging::Logger;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-use backends::BackendPreference;
 #[cfg(target_os = "linux")]
 use backends::RuntimeBackend;
 use backends::{RuntimeWindowSystem, resolve_runtime_backend};
@@ -51,18 +49,13 @@ pub(super) fn run() -> ExitCode {
         return execute_init(args.config_path, args.chord.as_deref(), args.force);
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    if !matches!(args.backend, BackendPreference::DryRun) {
-        window_zones::logging::diagnostic(format_args!(
-            "Unsupported host OS for live window-system actions. Use --dry-run."
-        ));
-        return ExitCode::FAILURE;
-    }
-
     let backend = match resolve_runtime_backend(args.backend) {
         Ok(backend) => backend,
         Err(error) => {
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             window_zones::logging::diagnostic(format_args!("Backend selection failed: {error}"));
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            window_zones::logging::diagnostic(format_args!("{error}"));
             return ExitCode::FAILURE;
         }
     };

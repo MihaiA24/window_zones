@@ -48,7 +48,9 @@ The platform-neutral core and runtime paths currently include:
 - `src/kwin_integration.rs` preserves the public KWin interface; `src/kwin_integration/` separates client adapters, protocol, companion state, D-Bus dispatch and native shortcut handling.
 - `scripts/smoke.sh` remains the smoke entry point. `scripts/smoke/` holds shared helpers and platform journeys; `fixtures/` holds literal generated helper programs.
 
-The executable still owns one runtime, one library `App` and one instruction queue. Module boundaries do not add service layers or change public commands and library imports.
+The executable still owns one runtime, one library `App` and one instruction queue. Module boundaries do not add service layers.
+
+On Windows/macOS, the public native hotkey adapter is `NativeHotkeySystem`. It maps canonical bindings directly to OS keycodes while retaining native hook/tap ownership and key-release handling.
 
 ## V1 verification
 

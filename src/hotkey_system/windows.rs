@@ -1,6 +1,6 @@
 //! One owned Win32 low-level keyboard hook, with an explicit ready/stop handshake.
 
-use super::{EventType, Key, RdevListener, modifier_mask};
+use super::{KeyEvent, NativeListenerState, modifier_mask};
 use ::windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Threading::GetCurrentThreadId;
@@ -16,16 +16,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 
-const MODIFIERS: [(u32, Key); 8] = [
-    (0xa0, Key::ShiftLeft),
-    (0xa1, Key::ShiftRight),
-    (0xa2, Key::ControlLeft),
-    (0xa3, Key::ControlRight),
-    (0xa4, Key::Alt),
-    (0xa5, Key::AltGr),
-    (0x5b, Key::MetaLeft),
-    (0x5c, Key::MetaRight),
-];
+const MODIFIERS: [u32; 8] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0x5b, 0x5c];
 
 struct Ready {
     id: u32,
@@ -43,13 +34,13 @@ struct Worker {
 
 #[derive(Debug)]
 pub(super) struct NativeListener {
-    pub(super) state: Arc<Mutex<RdevListener>>,
+    pub(super) state: Arc<Mutex<NativeListenerState>>,
     worker: Mutex<Option<Worker>>,
 }
 
 impl NativeListener {
     fn start() -> Self {
-        let state = Arc::new(Mutex::new(RdevListener::default()));
+        let state = Arc::new(Mutex::new(NativeListenerState::default()));
         let listener = Arc::clone(&state);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let spawn = thread::Builder::new()
@@ -138,7 +129,7 @@ pub(super) fn new_listener() -> Arc<NativeListener> {
         && let Err(error) = previous.stop()
     {
         // Never install a second hook unless the previous thread was joined.
-        let mut state = RdevListener::default();
+        let mut state = NativeListenerState::default();
         state.stop(error);
         return Arc::new(NativeListener {
             state: Arc::new(Mutex::new(state)),
@@ -163,7 +154,7 @@ impl Drop for NativeHook {
 }
 
 struct CallbackContext {
-    listener: Arc<Mutex<RdevListener>>,
+    listener: Arc<Mutex<NativeListenerState>>,
     failed: bool,
 }
 
@@ -171,7 +162,10 @@ thread_local! {
     static CONTEXT: RefCell<Option<CallbackContext>> = const { RefCell::new(None) };
 }
 
-fn run(listener: Arc<Mutex<RdevListener>>, ready: mpsc::SyncSender<Ready>) -> Result<(), String> {
+fn run(
+    listener: Arc<Mutex<NativeListenerState>>,
+    ready: mpsc::SyncSender<Ready>,
+) -> Result<(), String> {
     let mut message = MSG::default();
     let _ = unsafe { PeekMessageW(&mut message, HWND::default(), 0, 0, PM_NOREMOVE) };
     {
@@ -284,19 +278,22 @@ fn native_down(code: u32) -> bool {
     (unsafe { GetAsyncKeyState(code as i32) }) < 0
 }
 
-fn handle_event(state: &mut RdevListener, event: EventType, down: impl Fn(u32) -> bool) -> bool {
+fn handle_event(
+    state: &mut NativeListenerState,
+    event: KeyEvent,
+    down: impl Fn(u32) -> bool,
+) -> bool {
     let current = match event {
-        EventType::KeyPress(key) | EventType::KeyRelease(key) => key,
-        _ => return false,
+        KeyEvent::KeyPress(key) | KeyEvent::KeyRelease(key) => key,
     };
     let mut missed_modifier = false;
-    for (code, key) in MODIFIERS {
+    for key in MODIFIERS {
         // LowLevelKeyboardProc runs BEFORE GetAsyncKeyState changes for this
         // event. Reconcile other modifiers, then apply the current hook event.
         if key == current {
             continue;
         }
-        if down(code) {
+        if down(key) {
             state.pressed.insert(key);
         } else if state.pressed.remove(&key) {
             missed_modifier = true;
@@ -311,7 +308,7 @@ fn handle_event(state: &mut RdevListener, event: EventType, down: impl Fn(u32) -
     state.handle_event(event)
 }
 
-fn key_event(message: u32, native: &KBDLLHOOKSTRUCT) -> Option<EventType> {
+fn key_event(message: u32, native: &KBDLLHOOKSTRUCT) -> Option<KeyEvent> {
     let code = match native.vkCode {
         0x10 => {
             if native.scanCode == 0x36 {
@@ -338,119 +335,62 @@ fn key_event(message: u32, native: &KBDLLHOOKSTRUCT) -> Option<EventType> {
     };
     let key = key_from_code(code)?;
     match message {
-        WM_KEYDOWN | WM_SYSKEYDOWN => Some(EventType::KeyPress(key)),
-        WM_KEYUP | WM_SYSKEYUP => Some(EventType::KeyRelease(key)),
+        WM_KEYDOWN | WM_SYSKEYDOWN => Some(KeyEvent::KeyPress(key)),
+        WM_KEYUP | WM_SYSKEYUP => Some(KeyEvent::KeyRelease(key)),
         _ => None,
     }
 }
 
-fn key_from_code(code: u32) -> Option<Key> {
-    Some(match code {
-        0x08 => Key::Backspace,
-        0x09 => Key::Tab,
-        0x0d => Key::Return,
-        0x13 => Key::Pause,
-        0x14 => Key::CapsLock,
-        0x1b => Key::Escape,
-        0x20 => Key::Space,
-        0x21 => Key::PageUp,
-        0x22 => Key::PageDown,
-        0x23 => Key::End,
-        0x24 => Key::Home,
-        0x25 => Key::LeftArrow,
-        0x26 => Key::UpArrow,
-        0x27 => Key::RightArrow,
-        0x28 => Key::DownArrow,
-        0x2c => Key::PrintScreen,
-        0x2d => Key::Insert,
-        0x2e => Key::Delete,
-        0x30 => Key::Num0,
-        0x31 => Key::Num1,
-        0x32 => Key::Num2,
-        0x33 => Key::Num3,
-        0x34 => Key::Num4,
-        0x35 => Key::Num5,
-        0x36 => Key::Num6,
-        0x37 => Key::Num7,
-        0x38 => Key::Num8,
-        0x39 => Key::Num9,
-        0x41 => Key::KeyA,
-        0x42 => Key::KeyB,
-        0x43 => Key::KeyC,
-        0x44 => Key::KeyD,
-        0x45 => Key::KeyE,
-        0x46 => Key::KeyF,
-        0x47 => Key::KeyG,
-        0x48 => Key::KeyH,
-        0x49 => Key::KeyI,
-        0x4a => Key::KeyJ,
-        0x4b => Key::KeyK,
-        0x4c => Key::KeyL,
-        0x4d => Key::KeyM,
-        0x4e => Key::KeyN,
-        0x4f => Key::KeyO,
-        0x50 => Key::KeyP,
-        0x51 => Key::KeyQ,
-        0x52 => Key::KeyR,
-        0x53 => Key::KeyS,
-        0x54 => Key::KeyT,
-        0x55 => Key::KeyU,
-        0x56 => Key::KeyV,
-        0x57 => Key::KeyW,
-        0x58 => Key::KeyX,
-        0x59 => Key::KeyY,
-        0x5a => Key::KeyZ,
-        0x5b => Key::MetaLeft,
-        0x5c => Key::MetaRight,
-        0x70 => Key::F1,
-        0x71 => Key::F2,
-        0x72 => Key::F3,
-        0x73 => Key::F4,
-        0x74 => Key::F5,
-        0x75 => Key::F6,
-        0x76 => Key::F7,
-        0x77 => Key::F8,
-        0x78 => Key::F9,
-        0x79 => Key::F10,
-        0x7a => Key::F11,
-        0x7b => Key::F12,
-        0x7c..=0x87 => Key::Unknown(code),
-        0x90 => Key::NumLock,
-        0x91 => Key::ScrollLock,
-        0xa0 => Key::ShiftLeft,
-        0xa1 => Key::ShiftRight,
-        0xa2 => Key::ControlLeft,
-        0xa3 => Key::ControlRight,
-        0xa4 => Key::Alt,
-        0xa5 => Key::AltGr,
-        0xba => Key::SemiColon,
-        0xbb => Key::Equal,
-        0xbc => Key::Comma,
-        0xbd => Key::Minus,
-        0xbe => Key::Dot,
-        0xbf => Key::Slash,
-        0xc0 => Key::BackQuote,
-        0xdb => Key::LeftBracket,
-        0xdc => Key::BackSlash,
-        0xdd => Key::RightBracket,
-        0xde => Key::Quote,
-        _ => return None,
-    })
+fn key_from_code(code: u32) -> Option<u32> {
+    matches!(
+        code,
+        0x08 | 0x09 | 0x0d | 0x13 | 0x14 | 0x1b
+            | 0x20..=0x28
+            | 0x2c..=0x2e
+            | 0x30..=0x39
+            | 0x41..=0x5c
+            | 0x70..=0x87
+            | 0x90 | 0x91
+            | 0xa0..=0xa5
+            | 0xba..=0xc0
+            | 0xdb..=0xde
+    )
+    .then_some(code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hotkey_system::{HotkeyEvent, HotkeySystem, RdevHotkeySystem};
+    use crate::hotkey_system::{HotkeyEvent, HotkeySystem, NativeHotkeySystem};
 
-    fn system() -> RdevHotkeySystem {
-        RdevHotkeySystem::with_listener(Arc::new(Mutex::new(RdevListener::default())))
+    fn system() -> NativeHotkeySystem {
+        NativeHotkeySystem::with_listener(Arc::new(Mutex::new(NativeListenerState::default())))
     }
 
-    fn event(system: &RdevHotkeySystem, event: EventType, modifiers: &[u32]) -> bool {
+    fn event(system: &NativeHotkeySystem, event: KeyEvent, modifiers: &[u32]) -> bool {
         handle_event(&mut system.listener.lock().unwrap(), event, |code| {
             modifiers.contains(&code)
         })
+    }
+
+    #[test]
+    fn native_key_filter_preserves_the_supported_set() {
+        let admitted = [
+            8, 9, 13, 19, 20, 27, 32, 33, 34, 35, 36, 37, 38, 39, 40, 44, 45, 46, 48, 49, 50, 51,
+            52, 53, 54, 55, 56, 57, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+            81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 112, 113, 114, 115, 116, 117, 118, 119,
+            120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 144,
+            145, 160, 161, 162, 163, 164, 165, 186, 187, 188, 189, 190, 191, 192, 219, 220, 221,
+            222,
+        ];
+        for code in 0..=0xff {
+            assert_eq!(
+                key_from_code(code),
+                admitted.contains(&code).then_some(code),
+                "{code}"
+            );
+        }
+        assert_eq!(key_from_code(u32::MAX), None);
     }
 
     #[test]
@@ -466,38 +406,18 @@ mod tests {
         };
         assert_eq!(
             key_event(WM_SYSKEYDOWN, &right_alt),
-            Some(EventType::KeyPress(Key::AltGr))
+            Some(KeyEvent::KeyPress(0xa5))
         );
-        assert!(!event(&system, EventType::KeyPress(Key::ControlLeft), &[]));
-        assert!(!event(&system, EventType::KeyPress(Key::AltGr), &[0xa2]));
-        assert!(!event(
-            &system,
-            EventType::KeyPress(Key::KeyE),
-            &[0xa2, 0xa5]
-        ));
-        assert!(!event(
-            &system,
-            EventType::KeyRelease(Key::KeyE),
-            &[0xa2, 0xa5]
-        ));
-        assert!(!event(
-            &system,
-            EventType::KeyRelease(Key::AltGr),
-            &[0xa2, 0xa5]
-        ));
-        assert!(!event(
-            &system,
-            EventType::KeyRelease(Key::ControlLeft),
-            &[0xa2]
-        ));
+        assert!(!event(&system, KeyEvent::KeyPress(0xa2), &[]));
+        assert!(!event(&system, KeyEvent::KeyPress(0xa5), &[0xa2]));
+        assert!(!event(&system, KeyEvent::KeyPress(0x45), &[0xa2, 0xa5]));
+        assert!(!event(&system, KeyEvent::KeyRelease(0x45), &[0xa2, 0xa5]));
+        assert!(!event(&system, KeyEvent::KeyRelease(0xa5), &[0xa2, 0xa5]));
+        assert!(!event(&system, KeyEvent::KeyRelease(0xa2), &[0xa2]));
         assert_eq!(system.next_hotkey().unwrap(), None);
-        event(&system, EventType::KeyPress(Key::ControlLeft), &[]);
-        event(&system, EventType::KeyPress(Key::Alt), &[0xa2]);
-        assert!(event(
-            &system,
-            EventType::KeyPress(Key::KeyE),
-            &[0xa2, 0xa4]
-        ));
+        event(&system, KeyEvent::KeyPress(0xa2), &[]);
+        event(&system, KeyEvent::KeyPress(0xa4), &[0xa2]);
+        assert!(event(&system, KeyEvent::KeyPress(0x45), &[0xa2, 0xa4]));
         assert_eq!(
             system.next_hotkey().unwrap(),
             Some(HotkeyEvent::Pressed {
@@ -512,18 +432,14 @@ mod tests {
         system
             .register_hotkeys(&["alt+ctrl+left".to_string()])
             .unwrap();
-        event(&system, EventType::KeyPress(Key::ControlLeft), &[]);
-        event(&system, EventType::KeyPress(Key::Alt), &[0xa2]);
-        assert!(event(
-            &system,
-            EventType::KeyPress(Key::LeftArrow),
-            &[0xa2, 0xa4]
-        ));
+        event(&system, KeyEvent::KeyPress(0xa2), &[]);
+        event(&system, KeyEvent::KeyPress(0xa4), &[0xa2]);
+        assert!(event(&system, KeyEvent::KeyPress(0x25), &[0xa2, 0xa4]));
         assert!(system.next_hotkey().unwrap().is_some());
         // All releases happened on the secure desktop: only the next plain
         // key is observed, with the authoritative native modifiers now up.
-        assert!(!event(&system, EventType::KeyPress(Key::LeftArrow), &[]));
-        assert!(!event(&system, EventType::KeyRelease(Key::LeftArrow), &[]));
+        assert!(!event(&system, KeyEvent::KeyPress(0x25), &[]));
+        assert!(!event(&system, KeyEvent::KeyRelease(0x25), &[]));
         assert_eq!(system.next_hotkey().unwrap(), None);
     }
 
@@ -531,35 +447,21 @@ mod tests {
     fn current_modifier_event_wins_over_pre_event_async_state() {
         let mut system = system();
         system.register_hotkeys(&["ctrl+a".to_string()]).unwrap();
-        event(&system, EventType::KeyPress(Key::ControlLeft), &[]);
-        assert!(
-            system
-                .listener
-                .lock()
-                .unwrap()
-                .pressed
-                .contains(&Key::ControlLeft)
-        );
-        assert!(event(&system, EventType::KeyPress(Key::KeyA), &[0xa2]));
-        assert!(event(&system, EventType::KeyPress(Key::KeyA), &[0xa2]));
-        event(&system, EventType::KeyRelease(Key::ControlLeft), &[0xa2]);
-        assert!(
-            !system
-                .listener
-                .lock()
-                .unwrap()
-                .pressed
-                .contains(&Key::ControlLeft)
-        );
-        assert!(event(&system, EventType::KeyRelease(Key::KeyA), &[]));
-        assert!(!event(&system, EventType::KeyPress(Key::KeyA), &[]));
+        event(&system, KeyEvent::KeyPress(0xa2), &[]);
+        assert!(system.listener.lock().unwrap().pressed.contains(&0xa2));
+        assert!(event(&system, KeyEvent::KeyPress(0x41), &[0xa2]));
+        assert!(event(&system, KeyEvent::KeyPress(0x41), &[0xa2]));
+        event(&system, KeyEvent::KeyRelease(0xa2), &[0xa2]);
+        assert!(!system.listener.lock().unwrap().pressed.contains(&0xa2));
+        assert!(event(&system, KeyEvent::KeyRelease(0x41), &[]));
+        assert!(!event(&system, KeyEvent::KeyPress(0x41), &[]));
         assert!(system.next_hotkey().unwrap().is_some());
         assert_eq!(system.next_hotkey().unwrap(), None);
     }
 
     #[test]
     fn native_restart_replaces_silently_removed_hook_only_after_join() {
-        let mut first = RdevHotkeySystem::new();
+        let mut first = NativeHotkeySystem::new();
         first.register_hotkeys(&[]).unwrap();
         let previous = Arc::clone(first.native_listener.as_ref().unwrap());
         {
@@ -571,7 +473,7 @@ mod tests {
             assert!(!worker.thread.is_finished());
         }
         assert_eq!(previous.state.lock().unwrap().status(), Ok(()));
-        let mut second = RdevHotkeySystem::new();
+        let mut second = NativeHotkeySystem::new();
         second.register_hotkeys(&[]).unwrap();
         assert!(previous.worker.lock().unwrap().is_none());
         assert!(first.next_hotkey().is_err());

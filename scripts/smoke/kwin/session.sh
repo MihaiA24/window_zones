@@ -174,13 +174,9 @@ kde_live_preflight() {
     return 0
 }
 
-kde_live_write_publish_client_env() {
+kde_live_start_fixture() {
     cp "$SCRIPT_DIR/smoke/fixtures/kwin_publish_client_env.sh" "$KDE_PUBLISH_CLIENT_ENV"
     chmod 700 "$KDE_PUBLISH_CLIENT_ENV"
-}
-
-kde_live_start_fixture() {
-    kde_live_write_publish_client_env
     cp "$SCRIPT_DIR/smoke/fixtures/kwin_launcher.sh" "$KDE_LAUNCHER"
     chmod 700 "$KDE_LAUNCHER"
     start_group KDE_GROUP_PID "$KDE_KWIN_LOG" env \

@@ -136,11 +136,9 @@ EOF
         XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11 HOME="$X11_HOME" \
         XDG_CONFIG_HOME="$X11_CONFIG" XDG_DATA_HOME="$X11_DATA" \
         gnome-text-editor --standalone
-    deadline=$((SECONDS + 20))
-    while (( SECONDS < deadline )); do
-        find_last_window && break
-        sleep 0.2
-    done
+    XON_DISPLAY="$X11_DISPLAY"
+    XON_XAUTHORITY=''
+    WINDOW_ID=$(xwindow_for_pid "$editor_pid" 20 || true)
     assert_text 'X11 test window launched' 'window' "${WINDOW_ID:+window $WINDOW_ID}"
     xdotool windowactivate --sync "$WINDOW_ID" >/dev/null 2>&1 || true
     sleep 0.5

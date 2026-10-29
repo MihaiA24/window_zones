@@ -572,16 +572,8 @@ def run(binary, keep_logs, output_dir=None):
         return [child[1].get('label', '') for child in tray_menu()[2][2]]
     def tray_control(label):
         destination, menu, layout = tray_menu()
-        def find(node):
-            identifier, properties, children = node
-            if properties.get('label') == label:
-                return identifier
-            for child in children:
-                found = find(child)
-                if found is not None:
-                    return found
-            return None
-        identifier = find(layout)
+        identifier = next((identifier for identifier, properties, _ in layout[2]
+                           if properties.get('label') == label), None)
         if identifier is None:
             raise RuntimeError('Tray control missing: ' + label)
         call(destination, menu, 'com.canonical.dbusmenu', 'Event', GLib.Variant('(isvu)', (identifier, 'clicked', GLib.Variant('i', 0), 0)))
