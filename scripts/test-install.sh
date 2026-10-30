@@ -145,7 +145,10 @@ elif name == 'cargo':
         print(json.dumps(dict(target_directory=os.environ['CARGO_TARGET_DIR'])))
         sys.exit(0)
     profile = 'release' if '--release' in args else 'debug'
-    target = Path(os.environ['CARGO_TARGET_DIR']) / profile
+    target = Path(os.environ['CARGO_TARGET_DIR'])
+    if os.environ.get('CARGO_BUILD_TARGET'):
+        target /= os.environ['CARGO_BUILD_TARGET']
+    target /= profile
     target.mkdir(parents=True, exist_ok=True)
     for index, argument in enumerate(args):
         if argument == '--bin':
@@ -153,6 +156,8 @@ elif name == 'cargo':
             binary.write_text('#!' + sys.executable + '\nVERSION = ' + repr(os.environ['WZI_VERSION']) + '\n' +
                               (base / 'binary.py').read_text())
             binary.chmod(0o755)
+            print(json.dumps(dict(reason='compiler-artifact', target=dict(name=args[index + 1], kind=['bin']),
+                                  executable=str(binary))))
 elif name == 'kpackagetool6':
     log('package')
     package = Path(os.environ['XDG_DATA_HOME']) / 'kwin/scripts/window-zones'
@@ -462,6 +467,17 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         assert witness.read_text() == 'user config witness\n'
         print('PASS systemd ordering, recorded companion reuse, reinstall, ownership, uninstall')
 
+        env['CARGO_BUILD_TARGET'] = 'x86_64-unknown-linux-gnu'
+        env['WZI_VERSION'] = 'target-selected'
+        install(prefix, '--kwin-script', '--autostart')
+        wait_for(lambda: starts('window_zones_kwin', 'target-selected')
+                 and starts('window_zones', 'target-selected'),
+                 'installer selected stale host binaries instead of the target-qualified Cargo artifacts')
+        install(prefix, '--uninstall')
+        env.pop('CARGO_BUILD_TARGET')
+        env['WZI_VERSION'] = 'two'
+        print('PASS target-qualified Cargo artifacts replace stale unqualified binaries')
+
         env['WZI_SYSTEMD'] = '1'
         env['WZI_GRAPHICAL'] = '0'
         env['WZI_VERSION'] = 'three'
@@ -562,6 +578,27 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         wait_for(lambda: orphan_pids <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
                  'uninstall after launcher crash left supervised binaries alive')
         print('PASS inactive-target/unreachable fallback, stale identity, launcher crash, timezone, companion duplicate')
+
+        env['WZI_VERSION'] = 'xdg-old-prefix'
+        install(fallback, '--kwin-script', '--autostart')
+        previous_launcher = launch_desktop(desktop)
+        wait_for(lambda: starts('window_zones', 'xdg-old-prefix'),
+                 'old-prefix XDG session did not start')
+        previous_pids = {starts(role, 'xdg-old-prefix')[-1]['pid']
+                         for role in ('window_zones', 'window_zones_kwin')}
+        env['WZI_SYSTEMD'] = env['WZI_GRAPHICAL'] = '1'
+        env['WZI_VERSION'] = 'systemd-new-prefix'
+        install(replacement, '--kwin-script', '--autostart')
+        previous_launcher.wait(timeout=8)
+        wait_for(lambda: previous_pids <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
+                 'prefix/systemd cutover left the old XDG binaries alive')
+        wait_for(lambda: starts('window_zones', 'systemd-new-prefix', replacement / 'bin/window_zones'),
+                 'new-prefix systemd App did not start')
+        assert not desktop.exists(), 'prefix/systemd cutover left the old login launcher active'
+        install(fallback, '--uninstall')
+        assert witness.read_text() == 'user config witness\n'
+        install(replacement, '--uninstall')
+        print('PASS XDG-to-systemd cutover stops the previous prefix and preserves config')
 
         # A reachable manager with a failed dbus service must not claim it is running.
         env['WZI_SYSTEMD'] = env['WZI_GRAPHICAL'] = '1'

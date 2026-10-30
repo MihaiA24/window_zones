@@ -1,12 +1,20 @@
+#[cfg(target_os = "linux")]
+mod linux;
+
 use std::sync::mpsc;
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+use linux::LinuxTray;
+#[cfg(target_os = "windows")]
 use tray_item::{IconSource, TrayItem};
 use window_zones::{ConfigState, DispatchState, HotkeyRegistrationState};
 
 use super::{CliSurface, Report, Surface};
 use crate::application::notifications::Notifier;
-use crate::application::session::{Runtime, RuntimeInstruction, RuntimeRequest};
+#[cfg(target_os = "windows")]
+use crate::application::session::RuntimeInstruction;
+use crate::application::session::{Runtime, RuntimeRequest};
 
 /// Fixed tray status lines, updated in place.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -37,7 +45,11 @@ fn tray_status_lines(runtime: &Runtime) -> [String; 4] {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(in crate::application) struct TraySurface {
+    #[cfg(target_os = "linux")]
+    tray: LinuxTray,
+    #[cfg(target_os = "windows")]
     tray: TrayItem,
+    #[cfg(target_os = "windows")]
     label_ids: Vec<u32>,
     labels: Vec<String>,
     cli: CliSurface,
@@ -50,42 +62,36 @@ impl TraySurface {
         runtime: &Runtime,
         tx: &mpsc::Sender<RuntimeRequest>,
     ) -> Result<Self, String> {
-        #[cfg(target_os = "linux")]
-        let icon = IconSource::Resource("view-grid-symbolic");
-        #[cfg(target_os = "windows")]
-        let icon = IconSource::Resource("");
-        let mut tray = TrayItem::new("Window Zones", icon).map_err(|error| error.to_string())?;
-
         let labels = tray_status_lines(runtime).to_vec();
-        let mut label_ids = Vec::with_capacity(labels.len());
-        for line in &labels {
-            #[cfg(target_os = "linux")]
-            let id = {
+        #[cfg(target_os = "linux")]
+        let tray = LinuxTray::new(labels.clone(), tx)?;
+        #[cfg(target_os = "windows")]
+        let (tray, label_ids) = {
+            let mut tray = TrayItem::new("Window Zones", IconSource::Resource(""))
+                .map_err(|error| error.to_string())?;
+            let mut label_ids = Vec::with_capacity(labels.len());
+            for line in &labels {
+                let id = tray.inner_mut().add_label_with_id(line);
+                label_ids.push(id.map_err(|error| error.to_string())?);
+            }
+            for (label, instruction) in [
+                ("Show status", RuntimeInstruction::Status),
+                ("Reload", RuntimeInstruction::Reload),
+                ("Restart", RuntimeInstruction::Restart),
+                ("Quit", RuntimeInstruction::Quit),
+            ] {
                 let tx = tx.clone();
-                tray.inner_mut().add_menu_item_with_id(line, move || {
-                    let _ = tx.send(RuntimeInstruction::Status.into());
+                tray.add_menu_item(label, move || {
+                    let _ = tx.send(instruction.clone().into());
                 })
-            };
-            #[cfg(target_os = "windows")]
-            let id = tray.inner_mut().add_label_with_id(line);
-            label_ids.push(id.map_err(|error| error.to_string())?);
-        }
-
-        for (label, instruction) in [
-            ("Show status", RuntimeInstruction::Status),
-            ("Reload", RuntimeInstruction::Reload),
-            ("Restart", RuntimeInstruction::Restart),
-            ("Quit", RuntimeInstruction::Quit),
-        ] {
-            let tx = tx.clone();
-            tray.add_menu_item(label, move || {
-                let _ = tx.send(instruction.clone().into());
-            })
-            .map_err(|error| error.to_string())?;
-        }
+                .map_err(|error| error.to_string())?;
+            }
+            (tray, label_ids)
+        };
 
         Ok(Self {
             tray,
+            #[cfg(target_os = "windows")]
             label_ids,
             labels,
             dirty: false,
@@ -115,16 +121,19 @@ impl Surface for TraySurface {
             return;
         }
         self.dirty = false;
+        #[cfg(target_os = "linux")]
+        {
+            let labels = tray_status_lines(runtime);
+            if self.labels.as_slice() != labels.as_slice() {
+                self.tray.update_labels(&labels);
+                self.labels = labels.into();
+            }
+        }
+        #[cfg(target_os = "windows")]
         for (index, line) in tray_status_lines(runtime).into_iter().enumerate() {
             if self.labels[index] == line {
                 continue;
             }
-            #[cfg(target_os = "linux")]
-            let updated = self
-                .tray
-                .inner_mut()
-                .set_menu_item_label(&line, self.label_ids[index]);
-            #[cfg(target_os = "windows")]
             let updated = self
                 .tray
                 .inner_mut()

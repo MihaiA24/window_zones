@@ -3,7 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,10 @@ fn output(mut command: Command, input: Option<&str>) -> Output {
             panic!("cannot send runtime commands: {error}");
         }
     }
+    wait_output(child)
+}
+
+fn wait_output(mut child: Child) -> Output {
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
@@ -266,4 +270,212 @@ stop_app_cleanly 'receiver proof fixture exits' "$run_log"
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+mod tray {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::thread::{self, JoinHandle};
+
+    use dbus::blocking::LocalConnection;
+    use dbus_tree::{Factory, MethodErr};
+
+    use super::*;
+
+    struct Process(Option<Child>);
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    struct Bus {
+        process: Process,
+        address: String,
+    }
+
+    impl Bus {
+        fn new(directory: &Directory) -> Self {
+            let mut child = Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .arg(format!(
+                    "--address=unix:path={}",
+                    directory.0.join("bus").display()
+                ))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon is required for Linux tray contract tests");
+            let mut address = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            assert!(!address.trim().is_empty());
+            Self {
+                process: Process(Some(child)),
+                address: address.trim().into(),
+            }
+        }
+    }
+
+    struct Watcher {
+        stop: mpsc::Sender<()>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl Watcher {
+        fn new(address: &str, reject: bool) -> Self {
+            let address = address.to_owned();
+            let (stop, stopped) = mpsc::channel();
+            let (ready, started) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let connection = LocalConnection::new_address(&address).unwrap();
+                connection
+                    .request_name("org.kde.StatusNotifierWatcher", false, false, true)
+                    .unwrap();
+                let factory = Factory::new_fn::<()>();
+                let tree = factory.tree(()).add(
+                    factory.object_path("/StatusNotifierWatcher", ()).add(
+                        factory
+                            .interface("org.kde.StatusNotifierWatcher", ())
+                            .add_m(factory.method(
+                                "RegisterStatusNotifierItem",
+                                (),
+                                move |method| {
+                                    let _: String = method.msg.read1()?;
+                                    if reject {
+                                        Err(MethodErr::failed("tray registration refused"))
+                                    } else {
+                                        Ok(vec![method.msg.method_return()])
+                                    }
+                                },
+                            )),
+                    ),
+                );
+                tree.start_receive(&connection);
+                ready.send(()).unwrap();
+                while stopped.try_recv().is_err()
+                    && connection.process(Duration::from_millis(10)).is_ok()
+                {}
+            });
+            started.recv_timeout(Duration::from_secs(3)).unwrap();
+            Self {
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for Watcher {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn tray_command(directory: &Directory, address: &str) -> Command {
+        let config = directory.0.join("config.toml");
+        fs::write(&config, window_zones::starter_config("Ctrl+Alt")).unwrap();
+        let mut command = super::command();
+        command
+            .arg("--config")
+            .arg(config)
+            .args(["--tray", "run"])
+            .env("DBUS_SESSION_BUS_ADDRESS", address)
+            .env_remove("DBUS_STARTER_ADDRESS")
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn assert_startup_failure(result: Output, expected: &str) {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(result.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(
+            !String::from_utf8_lossy(&result.stdout).contains("Tray menu started"),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+
+    #[test]
+    fn unavailable_bus_fails_tray_startup_without_panicking_or_advertising_ready() {
+        let directory = Directory::new();
+        let address = format!("unix:path={}", directory.0.join("missing-bus").display());
+        assert_startup_failure(
+            output(tray_command(&directory, &address), None),
+            "DBUS_SESSION_BUS_ADDRESS",
+        );
+    }
+
+    #[test]
+    fn tray_requires_a_watcher_and_successful_registration() {
+        let directory = Directory::new();
+        let bus = Bus::new(&directory);
+        assert_startup_failure(
+            output(tray_command(&directory, &bus.address), None),
+            "StatusNotifierWatcher is unavailable",
+        );
+        let _watcher = Watcher::new(&bus.address, true);
+        assert_startup_failure(
+            output(tray_command(&directory, &bus.address), None),
+            "tray registration refused",
+        );
+    }
+
+    #[test]
+    fn tray_exits_with_failure_when_its_watcher_or_worker_bus_is_lost() {
+        for lose_bus in [false, true] {
+            let directory = Directory::new();
+            let mut bus = Bus::new(&directory);
+            let watcher = Watcher::new(&bus.address, false);
+            let log = directory.0.join("tray.log");
+            let mut command = tray_command(&directory, &bus.address);
+            command
+                .stdin(Stdio::piped())
+                .stdout(fs::File::create(&log).unwrap());
+            let mut app = Process(Some(command.spawn().unwrap()));
+            let child = app.0.as_mut().unwrap();
+            child.stdin.take().unwrap().write_all(b"quit\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !fs::read_to_string(&log)
+                .unwrap()
+                .contains("Tray menu started")
+            {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "tray exited before ready"
+                );
+                assert!(Instant::now() < deadline, "tray never registered");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "tray must not read stdin"
+            );
+            if lose_bus {
+                let daemon = bus.process.0.as_mut().unwrap();
+                daemon.kill().unwrap();
+                daemon.wait().unwrap();
+            }
+            drop(watcher);
+            let result = wait_output(app.0.take().unwrap());
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.status.code(), Some(1), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+            let expected = if lose_bus {
+                "Linux tray service failed"
+            } else {
+                "StatusNotifierWatcher is unavailable"
+            };
+            assert!(stderr.contains(expected), "{stderr}");
+        }
+    }
 }

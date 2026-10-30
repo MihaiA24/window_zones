@@ -141,6 +141,8 @@ On Unix, the lock directory must be owned by the current effective UID, non-syml
 
 See [Linux supervision](installation.md#linux-systemd-user-unit) and [macOS LaunchAgent](installation.md#macos-launchagent) for service commands, logs, ownership, and permissions.
 
+Linux `--tray` requires a running StatusNotifier/AppIndicator host on the session bus. Startup waits for actual registration; missing/refusing hosts exit 1 without announcing a working tray. Losing the watcher or worker bus after startup also closes the runtime with exit 1 instead of leaving an uncontrollable background process. The first menu status reflects the initial hotkey-registration attempt.
+
 The App prints runtime events once per change, never per retry:
 
 - `Config state: Loaded (N bindings)` / `Config state: Missing; run window_zones init ...`
@@ -195,9 +197,10 @@ The runtime uses its current accepted config, including reloads.
 Clients must inherit the runtime's compositor connection: `SWAYSOCK` for Sway,
 or `HYPRLAND_INSTANCE_SIGNATURE` and the same runtime namespace for Hyprland.
 The watched config pathname remains valid when its symlink is retargeted.
-Compositor socket replacement fails closed, including queued requests; close
-and relaunch the process to adopt the new connection. In-process `restart`
-does not change transport identity.
+Compositor socket replacement fails closed, including queued and interactive
+dispatch. Interactive dispatch closes the runtime with exit 1 without running
+the action; close and relaunch to adopt the new connection. In-process
+`restart` does not change transport identity.
 
 The socket has mode `0600` inside an owned `0700` directory next to the instance
 lock (`$XDG_RUNTIME_DIR/window_zones.dispatch/dispatch.sock` on a normal Linux
@@ -205,6 +208,13 @@ login). Quit removes the owned socket; after a crash the next lock-owning sessio
 can remove its stale socket, but refuses foreign files and symlinks.
 
 Window and display state come from `swaymsg`/`hyprctl`; both integrations are ungated (no Smoke run on record).
+
+Hyprland cross-output placement transfers the captured window to the destination
+output's active regular workspace before resizing/moving, then verifies native
+monitor/workspace ownership. Same-output and off-screen targets keep their
+workspace. Its existing surface-coordinate and reported-scale geometry remains
+approximate for grouped/plugin decorations, some XWayland frames and older
+fractional-scale IPC; those exact-frame cases are not certified.
 
 ## Linux X11
 

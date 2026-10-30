@@ -77,6 +77,7 @@ pub(in crate::application) fn execute_session(
             })?;
             let identity =
                 compositor_dispatch_identity(backend, path, |name| std::env::var_os(name))?;
+            runtime.compositor_identity = Some(identity.clone());
             local_dispatch::Server::start(
                 _lock.as_ref().expect("live session holds instance lock"),
                 identity,
@@ -99,8 +100,7 @@ pub(in crate::application) fn execute_session(
 
     if matches!(command, Command::Tui) {
         spawn_stdin_reader(parse_tui_input, tx);
-        run_runtime(&mut runtime, &mut TuiSurface::new(), instructions, true);
-        return ExitCode::SUCCESS;
+        return run_runtime(&mut runtime, &mut TuiSurface::new(), instructions, true);
     }
 
     if show_tray {
@@ -116,8 +116,7 @@ pub(in crate::application) fn execute_session(
                 }
             };
             drop(tx);
-            run_runtime(&mut runtime, &mut surface, instructions, true);
-            return ExitCode::SUCCESS;
+            return run_runtime(&mut runtime, &mut surface, instructions, true);
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -132,8 +131,7 @@ pub(in crate::application) fn execute_session(
         notifier: Notifier::new(backend),
     };
     spawn_stdin_reader(parse_runtime_input, tx);
-    run_runtime(&mut runtime, &mut surface, instructions, interactive);
-    ExitCode::SUCCESS
+    run_runtime(&mut runtime, &mut surface, instructions, interactive)
 }
 
 #[cfg(target_os = "linux")]

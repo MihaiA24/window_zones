@@ -292,6 +292,55 @@ stop_kde_session() {
   fi
 }
 
+retire_xdg_autostart() (
+  local file="$1" kind="$2"
+  [[ -f "$file" && ! -L "$file" && -O "$file" ]] || exit 0
+  INSTALL_PREFIX="$(python3 -c '
+import configparser
+from pathlib import Path
+import re
+import shlex
+import sys
+
+config = configparser.ConfigParser(interpolation=None)
+config.read(sys.argv[1])
+value = config.get("Desktop Entry", "Exec", fallback="")
+value = re.sub(r"\\([\\sntr])", lambda match: {
+    "\\": "\\", "s": " ", "n": "\n", "t": "\t", "r": "\r"
+}[match[1]], value)
+try:
+    args = [part.replace("\\$", "$").replace("\\`", "`").replace("%%", "%")
+            for part in shlex.split(value)]
+except ValueError:
+    sys.exit(0)
+if sys.argv[2] == "kwin":
+    if len(args) == 2 and args[0] == "/bin/bash":
+        path = Path(args[1])
+        if path.is_absolute() and path.parts[-3:] == ("share", "window-zones", "kde-session"):
+            print(path.parents[2])
+elif len(args) == 2 and args[1] == "run":
+    path = Path(args[0])
+    if path.is_absolute() and path.parts[-2:] == ("bin", "window_zones"):
+        print(path.parent.parent)
+' "$file" "$kind")" || exit 1
+  [[ -n "$INSTALL_PREFIX" && "$INSTALL_PREFIX" != *$'\n'* ]] || exit 0
+  INSTALL_DIR="$INSTALL_PREFIX/bin"
+  INSTALL_RECORD="$INSTALL_PREFIX/share/window-zones/install-record"
+  [[ -f "$INSTALL_RECORD" && ! -L "$INSTALL_RECORD" && -O "$INSTALL_RECORD" ]] || exit 0
+  if [[ "$kind" == kwin ]]; then
+    KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
+    grep -Fqx kwin-autostart "$INSTALL_RECORD" && kde_launcher_owned \
+      && desktop_owned "$file" /bin/bash "\"$(desktop_escape "$KDE_LAUNCHER")\"" || exit 0
+    KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
+    KDE_SESSION_KEY="${KDE_SESSION_KEY%% *}"
+    stop_kde_session
+  else
+    grep -Fqx autostart "$INSTALL_RECORD" \
+      && desktop_owned "$file" "$INSTALL_DIR/window_zones" run || exit 0
+  fi
+  rm -f -- "$file"
+)
+
 remove_unit() {
   local file="$1" binary="$2" args="$3" name="${1##*/}"
   if unit_owned "$file" "$binary" "$args"; then
@@ -472,12 +521,26 @@ if [[ "$KWIN_SCRIPT" -eq 1 && "$BINARY_NAME" != window_zones_kwin ]]; then
   BUILD_ARGS+=(--bin window_zones_kwin)
   BINARIES+=(window_zones_kwin)
 fi
-cargo "${BUILD_ARGS[@]}"
-TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 \
-  | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+BUILD_ARTIFACTS="$(cargo "${BUILD_ARGS[@]}" --message-format=json-render-diagnostics)"
 mkdir -p "$INSTALL_DIR"
 for name in "${BINARIES[@]}"; do
-  SOURCE_BIN="$TARGET_DIR/$BUILD_PROFILE/$name"
+  SOURCE_BIN="$(printf '%s\n' "$BUILD_ARTIFACTS" | python3 -c '
+import json
+import sys
+
+name = sys.argv[1]
+paths = {
+    message["executable"]
+    for line in sys.stdin
+    if (message := json.loads(line)).get("reason") == "compiler-artifact"
+    and message["target"]["name"] == name
+    and "bin" in message["target"]["kind"]
+    and message.get("executable")
+}
+if len(paths) != 1:
+    sys.exit(f"Expected one Cargo executable for {name}, found {len(paths)}")
+print(paths.pop())
+' "$name")"
   if [[ ! -x "$SOURCE_BIN" ]]; then
     printf 'Build did not produce expected binary: %s\n' "$SOURCE_BIN" >&2
     exit 1
@@ -603,6 +666,8 @@ elif [[ "$AUTOSTART" -eq 1 ]]; then
   record_install autostart
   if [[ "$KDE_AUTOSTART" -eq 1 ]]; then record_install kwin-autostart; fi
   if [[ "$USE_GRAPHICAL_SYSTEMD" -eq 1 ]]; then
+  retire_xdg_autostart "$KWIN_AUTOSTART_FILE" kwin
+  retire_xdg_autostart "$AUTOSTART_FILE" app
   mkdir -p "$UNIT_DIR"
   cat >"$UNIT_FILE" <<EOF
 [Unit]
@@ -646,14 +711,8 @@ EOF
       systemctl --user enable window-zones-kwin.service
       systemctl --user restart window-zones-kwin.service || warn 'Could not start the owned KWin companion.'
       report_systemd_start window-zones-kwin.service "$KWIN_UNIT_FILE"
-      if desktop_owned "$KWIN_AUTOSTART_FILE" /bin/bash "\"$(desktop_escape "$KDE_LAUNCHER")\""; then
-        rm -f -- "$KWIN_AUTOSTART_FILE"
-      fi
     fi
     systemctl --user enable window-zones.service
-    if desktop_owned "$AUTOSTART_FILE" "$INSTALL_DIR/window_zones" run; then
-      rm -f -- "$AUTOSTART_FILE"
-    fi
     if [[ ":${XDG_CURRENT_DESKTOP:-}:" == *:GNOME:* ]] \
       && ! busctl --user status org.window_zones.Gnome >/dev/null 2>&1; then
       # Starting now would only retry until GNOME Shell loads the companion at login.

@@ -405,7 +405,13 @@ impl HotkeySystem for GnomeHotkeySystem {
             if self.capabilities.is_none() {
                 self.capabilities = Some(get_capabilities(self.connection.as_ref().unwrap())?);
             }
-            require_capability(self.capabilities.as_ref().unwrap(), HOTKEYS_CAPABILITY)?;
+            // A missing capture capability needs a companion replacement, not a
+            // config edit. Retry it without caching this degraded connection.
+            require_capability(self.capabilities.as_ref().unwrap(), HOTKEYS_CAPABILITY).map_err(
+                |error| GnomeIntegrationError::Unavailable {
+                    message: error.to_string(),
+                },
+            )?;
             let connection = self.connection.as_ref().unwrap();
 
             let proxy = connection.with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
@@ -1590,25 +1596,93 @@ action = { type = "restore" }
     }
 
     #[test]
+    fn degraded_hotkey_companion_replacement_recovers_through_app_retry() {
+        use crate::{App, HOTKEY_RETRY_INTERVAL, RuntimeEvent};
+        use std::time::Instant;
+
+        let path = std::env::temp_dir().join(format!(
+            "window-zones-gnome-hotkey-recovery-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[[bindings]]
+hotkey = "ctrl+cmd+left"
+action = { type = "move-to-zone", zone = "left-half" }
+"#,
+        )
+        .unwrap();
+        let mut app = App::start_at(&path);
+        let mut state = FakeServiceState::complete();
+        state
+            .capabilities
+            .retain(|value| value != HOTKEYS_CAPABILITY);
+        let mut bus = FakeBus::new(state);
+        let mut system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
+        let start = Instant::now();
+
+        let first = app.tick(&mut system, start);
+        assert!(
+            matches!(first.as_slice(), [RuntimeEvent::HotkeysUnavailable { message }]
+                if message.contains(HOTKEYS_CAPABILITY)),
+            "{first:?}"
+        );
+        assert!(!app.hotkeys_registered());
+        assert!(
+            app.tick(&mut system, start + HOTKEY_RETRY_INTERVAL / 2)
+                .is_empty()
+        );
+        assert!(
+            app.tick(&mut system, start + HOTKEY_RETRY_INTERVAL)
+                .is_empty()
+        );
+        assert!(!app.hotkeys_registered());
+        bus.update_state(|state| {
+            assert_eq!(state.capabilities_calls, 2, "degraded capture is re-probed");
+            assert!(state.registered_hotkeys.is_empty());
+        });
+
+        // The runtime does not poll events while it has no registered set.
+        bus.stop_companion();
+        bus.update_state(|state| {
+            state.capabilities = FakeServiceState::complete().capabilities;
+        });
+        bus.start_companion();
+        let recovered = app.tick(&mut system, start + HOTKEY_RETRY_INTERVAL * 2);
+
+        assert_eq!(recovered, vec![RuntimeEvent::HotkeysRecovered { count: 1 }]);
+        assert!(app.hotkeys_registered());
+        assert_eq!(app.config().bindings[0].hotkey, "ctrl+cmd+left");
+        bus.update_state(|state| {
+            assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+left"]);
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn unsupported_hotkey_set_is_rejected_and_previous_set_survives() {
         let bus = FakeBus::new(FakeServiceState::complete());
         let mut system = GnomeHotkeySystem::with_bus_address(bus.address.clone());
         system
             .register_hotkeys(&["ctrl+cmd+left".to_string()])
             .unwrap();
-        bus.update_state(|state| {
-            state.register_error = Some((
-                "org.window_zones.Gnome.Error.Unsupported",
-                "non-canonical hotkey 'Ctrl+Left'".to_string(),
-            ));
-        });
-        let error = system
-            .register_hotkeys(&["Ctrl+Left".to_string()])
-            .unwrap_err();
-        assert!(matches!(error, HotkeySystemError::Rejected(_)));
-        bus.update_state(|state| {
-            assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+left".to_string()]);
-            assert_eq!(state.capabilities_calls, 1);
-        });
+        for (hotkey, message) in [
+            ("Ctrl+Left", "non-canonical hotkey 'Ctrl+Left'"),
+            ("cmd+1", "GNOME rejected hotkey 'cmd+1' (<Super>1)"),
+        ] {
+            bus.update_state(|state| {
+                state.register_error = Some((
+                    "org.window_zones.Gnome.Error.Unsupported",
+                    message.to_string(),
+                ));
+            });
+            let error = system.register_hotkeys(&[hotkey.to_string()]).unwrap_err();
+            assert!(matches!(error, HotkeySystemError::Rejected(_)));
+            assert!(error.to_string().contains(message));
+            bus.update_state(|state| {
+                assert_eq!(state.registered_hotkeys, vec!["ctrl+cmd+left"]);
+            });
+        }
     }
 }

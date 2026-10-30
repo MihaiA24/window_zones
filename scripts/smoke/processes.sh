@@ -79,7 +79,7 @@ start_fifo_app() {
         XDG_DATA_HOME="${XDG_DATA_HOME:-$TMP_DIR/data}" \
         "$BIN_PATH" --backend "$backend" --config "$CONFIG_PATH" "$@" "$mode" <"$fifo" >"$log_file" 2>&1 &
     APP_PID=$!
-    owned_process register "$APP_PID"
+    owned_process register "$APP_PID" || return 1
     exec {APP_FD}>"$fifo"
 }
 

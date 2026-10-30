@@ -10,6 +10,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import time
 import uuid
@@ -201,6 +202,38 @@ class Workspace:
                 return False
         return True
 
+    def native_processes(self):
+        """Read stable identities published inside private smoke roots before exec."""
+        if not self.state(required=False):
+            return []
+        result = {}
+        for native_root in self.scratch.iterdir():
+            if native_root.is_symlink() or not native_root.is_dir():
+                continue
+            registry = native_root / "pids"
+            if not registry.exists() and not registry.is_symlink():
+                continue
+            for path, expected in ((native_root, stat.S_ISDIR), (registry, stat.S_ISREG)):
+                metadata = path.lstat()
+                if (not expected(metadata.st_mode) or metadata.st_uid != os.getuid()
+                        or metadata.st_mode & 0o077):
+                    fail(f"Unsafe native ownership at {path}; require private owned paths, not symlinks.")
+            try:
+                saved = dict(tuple(map(int, line.split())) for line in registry.read_text().splitlines())
+            except (OSError, ValueError) as error:
+                fail(f"Cannot read native ownership at {registry}: {error}. Ownership is retained; inspect it before cleanup.")
+            for pid, start in saved.items():
+                try:
+                    if (pid == os.getpid() or pid <= 0 or start <= 0
+                            or (Path("/proc") / str(pid)).stat().st_uid != os.getuid()):
+                        continue
+                except OSError:
+                    continue
+                current = process_identity(pid)
+                if current and current["state"] != "Z" and current["start"] == str(start):
+                    result[pid] = {**current, "ownership_registry": str(registry)}
+        return list(result.values())
+
     def runtime_processes(self):
         result = []
         for directory in Path("/proc").iterdir():
@@ -215,7 +248,9 @@ class Workspace:
             if (observed and observed["state"] != "Z" and observed["checkout_marker"] == str(self.root)
                     and self.owns_runtime(observed["runtime_marker"]) and observed["pid"] != os.getpid()):
                 result.append(observed)
-        return result
+        recorded = {observed["pid"]: observed for observed in self.native_processes()}
+        recorded.update((observed["pid"], observed) for observed in result)
+        return list(recorded.values())
 
     def display_owner(self):
         socket = Path(f"/tmp/.X11-unix/X{self.display}")
@@ -434,13 +469,22 @@ class Workspace:
                 fail(f"PID {running['pid']} did not stop. Inspect it before retrying cleanup; evidence is retained.")
         for sig in (signal.SIGTERM, signal.SIGKILL):
             for observed in self.runtime_processes():
-                current = process(observed["pid"])
-                if (current and current["start"] == observed["start"]
-                        and current["checkout_marker"] == str(self.root)
-                        and current["runtime_marker"] == observed["runtime_marker"]
-                        and self.owns_runtime(current["runtime_marker"])):
-                    with contextlib.suppress(ProcessLookupError):
-                        os.kill(observed["pid"], sig)
+                try:
+                    descriptor = os.pidfd_open(observed["pid"])
+                except ProcessLookupError:
+                    continue
+                try:
+                    # Marker/registry ownership was established above. Recheck
+                    # the stable identity after opening, then signal only its pidfd.
+                    current = process_identity(observed["pid"])
+                    if (current and current["state"] != "Z"
+                            and current["start"] == observed["start"]
+                            and (Path("/proc") / str(observed["pid"])).stat().st_uid == os.getuid()):
+                        signal.pidfd_send_signal(descriptor, sig)
+                except (ProcessLookupError, FileNotFoundError):
+                    pass
+                finally:
+                    os.close(descriptor)
             deadline = time.monotonic() + 5
             while self.runtime_processes() and time.monotonic() < deadline:
                 select.select([], [], [], 0.1)

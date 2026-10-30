@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust toolchain with `cargo`, and Python 3 for Cargo metadata, in `PATH`.
+- Rust toolchain with `cargo`, and Python 3 for Cargo's JSON artifact stream, in `PATH`.
 - On Linux, `pkg-config` and D-Bus development headers are required for tray
   and KWin companion support:
   - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
@@ -85,10 +85,12 @@ For example, use a custom prefix or a debug build:
 ```
 
 The script resolves the repository relative to its location, builds the selected
-binaries with `cargo build --locked`, and replaces `<prefix>/bin/<binary>`.
-`CARGO_TARGET_DIR` and Cargo's configured target directory are honored. Prefixes are canonicalized before ownership records and autostart paths are derived. Re-running the same options replaces the installed
-files without duplicating ownership records or overwriting config. Re-run with
-`--autostart` after changing the prefix so the service points at the new binary.
+binaries with `cargo build --locked`, and installs the executable paths reported
+by Cargo's JSON artifact stream. `CARGO_TARGET_DIR`, configured target directories
+and `CARGO_BUILD_TARGET`/`build.target` are honored; stale unqualified binaries
+are not selected. Prefixes are canonicalized for ownership and autostart.
+Reinstall preserves user config and ownership records. Re-run with `--autostart`
+after changing prefix so the service points at the new binary.
 
 ## GNOME Shell companion
 
@@ -244,9 +246,11 @@ Installs from earlier commits of this unpublished branch must be stopped and
 uninstalled with that revision before reinstalling; legacy KDE state is not
 migrated.
 
-To switch from XDG to systemd later, re-run `--autostart` inside a desktop with
-an active graphical target. The installer stops the owned KDE launcher, removes
-the owned desktop fallback and installs/enables the units.
+To switch from XDG to systemd, re-run `--autostart` inside a desktop with an
+active graphical target. The installer validates the previous prefix's desktop
+entry, ownership record and KDE launcher marker before stopping its session and
+removing the fallback, including when the new prefix differs. Unowned entries
+are preserved; config is never replaced.
 
 ### macOS LaunchAgent
 

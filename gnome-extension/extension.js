@@ -635,13 +635,13 @@ export default class WindowZonesExtension extends Extension {
             Gio.BusType.SESSION,
             SERVICE_NAME,
             Gio.BusNameOwnerFlags.NONE,
+            null,
             connection => {
                 if (this._service)
                     this._service.destroy();
                 this._service = new WindowZonesService();
                 this._service.export(connection);
             },
-            () => {},
             () => {
                 if (this._service) {
                     this._service.destroy();

@@ -197,16 +197,21 @@ function moveWindow(windowId, x, y, width, height, callback) {
     const before = rectPayload(window.frameGeometry);
     const target = [x, y, width, height];
     const timer = new QTimer();
+    const boundary = new QTimer();
+    const connections = [];
+    const restoring = Boolean(window.tile) || window.maximizeMode !== 0;
+    let restorationIssued = false;
+    let placed = false;
     let finished = false;
-    let watching = false;
     const finish = error => {
         if (finished)
             return;
         finished = true;
         timer.stop();
+        boundary.stop();
         // KWin destroys a closed window's signal connections with its QObject.
-        if (watching && (!error || error.dbusError !== 'org.window_zones.KWin.Error.WindowGone'))
-            window.frameGeometryChanged.disconnect(changed);
+        if (!error || error.dbusError !== 'org.window_zones.KWin.Error.WindowGone')
+            connections.forEach(([signal, handler]) => signal.disconnect(handler));
         try {
             publishFocusedWindow();
         } finally {
@@ -227,11 +232,15 @@ function moveWindow(windowId, x, y, width, height, callback) {
             if (observed.some(value => !Number.isFinite(value))
                 || observed[2] <= 0 || observed[3] <= 0)
                 throw new Error('KWin reported an invalid window frame after placement');
-            if (!failure && observed.every((value, index) => value === target[index])) {
+            if (!final)
+                return;
+            if (!failure && placed && window.maximizeMode === 0 && !window.tile
+                && observed.every((value, index) => value === target[index])) {
                 finish();
-            } else if (final) {
-                const message = failure ? errorMessage(failure)
-                    : 'KWin did not reach the requested frame before the observation deadline';
+            } else {
+                const message = failure ? errorMessage(failure) : !placed
+                    ? 'KWin did not finish restoring the window before the observation deadline'
+                    : 'KWin did not retain the requested restored frame through the observation deadline';
                 finish(observed.some((value, index) => value !== before[index])
                     ? protocolError('PartialMove', JSON.stringify({
                         window_id: windowId, observed, message,
@@ -243,6 +252,45 @@ function moveWindow(windowId, x, y, width, height, callback) {
         }
     };
     const changed = () => observe(false);
+    const place = () => {
+        placed = true;
+        window.frameGeometry = {x, y, width, height};
+    };
+    const restored = () => {
+        if (finished || placed || !restorationIssued)
+            return;
+        observe(false);
+        if (!finished && window.maximizeMode === 0 && !window.tile)
+            boundary.start();
+    };
+    boundary.interval = 0;
+    boundary.singleShot = true;
+    boundary.timeout.connect(() => {
+        if (finished || placed)
+            return;
+        try {
+            observe(false);
+            if (!finished && window.maximizeMode === 0 && !window.tile)
+                place();
+        } catch (error) {
+            observe(true, error);
+        }
+    });
+    timer.interval = 750;
+    timer.singleShot = true;
+    timer.timeout.connect(() => observe(true));
+    [
+        [window.frameGeometryChanged, changed],
+        [window.maximizedChanged, restored],
+        [window.tileChanged, restored],
+        [window.damaged, restored],
+    ].forEach(([signal, handler]) => {
+        if (signal && typeof signal.connect === 'function' && typeof signal.disconnect === 'function') {
+            signal.connect(handler);
+            connections.push([signal, handler]);
+        }
+    });
+    timer.start();
     try {
         const tile = window.tile;
         if (tile) {
@@ -256,23 +304,17 @@ function moveWindow(windowId, x, y, width, height, callback) {
             }
         }
         window.setMaximize(false, false);
-        window.frameGeometry = {x, y, width, height};
+        restorationIssued = true;
+        if (!restoring)
+            place();
     } catch (error) {
         observe(true, error);
         return;
     }
-    // Wayland clients commit size changes asynchronously. Observe, never retry the mutation;
-    // a bounded wait cannot prove that a slow client will not change its frame again later.
-    timer.interval = 750;
-    timer.singleShot = true;
-    timer.timeout.connect(() => observe(true));
-    if (window.frameGeometryChanged
-        && typeof window.frameGeometryChanged.connect === 'function'
-        && typeof window.frameGeometryChanged.disconnect === 'function') {
-        window.frameGeometryChanged.connect(changed);
-        watching = true;
-    }
-    timer.start();
+    // Native Wayland acknowledges restoration in maximizedChanged/tileChanged. Xwayland changes
+    // those properties synchronously, before the client's CSD/configure; its repaint supplies
+    // the asynchronous boundary instead. Place once outside that commit, then keep observing
+    // until the deadline: a momentarily matching frame is not a completed placement.
     observe(false);
 }
 

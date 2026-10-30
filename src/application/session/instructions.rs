@@ -13,6 +13,8 @@ pub(in crate::application) enum RuntimeInstruction {
     Restart,
     Quit,
     InputClosed,
+    #[cfg(target_os = "linux")]
+    SurfaceFailed(String),
     Help,
     Dispatch(String),
     Unknown(String),

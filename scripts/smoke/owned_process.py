@@ -103,6 +103,7 @@ def register(path, owner, runner, pid):
         raise RuntimeError(f"refusing unowned smoke process {pid}")
     with Path(path).open("a") as stream:
         stream.write(f"{pid} {current[0]}\n")
+    return current[0]
 
 
 def cleanup(path, owner, runner):
@@ -110,6 +111,12 @@ def cleanup(path, owner, runner):
     deadline = time.monotonic() + 5
     while True:
         owned = discover(known, owner, runner)
+        # Persist discoveries before signalling: a failed teardown must remain
+        # recoverable even if a helper's environment later becomes unreadable.
+        with Path(path).open("a") as stream:
+            for pid, start in owned.items():
+                if known.get(pid) != start:
+                    stream.write(f"{pid} {start}\n")
         known.update(owned)
         if not owned:
             return
@@ -135,13 +142,23 @@ def main():
             os.close(fd)
     elif command == "register":
         register(path, owner, runner, int(args[0]))
+    elif command == "publish":
+        pid = int(args[0])
+        start = register(path, owner, runner, pid)
+        if start is None:
+            raise RuntimeError(f"cannot publish stable smoke identity for {pid}")
+        # Publication follows registration, while the launcher still has its
+        # readable inherited environment; exec may revoke access to environ.
+        with Path(args[1]).open("x") as stream:
+            stream.write(f"{pid} {start}\n")
     elif command == "cleanup":
         cleanup(path, owner, runner)
     else:
         pid = int(args[0])
         start = records(path).get(pid)
         if command == "alive":
-            return 0 if start is not None and is_alive(pid, start) else 1
+            expected = int(args[1]) if len(args) > 1 else start
+            return 0 if start is not None and start == expected and is_alive(pid, start) else 1
         if command == "signal":
             if start is not None:
                 signal_identity(pid, start, getattr(signal, f"SIG{args[1]}"))

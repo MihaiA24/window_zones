@@ -661,7 +661,11 @@ def run(binary, keep_logs, output_dir=None):
         indicator_dir = find_appindicator(resource_roots, version_match[1])
         check('Installed AppIndicator supports real GNOME tray testing', indicator_dir.is_dir(), indicator_dir)
         shutil.copytree(indicator_dir, work / 'data/gnome-shell/extensions' / indicator_uuid)
-        (work / 'config/glib-2.0/settings/keyfile').write_text("[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\ndisable-user-extensions=false\ndisable-extension-version-validation=false\n")
+        # A fresh HOME otherwise opens Shell's modal first-login tour over the fixture.
+        (work / 'config/glib-2.0/settings/keyfile').write_text(
+            "[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\n"
+            "disable-user-extensions=false\ndisable-extension-version-validation=false\n"
+            f"welcome-dialog-last-shown-version='{version_match[1]}.0'\n")
         for name in ('metadata.json', 'extension.js'):
             shutil.copy2(root / 'gnome-extension' / name, work / 'data/gnome-shell/extensions/window-zones@mihai-a24' / name)
         env = isolated_environment(work, pipewire_runtime, pipewire_remote, os.environ)
@@ -695,7 +699,15 @@ def run(binary, keep_logs, output_dir=None):
         remote('NotifyPointerMotionRelative', GLib.Variant('(dd)', (500.0, 400.0)))
         set_overview(False)
         inject([56, 15])
-        check('Native virtual keyboard establishes application focus', wait_for(lambda: focused()[0]), focused())
+        focus_ready = wait_for(lambda: focused()[0])
+        if not focus_ready:
+            capture_screen('focus-failure')
+            overview = call('org.gnome.Shell', '/org/gnome/Shell', 'org.freedesktop.DBus.Properties',
+                            'Get', GLib.Variant('(ss)', ('org.gnome.Shell', 'OverviewActive'))).unpack()[0]
+            (work / 'focus-failure.json').write_text(json.dumps({
+                'overview_active': overview, 'companion': focused(), 'gtk': window_state(window_log),
+            }, indent=2) + '\n')
+        check('Native virtual keyboard establishes application focus', focus_ready, focused())
         capture_screen('focus-before-input')
         focus_entry(window_log)
         inject([30])

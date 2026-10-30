@@ -626,7 +626,6 @@ checksum = "59d4bd406170690dc30eabb3badc67a085beaf9b2c3b1923afcc9c26a2191353"
 dependencies = [
  "cocoa 0.25.0",
  "core-graphics 0.23.2",
- "ksni",
  "libc",
  "objc",
  "objc-foundation",
@@ -682,6 +681,7 @@ dependencies = [
  "cocoa 0.22.0",
  "dbus",
  "dbus-tree",
+ "ksni",
  "objc",
  "parking_lot",
  "serde",

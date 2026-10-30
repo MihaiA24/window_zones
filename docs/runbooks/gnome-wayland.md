@@ -81,6 +81,12 @@ An empty hotkey set or the active controller's session-bus disconnect also
 releases its grabs and ownership of the registered set. Other App instances
 cannot replace a live controller's nonempty set.
 
+The companion exports its object only while it owns the service name. If an
+incumbent owns the name at enable time, queued acquisition exports the service
+when that incumbent leaves. A compatible but degraded companion lacking hotkey
+capture remains retryable; replacing it with the complete companion recovers
+without editing bindings. Actual shortcut conflicts remain transactional rejections.
+
 The companion owns:
 
 - service `org.window_zones.Gnome`;

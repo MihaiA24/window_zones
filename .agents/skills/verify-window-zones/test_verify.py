@@ -319,12 +319,16 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
     other_survivor.write_text("independent workspace")
     save(other.scratch / "owner.json", {**other.owner, "evidence": str(other_proof)})
     # Native helpers may outlive their driver and use a nested private runtime.
-    native_runtime = workspace.scratch / "gnome-123" / "gnome" / "runtime"
+    native_root = workspace.scratch / "gnome-123"
+    native_runtime = native_root / "gnome" / "runtime"
     sibling_runtime = base / "scratch-sibling" / "gnome-123" / "gnome" / "runtime"
     for runtime in (native_runtime, sibling_runtime):
         runtime.mkdir(mode=0o700, parents=True)
         for name in ("doc", "gvfs"):
             (runtime / name).mkdir()
+    native_root.chmod(0o700)
+    native_registry = native_root / "pids"
+    native_registry.touch(mode=0o600)
     linked_runtime = workspace.scratch / "runtime-link"
     linked_runtime.symlink_to(sibling_runtime, target_is_directory=True)
     helpers = []
@@ -340,15 +344,28 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
             ready = base / f"{name}.ready"
             ready_files.append(ready)
             script = ("import signal, time\nfrom pathlib import Path\n"
-                      + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "")
-                      + f"Path({str(ready)!r}).write_text('ready')\ntime.sleep(60)\n")
+                      + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else ""))
+            if name == "owned":
+                script += ("import ctypes, os, subprocess, sys\n"
+                           f"subprocess.run([sys.executable, {str(workspace.root / 'scripts/smoke/owned_process.py')!r}, "
+                           f"'publish', {str(native_registry)!r}, {str(native_root)!r}, '0', str(os.getpid()), "
+                           f"{str(native_root / 'owned.pid')!r}], check=True)\n"
+                           "libc = ctypes.CDLL(None, use_errno=True)\n"
+                           "if libc.prctl(4, 0, 0, 0, 0) != 0:\n"
+                           "    raise OSError(ctypes.get_errno(), 'PR_SET_DUMPABLE')\n")
+            script += f"Path({str(ready)!r}).write_text('ready')\ntime.sleep(60)\n"
             helpers.append(subprocess.Popen([sys.executable, "-c", script], cwd=base,
                            env={**workspace.env(), "XDG_RUNTIME_DIR": str(runtime),
+                                **({"WINDOW_ZONES_SMOKE_OWNER": str(native_root)} if name == "owned" else {}),
                                 "WINDOW_ZONES_VERIFY_CHECKOUT": checkout}, start_new_session=True))
         deadline = time.monotonic() + 10
         while not all(path.exists() for path in ready_files) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert all(path.exists() for path in ready_files), "Native helper startup failed"
+        assert process(helpers[0].pid) is None, "Protected helper environment remained readable"
+        foreign_start = gnome.owned_process.process(helpers[1].pid)[0]
+        with native_registry.open("a") as registry:
+            registry.write(f"{helpers[1].pid} {foreign_start + 1}\n")
         assert {p["pid"] for p in workspace.runtime_processes()} == {helpers[0].pid}
         # Exercise mount selection without requiring privileged real mounts.
         mounted = {runtime / name for runtime in (native_runtime, sibling_runtime) for name in ("doc", "gvfs")}
@@ -359,6 +376,27 @@ with tempfile.TemporaryDirectory(prefix="window-zones-verifier-check-") as direc
         assert set(json.loads(planned.getvalue())["unmount"]) == {
             str(native_runtime / "doc"), str(native_runtime / "gvfs")}
         assert all(child.poll() is None for child in helpers), "Dry-run signalled a helper"
+        native_registry.chmod(0o644)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rejected(lambda: workspace.cleanup(True), "Unsafe native ownership")
+        native_registry.chmod(0o600)
+        saved_registry = native_registry.with_suffix(".saved")
+        native_registry.rename(saved_registry)
+        native_registry.symlink_to(saved_registry)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rejected(lambda: workspace.cleanup(True), "Unsafe native ownership")
+        native_registry.unlink()
+        saved_registry.rename(native_registry)
+        with patch("wz_verify.runtime.signal.pidfd_send_signal", side_effect=PermissionError("denied")):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    workspace.cleanup(False)
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("Cleanup ignored a helper signalling failure")
+        assert (workspace.scratch / "owner.json").exists() and native_registry.exists()
+        assert helpers[0].poll() is None, "Failed cleanup lost its live helper"
         with contextlib.redirect_stdout(io.StringIO()):
             workspace.cleanup(False)
         assert helpers[0].poll() is not None, "Cleanup removed ownership before its native helper stopped"

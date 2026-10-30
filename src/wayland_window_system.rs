@@ -115,6 +115,8 @@ struct HyprWindow {
     address: String,
     at: [i32; 2],
     size: [u32; 2],
+    monitor: i64,
+    workspace: HyprWorkspace,
     floating: bool,
     fullscreen: u32,
     #[serde(rename = "fullscreenClient")]
@@ -123,6 +125,7 @@ struct HyprWindow {
 
 #[derive(Debug, Deserialize)]
 struct HyprMonitor {
+    id: i64,
     name: String,
     x: i32,
     y: i32,
@@ -130,8 +133,19 @@ struct HyprMonitor {
     height: u32,
     scale: f64,
     transform: u32,
+    #[serde(rename = "activeWorkspace")]
+    active_workspace: HyprWorkspace,
     reserved: [u32; 4],
     disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HyprWorkspace {
+    #[serde(default)]
+    id: Option<i64>,
+    name: String,
+    #[serde(default)]
+    address: Option<String>,
 }
 
 pub fn resolve_wayland_backend() -> Result<WaylandBackend, WindowSystemError> {
@@ -401,6 +415,7 @@ fn displays_hypr() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
 fn move_window_hypr(window_move: &WindowMove) -> Result<(), WindowSystemError> {
     move_window_hypr_with(
         window_move,
+        || run_wayland_json_command("hyprctl", &["-j", "monitors"], "hyprctl monitors"),
         || run_wayland_json_command("hyprctl", &["-j", "clients"], "hyprctl clients"),
         |command, window| {
             let reply =
@@ -412,16 +427,34 @@ fn move_window_hypr(window_move: &WindowMove) -> Result<(), WindowSystemError> {
 
 fn move_window_hypr_with(
     window_move: &WindowMove,
+    read_monitors: impl FnOnce() -> Result<Vec<HyprMonitor>, WindowSystemError>,
     mut read_clients: impl FnMut() -> Result<Vec<HyprWindow>, WindowSystemError>,
     run_command: impl FnOnce(&str, &WindowId) -> Result<(), WindowSystemError>,
 ) -> Result<(), WindowSystemError> {
-    let (command, initial) = hypr_move_command(&read_clients()?, window_move)?;
-    let result = run_command(&command, &window_move.window);
+    let clients = read_clients()?;
+    let monitors = read_monitors()?;
+    let destination = hypr_destination(&monitors, window_move.target)?;
+    let (command, initial, transfers_workspace) =
+        hypr_move_command(&clients, destination, window_move)?;
+    let mut result = run_command(&command, &window_move.window);
     let observed = read_clients().and_then(|clients| {
         let window = clients
             .iter()
             .find(|window| window.address == window_move.window.as_str())
             .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
+        if result.is_ok()
+            && let Some(destination) = destination
+            && (window.monitor != destination.id
+                || (transfers_workspace
+                    && !window
+                        .workspace
+                        .same_workspace(&destination.active_workspace)))
+        {
+            result = Err(WindowSystemError::Platform(format!(
+                "Hyprland did not transfer window {} to monitor {} workspace {}",
+                window_move.window, destination.name, destination.active_workspace.name
+            )));
+        }
         checked_scripted_frame(window.geometry(), &window_move.window)
     });
     finish_scripted_move(window_move, initial, result, observed)
@@ -429,8 +462,9 @@ fn move_window_hypr_with(
 
 fn hypr_move_command(
     windows: &[HyprWindow],
+    destination: Option<&HyprMonitor>,
     window_move: &WindowMove,
-) -> Result<(String, Rect), WindowSystemError> {
+) -> Result<(String, Rect, bool), WindowSystemError> {
     let address = window_move.window.as_str();
     let window = windows
         .iter()
@@ -462,6 +496,12 @@ fn hypr_move_command(
     if !window.floating || window.fullscreen != 0 {
         write!(command, "dispatch setfloating address:{address}; ").unwrap();
     }
+    let transfer = destination.filter(|monitor| window.monitor != monitor.id);
+    if let Some(destination) = transfer {
+        command.push_str("dispatch movetoworkspacesilent ");
+        destination.active_workspace.write_selector(&mut command)?;
+        write!(command, ",address:{address}; ").unwrap();
+    }
     // KeybindManager::{resizeWindow,moveWindow} resolve the explicit address
     // and Compositor::parseWindowVectorArgsRelative treats "exact" as global.
     // https://github.com/hyprwm/Hyprland/blob/v0.52.0/src/managers/KeybindManager.cpp
@@ -475,7 +515,27 @@ fn hypr_move_command(
         window_move.target.y
     )
     .unwrap();
-    Ok((command, initial))
+    Ok((command, initial, transfer.is_some()))
+}
+
+fn hypr_destination(
+    monitors: &[HyprMonitor],
+    target: Rect,
+) -> Result<Option<&HyprMonitor>, WindowSystemError> {
+    let center_x = 2 * i64::from(target.x) + i64::from(target.width);
+    let center_y = 2 * i64::from(target.y) + i64::from(target.height);
+    for monitor in monitors.iter().filter(|monitor| !monitor.disabled) {
+        let area = monitor.logical_area()?;
+        if center_x >= 2 * i64::from(area.x)
+            && center_x < 2 * (i64::from(area.x) + i64::from(area.width))
+            && center_y >= 2 * i64::from(area.y)
+            && center_y < 2 * (i64::from(area.y) + i64::from(area.height))
+        {
+            return Ok(Some(monitor));
+        }
+    }
+    // Restore can intentionally put an originally off-screen frame back.
+    Ok(None)
 }
 
 fn checked_scripted_frame(frame: Rect, window: &WindowId) -> Result<Rect, WindowSystemError> {
@@ -735,8 +795,46 @@ impl HyprWindow {
     }
 }
 
+impl HyprWorkspace {
+    fn same_workspace(&self, other: &Self) -> bool {
+        match (&self.address, &other.address) {
+            (Some(left), Some(right)) => left == right,
+            _ => match (self.id, other.id) {
+                (Some(left), Some(right)) => left == right,
+                _ => self.name == other.name,
+            },
+        }
+    }
+
+    fn write_selector(&self, command: &mut String) -> Result<(), WindowSystemError> {
+        if self.address.is_none()
+            && let Some(id) = self.id.filter(|id| *id > 0)
+        {
+            write!(command, "{id}").unwrap();
+            return Ok(());
+        }
+        let selector = self.address.as_deref().unwrap_or(&self.name);
+        // Legacy Hyprland batches split on semicolons and track brackets.
+        if selector.is_empty()
+            || selector == "name:"
+            || selector
+                .chars()
+                .any(|ch| matches!(ch, ';' | '[' | ']' | '\\' | '\n' | '\r' | '\0'))
+        {
+            return Err(WindowSystemError::Platform(
+                "hyprctl reported a workspace selector unsafe for batch dispatch".to_string(),
+            ));
+        }
+        if self.address.is_none() {
+            command.push_str("name:");
+        }
+        command.push_str(selector);
+        Ok(())
+    }
+}
+
 impl HyprMonitor {
-    fn usable_area(&self) -> Result<Rect, WindowSystemError> {
+    fn logical_area(&self) -> Result<Rect, WindowSystemError> {
         if !self.scale.is_finite() || self.scale <= 0.0 {
             return Err(WindowSystemError::Platform(format!(
                 "hyprctl monitor {} has invalid scale {}",
@@ -748,13 +846,18 @@ impl HyprMonitor {
         if matches!(self.transform, 1 | 3 | 5 | 7) {
             std::mem::swap(&mut width, &mut height);
         }
+        Ok(Rect::new(self.x, self.y, width, height))
+    }
+
+    fn usable_area(&self) -> Result<Rect, WindowSystemError> {
+        let area = self.logical_area()?;
         // HyprCtl.cpp emits top-left x/y followed by bottom-right x/y.
         let [left, top, right, bottom] = self.reserved;
         Ok(Rect::new(
-            self.x.saturating_add_unsigned(left),
-            self.y.saturating_add_unsigned(top),
-            width.saturating_sub(left).saturating_sub(right),
-            height.saturating_sub(top).saturating_sub(bottom),
+            area.x.saturating_add_unsigned(left),
+            area.y.saturating_add_unsigned(top),
+            area.width.saturating_sub(left).saturating_sub(right),
+            area.height.saturating_sub(top).saturating_sub(bottom),
         ))
     }
 }
@@ -1080,6 +1183,7 @@ mod tests {
             r#"{
             "id": 1, "name": "DP-1", "x": -720, "y": 30,
             "width": 2560, "height": 1440, "scale": 2.0, "transform": 3,
+            "activeWorkspace": {"id":2,"name":"2"},
             "reserved": [5, 23, 7, 11], "disabled": false
         }"#,
         )
@@ -1297,13 +1401,13 @@ mod tests {
             Rect::new(-2560, -100, 1280, 720),
         );
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap().0,
+            hypr_move_command(&clients, None, &target).unwrap().0,
             "dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
              dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
         );
         clients[0].floating = false;
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap().0,
+            hypr_move_command(&clients, None, &target).unwrap().0,
             "dispatch setfloating address:0x55e0ed70afc0; \
              dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
              dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
@@ -1311,7 +1415,7 @@ mod tests {
         clients[0].fullscreen = 1;
         clients[0].floating = true;
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap().0,
+            hypr_move_command(&clients, None, &target).unwrap().0,
             "dispatch settiled address:0x55e0ed70afc0; \
              dispatch setfloating address:0x55e0ed70afc0; \
              dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
@@ -1325,10 +1429,140 @@ mod tests {
         other.address = "0x1234".to_string();
         clients.insert(0, other);
         assert_eq!(
-            hypr_move_command(&clients, &target).unwrap().0,
+            hypr_move_command(&clients, None, &target).unwrap().0,
             "dispatch resizewindowpixel exact 1280 720,address:0x55e0ed70afc0; \
              dispatch movewindowpixel exact -2560 -100,address:0x55e0ed70afc0"
         );
+    }
+
+    const HYPR_MONITORS_JSON: &str = r#"[
+        {"id":0,"name":"DP-1","x":0,"y":0,"width":1920,"height":1080,
+         "scale":1.0,"transform":0,"activeWorkspace":{"id":4,"name":"em₄"},
+         "reserved":[0,0,0,0],"disabled":false},
+        {"id":1,"name":"DP-2","x":-2560,"y":-100,"width":2560,"height":1440,
+         "scale":1.0,"transform":0,"activeWorkspace":{"id":5,"name":"5"},
+         "reserved":[0,0,0,0],"disabled":false}
+    ]"#;
+
+    #[test]
+    fn hypr_cross_output_move_transfers_captured_client_and_checks_native_ownership() {
+        let target = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(-2560, -100, 1280, 720),
+        );
+        let initial = format!("[{}]", hypr_window_json());
+        // Native clients readback: surface position alone cannot establish
+        // monitor/workspace ownership.
+        let placed = r#"[{
+            "address":"0x55e0ed70afc0","at":[-2560,-100],"size":[1280,720],
+            "monitor":1,"workspace":{"id":5,"name":"5"},"floating":true,
+            "fullscreen":0,"fullscreenClient":0
+        }]"#;
+        for (monitor, workspace, accepted) in [(1, 5, true), (0, 5, false), (1, 4, false)] {
+            let mut after: serde_json::Value = serde_json::from_str(placed).unwrap();
+            after[0]["monitor"] = monitor.into();
+            after[0]["workspace"]["id"] = workspace.into();
+            let after = after.to_string();
+            let mut snapshots = [initial.as_str(), after.as_str()].into_iter();
+            let result = move_window_hypr_with(
+                &target,
+                || Ok(serde_json::from_str(HYPR_MONITORS_JSON).unwrap()),
+                || Ok(serde_json::from_str(snapshots.next().unwrap()).unwrap()),
+                |command, window| {
+                    assert_eq!(window, &target.window);
+                    assert!(command.split(';').any(|dispatch| dispatch.trim()
+                        == "dispatch movetoworkspacesilent 5,address:0x55e0ed70afc0"));
+                    assert!(!command.contains("focus"));
+                    Ok(())
+                },
+            );
+            if accepted {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(WindowSystemError::PartialMove { observed, message })
+                        if observed == target.target && message.contains("did not transfer")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn hypr_reverse_output_and_named_workspace_dispatch_keep_the_captured_address() {
+        let mut clients: Vec<HyprWindow> =
+            serde_json::from_str(&format!("[{}]", hypr_window_json())).unwrap();
+        let mut monitors: Vec<HyprMonitor> = serde_json::from_str(HYPR_MONITORS_JSON).unwrap();
+        clients[0].monitor = 1;
+        let back = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(1320, 680, 600, 400),
+        );
+        for (workspace, selector) in [
+            (r#"{"id":4,"name":"em₄"}"#, "4"),
+            (r#"{"id":-1337,"name":"em₄"}"#, "name:em₄"),
+            (
+                r#"{"address":"name:em₄","type":"named","name":"em₄"}"#,
+                "name:em₄",
+            ),
+        ] {
+            monitors[0].active_workspace = serde_json::from_str(workspace).unwrap();
+            let destination = hypr_destination(&monitors, back.target).unwrap();
+            let (command, _, transferred) =
+                hypr_move_command(&clients, destination, &back).unwrap();
+            assert!(transferred);
+            assert!(command.split(';').any(|dispatch| dispatch.trim()
+                == format!(
+                    "dispatch movetoworkspacesilent {selector},address:{}",
+                    back.window
+                )));
+        }
+        monitors[0].active_workspace =
+            serde_json::from_str(r#"{"id":-1337,"name":"x; dispatch killactive"}"#).unwrap();
+        let destination = hypr_destination(&monitors, back.target).unwrap();
+        assert!(hypr_move_command(&clients, destination, &back).is_err());
+    }
+
+    #[test]
+    fn hypr_same_output_placements_keep_workspace_and_transfer_failures_keep_observed_geometry() {
+        let mut clients: Vec<HyprWindow> =
+            serde_json::from_str(&format!("[{}]", hypr_window_json())).unwrap();
+        clients[0].workspace = serde_json::from_str(r#"{"id":9,"name":"9"}"#).unwrap();
+        let monitors: Vec<HyprMonitor> = serde_json::from_str(HYPR_MONITORS_JSON).unwrap();
+        let target = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(100, 100, 800, 600),
+        );
+        let destination = hypr_destination(&monitors, target.target).unwrap();
+        let (command, _, transferred) = hypr_move_command(&clients, destination, &target).unwrap();
+        assert!(!transferred);
+        assert!(!command.contains("movetoworkspace"));
+
+        let initial = format!("[{}]", hypr_window_json());
+        let after = r#"[{
+            "address":"0x55e0ed70afc0","at":[-2560,-100],"size":[1280,720],
+            "monitor":0,"workspace":{"id":4,"name":"em₄"},"floating":true,
+            "fullscreen":0,"fullscreenClient":0
+        }]"#;
+        let mut snapshots = [initial.as_str(), after].into_iter();
+        let target = WindowMove::new(target.window, Rect::new(-2560, -100, 1280, 720));
+        let result = move_window_hypr_with(
+            &target,
+            || Ok(serde_json::from_str(HYPR_MONITORS_JSON).unwrap()),
+            || Ok(serde_json::from_str(snapshots.next().unwrap()).unwrap()),
+            |command, window| {
+                validate_hypr_batch_reply(
+                    "workspace transfer rejected\n\n\nok\n\n\nok",
+                    command.split(';').count(),
+                    window,
+                )
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(WindowSystemError::PartialMove { observed, message })
+                if observed == target.target && message.contains("workspace transfer rejected")
+        ));
     }
 
     #[test]
@@ -1340,14 +1574,14 @@ mod tests {
         ];
         let target = WindowMove::new(WindowId::new("0x55e0ed70afc0"), Rect::new(0, 0, 800, 600));
         assert_eq!(
-            hypr_move_command(&[], &target),
+            hypr_move_command(&[], None, &target),
             Err(WindowSystemError::WindowGone(target.window.clone()))
         );
         for (internal, client) in [(2, 0), (0, 2), (3, 0)] {
             clients[0].fullscreen = internal;
             clients[0].fullscreen_client = client;
             assert!(matches!(
-                hypr_move_command(&clients, &target),
+                hypr_move_command(&clients, None, &target),
                 Err(WindowSystemError::Platform(message)) if message.contains("leave fullscreen first")
             ));
         }
@@ -1355,7 +1589,7 @@ mod tests {
             clients[0].address = address.to_string();
             let target = WindowMove::new(WindowId::new(address), target.target);
             assert!(matches!(
-                hypr_move_command(&clients, &target),
+                hypr_move_command(&clients, None, &target),
                 Err(WindowSystemError::Platform(message)) if message.contains("invalid window address")
             ));
         }
@@ -1400,6 +1634,7 @@ mod tests {
         let mut snapshots = [initial.as_str(), after].into_iter();
         move_window_hypr_with(
             window_move,
+            || Ok(Vec::new()),
             || {
                 serde_json::from_str(snapshots.next().expect("unexpected clients read"))
                     .map_err(|error| WindowSystemError::Platform(error.to_string()))
