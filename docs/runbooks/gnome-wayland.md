@@ -278,12 +278,17 @@ The `gnome-live` gate mechanically runs the [identified-window and hotkey-rollba
 
 Its placement runtime also reloads one of those safe bindings through all
 fourteen built-in zones and center, injecting each accelerator with the test
-window's identity and focus checked before input. Each key needs fresh successful
-App status and independent Xwayland/companion frame observations. Xwayland pixels
-are normalized using independent monitor/X server layout metadata; target
-rectangles remain in Mutter logical units. Captures come from the actual
-compositor monitor, not the black Xwayland root. Post-input focus and Overview
-state are recorded. Interactive Restore then returns to
+window's identity and focus checked before input. Each key needs a new
+`--perf-log` dispatch receipt after the input checkpoint, matching the runtime
+PID, canonical hotkey, resolved action and successful result; cached status is
+not delivery proof. Independent Xwayland/companion frame observations must also
+match. Xwayland pixels are normalized using independent monitor/X server layout
+metadata; target rectangles remain in Mutter logical units. Captures come from
+the actual compositor monitor, not the black Xwayland root. Post-input focus and
+Overview state are recorded. Close Overview and Shell menus (including Quick
+Settings) before the gate and leave keyboard/mouse idle until it finishes:
+Shell modal grabs can intercept input without changing those focus observations.
+Interactive Restore then returns to
 the frame before the first accelerator move; a second physical Restore must
 report consumed history without changing the frame. The original four-binding
 fixture is restored before the remaining lifecycle/rollback checks.

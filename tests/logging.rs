@@ -204,3 +204,66 @@ fn session_log_appends_outcomes_and_survives_runtime_restart() {
         1
     );
 }
+
+#[test]
+fn seated_receiver_proof_rejects_cached_success_and_wrong_actions() {
+    let directory = Directory::new();
+    let mut shell = Command::new("timeout");
+    shell
+        .args(["8s", "bash", "-euo", "pipefail", "-c"])
+        .arg(
+            r#"
+source "$PROJECT_ROOT/scripts/smoke/assertions.sh"
+source "$PROJECT_ROOT/scripts/smoke/waits.sh"
+source "$PROJECT_ROOT/scripts/smoke/processes.sh"
+source "$PROJECT_ROOT/scripts/smoke/gnome-live/placement.sh"
+SCRIPT_DIR="$PROJECT_ROOT/scripts"
+PID_FILE="$TMP_DIR/pids"
+CURRENT_GATE=receiver-proof
+ASSERT_LOG="$TMP_DIR/assertions.log"
+ASSERTIONS=0 FAILURES=0 SKIPPED=0 KEEP_LOGS=1
+GNOME_LIVE_ACTIVE=0 GNOME_LIVE_RESTORE_FAILURE=0
+export WINDOW_ZONES_SMOKE_OWNER="$TMP_DIR"
+trap cleanup EXIT
+trap 'exit 143' TERM
+: >"$PID_FILE"
+: >"$ASSERT_LOG"
+CONFIG_PATH="$TMP_DIR/config.toml"
+printf '[[bindings]]\nhotkey = "ctrl+cmd+left"\naction = { type = "move-to-zone", zone = "left-half" }\n' >"$CONFIG_PATH"
+GNOME_SAFE_LEFT_HOTKEY=ctrl+cmd+left
+GNOME_LIVE_EXPECTED_ACTION='{"type":"move-to-zone","zone":"left-half"}'
+GNOME_LIVE_PERF_LOG="$TMP_DIR/dispatch.jsonl"
+run_log="$TMP_DIR/run.log"
+start_fifo_app run dry-run "$run_log" --perf-log "$GNOME_LIVE_PERF_LOG"
+send_app 'dispatch ctrl+cmd+left'
+wait_for_text "$run_log" 'Dispatch state: Succeeded' 2
+GNOME_LIVE_DISPATCH_OFFSET=$(stat -c '%s' "$GNOME_LIVE_PERF_LOG")
+if gnome_live_placement_result "$run_log" 'cached success'; then exit 41; fi
+[[ "$FAILURES" -eq 1 ]]
+GNOME_LIVE_EXPECTED_ACTION='{"type":"move-to-zone","zone":"bottom-half"}'
+GNOME_LIVE_DISPATCH_OFFSET=$(stat -c '%s' "$GNOME_LIVE_PERF_LOG")
+send_app 'dispatch ctrl+cmd+left'
+if gnome_live_placement_result "$run_log" 'wrong action'; then exit 42; fi
+[[ "$FAILURES" -eq 2 ]]
+GNOME_LIVE_EXPECTED_ACTION='{"type":"move-to-zone","zone":"left-half"}'
+GNOME_LIVE_DISPATCH_OFFSET=$(stat -c '%s' "$GNOME_LIVE_PERF_LOG")
+send_app 'dispatch ctrl+cmd+left'
+gnome_live_placement_result "$run_log" 'fresh matching action'
+stop_app_cleanly 'receiver proof fixture exits' "$run_log"
+[[ "$FAILURES" -eq 2 ]]
+"#,
+        )
+        .env("PROJECT_ROOT", env!("CARGO_MANIFEST_DIR"))
+        .env("TMP_DIR", &directory.0)
+        .env("BIN_PATH", env!("CARGO_BIN_EXE_window_zones"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = output(shell, None);
+    assert!(
+        result.status.success(),
+        "{}\n{}\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

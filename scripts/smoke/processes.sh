@@ -67,6 +67,7 @@ install_smoke_traps() {
 
 start_fifo_app() {
     local mode=$1 backend=$2 log_file=$3
+    shift 3
     local fifo="$TMP_DIR/${CURRENT_GATE}-${mode}.fifo"
     rm -f "$fifo"
     mkfifo "$fifo"
@@ -76,7 +77,7 @@ start_fifo_app() {
         GDK_BACKEND="${GDK_BACKEND:-}" \
         HOME="${HOME:-$TMP_DIR/home}" XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$TMP_DIR/config}" \
         XDG_DATA_HOME="${XDG_DATA_HOME:-$TMP_DIR/data}" \
-        "$BIN_PATH" --backend "$backend" --config "$CONFIG_PATH" "$mode" <"$fifo" >"$log_file" 2>&1 &
+        "$BIN_PATH" --backend "$backend" --config "$CONFIG_PATH" "$@" "$mode" <"$fifo" >"$log_file" 2>&1 &
     APP_PID=$!
     owned_process register "$APP_PID"
     exec {APP_FD}>"$fifo"
