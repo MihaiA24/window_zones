@@ -12,7 +12,7 @@ import sys
 import uuid
 
 from .runtime import CHECK_EPOCH, VALID, ZONES, digest, fail, load, save
-from .journeys import ANSI, session, smoke, tui_dispatch_action
+from .journeys import ANSI, session, smoke, smoke_summary, tui_dispatch_action
 
 
 def differences(expected, actual, path="$"):
@@ -93,7 +93,6 @@ def check_behaviors(workspace, prefix):
                 check_seed(workspace, seed, zone)
                 code, text = workspace.run(workspace.app_args(options, ["dispatch", hotkey]), f"{prefix}/{variant}-{name}")
                 result[variant][name] = dispatch_observation(code, text, workspace.config)
-    check_seed(workspace, "valid")
     return result
 
 
@@ -134,7 +133,7 @@ def check_e2e(workspace, prefix):
         if name in ("x11-left-half", "x11-center-third", "x11-left-two-thirds", "x11-next-display",
                     "x11-previous-display", "X11 real hotkey moves window"):
             geometry[name] = list(map(int, match.groups()[1:]))
-    summary = re.search(r"Smoke assertions: \d+; failures: (\d+)", assertions)
+    summary = smoke_summary(assertions, "x11")
     after_error = native_run.partition("Config reload error:")[2]
     retained = re.search(r"binding count: (\d+)", after_error)
     action = re.findall(r"last action: (alt\+ctrl\+\w+)", native_run)
@@ -153,7 +152,7 @@ def check_e2e(workspace, prefix):
     before_cancel = workspace.config.read_bytes()
     session(workspace, argparse.Namespace(mode="tui", backend_flag="backend", discovery=False, journey="lifecycle",
                                command=["status"], expect=["Config:"], quit="eof"))
-    return {"failures": int(summary.group(1)) if summary else None, "geometry": geometry, "captured_png": captures,
+    return {"failures": summary["failed"], "geometry": geometry, "captured_png": captures,
             "native_backend": "x11" if "Window backend: x11" in native_run else None,
             "hotkey_action": action[-1] if action else None, "retained_binding_count": int(retained.group(1)) if retained else None,
             "config_recovered": "Config state: Loaded" in after_error,
@@ -163,9 +162,10 @@ def check_e2e(workspace, prefix):
 
 
 def measurement_summary(samples):
+    minimum, maximum = min(samples), max(samples)
     return {"runs": len(samples), "median_ms": statistics.median(samples) / 1_000_000,
-            "min_ms": min(samples) / 1_000_000, "max_ms": max(samples) / 1_000_000,
-            "spread_ms": (max(samples) - min(samples)) / 1_000_000}
+            "min_ms": minimum / 1_000_000, "max_ms": maximum / 1_000_000,
+            "spread_ms": (maximum - minimum) / 1_000_000}
 
 
 def check_performance(workspace, options, prefix, golden):
@@ -227,8 +227,9 @@ def check_performance(workspace, options, prefix, golden):
     if candidate_median > maximum:
         delta.append({"path": "$.candidate.median_ms", "expected": {"maximum": maximum / 1_000_000},
                       "actual": candidate_median / 1_000_000})
-    if digest(baseline_binary) != baseline_hash:
-        delta.append({"path": "$.baseline.binary_sha256", "expected": baseline_hash, "actual": digest(baseline_binary)})
+    actual_hash = digest(baseline_binary)
+    if actual_hash != baseline_hash:
+        delta.append({"path": "$.baseline.binary_sha256", "expected": baseline_hash, "actual": actual_hash})
     return {"dispatch": golden["dispatch"], "runs_per_side": options.runs,
             "max_regression_percent": options.max_regression_percent}, {
                 "baseline_ref": options.baseline_ref, "baseline_commit": commit, "baseline_binary_sha256": baseline_hash,
@@ -285,8 +286,9 @@ def check_command(workspace, options):
                     delta.append({"path": "$.confirmed_fixed_work", "expected": True,
                                   "actual": observed["work_confirmed"] and observed["fixed_input_unchanged"]})
             report.update(expected=expected, actual=observed, difference=delta)
-            if workspace.build_status() != "current":
-                report["difference"].append({"path": "$.build", "expected": "current", "actual": workspace.build_status()})
+            status = workspace.build_status()
+            if status != "current":
+                report["difference"].append({"path": "$.build", "expected": "current", "actual": status})
             report["status"] = "fail" if report["difference"] else "pass"
             workspace.event("check-result", scenario=options.scenario, status=report["status"], report=str(folder / "report.json"))
     except (Exception, KeyboardInterrupt) as error:

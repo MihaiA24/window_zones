@@ -39,9 +39,11 @@ def parser(workspace):
                                     epilog="Default lifecycle: status, TUI refresh, dispatch, reload, restart, quit. "
                                     "--journey reload edits valid/invalid/empty/missing configs and verifies retention/recovery; "
                                     "--journey watcher performs those edits without explicit reload. "
+                                    "--journey starter verifies all 18 starter bindings and window history in run mode; "
+                                    "--journey read-error verifies directory-read errors, identical recovery and missing-file recovery. "
                                     "Custom: --command 'dispatch Alt+Ctrl+Left' --expect 'Last action: alt+ctrl+left'.")
     interactive.add_argument("--mode", choices=("run", "tui"), default="tui")
-    interactive.add_argument("--journey", choices=("lifecycle", "reload", "watcher"), default="lifecycle")
+    interactive.add_argument("--journey", choices=("lifecycle", "reload", "watcher", "starter", "read-error"), default="lifecycle")
     interactive.add_argument("--command", action="append", default=[], help="Literal user line; pair each with --expect. Overrides the built-in journey.")
     interactive.add_argument("--expect", action="append", default=[],
                              help="Literal result for the paired command. TUI dispatch also requires completed success; "
@@ -60,7 +62,7 @@ def parser(workspace):
         child.add_argument("--discovery", action="store_true", help="Exercise XDG config discovery instead of explicit --config.")
     checks = commands.add_parser("check", help="Fixed-input behavioral and native end-to-end checks; JSON differences and retained proof.")
     scenarios = checks.add_subparsers(dest="scenario", required=True)
-    for name, help_text in (("behaviors", "Compare all built-in/custom zones, display moves and error states through both CLI flag/config variants."),
+    for name, help_text in (("behaviors", "Compare eight built-in zones, a custom zone, next/previous display moves and error states through both CLI flag/config variants."),
                             ("sessions", "Run the fixed CLI/TUI reload, watcher and cancel matrix with all flag/config and quit variants."),
                             ("e2e", "Reuse the native X11 smoke gate; compare observed geometry, real hotkey, reload, persistence and cancel."),
                             ("performance", "Alternate baseline/candidate startup+dispatch samples; compare confirmed work and a median regression budget.")):
@@ -94,7 +96,7 @@ def main():
         if options.action == "cleanup" and options.dry_run:
             workspace.cleanup(True)
             return 0
-        if getattr(options, "dry_run", False) and options.action != "cleanup":
+        if getattr(options, "dry_run", False):
             workspace.state(False)
             print(json.dumps({"plan": vars(options), "checkout": str(workspace.root), "profile": workspace.profile,
                               "scratch": str(workspace.scratch), "display": f":{workspace.display}", "tcp_ports": [],
@@ -127,8 +129,9 @@ def main():
                     elif options.driver == "smoke":
                         smoke(workspace, options)
                     elif options.driver == "tests":
+                        # Test/dev feature unification must not replace the pinned app.
                         rc, _ = workspace.run([str(workspace.root / "scripts/test.sh")], "tests-" + str(time.time_ns()), timeout=600,
-                                    environment=dict(os.environ, WINDOW_ZONES_VERIFY_CHECKOUT=str(workspace.root), CARGO_TARGET_DIR=str(workspace.root / "target")))
+                                    environment=dict(os.environ, WINDOW_ZONES_VERIFY_CHECKOUT=str(workspace.root), CARGO_TARGET_DIR=str(workspace.root / "target" / "verification-tests")))
                         if rc:
                             fail("Repository tests failed. Inspect the test logs and fix the reported failure.")
                     if workspace.build_status() != "current":

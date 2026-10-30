@@ -1,14 +1,14 @@
 # Windows Smoke Runbook
 
 > **Windows is currently a DEFERRED, non-blocking V1 release gate.** The GitHub
-> Actions Windows job proves the Windows code compiles and unit-tests. Run this
-> procedure later on a real Windows desktop before changing the matrix to a
-> blocking pass or fail.
+> Actions Windows job checks compilation and unit tests, not desktop behavior.
+> Run this procedure on a real Windows desktop before making it a blocking gate.
 
 This procedure uses the real `window_zones.exe`, real Win32 windows, the real
 monitor work areas, and real keyboard input. Do not use Wine or a cross-compile
-as evidence. Keep screenshots outside the repository; screenshots are
-out-of-band evidence and are not committed.
+as evidence. Keep transcripts and screenshots as temporary artifacts outside
+the repository; do not commit them. Observed results and limitations belong
+only in the completed report in the PR description.
 
 ## Prerequisites
 
@@ -68,19 +68,11 @@ action = { type = "move-to-previous-display" }
 [System.IO.File]::WriteAllText($config, $configText, [System.Text.UTF8Encoding]::new($false))
 ```
 
-The exact CLI forms used below are:
+For a one-shot action, use `& $bin --backend windows --config $config dispatch "Ctrl+Alt+Left"`. The interactive and tray commands appear in their checks below.
 
-```powershell
-& $bin --backend auto --config $config status
-& $bin --backend windows --config $config dispatch "Ctrl+Alt+Left"
-& $bin --backend windows --config $config run
-& $bin --backend windows --config $config tui
-& $bin --backend windows --config $config --tray run
-```
-
-`dispatch` is useful for a one-shot action, but geometry evidence must be
-collected while the target window is actually focused. The interactive `run`
-session plus a physical key press is the primary zone/display and hotkey check.
+Geometry evidence must be collected while the target window is actually focused.
+The interactive `run` session plus a physical key press is the primary
+zone/display and hotkey check.
 
 ## Geometry observer
 
@@ -106,16 +98,29 @@ public static class WindowZonesProbe
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(
+        IntPtr hWnd, int attribute, out RECT rect, int size);
+
     [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hWnd);
 }
 '@
+# Keep this observer in physical pixels even if PowerShell set process awareness earlier.
+$previousDpiContext = [WindowZonesProbe]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
 Add-Type -AssemblyName System.Windows.Forms
 
-function Get-WzWindowRect([IntPtr] $Handle) {
+function Get-WzWindowRect([IntPtr] $Handle, [switch] $Outer) {
     $rect = New-Object 'WindowZonesProbe+RECT'
-    if (-not [WindowZonesProbe]::GetWindowRect($Handle, [ref] $rect)) {
-        throw "GetWindowRect failed for $Handle"
+    if ($Outer) {
+        if (-not [WindowZonesProbe]::GetWindowRect($Handle, [ref] $rect)) {
+            throw "GetWindowRect failed for $Handle"
+        }
+    } elseif ([WindowZonesProbe]::DwmGetWindowAttribute($Handle, 9, [ref] $rect, 16) -ne 0) {
+        throw "DwmGetWindowAttribute(EXTENDED_FRAME_BOUNDS) failed for $Handle"
     }
     [pscustomobject]@{
         X = $rect.Left
@@ -168,10 +173,15 @@ Get-WzWindowWorkArea $target.MainWindowHandle
 Get-WzWindowRect $target.MainWindowHandle
 ```
 
-`WorkingArea` is the Win32 work area used by the Windows adapter, excluding
-reserved taskbar/dock space. `GetWindowRect` reports the full window frame, the
-same rectangle that the adapter reads and moves. Record all `DeviceName`, `X`,
-`Y`, `Width`, and `Height` values exactly, including negative coordinates.
+`WorkingArea` is the Win32 usable area, excluding reserved taskbar/dock space.
+`Get-WzWindowRect` uses DWM extended frame bounds: the **visible** window frame
+in physical desktop pixels. `Get-WzWindowRect $target.MainWindowHandle -Outer`
+uses `GetWindowRect`, which can also include invisible resize borders. The App
+requests per-monitor-v2 process DPI awareness at adapter construction; an
+already-set awareness context is retained. It compensates the invisible borders
+before `SetWindowPos` so the visible frame, not the larger outer rectangle, lands
+on the zone, including across monitors with different scale factors. Record all
+`DeviceName`, `X`, `Y`, `Width`, and `Height` values, including negative coordinates.
 
 For a work area `(x, y, w, h)`, the exact expected built-in zone rectangles
 are:
@@ -215,12 +225,11 @@ successful geometry check, outside the repository.
    & $bin --backend windows --config $config run
    ```
 
-   Wait for `Interactive session started`; a successful initial registration has
-   no success log line, so record the absence of a `Hotkey registration
-   initially failed` diagnostic. In the observer window, focus Notepad and
-   capture its current monitor work area and frame rectangle. While Notepad is
-   focused, press the real `Ctrl+Alt+Left` keys. After each zone key press, run
-   these observer commands:
+   Wait for `Interactive session started` and `Hotkeys registered: 4`; record
+   both lines and any registration diagnostic. In the observer window, focus
+   Notepad and capture its monitor usable area and visible frame rectangle.
+   While Notepad is focused, press the real `Ctrl+Alt+Left` keys. After each
+   zone key press, run these observer commands:
 
    ```powershell
    Get-WzWindowWorkArea $target.MainWindowHandle
@@ -233,6 +242,21 @@ successful geometry check, outside the repository.
    expected, and observed rectangles and retain an external screenshot for each
    zone.
 
+   **Restore before move:** maximize Notepad with its title-bar button, confirm
+   `[WindowZonesProbe]::IsZoomed($target.MainWindowHandle)` is `True`, then press
+   `Ctrl+Alt+Left`. `IsZoomed` must become `False` and the visible frame must
+   equal the left-half zone. Repeat after Windows Snap has tiled Notepad.
+   The adapter also restores a minimized HWND captured before minimization.
+   A fresh action does not select an already-minimized window; this manual
+   checklist does not evidence the query/minimize race.
+
+   **Fullscreen boundary:** with a borderless fullscreen window covering its
+   full monitor, dispatch must report `leave fullscreen first` without moving
+   it. Detection is a cheap heuristic (no caption/resize frame, covers monitor,
+   not maximized/minimized), not a universal fullscreen API: decorated
+   fullscreen modes may not be detected and ordinary monitor-sized borderless
+   windows may be refused. Leave fullscreen explicitly before positioning.
+
 4. **Move to another display with two monitors.** Arrange two monitors in
    Windows Display Settings and record the exact work-area layout from
    `Get-WzWorkAreas`, including each device name and any negative global
@@ -242,25 +266,41 @@ successful geometry check, outside the repository.
    rectangle; identify the target display from the new `Screen.FromHandle`
    work area and compare exact integers. Press `Ctrl+Alt+Up` to return and
    record the source/target displays and both expected/observed rectangles.
-   In the observer PowerShell, run the same two commands again to record the
-   target display and the observed frame:
-
-   ```powershell
-   Get-WzWindowWorkArea $target.MainWindowHandle
-   Get-WzWindowRect $target.MainWindowHandle
-   ```
+   Repeat the observer commands from check 3 to record the target display and frame.
 
    This proves display movement against two real monitor work areas, rather
    than relying on the companion's self-reported geometry.
 
-5. **Global hotkey registration and a real key press.** In the `run` output,
-   record the absence of an initial registration failure. With Notepad focused,
-   press each configured combination physically (at minimum `Ctrl+Alt+Left` and
-   `Ctrl+Alt+Down`), not by typing the `dispatch` command. Each press must
-   produce the configured move and the session must remain alive. Record the
-   exact key sequence, the resulting `Dispatch state: Succeeded` output, and
-   the observed rectangle. Return to the application console and type `status`
-   to record the runtime status, including `hotkey state: Registered`.
+   Repeat with different monitor scale factors (for example 100% and 150%),
+   recording the scaling settings, visible frame, and optional `-Outer` frame
+   on both monitors. Exact visible-frame equality is the DPI check; invisible
+   border sizes need not remain the same on the second monitor.
+
+5. **Exclusive global hotkeys and a real key press.** Record
+   `Hotkeys registered: 4`. With Notepad focused, press each configured
+   combination physically (at minimum `Ctrl+Alt+Left` and `Ctrl+Alt+Down`), not
+   with `dispatch`. Each press must produce the move without Notepad receiving
+   that combination's key press or matching release. Put text and a caret in
+   Notepad first and verify the consumed arrow does not move its caret; use an
+   application with an observable matching shortcut if needed. Hold the key
+   for repeats, release the modifiers before the arrow, and confirm there is
+   only one dispatch per physical press and no leaked arrow release. Unbound
+   combinations and ordinary typing must still reach the application.
+
+   Record the exact key sequence, `Dispatch state: Succeeded`, the observed
+   frame, and the receiving application's behavior. Type `status` in the App
+   console to record `hotkey state: Registered`. The adapter owns a Win32
+   low-level hook, not `RegisterHotKey`, and waits for native readiness. It
+   consumes configured combinations but cannot arbitrate other programs'
+   hook ordering; record any collision as a failed smoke check.
+   On a Polish or German layout, verify AltGr+E/C still types the expected
+   characters and does not move the window. Left-Ctrl/right-Alt is reserved
+   for AltGr; use left-Alt for Ctrl+Alt bindings. After Ctrl+Alt+Del and Cancel,
+   plain Left/C/Backspace must remain ordinary editing keys.
+   Exercise actual hook timeout/removal, then `restart`, and require one working
+   listener with no duplicate dispatches. A native unhook regression is not
+   proof of an OS-induced timeout. Also load `--dry-run status` on pre-1903
+   Windows 10: optional `IsWindowArranged` lookup must not prevent startup.
 
 6. **Config reload atomicity with an invalid config.** Leave `run` active. In
    the observer PowerShell, replace the file with invalid TOML and wait at least
@@ -310,6 +350,11 @@ successful geometry check, outside the repository.
    transcript. The `dispatch` line checks the TUI command path; geometry proof
    comes from the focused-window hotkey checks above.
 
+   After `restart`, physically press one binding and verify exactly one
+   dispatch. The low-level listener is reused, not spawned again. After `quit`,
+   the formerly registered combination must again reach the foreground app;
+   verify no stale grab remains. Repeat the physical check with two restarts.
+
 8. **Tray behavior.** Start the tray surface:
 
    ```powershell
@@ -327,11 +372,12 @@ When a check fails, preserve the command output, the exact monitor layout,
 the observed/expected rectangles, and an external screenshot. Do not change
 product code as part of this run; report the defect instead.
 
-## Results to paste into `docs/runbooks/testing.md`
+## Report for the PR description
 
-Replace the placeholders after the manual run. Keep `deferred - unverified`
-until all required evidence is captured; use `blocking - pass` or
-`blocking - fail` only after the run is complete.
+Replace the placeholders after the manual run and paste the completed report
+only into the PR description, never into repository documentation or other
+files. Keep `deferred - unverified` until all required evidence is captured;
+use `blocking - pass` or `blocking - fail` only after the run is complete.
 
 ```markdown
 | Gate | Status | Environment | Verified configuration | Date | How to reproduce |

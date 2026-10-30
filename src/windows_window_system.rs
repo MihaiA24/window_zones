@@ -1,32 +1,171 @@
 #[cfg(target_os = "windows")]
-use crate::{DisplayGeometry, FocusedWindow, Rect, WindowMove, WindowSystem, WindowSystemError};
+use crate::{DisplayGeometry, FocusedWindow, WindowId, WindowMove, WindowSystem};
+use crate::{Rect, WindowSystemError};
 
 #[cfg(target_os = "windows")]
-use std::convert::TryFrom;
-
+use windows::Win32::Foundation::{BOOL, E_ACCESSDENIED, HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MONITORINFOEXW, MonitorFromWindow,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowRect, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow, IsZoomed,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
+    WS_CAPTION, WS_THICKFRAME,
+};
+#[cfg(target_os = "windows")]
+use windows::core::{s, w};
 
 #[cfg(target_os = "windows")]
-#[derive(Debug, Default)]
-pub struct WindowsWindowSystem;
+fn window_is_arranged(hwnd: HWND) -> Option<bool> {
+    type IsArranged = unsafe extern "system" fn(HWND) -> BOOL;
+    static IS_ARRANGED: std::sync::LazyLock<Option<IsArranged>> = std::sync::LazyLock::new(|| {
+        // IsWindowArranged only exists from Windows 10 1903. A static import
+        // would prevent older Windows 10 from loading even dry-run commands.
+        let module = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok()?;
+        let address = unsafe { GetProcAddress(module, s!("IsWindowArranged")) }?;
+        Some(unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, IsArranged>(address)
+        })
+    });
+    IS_ARRANGED.map(|query| unsafe { query(hwnd) }.as_bool())
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct WindowsWindowSystem {
+    dpi_error: Option<String>,
+}
 
 #[cfg(target_os = "windows")]
 impl WindowsWindowSystem {
     pub fn new() -> Self {
-        Self
+        let dpi_error =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+                .err()
+                // Windows returns access denied when a manifest or earlier call set awareness.
+                .filter(|error| error.code() != E_ACCESSDENIED)
+                .map(|error| format!("failed to enable per-monitor-v2 DPI awareness: {error}"));
+        Self { dpi_error }
     }
 
-    fn collect_displays() -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+    fn dpi_status(&self) -> Result<(), WindowSystemError> {
+        match &self.dpi_error {
+            Some(error) => Err(WindowSystemError::Platform(error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn window_error(hwnd: HWND, id: &WindowId, message: String) -> WindowSystemError {
+        if unsafe { IsWindow(hwnd) }.as_bool() {
+            WindowSystemError::Platform(message)
+        } else {
+            WindowSystemError::WindowGone(id.clone())
+        }
+    }
+
+    fn frame_rect(hwnd: HWND, id: &WindowId, visible: bool) -> Result<Rect, WindowSystemError> {
+        let mut rect = RECT::default();
+        let result = unsafe {
+            if visible {
+                DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_EXTENDED_FRAME_BOUNDS,
+                    (&mut rect as *mut RECT).cast(),
+                    std::mem::size_of::<RECT>() as u32,
+                )
+            } else {
+                GetWindowRect(hwnd, &mut rect)
+            }
+        };
+        result.map_err(|error| {
+            Self::window_error(
+                hwnd,
+                id,
+                format!(
+                    "failed to query {} window frame: {error}",
+                    if visible { "visible" } else { "outer" }
+                ),
+            )
+        })?;
+        let width = u32::try_from(i64::from(rect.right) - i64::from(rect.left))
+            .map_err(|_| WindowSystemError::Platform("window width out of range".to_string()))?;
+        let height = u32::try_from(i64::from(rect.bottom) - i64::from(rect.top))
+            .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
+        Ok(Rect::new(rect.left, rect.top, width, height))
+    }
+
+    fn fullscreen_like(hwnd: HWND, frame: Rect) -> bool {
+        let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+        if style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0 {
+            return false;
+        }
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return false;
+        }
+        frame.x <= info.rcMonitor.left
+            && frame.y <= info.rcMonitor.top
+            && i64::from(frame.x) + i64::from(frame.width) >= i64::from(info.rcMonitor.right)
+            && i64::from(frame.y) + i64::from(frame.height) >= i64::from(info.rcMonitor.bottom)
+    }
+
+    fn set_frame(hwnd: HWND, id: &WindowId, target: Rect) -> Result<(), WindowSystemError> {
+        let width = i32::try_from(target.width)
+            .map_err(|_| WindowSystemError::Platform("window width out of range".to_string()))?;
+        let height = i32::try_from(target.height)
+            .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                HWND::default(),
+                target.x,
+                target.y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            )
+        }
+        .map_err(|error| Self::window_error(hwnd, id, format!("SetWindowPos failed: {error}")))
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Default for WindowsWindowSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowSystem for WindowsWindowSystem {
+    fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
+        self.dpi_status()?;
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            return Ok(None);
+        }
+        let id = WindowId::new((hwnd.0 as usize).to_string());
+        let geometry = Self::frame_rect(hwnd, &id, true)?;
+        Ok(Some(FocusedWindow::new(id, geometry)))
+    }
+
+    fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
+        self.dpi_status()?;
         let mut displays = Vec::<DisplayGeometry>::new();
 
         let result = unsafe {
@@ -47,102 +186,70 @@ impl WindowsWindowSystem {
         Ok(displays)
     }
 
-    fn display_id_for_monitor(handle: HMONITOR) -> Result<String, WindowSystemError> {
-        let mut info = MONITORINFOEXW {
-            monitorInfo: MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        unsafe {
-            GetMonitorInfoW(handle, &mut info.monitorInfo)
-                .ok()
-                .map_err(|error| WindowSystemError::Platform(error.to_string()))?;
+    fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
+        self.dpi_status()?;
+        let id = &window_move.window;
+        let value = id.as_str().parse::<usize>().map_err(|_| {
+            WindowSystemError::Platform("invalid Windows window identity".to_string())
+        })?;
+        let hwnd = HWND(value as *mut std::ffi::c_void);
+        if !unsafe { IsWindow(hwnd) }.as_bool() {
+            return Err(WindowSystemError::WindowGone(id.clone()));
         }
 
-        let len = info
-            .szDevice
-            .iter()
-            .position(|character| *character == 0)
-            .unwrap_or(info.szDevice.len());
-        if len == 0 {
+        let before = Self::frame_rect(hwnd, id, true)?;
+        let maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+        let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+        if !maximized && !minimized && Self::fullscreen_like(hwnd, before) {
             return Err(WindowSystemError::Platform(
-                "monitor device name missing".to_string(),
+                "fullscreen-like window cannot be moved; leave fullscreen first".to_string(),
             ));
         }
-
-        Ok(String::from_utf16_lossy(&info.szDevice[..len]))
-    }
-
-    fn display_for_window(handle: HWND) -> Result<String, WindowSystemError> {
-        let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
-        if monitor.is_invalid() {
+        if unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_THICKFRAME.0 == 0 {
             return Err(WindowSystemError::Platform(
-                "failed to identify monitor for focused window".to_string(),
+                "cannot move a non-resizable Windows window".to_string(),
             ));
         }
+        let result = (|| {
+            // Older Windows cannot report the snapped state. Restoring a
+            // normal window is harmless, and keeps snapped placement working.
+            if maximized || minimized || window_is_arranged(hwnd).unwrap_or(true) {
+                // SW_RESTORE activates a captured window even if focus changed
+                // since dispatch. This restores it without stealing focus.
+                let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+            }
 
-        Self::display_id_for_monitor(monitor)
-    }
-}
+            let outer = Self::frame_rect(hwnd, id, false)?;
+            let visible = Self::frame_rect(hwnd, id, true)?;
+            let target = compensate_invisible_borders(window_move.target, outer, visible)?;
+            Self::set_frame(hwnd, id, target)?;
 
-#[cfg(target_os = "windows")]
-impl WindowSystem for WindowsWindowSystem {
-    fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-        let hwnd = unsafe { GetForegroundWindow() };
-        if hwnd.0.is_null() {
-            return Ok(None);
-        }
-
-        let mut rect = RECT::default();
-        unsafe {
-            GetWindowRect(hwnd, &mut rect).map_err(|error| {
-                WindowSystemError::Platform(format!("GetWindowRect failed: {error}"))
-            })?;
-        }
-
-        let width = u32::try_from(rect.right - rect.left)
-            .map_err(|_| WindowSystemError::Platform("window width out of range".to_string()))?;
-        let height = u32::try_from(rect.bottom - rect.top)
-            .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
-
-        let geometry = Rect::new(rect.left, rect.top, width, height);
-        let display_id = Self::display_for_window(hwnd)?;
-
-        Ok(Some(FocusedWindow::new(display_id, geometry)))
-    }
-
-    fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-        Self::collect_displays()
-    }
-
-    fn move_focused_window(&mut self, window_move: WindowMove) -> Result<(), WindowSystemError> {
-        let hwnd = unsafe { GetForegroundWindow() };
-        if hwnd.0.is_null() {
-            return Err(WindowSystemError::Platform("no focused window".to_string()));
-        }
-
-        let width = i32::try_from(window_move.target.width)
-            .map_err(|_| WindowSystemError::Platform("window width out of range".to_string()))?;
-        let height = i32::try_from(window_move.target.height)
-            .map_err(|_| WindowSystemError::Platform("window height out of range".to_string()))?;
-
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                HWND::default(),
-                window_move.target.x,
-                window_move.target.y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-            )
-            .map_err(|_| WindowSystemError::Platform("SetWindowPos failed".to_string()))?;
-        }
-
-        Ok(())
+            // Crossing DPI boundaries can change invisible borders during SetWindowPos.
+            let mut visible = Self::frame_rect(hwnd, id, true)?;
+            if visible != window_move.target {
+                let outer = Self::frame_rect(hwnd, id, false)?;
+                let target = compensate_invisible_borders(window_move.target, outer, visible)?;
+                Self::set_frame(hwnd, id, target)?;
+                visible = Self::frame_rect(hwnd, id, true)?;
+            }
+            verify_placement(window_move.target, visible)
+        })();
+        result.map_err(|error| {
+            if matches!(
+                error,
+                WindowSystemError::WindowGone(_) | WindowSystemError::PartialMove { .. }
+            ) {
+                return error;
+            }
+            match Self::frame_rect(hwnd, id, true) {
+                Ok(observed) if observed != before => WindowSystemError::PartialMove {
+                    observed,
+                    message: error.to_string(),
+                },
+                Err(gone @ WindowSystemError::WindowGone(_)) => gone,
+                _ => error,
+            }
+        })
     }
 }
 
@@ -185,4 +292,86 @@ extern "system" fn monitor_enum_callback(
     }
 
     windows::Win32::Foundation::BOOL(1)
+}
+
+/// Translate a visible-frame target into a Win32 outer-frame target.
+fn compensate_invisible_borders(
+    target: Rect,
+    outer: Rect,
+    visible: Rect,
+) -> Result<Rect, WindowSystemError> {
+    let x = i64::from(target.x) + i64::from(outer.x) - i64::from(visible.x);
+    let y = i64::from(target.y) + i64::from(outer.y) - i64::from(visible.y);
+    let width = i64::from(target.width) + i64::from(outer.width) - i64::from(visible.width);
+    let height = i64::from(target.height) + i64::from(outer.height) - i64::from(visible.height);
+    let error =
+        || WindowSystemError::Platform("border-compensated window frame out of range".to_string());
+    Ok(Rect::new(
+        i32::try_from(x).map_err(|_| error())?,
+        i32::try_from(y).map_err(|_| error())?,
+        u32::try_from(width).map_err(|_| error())?,
+        u32::try_from(height).map_err(|_| error())?,
+    ))
+}
+
+fn verify_placement(target: Rect, observed: Rect) -> Result<(), WindowSystemError> {
+    if observed != target {
+        return Err(WindowSystemError::PartialMove {
+            observed,
+            message: format!(
+                "window constrained placement: requested {target:?}, observed {observed:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constrained_placement_reports_observed_frame_instead_of_success() {
+        let target = Rect::new(-1920, 0, 480, 1080);
+        let observed = Rect::new(-1920, 0, 640, 1080);
+        assert!(matches!(
+            verify_placement(target, observed),
+            Err(WindowSystemError::PartialMove { observed: frame, .. }) if frame == observed
+        ));
+        assert_eq!(verify_placement(target, target), Ok(()));
+    }
+
+    #[test]
+    fn compensates_asymmetric_invisible_borders_on_negative_monitor() {
+        let outer = Rect::new(93, 100, 816, 607);
+        let visible = Rect::new(100, 100, 800, 600);
+        assert_eq!(
+            compensate_invisible_borders(Rect::new(-1920, -200, 960, 1080), outer, visible)
+                .unwrap(),
+            Rect::new(-1927, -200, 976, 1087),
+        );
+    }
+
+    #[test]
+    fn borderless_frame_needs_no_compensation() {
+        let frame = Rect::new(20, 30, 500, 400);
+        let target = Rect::new(100, 200, 900, 700);
+        assert_eq!(
+            compensate_invisible_borders(target, frame, frame).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn rejects_border_compensation_overflow_instead_of_wrapping() {
+        let outer = Rect::new(-8, 0, 116, 100);
+        let visible = Rect::new(0, 0, 100, 100);
+        assert!(
+            compensate_invisible_borders(Rect::new(i32::MIN, 0, 100, 100), outer, visible).is_err()
+        );
+        assert!(
+            compensate_invisible_borders(Rect::new(0, 0, u32::MAX, 100), outer, visible).is_err()
+        );
+        assert!(compensate_invisible_borders(Rect::new(0, 0, 1, 1), visible, outer).is_err());
+    }
 }

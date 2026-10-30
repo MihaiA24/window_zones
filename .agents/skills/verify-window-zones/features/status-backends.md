@@ -8,6 +8,7 @@ Users inspect the resolved backend, loaded configuration, bindings and recent ru
 - `status-runtime`: interactive status and TUI refresh show the running instance rather than a fresh process.
 - `status-routing`: auto/explicit X11 or Wayland routing identifies the real backend; missing companions remain visible without X11 fallback.
 - `status-dry-run`: `--backend dry-run` and `--dry-run` provide a safe core-only status path.
+- `status-options`: missing option values fail before backend startup; an option token cannot become a config/log pathname.
 
 ## How to get to it (user POV)
 
@@ -24,10 +25,12 @@ Preconditions:
 
 - **CLI success.** `"$V" drive cli --expect 'config state: Loaded' --expect 'binding count: 5' -- status` reports the private config and five bindings.
 - **Flag/discovery variants.** Repeat with `"$V" drive cli --backend-flag alias --discovery --expect 'config state: Loaded' -- status`; also exercise alias/explicit-path and backend/discovery combinations when affected.
-- **Runtime views.** `"$V" drive session --mode run --command status --expect 'binding count: 5'` and `"$V" drive session --mode tui --command refresh --expect 'Window Zones TUI'` capture the typed command and returned view. For dispatch state, send dispatch and status in the same session.
+- **Runtime views.** `"$V" drive session --mode run --command status --expect 'binding count: 5'`; for TUI use `--mode tui --command refresh --expect 'Window backend: dry-run' --command status --expect 'Last error: none'`. Each assertion waits for a completed post-action prompt. Native capability degradation/recovery is a separate journey below; a TUI banner alone does not establish it.
+- **Missing values.** `"$V" drive cli --expect-exit 1 --expect '--log-file requires a value' -- --log-file --dry-run status`; repeat with `--expect '--perf-log requires a value' -- --perf-log --dry-run status`. Both reach the App parser before startup. `drive cli` rejects `run`/`tui` arguments itself, so they cannot demonstrate this parser error. No file named `--dry-run` may be created; use `./--dry-run` when intentionally selecting that literal filename.
 - **Empty/error.** Run `"$V" drive config missing`, then `"$V" drive cli --expect 'config state: Missing' --expect 'binding count: 0' -- status`. Repeat with `drive config invalid` and expect `config state: Error`; empty TOML must be `Loaded` with count 0, not Missing. Restore `drive config valid`.
 - **Real routing.** `"$V" drive smoke x11` asserts auto resolves X11; `"$V" drive smoke gnome` / `"$V" drive smoke kde-live` cover their own native capabilities/status. Retain the backend/capability logs, not just the gate summary.
-- **Persistence/cancel.** Re-run one-shot status after a config mutation and after session quit. Config survives; runtime last action starts at `<none>`. Status is read-only, with no edit/cancel dialog; session quit is its cancellation boundary.
+- **Live capability refresh.** In an owned GNOME session, inspect capabilities, disable the owned companion, then request TUI `refresh`: require unavailable labels without first dispatching. Re-enable it and require fresh capabilities; the prior successful cache is not proof of current health.
+- **Persistence/cancel.** Re-run one-shot status after a config mutation and after session quit. Config survives; runtime last action starts at `<none>`. Status does not edit config or move windows, but explicit `--log-file` can create/append logs. There is no status edit/cancel dialog; session quit is its cancellation boundary.
 
 ## Gotchas
 
@@ -37,3 +40,4 @@ Preconditions:
 - The GNOME companion declares Shell 50/51 compatibility. Synthetic Shell 51 proof covers companion discovery, capabilities, displays and runtime controls, not seated focus or accelerator capture.
 - The no-argument launcher default, tray `Show status`, unavailable-companion routing and platform-specific flags are distinct entry points. Existing synthetic gates do not prove all of them. If affected, record the missing seated/tray/platform precondition and obtain real surface evidence; do not claim a dry-run replacement pass.
 - A backend label is selection, not health: X11 status does not connect to X11, while GNOME/KDE status probes companion capabilities. A TUI banner proves redraw, not correct dashboard state; inspect its post-action fields and diagnostics.
+- Unsupported hosts reject native `auto` selection during backend resolution, not through an unsupported runtime adapter. Preserve the existing diagnostic and parser/help/initialization precedence; dry-run remains a separate supported path.
