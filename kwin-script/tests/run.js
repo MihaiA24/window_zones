@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const createClock = require('./clock.js');
 
 function signal() {
     const handlers = new Set();
@@ -15,8 +16,7 @@ function signal() {
 }
 
 function scriptSession(windows = []) {
-    let now = 0;
-    const timers = [];
+    const clock = createClock(signal);
     const calls = [];
     const pending = [];
     const shortcuts = new Map();
@@ -25,22 +25,8 @@ function scriptSession(windows = []) {
         stackingOrder: windows, windowRemoved: signal(),
         clientArea: () => ({x: 0, y: 40, width: 1200, height: 860}),
     };
-    class QTimer {
-        constructor() {
-            this.timeout = signal();
-            this.active = false;
-            timers.push(this);
-        }
-        start() {
-            this.active = true;
-            this.deadline = now + this.interval;
-        }
-        stop() {
-            this.active = false;
-        }
-    }
     const context = vm.createContext({
-        console, QTimer, Date: {now: () => now},
+        console, QTimer: clock.QTimer, Date: {now: clock.now},
         KWin: {MaximizeArea: 2},
         workspace,
         registerShortcut: (title, _text, _sequence, callback) => {
@@ -63,22 +49,7 @@ function scriptSession(windows = []) {
             assert.notEqual(index, -1, `KWin must call ${method}`);
             return pending.splice(index, 1)[0];
         },
-        advance(milliseconds) {
-            const target = now + milliseconds;
-            for (;;) {
-                const timer = timers.filter(timer => timer.active && timer.deadline <= target)
-                    .sort((left, right) => left.deadline - right.deadline)[0];
-                if (!timer)
-                    break;
-                now = timer.deadline;
-                if (timer.singleShot)
-                    timer.active = false;
-                else
-                    timer.deadline += timer.interval;
-                timer.timeout.emit();
-            }
-            now = target;
-        },
+        advance: clock.advance,
     };
 }
 

@@ -12,9 +12,12 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
+from smoke import owned_process
 
 CHECK_EPOCH = 1704067200
 VALID = '''[[bindings]]
@@ -469,22 +472,7 @@ class Workspace:
                 fail(f"PID {running['pid']} did not stop. Inspect it before retrying cleanup; evidence is retained.")
         for sig in (signal.SIGTERM, signal.SIGKILL):
             for observed in self.runtime_processes():
-                try:
-                    descriptor = os.pidfd_open(observed["pid"])
-                except ProcessLookupError:
-                    continue
-                try:
-                    # Marker/registry ownership was established above. Recheck
-                    # the stable identity after opening, then signal only its pidfd.
-                    current = process_identity(observed["pid"])
-                    if (current and current["state"] != "Z"
-                            and current["start"] == observed["start"]
-                            and (Path("/proc") / str(observed["pid"])).stat().st_uid == os.getuid()):
-                        signal.pidfd_send_signal(descriptor, sig)
-                except (ProcessLookupError, FileNotFoundError):
-                    pass
-                finally:
-                    os.close(descriptor)
+                owned_process.signal_identity(observed["pid"], int(observed["start"]), sig)
             deadline = time.monotonic() + 5
             while self.runtime_processes() and time.monotonic() < deadline:
                 select.select([], [], [], 0.1)

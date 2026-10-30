@@ -25,6 +25,10 @@ The GNOME and KDE adapter contract tests use fake compositor services on private
 `dbus-daemon` instances; KWin controller ownership is also checked through the real
 Rust dispatcher. Neither requires a running compositor session.
 
+The KWin Node harness and Rust-launched captured-frame fixture share
+`kwin-script/tests/clock.js`. Verifier cleanup and native smoke share
+`scripts/smoke/owned_process.py` for PID/start-checked pidfd signalling.
+
 Verifier `drive tests` uses persistent `target/verification-tests` Cargo output.
 It must not overwrite the App binaries pinned by `launch`; test-only dependency
 features can produce different binaries even when the source is unchanged.

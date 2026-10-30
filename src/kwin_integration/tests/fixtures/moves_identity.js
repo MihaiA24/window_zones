@@ -1,7 +1,9 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const vm = require('node:vm');
+const createClock = require(path.resolve(path.dirname(process.argv[1]), '../../tests/clock.js'));
 function signal() {
     const handlers = new Set();
     return {
@@ -34,34 +36,12 @@ const workspace = {
     activeWindow: first, screens: [], stackingOrder: [first, second],
     windowActivated: signal(), windowRemoved: signal(),
 };
-let now = 0;
+const {QTimer, advance} = createClock(signal);
 let completions = 0;
-const timers = [];
-function advance(milliseconds) {
-    const target = now + milliseconds;
-    for (;;) {
-        const timer = timers.filter(timer => timer.active && timer.deadline <= target)
-            .sort((left, right) => left.deadline - right.deadline)[0];
-        if (!timer)
-            break;
-        now = timer.deadline;
-        if (timer.singleShot)
-            timer.active = false;
-        else
-            timer.deadline += timer.interval;
-        timer.timeout.emit();
-    }
-    now = target;
-}
 const context = vm.createContext({
     workspace, console,
     completeMove: error => { assert.equal(error, undefined); completions++; },
-    QTimer: function() {
-        this.timeout = signal();
-        this.start = () => { this.active = true; this.deadline = now + this.interval; };
-        this.stop = () => { this.active = false; };
-        timers.push(this);
-    },
+    QTimer,
     callDBus: (...args) => { if (args[3] === 'UpdateFocusedWindow') updates.push(JSON.parse(args[4])); },
 });
 vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);

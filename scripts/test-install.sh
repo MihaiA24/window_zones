@@ -141,9 +141,6 @@ if name == 'uname':
 elif name == 'pkg-config':
     pass
 elif name == 'cargo':
-    if args[0] == 'metadata':
-        print(json.dumps(dict(target_directory=os.environ['CARGO_TARGET_DIR'])))
-        sys.exit(0)
     profile = 'release' if '--release' in args else 'debug'
     target = Path(os.environ['CARGO_TARGET_DIR'])
     if os.environ.get('CARGO_BUILD_TARGET'):
