@@ -497,6 +497,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo 'python3 is required to read Cargo build metadata.' >&2
   exit 1
 fi
+if [[ "$GNOME_EXTENSION" -eq 1 ]] && ! command -v glib-compile-schemas >/dev/null 2>&1; then
+  echo '--gnome-extension requires glib-compile-schemas; install the GLib schema compiler and re-run this script.' >&2
+  exit 1
+fi
 if [[ "$KWIN_SCRIPT" -eq 1 ]] && ! command -v kpackagetool6 >/dev/null 2>&1; then
   echo '--kwin-script requires kpackagetool6; install the Plasma 6 package tools and re-run this script.' >&2
   exit 1
@@ -551,8 +555,10 @@ print(paths.pop())
 done
 
 if [[ "$GNOME_EXTENSION" -eq 1 ]]; then
-  mkdir -p "$GNOME_DIR"
+  mkdir -p "$GNOME_DIR/schemas"
   install -m 644 -- "$PROJECT_ROOT/gnome-extension/metadata.json" "$PROJECT_ROOT/gnome-extension/extension.js" "$GNOME_DIR/"
+  install -m 644 -- "$PROJECT_ROOT/gnome-extension/schemas/org.gnome.shell.extensions.window-zones.gschema.xml" "$GNOME_DIR/schemas/"
+  glib-compile-schemas "$GNOME_DIR/schemas"
   printf '%s\n' "$INSTALL_PREFIX" >"$GNOME_DIR/.window-zones-install-prefix"
   record_install gnome-extension
   if command -v gnome-extensions >/dev/null 2>&1 && gnome-extensions enable "$GNOME_ID" 2>/dev/null; then
@@ -563,7 +569,7 @@ if [[ "$GNOME_EXTENSION" -eq 1 ]]; then
     warn "Could not enable the GNOME companion; after logging back in, run: gnome-extensions enable $GNOME_ID"
   fi
   printf 'GNOME companion: %s\n' "$GNOME_DIR"
-  echo 'GNOME on Wayland needs a log out/in before a newly installed extension loads.'
+  echo 'GNOME on Wayland needs a log out/in after installing or upgrading the companion.'
   printf 'Verify: gnome-extensions info %s (State: ACTIVE)\n' "$GNOME_ID"
   echo 'Verify: gsettings get org.gnome.shell disable-user-extensions (must be false)'
 fi

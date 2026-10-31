@@ -8,9 +8,11 @@
   - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
   - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
 - (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
-- For GNOME Wayland, GNOME Shell 50 or 51 and `gnome-extensions` are required when
-  using the optional companion; install steps are in
-  `docs/runbooks/gnome-wayland.md`.
+- For GNOME Wayland, GNOME Shell 50 or 51, `gnome-extensions`, and
+  `glib-compile-schemas` (the GLib schema compiler) are required when using the
+  optional companion. The installer checks for the compiler before building or
+  replacing installed files; installs without `--gnome-extension` and uninstalls
+  do not require it. Install steps are in `docs/runbooks/gnome-wayland.md`.
 - For KDE Plasma Wayland, `kpackagetool6` is required to install the KWin
   script; setup steps are in `docs/runbooks/kde-wayland.md`.
 
@@ -95,20 +97,28 @@ after changing prefix so the service points at the new binary.
 ## GNOME Shell companion
 
 `--gnome-extension` installs `metadata.json` and `extension.js` into
-`${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/window-zones@mihai-a24/`
-and enables it. GNOME Shell only knows extensions it scanned at login, so
-`gnome-extensions enable` refuses one installed during the session; the
-installer then adds `window-zones@mihai-a24` to
+`${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/window-zones@mihai-a24/`,
+along with `schemas/org.gnome.shell.extensions.window-zones.gschema.xml`. It
+compiles the per-extension schema directory with `glib-compile-schemas` to create
+`schemas/gschemas.compiled`, then enables the companion. No system-wide schema
+installation or root access is needed. GNOME Shell only knows extensions it
+scanned at login, so `gnome-extensions enable` refuses one installed during the
+session; the installer then adds `window-zones@mihai-a24` to
 `org.gnome.shell enabled-extensions` itself, which the next login reads.
 
-**GNOME on Wayland needs a log out/in before a newly installed extension loads.**
-An upgrade also needs the companion to be reloaded; follow the
-[GNOME lifecycle runbook](gnome-wayland.md). The installer records the owning
-prefix in the companion's `.window-zones-install-prefix` marker. Uninstall
-disables the extension, removes its enabled-list entry and deletes its files
-only while that marker matches the selected prefix. Missing or different
-ownership leaves the companion and activation unchanged; reinstall with
-`--gnome-extension` from the intended prefix before removing it.
+**GNOME on Wayland needs a log out/in after installing or upgrading the companion.**
+Re-run the installer with `--gnome-extension` to replace the companion sources,
+install its schema XML and rebuild its compiled schema cache, including when
+upgrading an older installation without schemas. A running Shell keeps its loaded
+companion until the fresh login; follow the [GNOME lifecycle runbook](gnome-wayland.md).
+Reinstall preserves user config and existing extension settings. The installer
+records the owning prefix in the companion's `.window-zones-install-prefix`
+marker. Uninstall disables the extension, removes its enabled-list entry and
+deletes its files, including the schema XML and compiled cache, only while that
+marker matches the selected prefix. Missing or different ownership leaves the
+companion, schemas and activation unchanged; reinstall with `--gnome-extension`
+from the intended prefix before removing it. Removing the owned companion does
+not reset its saved GSettings values.
 
 Upgrade the binary and companion together: the combined contract uses
 `org.window_zones.Gnome2`, with identified-window moves and optional

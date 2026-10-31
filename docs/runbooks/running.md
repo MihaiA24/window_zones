@@ -66,11 +66,13 @@ The neighbour must overlap vertically. There is no double-press time limit,
 and the outer edge stays put rather than wrapping. Explicit next/previous
 display actions still wrap and preserve the window's layout.
 
-GNOME animates placement for 250 ms using compositor transforms and a fading
-snapshot, not repeated client resize requests. Desktop animation settings and
-reduced motion are respected. Maximized/tiled restoration completes before
-the destination frame is requested, preventing a late Wayland restore
-acknowledgement from overwriting it.
+GNOME animates placement for 150 ms by default using compositor transforms
+and a fading snapshot, not repeated client resize requests. Its native
+[per-extension setting](#gnome-wayland) accepts 0..1000 ms, with 0 disabling
+only Window Zones' custom animation. Global disabled animations and GNOME 51
+reduced motion remain dominant; other backends are unchanged. Maximized/tiled
+restoration completes before the destination frame is requested, preventing a
+late Wayland restore acknowledgement from overwriting it.
 
 ## Session event logging
 
@@ -246,6 +248,28 @@ $HOME/.local/bin/window_zones run
 ```
 
 Use `docs/runbooks/gnome-wayland.md` for extension installation, reload/restart checks, companion disconnect recovery, and the full two-display smoke checklist.
+
+For a new source/metadata/schema upgrade, rerun the installer with
+`--gnome-extension` and log out and back in; copying files does not refresh a
+running Shell. Once that companion is loaded, its GNOME-only native setting
+changes the next move immediately without App restart or TOML/companion reload:
+
+```bash
+# Default 150 ms; unsigned 0..1000 ms. Use 0 for no custom placement animation.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  set org.gnome.shell.extensions.window-zones animation-duration-ms 150
+
+# Reset restores 150 ms; another accepted value, e.g. 300, sets a custom duration.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  reset org.gnome.shell.extensions.window-zones animation-duration-ms
+```
+
+Out-of-range values are rejected without changing the accepted setting. A move
+already in progress keeps its selected duration. Global GNOME disabled
+animations and GNOME 51 reduced motion still override nonzero values; 0 skips
+only the custom Window Zones effect, not native frame completion or GNOME's
+own restoration effects. This setting is not part of the TOML config and does
+not affect other backends.
 
 ## macOS
 

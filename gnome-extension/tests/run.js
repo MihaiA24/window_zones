@@ -3,7 +3,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import System from 'system';
-import {display, makeWindow, Main, Meta, settings, Shell, St, TestActor} from './stubs.js';
+import {animationSettings, display, makeWindow, Main, Meta, settings, Shell, St, TestActor} from './stubs.js';
 
 // GIO/GVfs can cache the session bus during imports. Isolate the process,
 // rather than changing its bus address after that connection already exists.
@@ -26,7 +26,6 @@ const redirected = new TextDecoder().decode(bytes)
     .replace(/^import Meta from 'gi:\/\/Meta';$/m, `import {Meta} from '${stubs}';`)
     .replace(/^import Shell from 'gi:\/\/Shell';$/m, `import {Shell} from '${stubs}';`)
     .replace(/^import \* as Main from 'resource:.*$/m, `import {Main} from '${stubs}';`)
-    .replace(/^import \{WINDOW_ANIMATION_TIME\} from 'resource:.*$/m, `import {WINDOW_ANIMATION_TIME} from '${stubs}';`)
     .replace(/^import \{Extension\} from 'resource:.*$/m, `import {Extension} from '${stubs}';`);
 const [fd, copy] = GLib.file_open_tmp('window-zones-contract-XXXXXX.js');
 GLib.close(fd);
@@ -84,7 +83,7 @@ const connection = {
             new GLib.Variant('(sss)', [sender, sender, '']));
     },
 };
-const service = new WindowZonesService();
+const service = new WindowZonesService(animationSettings);
 service.export(connection);
 
 async function call(name, args = [], sender = ':1.42', expectedError = null) {
@@ -220,6 +219,14 @@ for (const [animations, reducedMotion, x] of [[false, 0, 30], [true, 1, 50], [tr
 }
 settings.enable_animations = true;
 settings.reducedMotion = 0;
+for (const [duration, x, lower, upper] of [[0, 90, 0, 100], [150, 110, 120, 250], [400, 130, 350, 600]]) {
+    animationSettings.duration = duration;
+    await call('MoveWindow', [window.id, x, 40, 600, 700]);
+    metrics = await call('GetLastTransitionMetrics');
+    equal(metrics[1] >= lower && metrics[1] < upper, true,
+        `live app animation duration ${duration} ms controls completed placement`);
+}
+animationSettings.duration = 250;
 window.actor = null;
 for (const discovery of ['GetFocusedWindow', 'GetDisplays']) {
     await call('MoveWindow', [window.id, 80, 40, 600, 700]);

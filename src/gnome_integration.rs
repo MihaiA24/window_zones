@@ -22,6 +22,8 @@ pub const GNOME_OBJECT_PATH: &str = "/org/window_zones/Gnome";
 pub const GNOME_INTERFACE: &str = "org.window_zones.Gnome2";
 const HOTKEY_SIGNAL: &str = "HotkeyPressed";
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
+// The companion permits up to 1 s of animation after bounded frame restoration.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FOCUSED_WINDOW_CAPABILITY: &str = "focused-window";
 const DISPLAYS_CAPABILITY: &str = "displays";
@@ -238,7 +240,7 @@ impl WindowSystem for GnomeWindowSystem {
             let proxy =
                 cached
                     .connection
-                    .with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, CALL_TIMEOUT);
+                    .with_proxy(GNOME_SERVICE_NAME, GNOME_OBJECT_PATH, MOVE_TIMEOUT);
             proxy
                 .method_call::<(), _, _, _>(
                     GNOME_INTERFACE,

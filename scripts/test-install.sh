@@ -194,6 +194,9 @@ elif name in ('busctl', 'dbus-send'):
     sys.exit(0 if ready.exists() else 1)
 elif name in ('kwriteconfig6', 'qdbus6'):
     log('kwin-setting')
+elif name == 'glib-compile-schemas':
+    # Only model the installed artifact here; native GNOME checks use the real compiler.
+    (Path(args[0]) / 'gschemas.compiled').write_bytes(b'installer fixture schema cache\n')
 elif name == 'gnome-extensions':
     log('gnome-extension')
     if args not in (['enable', 'window-zones@mihai-a24'], ['disable', 'window-zones@mihai-a24']):
@@ -264,7 +267,8 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
     events_file.touch()
     (base / 'binary.py').write_text(fixture_binary)
     for name in ('uname', 'pkg-config', 'cargo', 'kpackagetool6', 'systemctl', 'busctl',
-                 'dbus-send', 'kwriteconfig6', 'qdbus6', 'launchctl', 'plutil', 'gnome-extensions', 'gsettings'):
+                 'dbus-send', 'kwriteconfig6', 'qdbus6', 'launchctl', 'plutil', 'gnome-extensions', 'gsettings',
+                 'glib-compile-schemas'):
         tool = tools / name
         tool.write_text('#!' + sys.executable + '\n' + fixture_tool)
         tool.chmod(0o755)
