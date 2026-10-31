@@ -106,6 +106,68 @@ pathlib.Path(sys.argv[1]).write_text(str(replacement.pid))
                 owned_process.signal_identity(foreign.pid, foreign_start, signal.SIGKILL)
                 foreign.wait(timeout=5)
 
+    def test_cleanup_keeps_published_identity_when_orphan_environment_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, publication, ready = (root / name for name in ("pids", "child.pid", "ready"))
+            registry.touch(mode=0o600)
+            owner = str(root)
+            foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            foreign_start = owned_process.process(foreign.pid)[0]
+            child_code = '''
+import ctypes, os, pathlib, subprocess, sys, time
+registry, owner, publication, ready, helper = sys.argv[1:]
+subprocess.run([sys.executable, helper, "publish", registry, owner, "0",
+                str(os.getpid()), publication], check=True)
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_DUMPABLE")
+pathlib.Path(ready).touch()
+time.sleep(60)
+'''
+            launcher = subprocess.Popen(
+                [sys.executable, "-c", '''
+import pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", *sys.argv[1:]])
+ready = pathlib.Path(sys.argv[-2])
+deadline = time.monotonic() + 5
+while not ready.exists():
+    if child.poll() is not None or time.monotonic() >= deadline:
+        raise RuntimeError("owned child did not publish its protected identity")
+    time.sleep(0.01)
+''', child_code, str(registry), owner, str(publication), str(ready),
+                 str(SCRIPTS / "smoke/owned_process.py")],
+                env={**os.environ, "WINDOW_ZONES_SMOKE_OWNER": owner},
+            )
+            try:
+                self.assertEqual(launcher.wait(timeout=10), 0)
+                pid, start = map(int, publication.read_text().split())
+                self.assertEqual(owned_process.records(registry)[pid], start)
+                self.assertFalse(owned_process.has_owner(pid, owner))
+                self.assertTrue(owned_process.is_alive(pid, start))
+                for expected, status in ((start, 0), (start + 1, 1)):
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPTS / "smoke/owned_process.py"), "alive",
+                         str(registry), owner, "0", str(pid), str(expected)],
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                owned_process.signal_identity(pid, start + 1, signal.SIGTERM)
+                self.assertTrue(owned_process.is_alive(pid, start))
+                with registry.open("a") as stream:
+                    stream.write(f"{foreign.pid} {foreign_start + 1}\n")
+                with self.assertRaisesRegex(RuntimeError, "unowned smoke process"):
+                    owned_process.register(registry, owner, 0, foreign.pid)
+                owned_process.cleanup(registry, owner, os.getpid())
+                self.assertFalse(owned_process.is_alive(pid, start))
+                self.assertIsNone(foreign.poll())
+            finally:
+                if launcher.poll() is None:
+                    launcher.terminate()
+                    launcher.wait(timeout=5)
+                owned_process.cleanup(registry, owner, os.getpid())
+                owned_process.signal_identity(foreign.pid, foreign_start, signal.SIGKILL)
+                foreign.wait(timeout=5)
+
     def test_nested_cleanup_preserves_outer_owner_and_rescues_private_orphans(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

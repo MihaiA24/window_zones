@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const createClock = require('./clock.js');
 
 function signal() {
     const handlers = new Set();
@@ -15,8 +16,7 @@ function signal() {
 }
 
 function scriptSession(windows = []) {
-    let now = 0;
-    const timers = [];
+    const clock = createClock(signal);
     const calls = [];
     const pending = [];
     const shortcuts = new Map();
@@ -25,22 +25,8 @@ function scriptSession(windows = []) {
         stackingOrder: windows, windowRemoved: signal(),
         clientArea: () => ({x: 0, y: 40, width: 1200, height: 860}),
     };
-    class QTimer {
-        constructor() {
-            this.timeout = signal();
-            this.active = false;
-            timers.push(this);
-        }
-        start() {
-            this.active = true;
-            this.deadline = now + this.interval;
-        }
-        stop() {
-            this.active = false;
-        }
-    }
     const context = vm.createContext({
-        console, QTimer, Date: {now: () => now},
+        console, QTimer: clock.QTimer, Date: {now: clock.now},
         KWin: {MaximizeArea: 2},
         workspace,
         registerShortcut: (title, _text, _sequence, callback) => {
@@ -63,22 +49,7 @@ function scriptSession(windows = []) {
             assert.notEqual(index, -1, `KWin must call ${method}`);
             return pending.splice(index, 1)[0];
         },
-        advance(milliseconds) {
-            const target = now + milliseconds;
-            for (;;) {
-                const timer = timers.filter(timer => timer.active && timer.deadline <= target)
-                    .sort((left, right) => left.deadline - right.deadline)[0];
-                if (!timer)
-                    break;
-                now = timer.deadline;
-                if (timer.singleShot)
-                    timer.active = false;
-                else
-                    timer.deadline += timer.interval;
-                timer.timeout.emit();
-            }
-            now = target;
-        },
+        advance: clock.advance,
     };
 }
 
@@ -142,7 +113,8 @@ function movableWindow(id, initial) {
     let frame = initial;
     return {
         internalId: id, managed: true, normalWindow: true, moveable: true, resizeable: true,
-        frameGeometryChanged: signal(), setMaximize: () => {},
+        maximizeMode: 0, frameGeometryChanged: signal(), maximizedChanged: signal(),
+        tileChanged: signal(), damaged: signal(), setMaximize: () => {},
         get frameGeometry() { return frame; },
         set frameGeometry(value) { this.requested = value; },
         commit(value) {
@@ -183,12 +155,66 @@ assert.equal(second.requested, undefined, 'observation and placement retain the 
 moves.advance(1000);
 assert.equal(moves.calls('CompleteRequest').length, 1, 'the observation completes once');
 
-// An exact asynchronous commit can complete without waiting for the observation deadline.
+// An exact asynchronous commit remains observed through the bounded completion boundary.
 moves.workspace.activeWindow = first;
 requestMove(moves, 2, original);
 assert.equal(moves.calls('CompleteRequest').length, 1);
 first.commit(original);
+assert.equal(moves.calls('CompleteRequest').length, 1, 'a matching frame is not a stable completion');
+moves.advance(750);
 assert.deepEqual(moves.take('CompleteRequest').args, ['2', true, '', '']);
+
+// Xwayland reports restored maximize state before the client restores its CSD/configure.
+// Even a frame that already equals the target must wait for that restoration before placement.
+const restoring = movableWindow('window-1', target);
+restoring.maximizeMode = 3;
+restoring.setMaximize = () => {
+    restoring.maximizeMode = 0;
+    restoring.maximizedChanged.emit();
+};
+let placements = 0;
+Object.defineProperty(restoring, 'frameGeometry', {
+    set(value) {
+        placements++;
+        this.requested = value;
+        this.commit(value);
+    },
+});
+const restored = readySession([restoring]);
+requestMove(restored, 10);
+assert.equal(restored.calls('CompleteRequest').length, 0, 'initial equality precedes restoration');
+assert.equal(placements, 0, 'do not configure the target with maximized CSD extents');
+restored.advance(25);
+restoring.commit({x: 0, y: 40, width: 560, height: 810});
+restoring.damaged.emit(restoring);
+assert.equal(placements, 0, 'placement must not run inside the restoration commit');
+restored.advance(0);
+assert.equal(placements, 1, 'place once after the restored client frame boundary');
+restored.advance(725);
+assert.deepEqual(restored.take('CompleteRequest').args, ['10', true, '', '']);
+assert.deepEqual({...restoring.frameGeometry}, target);
+
+// A late configure after an initially matching assignment must not be reported as success.
+requestMove(restored, 11);
+assert.equal(restored.calls('CompleteRequest').length, 1);
+restoring.commit(constrained);
+restored.advance(750);
+partialResult(restored, constrained);
+assert.equal(placements, 2, 'a constrained/late frame is observed, never repeatedly overwritten');
+
+// Native Wayland acknowledges maximize restoration after committing its restored frame.
+const native = movableWindow('window-1', target);
+native.maximizeMode = 3;
+const nativeRestore = readySession([native]);
+requestMove(nativeRestore, 12, original);
+native.commit(original);
+assert.equal(native.requested, undefined, 'a restored frame alone is not a maximize acknowledgement');
+native.maximizeMode = 0;
+native.maximizedChanged.emit();
+nativeRestore.advance(0);
+assert.deepEqual({...native.requested}, original, 'Restore retains its exact captured target');
+nativeRestore.advance(750);
+assert.deepEqual(nativeRestore.take('CompleteRequest').args, ['12', true, '', '']);
 
 const synchronous = movableWindow('window-1', original);
 Object.defineProperty(synchronous, 'frameGeometry', {

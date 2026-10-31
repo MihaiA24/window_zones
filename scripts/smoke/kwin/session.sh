@@ -184,6 +184,8 @@ kde_live_start_fixture() {
         BUS_FILE="$KDE_BUS_FILE" KDE_BUS_FILE="$KDE_BUS_FILE" \
         KDE_COMPANION_BIN="$KDE_COMPANION_BIN" KDE_SERVICE_LOG="$KDE_SERVICE_LOG" \
         KDE_SERVICE_PID_FILE="$KDE_SERVICE_PID_FILE" KDE_KWIN_PID_FILE="$KDE_KWIN_PID_FILE" \
+        KDE_OWNED_PROCESS_HELPER="$SCRIPT_DIR/smoke/owned_process.py" \
+        KDE_PID_REGISTRY="$PID_FILE" KDE_RUNNER_PID="$$" \
         KDE_SOCKET="$KDE_SOCKET" \
         KDE_PUBLISH_CLIENT_ENV="$KDE_PUBLISH_CLIENT_ENV" \
         KDE_XDISPLAY_FILE="$KDE_XDISPLAY_FILE" KDE_XAUTHORITY_FILE="$KDE_XAUTHORITY_FILE" \
@@ -195,7 +197,7 @@ kde_live_start_fixture() {
         KDE_SESSION_VERSION=6 XDG_SESSION_TYPE=wayland \
         QT_LOGGING_RULES='kwin_libeis.debug=true;kwin_scripting.debug=true' \
         QT_FORCE_STDERR_LOGGING=1 \
-        dbus-run-session -- "$KDE_LAUNCHER"
+        dbus-run-session -- "$KDE_LAUNCHER" || return 1
     if wait_for_file "$KDE_BUS_FILE" 20; then
         KDE_BUS=$(cat "$KDE_BUS_FILE")
         export DBUS_SESSION_BUS_ADDRESS="$KDE_BUS"
@@ -205,11 +207,20 @@ kde_live_start_fixture() {
     fi
     if wait_for_file "$KDE_SERVICE_PID_FILE" 10; then
         KDE_SERVICE_PID=$(cat "$KDE_SERVICE_PID_FILE")
-        owned_process register "$KDE_SERVICE_PID"
+        owned_process register "$KDE_SERVICE_PID" || return 1
+    else
+        log 'BLOCKED KDE live: companion did not publish its PID'
+        return 1
     fi
     if wait_for_file "$KDE_KWIN_PID_FILE" 10; then
-        KDE_KWIN_PID=$(cat "$KDE_KWIN_PID_FILE")
-        owned_process register "$KDE_KWIN_PID"
+        read -r KDE_KWIN_PID KDE_KWIN_START <"$KDE_KWIN_PID_FILE" || return 1
+        if ! owned_process alive "$KDE_KWIN_PID" "$KDE_KWIN_START"; then
+            log 'BLOCKED KDE live: KWin published an unregistered or stopped PID/start identity'
+            return 1
+        fi
+    else
+        log 'BLOCKED KDE live: KWin did not publish its owned PID/start identity'
+        return 1
     fi
     wait_for_text "$KDE_SERVICE_LOG" 'KWin companion service started' 15 || true
     assert_text 'KDE companion service starts before KWin' \

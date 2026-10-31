@@ -53,6 +53,7 @@ run_kde_live() {
     KDE_CONFLICT_SCRIPT_ID='-1'
     KDE_SERVICE_PID=''
     KDE_KWIN_PID=''
+    KDE_KWIN_START=''
     KDE_EDITOR_PID=''
     APP_PID=''
     APP_FD=''
@@ -116,7 +117,7 @@ run_kde_live() {
         return 0
     fi
     local kwin_alive=0
-    kill -0 "$KDE_KWIN_PID" 2>/dev/null && kwin_alive=1
+    owned_process alive "$KDE_KWIN_PID" "$KDE_KWIN_START" && kwin_alive=1
     assert_eq 'KDE nested KWin fixture starts' 1 "$kwin_alive"
     kde_live_prepare_environment
     local xdisplay_ok=0

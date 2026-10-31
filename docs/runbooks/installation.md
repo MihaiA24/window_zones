@@ -2,15 +2,17 @@
 
 ## Prerequisites
 
-- Rust toolchain with `cargo`, and Python 3 for Cargo metadata, in `PATH`.
+- Rust toolchain with `cargo`, and Python 3 for Cargo's JSON artifact stream, in `PATH`.
 - On Linux, `pkg-config` and D-Bus development headers are required for tray
   and KWin companion support:
   - Debian/Ubuntu: `sudo apt install pkg-config libdbus-1-dev`
   - Fedora: `sudo dnf install pkgconf-pkg-config dbus-devel`
 - (Optional) `$HOME/.local/bin` on `PATH` for default installation location.
-- For GNOME Wayland, GNOME Shell 50 or 51 and `gnome-extensions` are required when
-  using the optional companion; install steps are in
-  `docs/runbooks/gnome-wayland.md`.
+- For GNOME Wayland, GNOME Shell 50 or 51, `gnome-extensions`, and
+  `glib-compile-schemas` (the GLib schema compiler) are required when using the
+  optional companion. The installer checks for the compiler before building or
+  replacing installed files; installs without `--gnome-extension` and uninstalls
+  do not require it. Install steps are in `docs/runbooks/gnome-wayland.md`.
 - For KDE Plasma Wayland, `kpackagetool6` is required to install the KWin
   script; setup steps are in `docs/runbooks/kde-wayland.md`.
 
@@ -85,28 +87,38 @@ For example, use a custom prefix or a debug build:
 ```
 
 The script resolves the repository relative to its location, builds the selected
-binaries with `cargo build --locked`, and replaces `<prefix>/bin/<binary>`.
-`CARGO_TARGET_DIR` and Cargo's configured target directory are honored. Prefixes are canonicalized before ownership records and autostart paths are derived. Re-running the same options replaces the installed
-files without duplicating ownership records or overwriting config. Re-run with
-`--autostart` after changing the prefix so the service points at the new binary.
+binaries with `cargo build --locked`, and installs the executable paths reported
+by Cargo's JSON artifact stream. `CARGO_TARGET_DIR`, configured target directories
+and `CARGO_BUILD_TARGET`/`build.target` are honored; stale unqualified binaries
+are not selected. Prefixes are canonicalized for ownership and autostart.
+Reinstall preserves user config and ownership records. Re-run with `--autostart`
+after changing prefix so the service points at the new binary.
 
 ## GNOME Shell companion
 
 `--gnome-extension` installs `metadata.json` and `extension.js` into
-`${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/window-zones@mihai-a24/`
-and enables it. GNOME Shell only knows extensions it scanned at login, so
-`gnome-extensions enable` refuses one installed during the session; the
-installer then adds `window-zones@mihai-a24` to
+`${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/window-zones@mihai-a24/`,
+along with `schemas/org.gnome.shell.extensions.window-zones.gschema.xml`. It
+compiles the per-extension schema directory with `glib-compile-schemas` to create
+`schemas/gschemas.compiled`, then enables the companion. No system-wide schema
+installation or root access is needed. GNOME Shell only knows extensions it
+scanned at login, so `gnome-extensions enable` refuses one installed during the
+session; the installer then adds `window-zones@mihai-a24` to
 `org.gnome.shell enabled-extensions` itself, which the next login reads.
 
-**GNOME on Wayland needs a log out/in before a newly installed extension loads.**
-An upgrade also needs the companion to be reloaded; follow the
-[GNOME lifecycle runbook](gnome-wayland.md). The installer records the owning
-prefix in the companion's `.window-zones-install-prefix` marker. Uninstall
-disables the extension, removes its enabled-list entry and deletes its files
-only while that marker matches the selected prefix. Missing or different
-ownership leaves the companion and activation unchanged; reinstall with
-`--gnome-extension` from the intended prefix before removing it.
+**GNOME on Wayland needs a log out/in after installing or upgrading the companion.**
+Re-run the installer with `--gnome-extension` to replace the companion sources,
+install its schema XML and rebuild its compiled schema cache, including when
+upgrading an older installation without schemas. A running Shell keeps its loaded
+companion until the fresh login; follow the [GNOME lifecycle runbook](gnome-wayland.md).
+Reinstall preserves user config and existing extension settings. The installer
+records the owning prefix in the companion's `.window-zones-install-prefix`
+marker. Uninstall disables the extension, removes its enabled-list entry and
+deletes its files, including the schema XML and compiled cache, only while that
+marker matches the selected prefix. Missing or different ownership leaves the
+companion, schemas and activation unchanged; reinstall with `--gnome-extension`
+from the intended prefix before removing it. Removing the owned companion does
+not reset its saved GSettings values.
 
 Upgrade the binary and companion together: the combined contract uses
 `org.window_zones.Gnome2`, with identified-window moves and optional
@@ -244,9 +256,11 @@ Installs from earlier commits of this unpublished branch must be stopped and
 uninstalled with that revision before reinstalling; legacy KDE state is not
 migrated.
 
-To switch from XDG to systemd later, re-run `--autostart` inside a desktop with
-an active graphical target. The installer stops the owned KDE launcher, removes
-the owned desktop fallback and installs/enables the units.
+To switch from XDG to systemd, re-run `--autostart` inside a desktop with an
+active graphical target. The installer validates the previous prefix's desktop
+entry, ownership record and KDE launcher marker before stopping its session and
+removing the fallback, including when the new prefix differs. Unowned entries
+are preserved; config is never replaced.
 
 ### macOS LaunchAgent
 

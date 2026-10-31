@@ -66,11 +66,13 @@ The neighbour must overlap vertically. There is no double-press time limit,
 and the outer edge stays put rather than wrapping. Explicit next/previous
 display actions still wrap and preserve the window's layout.
 
-GNOME animates placement for 250 ms using compositor transforms and a fading
-snapshot, not repeated client resize requests. Desktop animation settings and
-reduced motion are respected. Maximized/tiled restoration completes before
-the destination frame is requested, preventing a late Wayland restore
-acknowledgement from overwriting it.
+GNOME animates placement for 150 ms by default using compositor transforms
+and a fading snapshot, not repeated client resize requests. Its native
+[per-extension setting](#gnome-wayland) accepts 0..1000 ms, with 0 disabling
+only Window Zones' custom animation. Global disabled animations and GNOME 51
+reduced motion remain dominant; other backends are unchanged. Maximized/tiled
+restoration completes before the destination frame is requested, preventing a
+late Wayland restore acknowledgement from overwriting it.
 
 ## Session event logging
 
@@ -141,6 +143,8 @@ On Unix, the lock directory must be owned by the current effective UID, non-syml
 
 See [Linux supervision](installation.md#linux-systemd-user-unit) and [macOS LaunchAgent](installation.md#macos-launchagent) for service commands, logs, ownership, and permissions.
 
+Linux `--tray` requires a running StatusNotifier/AppIndicator host on the session bus. Startup waits for actual registration; missing/refusing hosts exit 1 without announcing a working tray. Losing the watcher or worker bus after startup also closes the runtime with exit 1 instead of leaving an uncontrollable background process. The first menu status reflects the initial hotkey-registration attempt.
+
 The App prints runtime events once per change, never per retry:
 
 - `Config state: Loaded (N bindings)` / `Config state: Missing; run window_zones init ...`
@@ -195,9 +199,10 @@ The runtime uses its current accepted config, including reloads.
 Clients must inherit the runtime's compositor connection: `SWAYSOCK` for Sway,
 or `HYPRLAND_INSTANCE_SIGNATURE` and the same runtime namespace for Hyprland.
 The watched config pathname remains valid when its symlink is retargeted.
-Compositor socket replacement fails closed, including queued requests; close
-and relaunch the process to adopt the new connection. In-process `restart`
-does not change transport identity.
+Compositor socket replacement fails closed, including queued and interactive
+dispatch. Interactive dispatch closes the runtime with exit 1 without running
+the action; close and relaunch to adopt the new connection. In-process
+`restart` does not change transport identity.
 
 The socket has mode `0600` inside an owned `0700` directory next to the instance
 lock (`$XDG_RUNTIME_DIR/window_zones.dispatch/dispatch.sock` on a normal Linux
@@ -205,6 +210,13 @@ login). Quit removes the owned socket; after a crash the next lock-owning sessio
 can remove its stale socket, but refuses foreign files and symlinks.
 
 Window and display state come from `swaymsg`/`hyprctl`; both integrations are ungated (no Smoke run on record).
+
+Hyprland cross-output placement transfers the captured window to the destination
+output's active regular workspace before resizing/moving, then verifies native
+monitor/workspace ownership. Same-output and off-screen targets keep their
+workspace. Its existing surface-coordinate and reported-scale geometry remains
+approximate for grouped/plugin decorations, some XWayland frames and older
+fractional-scale IPC; those exact-frame cases are not certified.
 
 ## Linux X11
 
@@ -236,6 +248,28 @@ $HOME/.local/bin/window_zones run
 ```
 
 Use `docs/runbooks/gnome-wayland.md` for extension installation, reload/restart checks, companion disconnect recovery, and the full two-display smoke checklist.
+
+For a new source/metadata/schema upgrade, rerun the installer with
+`--gnome-extension` and log out and back in; copying files does not refresh a
+running Shell. Once that companion is loaded, its GNOME-only native setting
+changes the next move immediately without App restart or TOML/companion reload:
+
+```bash
+# Default 150 ms; unsigned 0..1000 ms. Use 0 for no custom placement animation.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  set org.gnome.shell.extensions.window-zones animation-duration-ms 150
+
+# Reset restores 150 ms; another accepted value, e.g. 300, sets a custom duration.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  reset org.gnome.shell.extensions.window-zones animation-duration-ms
+```
+
+Out-of-range values are rejected without changing the accepted setting. A move
+already in progress keeps its selected duration. Global GNOME disabled
+animations and GNOME 51 reduced motion still override nonzero values; 0 skips
+only the custom Window Zones effect, not native frame completion or GNOME's
+own restoration effects. This setting is not part of the TOML config and does
+not affect other backends.
 
 ## macOS
 

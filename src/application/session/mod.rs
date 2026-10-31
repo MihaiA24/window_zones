@@ -46,6 +46,8 @@ pub(super) struct Runtime {
     pub(super) window_system: RuntimeWindowSystem,
     hotkey_system: RuntimeHotkeySystem,
     next_tick: Instant,
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    compositor_identity: Option<local_dispatch::Identity>,
 }
 
 impl Runtime {
@@ -60,6 +62,8 @@ impl Runtime {
             window_system: RuntimeWindowSystem::with_backend(backend),
             hotkey_system: RuntimeHotkeySystem::new(backend),
             next_tick: Instant::now(),
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            compositor_identity: None,
         })
     }
 

@@ -3,8 +3,8 @@ import GLib from 'gi://GLib';
 
 // Shell 50 lacks the reduced-motion enum and setting; tests also exercise 51.
 export const settings = {enable_animations: true};
+export const animationSettings = {duration: 250, get_uint() { return this.duration; }};
 export const Clutter = {AnimationMode: {EASE_OUT_QUAD: 0}};
-export const WINDOW_ANIMATION_TIME = 250;
 
 export class TestActor {
     constructor(properties = {}) {
@@ -81,7 +81,9 @@ export const Meta = {
 };
 
 export const Shell = {ActionMode: {NONE: 0, NORMAL: 1}};
-export class Extension {}
+export class Extension {
+    getSettings() { return animationSettings; }
+}
 
 export const Main = {
     overview: {visible: false},

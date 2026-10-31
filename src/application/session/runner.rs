@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "linux", all(test, unix)))]
 use std::io::Write as _;
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,12 +26,19 @@ pub(super) fn run_runtime(
     surface: &mut impl Surface,
     instructions: mpsc::Receiver<RuntimeRequest>,
     quit_on_input_end: bool,
-) {
+) -> ExitCode {
     surface.start(runtime);
     surface.report(runtime, Report::Event(runtime.app.startup_event()));
 
     let mut input_open = true;
-    loop {
+    let exit_code = loop {
+        let (events, dispatches) = runtime.poll(Instant::now());
+        for event in events {
+            surface.report(runtime, Report::Event(event));
+        }
+        for dispatch in dispatches {
+            surface.report(runtime, Report::HotkeyDispatch(dispatch));
+        }
         let instruction = if input_open {
             match instructions.recv_timeout(HOTKEY_POLL_INTERVAL) {
                 Ok(instruction) => Some(instruction),
@@ -39,7 +47,7 @@ pub(super) fn run_runtime(
                     input_open = false;
                     if quit_on_input_end {
                         surface.report(runtime, Report::InputClosed);
-                        break;
+                        break ExitCode::SUCCESS;
                     }
                     None
                 }
@@ -71,11 +79,30 @@ pub(super) fn run_runtime(
                     continue;
                 }
             }
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            if matches!(request.instruction, RuntimeInstruction::Dispatch(_))
+                && runtime
+                    .compositor_identity
+                    .as_ref()
+                    .is_some_and(|identity| !identity.compositor_is_current())
+            {
+                window_zones::logging::diagnostic(format_args!(
+                    "Compositor instance changed before execution; no action was run; close and relaunch the session"
+                ));
+                break ExitCode::FAILURE;
+            }
             match request.instruction {
-                RuntimeInstruction::Quit => break,
+                RuntimeInstruction::Quit => break ExitCode::SUCCESS,
+                #[cfg(target_os = "linux")]
+                RuntimeInstruction::SurfaceFailed(message) => {
+                    window_zones::logging::diagnostic(format_args!(
+                        "Runtime surface failed: {message}"
+                    ));
+                    break ExitCode::FAILURE;
+                }
                 RuntimeInstruction::InputClosed if quit_on_input_end => {
                     surface.report(runtime, Report::InputClosed);
-                    break;
+                    break ExitCode::SUCCESS;
                 }
                 RuntimeInstruction::InputClosed | RuntimeInstruction::Empty => {}
                 RuntimeInstruction::Status => surface.report(runtime, Report::Status),
@@ -126,17 +153,11 @@ pub(super) fn run_runtime(
             }
         }
 
-        let (events, dispatches) = runtime.poll(now);
-        for event in events {
-            surface.report(runtime, Report::Event(event));
-        }
-        for dispatch in dispatches {
-            surface.report(runtime, Report::HotkeyDispatch(dispatch));
-        }
         surface.refresh(runtime, now, handled_input);
-    }
+    };
 
     surface.finish();
+    exit_code
 }
 
 #[cfg(test)]

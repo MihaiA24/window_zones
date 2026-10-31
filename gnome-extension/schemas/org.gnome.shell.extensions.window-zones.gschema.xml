@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.window-zones" path="/org/gnome/shell/extensions/window-zones/">
+    <key name="animation-duration-ms" type="u">
+      <range min="0" max="1000"/>
+      <default>150</default>
+      <summary>Window placement animation duration</summary>
+      <description>Window Zones placement animation duration in milliseconds. Zero disables its animation. GNOME animation and reduced-motion preferences still take precedence.</description>
+    </key>
+  </schema>
+</schemalist>

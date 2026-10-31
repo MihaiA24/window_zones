@@ -106,6 +106,8 @@ Failures retain proof and remove the owned profile; fix the reported cause, then
 
 Cleanup validates UID, checkout/PID start identity and private-runtime markers, including native runtime directories nested beneath owned scratch; symlinked runtimes and sibling-prefix paths are not adopted. It terminates only owned processes (including orphaned native helpers), waits for them to stop after TERM/KILL, unmounts private portal/GVFS mounts, then removes scratch while preserving evidence/build metadata. Ownership survives a helper that will not stop or a partial removal failure so cleanup can be retried. Never kill by process name or remove another display's lock/socket. Confirm evidence remains and doctor shows no launched profile/active instance/display; exit 1 after cleanup is expected (`launched: false`), while freshness remains separately visible. The smoke runner also tears down its compositor/window-manager/editor children.
 
+KWin records a trusted PID/start identity before exec, then validates that handoff explicitly. Cleanup also reads registries from owned private native roots, so an unreadable environment or lost parent does not orphan the compositor. Registry privacy, non-symlink paths, UID and stable start identity remain required; failed teardown retains ownership for recovery.
+
 ## Helpers
 
 `verify` and `test_verify.py` are executable. Use `"$V" --help`, `"$V" drive --help`, and each subcommand's `--help`; destructive operations accept `--dry-run`. Run the safety regression directly with `python3 .agents/skills/verify-window-zones/test_verify.py` or through the existing `scripts/test.sh` (`drive tests` preserves its output).

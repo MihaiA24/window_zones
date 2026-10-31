@@ -104,3 +104,45 @@ fn a_compositor_replaced_after_queueing_cannot_receive_the_action() {
     fs::remove_file(socket_path).unwrap();
     fs::remove_file(config_path).unwrap();
 }
+
+#[test]
+fn interactive_dispatch_refuses_a_replaced_compositor_even_after_restart() {
+    use std::fs;
+    use std::os::unix::net::UnixDatagram;
+    use std::process::ExitCode;
+
+    use crate::application::test_support::temp_path;
+
+    let config_path = temp_path("interactive_compositor_config.toml");
+    let socket_path = temp_path("interactive_compositor.sock");
+    fs::write(&config_path, window_zones::starter_config("Ctrl+Alt")).unwrap();
+    let original = UnixDatagram::bind(&socket_path).unwrap();
+    let mut runtime =
+        Runtime::new(Some(config_path.clone()), RuntimeBackend::DryRun, None).unwrap();
+    runtime.compositor_identity = Some(Identity::new("sway", &socket_path, &config_path).unwrap());
+    fs::remove_file(&socket_path).unwrap();
+    let replacement = UnixDatagram::bind(&socket_path).unwrap();
+    let (instructions, receiver) = mpsc::channel();
+    for instruction in [
+        RuntimeInstruction::Restart,
+        RuntimeInstruction::Dispatch("Ctrl+Alt+Left".to_string()),
+        RuntimeInstruction::Quit,
+    ] {
+        instructions.send(instruction.into()).unwrap();
+    }
+    let exit = run_runtime(
+        &mut runtime,
+        &mut CliSurface {
+            prompt: false,
+            notifier: None,
+        },
+        receiver,
+        true,
+    );
+    assert_eq!(exit, ExitCode::FAILURE);
+    assert!(runtime.window_system.last_move().is_none());
+    assert!(matches!(runtime.app.dispatch_state(), DispatchState::Idle));
+    drop((original, replacement));
+    fs::remove_file(socket_path).unwrap();
+    fs::remove_file(config_path).unwrap();
+}

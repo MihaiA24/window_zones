@@ -661,11 +661,24 @@ def run(binary, keep_logs, output_dir=None):
         indicator_dir = find_appindicator(resource_roots, version_match[1])
         check('Installed AppIndicator supports real GNOME tray testing', indicator_dir.is_dir(), indicator_dir)
         shutil.copytree(indicator_dir, work / 'data/gnome-shell/extensions' / indicator_uuid)
-        (work / 'config/glib-2.0/settings/keyfile').write_text("[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\ndisable-user-extensions=false\ndisable-extension-version-validation=false\n")
+        # A fresh HOME otherwise opens Shell's modal first-login tour over the fixture.
+        (work / 'config/glib-2.0/settings/keyfile').write_text(
+            "[org/gnome/shell]\nenabled-extensions=['window-zones@mihai-a24', '" + indicator_uuid + "']\n"
+            "disable-user-extensions=false\ndisable-extension-version-validation=false\n"
+            f"welcome-dialog-last-shown-version='{version_match[1]}.0'\n"
+            "[org/gnome/shell/extensions/window-zones]\nanimation-duration-ms=uint32 250\n")
         for name in ('metadata.json', 'extension.js'):
             shutil.copy2(root / 'gnome-extension' / name, work / 'data/gnome-shell/extensions/window-zones@mihai-a24' / name)
+        schema_dir = work / 'data/gnome-shell/extensions/window-zones@mihai-a24/schemas'
+        shutil.copytree(root / 'gnome-extension/schemas', schema_dir)
         env = isolated_environment(work, pipewire_runtime, pipewire_remote, os.environ)
         env['WINDOW_ZONES_SMOKE_PRIVATE_OWNER'] = owner
+        compiled = subprocess.run(['glib-compile-schemas', '--strict', str(schema_dir)],
+                                  env=env, capture_output=True, text=True, timeout=8)
+        (work / 'compile-schemas.log').write_text(compiled.stdout + compiled.stderr)
+        check('Private companion schemas compile before Shell starts',
+              compiled.returncode == 0 and (schema_dir / 'gschemas.compiled').is_file(),
+              compiled.stdout + compiled.stderr)
         bus, bus_log = start(['dbus-daemon', '--session', '--nofork', '--print-address=1'], 'session-bus')
         if not wait_for(lambda: text(bus_log).strip() or bus.poll() is not None):
             raise RuntimeError('Private session bus did not start')
@@ -695,7 +708,15 @@ def run(binary, keep_logs, output_dir=None):
         remote('NotifyPointerMotionRelative', GLib.Variant('(dd)', (500.0, 400.0)))
         set_overview(False)
         inject([56, 15])
-        check('Native virtual keyboard establishes application focus', wait_for(lambda: focused()[0]), focused())
+        focus_ready = wait_for(lambda: focused()[0])
+        if not focus_ready:
+            capture_screen('focus-failure')
+            overview = call('org.gnome.Shell', '/org/gnome/Shell', 'org.freedesktop.DBus.Properties',
+                            'Get', GLib.Variant('(ss)', ('org.gnome.Shell', 'OverviewActive'))).unpack()[0]
+            (work / 'focus-failure.json').write_text(json.dumps({
+                'overview_active': overview, 'companion': focused(), 'gtk': window_state(window_log),
+            }, indent=2) + '\n')
+        check('Native virtual keyboard establishes application focus', focus_ready, focused())
         capture_screen('focus-before-input')
         focus_entry(window_log)
         inject([30])
@@ -1016,6 +1037,7 @@ action = { type = "move-to-previous-display" }
             return [row for row in perf_rows() if row['event'] == 'dispatch']
         session = perf_rows()[0]
         check('Logger records actual process memory before moving', session['pid'] == runtime.pid and session['rss_kib'] > 0 and session['peak_rss_kib'] >= session['rss_kib'], session)
+        print('PERFORMANCE_CATEGORY native-baseline animation-duration-ms=250', flush=True)
         transition_count = len(transition_rows())
         for _ in range(2):
             for code in (29, 125, 106):
@@ -1033,6 +1055,9 @@ action = { type = "move-to-previous-display" }
         except GLib.Error as error:
             metrics_isolated = Gio.DBusError.get_remote_error(error) == 'org.window_zones.Gnome.Error.InvalidWindowState'
         check('Independent caller cannot read another controller transition metrics', metrics_isolated)
+        # The performance receipt precedes redraw; finish it before the restart checkpoint.
+        assert_tui_frame('Performance TUI displays the completed rapid transitions', runtime_log,
+                         action='ctrl+cmd+right')
         checkpoint = len(text(runtime_log))
         send(runtime, 'restart')
         assert_tui_frame('Performance TUI restarts without losing logger', runtime_log, checkpoint,
@@ -1047,6 +1072,77 @@ action = { type = "move-to-previous-display" }
         inject([29, 125, 106])
         assert_frame('Maximized transition reaches right half', expected_zones[1], window_log)
         check('Maximized completion includes the finished visual transition', wait_for(lambda: len(transition_rows()) == transition_count + 1) and transition_rows()[-1]['result'] == 'ok' and 200 <= transition_rows()[-1]['completion_ms'] <= transition_rows()[-1]['dispatch_ms'], transition_rows()[-1])
+        # Exercise the installed extension's public setting through real keyboard moves.
+        animation_evidence = work / 'animation-duration.jsonl'
+        settings_command = ['gsettings', '--schemadir', str(schema_dir)]
+        animation_schema = 'org.gnome.shell.extensions.window-zones'
+        def record_animation_case(evidence):
+            with animation_evidence.open('a') as output:
+                output.write(json.dumps(evidence) + '\n')
+            print('PERFORMANCE_CASE ' + json.dumps(evidence), flush=True)
+        def animation_setting(category, operation, expected, value=None, *, rejected=False):
+            command = [*settings_command, operation, animation_schema, 'animation-duration-ms']
+            if value is not None:
+                command.append(str(value))
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=8)
+            read_command = [*settings_command, 'get', animation_schema, 'animation-duration-ms']
+            current = subprocess.run(read_command, env=env, capture_output=True, text=True, timeout=8)
+            evidence = dict(category='animation-duration/' + category, command=command,
+                            exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr,
+                            read_command=read_command, read_exit_code=current.returncode,
+                            read_stdout=current.stdout, read_stderr=current.stderr,
+                            expected_duration_ms=expected, runtime_pid=runtime.pid)
+            record_animation_case(evidence)
+            check('Animation duration [' + category + '] native setting ' +
+                  ('is rejected and retains accepted value' if rejected else 'reads expected value'),
+                  (result.returncode != 0 if rejected else result.returncode == 0)
+                  and current.returncode == 0 and current.stdout.strip() == 'uint32 ' + str(expected),
+                  evidence)
+            # The keyfile backend notifies the already-running Shell asynchronously.
+            time.sleep(0.1)
+        def animation_move(category, code, expected, duration, minimum, maximum=None):
+            before = len(transition_rows())
+            inject([29, 125, code])
+            assert_frame('Animation duration [' + category + '] native and client geometry',
+                         expected, window_log)
+            check('Animation duration [' + category + '] appends one completed keyboard move',
+                  wait_for(lambda: len(transition_rows()) == before + 1), transition_rows()[before:])
+            row = transition_rows()[-1]
+            evidence = dict(category='animation-duration/' + category, duration_ms=duration,
+                            transition_index=before, runtime_pid=runtime.pid, shell_pid=shell.pid,
+                            frame=focused(), client_state=window_state(window_log), performance=row)
+            record_animation_case(evidence)
+            check('Animation duration [' + category + '] completed native timing and unchanged App PID',
+                  runtime.poll() is None and row['pid'] == runtime.pid == session['pid']
+                  and row['hotkey'] == ('ctrl+cmd+left' if code == 105 else 'ctrl+cmd+right')
+                  and row['result'] == 'ok' and row['metrics_error'] is None
+                  and 0 <= row['request_ms'] < 100
+                  and minimum <= row['completion_ms'] <= row['dispatch_ms']
+                  and (maximum is None or row['completion_ms'] < maximum), evidence)
+            return row['completion_ms']
+        animation_setting('default-reset', 'reset', 150)
+        default_completion = animation_move('default-150', 105, expected_zones[0], 150, 150, 250)
+        animation_setting('disabled-set', 'set', 0, 0)
+        disabled_completion = animation_move('disabled-0', 106, expected_zones[1], 0, 0, 150)
+        check('Animation duration zero removes the default custom delay',
+              default_completion - disabled_completion >= 100,
+              dict(default_completion_ms=default_completion, disabled_completion_ms=disabled_completion))
+        animation_setting('custom-set', 'set', 1000, 1000)
+        custom_completion = animation_move('custom-1000', 105, expected_zones[0], 1000, 1000, 1500)
+        check('Animation duration custom setting completes later than the default',
+              custom_completion >= default_completion + 100,
+              dict(default_completion_ms=default_completion, custom_completion_ms=custom_completion))
+        animation_setting('invalid-1001', 'set', 1000, 1001, rejected=True)
+        animation_move('invalid-retains-1000', 106, expected_zones[1], 1000, 1000, 1500)
+        animation_setting('live-reset', 'reset', 150)
+        reset_completion = animation_move('live-reset-150', 105, expected_zones[0], 150, 150, 250)
+        check('Animation duration live reset restores default timing without restart',
+              custom_completion >= reset_completion + 100,
+              dict(custom_completion_ms=custom_completion, reset_completion_ms=reset_completion,
+                   runtime_pid=runtime.pid, original_pid=session['pid']))
+        animation_setting('restore-private-baseline', 'set', 250, 250)
+        animation_move('restored-private-250', 106, expected_zones[1], 250, 200)
+        print('PERFORMANCE_CATEGORY global-enable-animations animation-duration-ms=250', flush=True)
         subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'false'], env=env, check=True)
         time.sleep(0.1)
         transition_count = len(transition_rows())
@@ -1055,6 +1151,7 @@ action = { type = "move-to-previous-display" }
         check('Disabled animation logs completion without animation delay', wait_for(lambda: len(transition_rows()) == transition_count + 1) and transition_rows()[-1]['result'] == 'ok' and transition_rows()[-1]['completion_ms'] < 200, transition_rows()[-1])
         subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'true'], env=env, check=True)
         if reduced_motion:
+            print('PERFORMANCE_CATEGORY global-reduced-motion animation-duration-ms=250', flush=True)
             subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'reduce'], env=env, check=True)
             time.sleep(0.1)
             transition_count = len(transition_rows())
@@ -1062,6 +1159,7 @@ action = { type = "move-to-previous-display" }
             assert_frame('Reduced motion still places window correctly', expected_zones[1], window_log)
             check('Reduced motion avoids custom movement animation', wait_for(lambda: len(transition_rows()) == transition_count + 1) and transition_rows()[-1]['result'] == 'ok' and transition_rows()[-1]['completion_ms'] < 200, transition_rows()[-1])
             subprocess.run(['gsettings', 'set', 'org.gnome.desktop.a11y.interface', 'reduced-motion', 'no-preference'], env=env, check=True)
+        print('PERFORMANCE_CATEGORY native-rejection-and-capture animation-duration-ms=250', flush=True)
         send(window, 'fullscreen')
         check('Performance fixture enters fullscreen', wait_for(lambda: window_state(window_log)[4]), window_state(window_log))
         transition_count = len(transition_rows())

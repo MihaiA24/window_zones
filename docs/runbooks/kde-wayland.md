@@ -134,6 +134,12 @@ in [KWin 6.0's maximize handling](https://github.com/KDE/kwin/blob/v6.0.5/src/xd
 [`Window.setMaximize(false, false)`](https://github.com/KDE/kwin/blob/Plasma/6.5/src/window.h)
 is script-invokable; `setQuickTileMode` is not.
 
+Placement waits for restoration acknowledgement or a client repaint before one
+final frame assignment. The script observes through its existing 750 ms deadline
+instead of completing on transient equality; a later constrained/restoration
+change becomes `PartialMove` with the observed frame. Completion is bounded,
+not a guarantee against changes after that observation window.
+
 The script-facing `NextRequest` returns
 `(request_id, kind, window_id, x, y, width, height, hotkeys_json)`.
 IDs start at `1`, skip `0` on wrap, and retain their sequence across script
