@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use dbus_tree::MethodErr;
 
 use super::protocol::{
-    DisplayPayload, KWIN_PROTOCOL_MAJOR, NextRequestPayload, REQUEST_MOVE,
+    CALL_TIMEOUT, DisplayPayload, KWIN_PROTOCOL_MAJOR, NextRequestPayload, REQUEST_MOVE,
     REQUEST_REFRESH_DISPLAYS, REQUEST_REGISTER_HOTKEYS, method_error, sender_name,
 };
 
@@ -80,7 +80,7 @@ impl CompanionState {
         if protocol_major != KWIN_PROTOCOL_MAJOR {
             return Err(method_error(
                 "org.window_zones.KWin.Error.Incompatible",
-                "unsupported KWin companion protocol major",
+                "unsupported KWin companion protocol major; upgrade the KWin script and companion service together to protocol 4",
             ));
         }
         if !reset_state && self.script_sender.as_deref() == Some(script_sender.as_str()) {
@@ -128,7 +128,7 @@ impl CompanionState {
         self.events.clear();
         Err(method_error(
             "org.window_zones.KWin.Error.Unavailable",
-            "KWin script is not connected; enable or upgrade the Window Zones KWin script to protocol 3",
+            "KWin script is not connected; enable or upgrade the Window Zones KWin script to protocol 4",
         ))
     }
 
@@ -226,6 +226,13 @@ impl CompanionState {
         self.requests
             .push_back(CompanionRequest::RefreshDisplays { id });
         id
+    }
+
+    pub(super) fn request_timeout_ms(&self) -> u64 {
+        // Claimed requests stay queued until completion; retained results do not.
+        u64::try_from(self.requests.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(CALL_TIMEOUT.as_millis() as u64)
     }
 
     fn next_request(&mut self, sender: &str) -> Result<NextRequestPayload, MethodErr> {

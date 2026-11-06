@@ -7,10 +7,12 @@ use crate::{HotkeySystemError, Rect, WindowId, WindowSystemError};
 
 pub const KWIN_SERVICE_NAME: &str = "org.window_zones.KWin";
 pub const KWIN_OBJECT_PATH: &str = "/org/window_zones/KWin";
-pub const KWIN_INTERFACE: &str = "org.window_zones.KWin3";
-pub const KWIN_PROTOCOL_MAJOR: u32 = 3;
+pub const KWIN_INTERFACE: &str = "org.window_zones.KWin4";
+pub const KWIN_PROTOCOL_MAJOR: u32 = 4;
 
 pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(1);
+// Each distinct pending request can contribute one one-second slot.
+pub(super) const MAX_REQUEST_TIMEOUT_MS: u64 = u32::MAX as u64 * CALL_TIMEOUT.as_millis() as u64;
 pub(super) const FOCUSED_WINDOW_CAPABILITY: &str = "focused-window";
 pub(super) const DISPLAYS_CAPABILITY: &str = "displays";
 pub(super) const MOVE_RESIZE_CAPABILITY: &str = "move-resize";
@@ -29,7 +31,7 @@ pub enum KwinIntegrationError {
     )]
     Unavailable { message: String },
     #[error(
-        "KWin companion is incompatible: {message}; upgrade the KWin script and companion service together"
+        "KWin companion is incompatible: {message}; upgrade the KWin script and companion service together to protocol 4"
     )]
     Incompatible { message: String },
     #[error(

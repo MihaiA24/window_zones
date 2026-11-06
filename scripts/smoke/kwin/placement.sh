@@ -15,13 +15,15 @@ kde_live_dispatch() {
 kde_live_move() {
     # window x,y,w,h: queue the Companion's MoveWindow directly and wait for the script's result;
     # print `ok` or the completed error.
-    local reply='' request='' result='' deadline=$((SECONDS + 10))
+    local reply='' signature='' request='' timeout_ms='' result='' deadline
     reply=$(kde_live_companion_call MoveWindow siiuu "$1" ${2//,/ } 2>&1 || true)
-    request=$(printf '%s\n' "$reply" | sed -n 's/^u //p')
-    if [[ -z "$request" ]]; then
+    read -r signature request timeout_ms <<<"$reply"
+    if [[ "$signature" != ut || ! "$request" =~ ^[1-9][0-9]*$ || ! "$timeout_ms" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s' "$reply"
         return 0
     fi
+    # SECONDS is rounded down; retain the full advertised budget at either clock boundary.
+    deadline=$((SECONDS + (timeout_ms + 999) / 1000 + 1))
     while (( SECONDS < deadline )); do
         result=$(kde_live_companion_call GetRequestResult s "$request" 2>&1 || true)
         [[ "$result" == 'bss true'* ]] && break

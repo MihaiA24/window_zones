@@ -14,7 +14,7 @@ use crate::{
 use super::protocol::{
     CALL_TIMEOUT, DISPLAYS_CAPABILITY, DisplayPayload, FOCUSED_WINDOW_CAPABILITY,
     HOTKEYS_CAPABILITY, KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_SERVICE_NAME, KwinIntegrationError,
-    MOVE_RESIZE_CAPABILITY, classify_dbus_error,
+    MAX_REQUEST_TIMEOUT_MS, MOVE_RESIZE_CAPABILITY, classify_dbus_error,
 };
 
 #[derive(Default)]
@@ -165,7 +165,8 @@ impl KwinWindowSystem {
     where
         A: AppendAll,
     {
-        let (request_id,): (u32,) = self.call_with_capability(capability, method, args)?;
+        let (request_id, timeout_ms): (u32, u64) =
+            self.call_with_capability(capability, method, args)?;
 
         let mut connection_slot = self.connection.lock();
         let connection =
@@ -174,7 +175,7 @@ impl KwinWindowSystem {
                 .ok_or_else(|| KwinIntegrationError::Unavailable {
                     message: "D-Bus connection was not established".to_string(),
                 })?;
-        let result = wait_for_request(connection, request_id);
+        let result = wait_for_request(connection, request_id, timeout_ms);
         if let Err(error) = &result
             && error.should_reconnect()
         {
@@ -236,12 +237,12 @@ impl KwinHotkeySystem {
                     message: "failed to encode hotkey request payload".to_string(),
                 })?;
             let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
-            let (request_id,): (u32,) = proxy
+            let (request_id, timeout_ms): (u32, u64) = proxy
                 .method_call(KWIN_INTERFACE, "RegisterHotkeys", (payload,))
                 .map_err(classify_dbus_error)?;
             // The script preflights owners and SetShortcut verifies assignment before commit.
             // A later sampler could refuse an already committed set without rolling it back.
-            wait_for_request(connection, request_id)
+            wait_for_request(connection, request_id, timeout_ms)
         })();
 
         if let Err(error) = &result
@@ -321,8 +322,20 @@ fn require_capability(
     })
 }
 
-fn wait_for_request(connection: &Connection, request_id: u32) -> Result<(), KwinIntegrationError> {
-    let deadline = Instant::now() + CALL_TIMEOUT;
+fn wait_for_request(
+    connection: &Connection,
+    request_id: u32,
+    timeout_ms: u64,
+) -> Result<(), KwinIntegrationError> {
+    let invalid_timeout = || KwinIntegrationError::Incompatible {
+        message: format!("invalid KWin request timeout: {timeout_ms}ms"),
+    };
+    if !(CALL_TIMEOUT.as_millis() as u64..=MAX_REQUEST_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(invalid_timeout());
+    }
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(invalid_timeout)?;
     let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
 
     loop {

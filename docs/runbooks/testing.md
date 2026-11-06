@@ -67,7 +67,7 @@ This runbook defines V1 Release gates and how to reproduce them. Report results,
 |---|---|---|
 | GNOME Wayland and TUI lifecycle | blocking | Synthetic session and expanded seated run with the upgraded `Gnome2` companion |
 | Linux X11 and TUI lifecycle | blocking | Xvfb/Openbox run, including identified moves, exclusive hotkey rollback and TUI lifecycle |
-| KDE Plasma Wayland | deferred, non-blocking | Seated KWin 6.x run with the protocol-3 script and companion; a nested pass cannot close this gate |
+| KDE Plasma Wayland | deferred, non-blocking | Seated KWin 6.x run with the protocol-4 script and companion; a nested pass cannot close this gate |
 | Windows | deferred, non-blocking | Manual Windows run |
 
 Release gate status is exactly one of `pending`, `blocking - pass`, `blocking - fail`, or `deferred - unverified`. macOS, Sway, and Hyprland are ungated integrations. Linux Smoke runs report `Smoke assertions (<gate>): N; passed: P; failed: F; skipped: S`.

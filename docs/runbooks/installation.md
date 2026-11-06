@@ -142,8 +142,9 @@ with `gsettings set org.gnome.shell disable-user-extensions false`.
 ID is **`window-zones`**. It also builds and installs
 `<prefix>/bin/window_zones_kwin`; upgrade the script and binary together.
 
-The KWin script and Rust companion use protocol major 3 for identified-window
-moves and live display/shortcut updates; older files are incompatible.
+The App, KWin script and Rust companion use protocol major 4 for identified-window
+moves and queue-aware completion deadlines. Upgrade all three together; older
+files are incompatible.
 
 Enable **Window Zones** in **System Settings -> Window Management -> KWin
 Scripts**. After upgrading, disable/re-enable the script to reload its code and

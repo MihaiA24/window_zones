@@ -141,7 +141,10 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             let mut state = refresh_displays_state.lock();
                             state.ensure_ready()?;
                             let request_id = state.enqueue_refresh_displays();
-                            Ok(vec![method.msg.method_return().append1(request_id)])
+                            Ok(vec![method
+                                .msg
+                                .method_return()
+                                .append2(request_id, state.request_timeout_ms())])
                         }))
                         .add_m(factory.method("SetShortcut", (), move |method| {
                             let (hotkey, key): (String, i32) = method.msg.read2()?;
@@ -162,7 +165,10 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             let mut state = move_state.lock();
                             state.ensure_ready()?;
                             let request_id = state.enqueue_move(window, x, y, width, height);
-                            Ok(vec![method.msg.method_return().append1(request_id)])
+                            Ok(vec![method
+                                .msg
+                                .method_return()
+                                .append2(request_id, state.request_timeout_ms())])
                         }))
                         .add_m(factory.method("RegisterHotkeys", (), move |method| {
                             let payload: String = method.msg.read1()?;
@@ -172,7 +178,10 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             state.ensure_ready()?;
                             state.authorize_controller(sender)?;
                             let request_id = state.enqueue_hotkeys(hotkeys);
-                            Ok(vec![method.msg.method_return().append1(request_id)])
+                            Ok(vec![method
+                                .msg
+                                .method_return()
+                                .append2(request_id, state.request_timeout_ms())])
                         }))
                         .add_m(factory.method("NextRequest", (), move |method| {
                             next_request_state.lock().poll_next_request(method.msg)

@@ -2,7 +2,7 @@ kde_live_companion_call() {
     local method=$1
     shift
     busctl --address="$KDE_BUS" call \
-        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin3 "$method" "$@"
+        org.window_zones.KWin /org/window_zones/KWin org.window_zones.KWin4 "$method" "$@"
 }
 
 kde_live_kwin_call() {

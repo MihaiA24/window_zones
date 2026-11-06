@@ -76,7 +76,7 @@ assert.deepEqual(session.calls('CompleteRequest')[0].args.slice(0, 3),
 const stalePoll = session.take('NextRequest');
 session.advance(4000);
 const reconnect = session.take('RegisterCompanion');
-assert.deepEqual(reconnect.args, ['3', false]);
+assert.deepEqual(reconnect.args, ['4', false]);
 reconnect.callback();
 session.take('UpdateDisplays').callback();
 session.take('UpdateFocusedWindow').callback();

@@ -36,7 +36,7 @@ The platform-neutral core and runtime paths currently include:
 - GNOME Shell 50/51 companion integration over the versioned user-session D-Bus contract (`org.window_zones.Gnome2`);
 - automatic restoration of GNOME-maximized/tiled windows for zones and display moves, preserving their layout on the destination display;
 - GNOME compositor animations for placement and display moves, respecting disabled animations and reduced motion;
-- native KDE Plasma Wayland KWin script and protocol-3 companion integration;
+- native KDE Plasma Wayland KWin script and protocol-4 companion integration;
 - exclusive global hotkeys on X11 (`XGrabKey`), Windows and macOS (grabbing hook), GNOME, and KDE companion paths;
 - CLI, stdlib ANSI TUI, optional Linux/Windows tray, single-instance `run`, and desktop notifications for background problems;
 - opt-in `--log-file PATH` timestamped session events, with nonfatal sink failures and restart-safe append; see [session logging](docs/runbooks/running.md#session-event-logging).

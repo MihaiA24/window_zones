@@ -2,8 +2,8 @@
 
 const SERVICE_NAME = 'org.window_zones.KWin';
 const OBJECT_PATH = '/org/window_zones/KWin';
-const INTERFACE_NAME = 'org.window_zones.KWin3';
-const PROTOCOL_MAJOR = 3;
+const INTERFACE_NAME = 'org.window_zones.KWin4';
+const PROTOCOL_MAJOR = 4;
 const REQUEST_MOVE = 'move';
 const REQUEST_REFRESH_DISPLAYS = 'refresh-displays';
 const REQUEST_REGISTER_HOTKEYS = 'register-hotkeys';
@@ -364,8 +364,8 @@ function registerHotkeys(hotkeys, callback) {
         timer.stop();
         callback(error);
     };
-    // KWin does not invoke callDBus callbacks on errors. Bound the entire update before the
-    // App's one-second request deadline and ignore late replies after a timeout.
+    // KWin does not invoke callDBus callbacks on errors. Bound the entire update within its
+    // one-second queue slot and ignore late replies after a timeout.
     timer.interval = 750;
     timer.singleShot = true;
     timer.timeout.connect(() => finish(protocolError('Unavailable', 'KGlobalAccel shortcut update timed out')));
