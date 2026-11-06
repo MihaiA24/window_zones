@@ -16,12 +16,12 @@ Window Zones positions existing windows within the user's desktop; it does not m
 
 **Binding**: A configured association between a hotkey and an action.
 
-**Companion**: The compositor-owned counterpart that exposes native window control and hotkeys to the app on GNOME or KDE Wayland.
+**Companion**: The compositor-owned counterpart exposing native window control and, where supported, hotkeys to the App on Wayland.
 _Avoid_: generic Wayland backend.
 
 **Capability**: An operation a companion supports. A **degraded integration** is reachable but lacks one or more capabilities.
 
-**Compositor-bound dispatch**: A Sway or Hyprland keybinding forwarding an action to the running app instead of the app capturing global hotkeys.
+**Compositor-bound dispatch**: A Sway, Hyprland, or COSMIC keybinding forwarding an action to the running App instead of the App capturing global hotkeys.
 
 **Window identity**: An opaque, adapter-scoped identity that keeps a move addressed to the captured window even if focus changes.
 

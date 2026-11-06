@@ -40,7 +40,7 @@ impl RuntimeHotkeySystem {
         match backend {
             RuntimeBackend::DryRun => Self::Noop,
             #[cfg(target_os = "linux")]
-            RuntimeBackend::Wayland(_) => Self::Noop,
+            RuntimeBackend::Wayland(_) | RuntimeBackend::Cosmic => Self::Noop,
             #[cfg(target_os = "linux")]
             RuntimeBackend::X11 => Self::X11(X11HotkeySystem::new()),
             #[cfg(target_os = "linux")]

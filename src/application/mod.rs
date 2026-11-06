@@ -12,8 +12,6 @@ use std::process::ExitCode;
 
 use window_zones::logging::Logger;
 
-#[cfg(target_os = "linux")]
-use backends::RuntimeBackend;
 use backends::{RuntimeWindowSystem, resolve_runtime_backend};
 use cli::{Command, ParseStatus, execute_init, parse_args, print_help};
 #[cfg(target_os = "linux")]
@@ -72,7 +70,7 @@ pub(super) fn run() -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     if let Command::Dispatch { hotkey } = &args.command
-        && matches!(backend, RuntimeBackend::Wayland(_))
+        && backend.compositor_bound()
     {
         return execute_compositor_dispatch(
             args.config_path,

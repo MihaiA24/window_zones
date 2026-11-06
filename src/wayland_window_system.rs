@@ -1,8 +1,8 @@
 //! Linux Wayland adapter for `WindowSystem`.
 //!
 //! Sway and Hyprland use compositor-bound dispatch and identify windows before
-//! moving them. Session routing also recognizes GNOME and KDE, whose separate
-//! companion integrations own their window operations.
+//! moving them. Session routing also recognizes GNOME, KDE, and COSMIC, whose
+//! separate compositor integrations own their window operations.
 
 use crate::{
     DisplayGeometry, FocusedWindow, Rect, WindowId, WindowMove, WindowSystem, WindowSystemError,
@@ -19,6 +19,7 @@ use std::process::Command;
 pub enum WaylandBackend {
     Gnome,
     Kde,
+    Cosmic,
     Sway,
     Hyprland,
 }
@@ -170,16 +171,17 @@ fn resolve_wayland_backend_with_env(
 
     let gnome = is_gnome_session_with_env(&get_env);
     let kde = is_kde_session_with_env(&get_env);
+    let cosmic = desktop_signal_matches(&get_env, "cosmic");
     let sway = is_sway_session_with_env(&get_env);
     let hyprland = is_hyprland_session_with_env(&get_env);
-    let compositor_count = [gnome, kde, sway, hyprland]
+    let compositor_count = [gnome, kde, cosmic, sway, hyprland]
         .into_iter()
         .filter(|detected| *detected)
         .count();
 
     if compositor_count > 1 {
         return Err(WindowSystemError::Platform(
-            "conflicting Wayland compositor signals; keep only one of GNOME, KDE Plasma, Sway, or Hyprland session identities".to_string(),
+            "conflicting Wayland compositor signals; keep only one of GNOME, KDE Plasma, COSMIC, Sway, or Hyprland session identities".to_string(),
         ));
     }
 
@@ -189,6 +191,10 @@ fn resolve_wayland_backend_with_env(
 
     if kde {
         return Ok(WaylandBackend::Kde);
+    }
+
+    if cosmic {
+        return Ok(WaylandBackend::Cosmic);
     }
 
     if sway {
@@ -211,7 +217,7 @@ fn resolve_wayland_backend_with_env(
     }
 
     Err(WindowSystemError::Platform(
-        "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), KDE Plasma (KDE_FULL_SESSION/KDE_SESSION_VERSION or KDE desktop variables), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
+        "Wayland compositor is unknown or conflicting. Supported signals identify GNOME (GNOME desktop variables), KDE Plasma (KDE_FULL_SESSION/KDE_SESSION_VERSION or KDE desktop variables), COSMIC (COSMIC desktop variables and its patched compositor bridge), Sway (SWAYSOCK and swaymsg), or Hyprland (HYPRLAND_INSTANCE_SIGNATURE/XDG_CURRENT_DESKTOP=hyprland and hyprctl).".to_string(),
     ))
 }
 

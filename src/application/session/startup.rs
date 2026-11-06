@@ -67,7 +67,7 @@ pub(in crate::application) fn execute_session(
     }
     let (tx, instructions) = mpsc::channel();
     #[cfg(target_os = "linux")]
-    let _dispatch_server = if matches!(backend, RuntimeBackend::Wayland(_)) {
+    let _dispatch_server = if backend.compositor_bound() {
         let server = (|| {
             let path = runtime.app.config_path().ok_or_else(|| {
                 io::Error::new(
@@ -180,6 +180,22 @@ fn compositor_dispatch_identity(
                     socket
                 },
             )
+        }
+        RuntimeBackend::Cosmic => {
+            let display = PathBuf::from(required("WAYLAND_DISPLAY")?);
+            let socket = if display.is_absolute() {
+                display
+            } else {
+                let runtime = PathBuf::from(required("XDG_RUNTIME_DIR")?);
+                if !runtime.is_absolute() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "XDG_RUNTIME_DIR must be absolute for COSMIC dispatch",
+                    ));
+                }
+                runtime.join(display)
+            };
+            ("cosmic", socket)
         }
         _ => unreachable!("only compositor-bound backends use local dispatch"),
     };

@@ -37,6 +37,7 @@ The platform-neutral core and runtime paths currently include:
 - automatic restoration of GNOME-maximized/tiled windows for zones and display moves, preserving their layout on the destination display;
 - GNOME compositor animations for placement and display moves, respecting disabled animations and reduced motion;
 - native KDE Plasma Wayland KWin script and protocol-4 companion integration;
+- native COSMIC Wayland placement through an opt-in [custom compositor bridge](docs/runbooks/running.md#cosmic-wayland-custom-compositor), with compositor-owned shortcuts forwarding to the running App;
 - exclusive global hotkeys on X11 (`XGrabKey`), Windows and macOS (grabbing hook), GNOME, and KDE companion paths;
 - CLI, stdlib ANSI TUI, optional Linux/Windows tray, single-instance `run`, and desktop notifications for background problems;
 - opt-in `--log-file PATH` timestamped session events, with nonfatal sink failures and restart-safe append; see [session logging](docs/runbooks/running.md#session-event-logging).
@@ -46,6 +47,7 @@ The platform-neutral core and runtime paths currently include:
 
 - `src/main.rs` delegates to the binary-private `src/application/` composition root. CLI parsing, backend selection, session lifecycle, control surfaces, ownership and notifications have separate modules.
 - `src/kwin_integration.rs` preserves the public KWin interface; `src/kwin_integration/` separates client adapters, protocol, companion state, D-Bus dispatch and native shortcut handling.
+- `cosmic-comp/` contains the pinned compositor patch and bridge overlay; `scripts/build-cosmic.sh` builds it locally without installation or desktop restart.
 - `scripts/smoke.sh` remains the smoke entry point. `scripts/smoke/` holds shared helpers and platform journeys; `fixtures/` holds literal generated helper programs.
 
 The executable still owns one runtime, one library `App` and one instruction queue. Module boundaries do not add service layers.
@@ -56,7 +58,7 @@ On Windows/macOS, the public native hotkey adapter is `NativeHotkeySystem`. It m
 
 - Blocking Release gates: GNOME Wayland (`./scripts/smoke.sh gnome` in a Synthetic session plus `./scripts/smoke.sh gnome-live` on the seated session) and Linux X11 (`./scripts/smoke.sh x11`), each including the TUI lifecycle Smoke run.
 - KDE Plasma Wayland (`./scripts/smoke.sh kde-live` on a nested KWin) and Windows (`docs/runbooks/windows-smoke.md`) are implemented but deferred and non-blocking until a seated KWin 6.x Smoke run and the manual Windows run pass.
-- macOS, Sway, and Hyprland are ungated integrations. Sway and Hyprland use compositor-bound dispatch (`window_zones dispatch <hotkey>` from the compositor keybinding config) into a running `run`/`tui` session, retaining Restore history without global hotkey capture.
+- macOS, Sway, Hyprland, and patched COSMIC are ungated integrations. Sway, Hyprland, and COSMIC use compositor-bound dispatch (`window_zones dispatch <hotkey>` from compositor custom-command bindings) into a running `run`/`tui` session, retaining Restore history without automatic global hotkey capture.
 - `docs/runbooks/testing.md` contains gate requirements and reproduction commands. Report observed results, exact configurations, dates, unverified limits, and retained evidence paths in the PR description. Verifier cleanup preserves evidence under ignored `target/verification/`; do not check verification artifacts into the repository.
 
 ## Configuration discovery

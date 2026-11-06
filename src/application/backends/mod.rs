@@ -35,8 +35,17 @@ pub(super) enum RuntimeBackend {
     Gnome,
     #[cfg(target_os = "linux")]
     Kde,
+    #[cfg(target_os = "linux")]
+    Cosmic,
     #[cfg(target_os = "windows")]
     Windows,
     #[cfg(target_os = "macos")]
     MacOS,
+}
+
+impl RuntimeBackend {
+    #[cfg(target_os = "linux")]
+    pub(in crate::application) fn compositor_bound(self) -> bool {
+        matches!(self, Self::Wayland(_) | Self::Cosmic)
+    }
 }

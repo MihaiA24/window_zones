@@ -135,7 +135,7 @@ class Workspace:
         files = [self.root / "Cargo.toml", self.root / "Cargo.lock",
                  self.skill / "verify", self.expected, self.fixed_clock]
         files.extend((self.skill / "wz_verify").rglob("*.py"))
-        for directory in ("src", "gnome-extension", "kwin-script", "scripts", ".cargo"):
+        for directory in ("src", "gnome-extension", "kwin-script", "cosmic-comp", "scripts", ".cargo"):
             files.extend(p for p in (self.root / directory).rglob("*") if p.is_file() and p.suffix not in (".pyc", ".pyo"))
         hashed = hashlib.sha256()
         for path in sorted(files):
@@ -274,7 +274,7 @@ class Workspace:
                      "DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE",
                      "XAUTHORITY", "DCONF_PROFILE", "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE",
                      "WINDOW_ZONES_SMOKE_GNOME_DATA_DIRS", "WINDOW_ZONES_SMOKE_PIPEWIRE_RUNTIME_DIR",
-                     "WINDOW_ZONES_SMOKE_PIPEWIRE_REMOTE"):
+                     "WINDOW_ZONES_SMOKE_PIPEWIRE_REMOTE", "WINDOW_ZONES_SMOKE_COSMIC_PARENT_DISPLAY"):
             result.pop(name, None)
         result["CARGO_HOME"] = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
         result["RUSTUP_HOME"] = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))

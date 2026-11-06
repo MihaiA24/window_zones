@@ -302,7 +302,7 @@ def capture_current_monitor(output, window_id=None):
                 consumer.wait(timeout=5)
 
 
-def test_window(title):
+def test_window(title, fixed=False):
     import gi
     gi.require_version('Gtk', '4.0')
     gi.require_version('Gdk', '4.0')
@@ -311,6 +311,8 @@ def test_window(title):
     window = Gtk.Window(title='Window Zones test: ' + title)
     window.set_default_size(720, 480)
     window.set_decorated(False)
+    if fixed:
+        window.set_resizable(False)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
     for setter in (box.set_margin_top, box.set_margin_bottom, box.set_margin_start, box.set_margin_end):
         setter(24)
@@ -1249,13 +1251,15 @@ if __name__ == '__main__':
     parser.add_argument('--keep-logs', action='store_true')
     parser.add_argument('--output-dir', type=Path, help='Create this evidence directory instead of a temporary one')
     parser.add_argument('--test-window', metavar='TITLE')
+    parser.add_argument('--test-window-fixed', action='store_true',
+                        help='Start --test-window non-resizable before its first native commit')
     parser.add_argument('--xwayland-transform', type=Path,
                         help='Record current Mutter/Xwayland layout and print scale and logical origin')
     parser.add_argument('--capture', type=Path, help='Capture the current GNOME compositor without input')
     parser.add_argument('--capture-window', type=int, help='Choose the captured monitor by this Xwayland window')
     args = parser.parse_args()
     if args.test_window:
-        test_window(args.test_window)
+        test_window(args.test_window, fixed=args.test_window_fixed)
     else:
         interrupted_signal = None
         def terminate(signum, _frame):

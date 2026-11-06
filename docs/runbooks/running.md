@@ -87,7 +87,7 @@ Records have RFC 3339 UTC timestamps and escaped control characters. They includ
 
 File open/write failures disable the file sink and warn best-effort; even unwritable stderr does not abort the command. Genuine CLI/startup errors retain their failure exit status. No default session file is created.
 
-This is distinct from `--perf-log` JSONL below. Both may be enabled with separate destinations. For full Sway/Hyprland runtime events, enable session logging on the persistent `run`/`tui`; an optional dispatch-client log contains that client's lifecycle and forwarded result.
+This is distinct from `--perf-log` JSONL below. Both may be enabled with separate destinations. For full Sway/Hyprland/COSMIC runtime events, enable session logging on the persistent `run`/`tui`; an optional dispatch-client log contains that client's lifecycle and forwarded result.
 
 ## Performance logging
 
@@ -107,7 +107,7 @@ per attempted action, including failures. Each row has a timestamp, PID,
 action/result/error, and memory scope. Choose a fresh path for an isolated
 measurement; runtime `restart` preserves the open log.
 
-On Sway/Hyprland, set `--perf-log` on the persistent `run`/`tui` session.
+On Sway/Hyprland/COSMIC, set `--perf-log` on the persistent `run`/`tui` session.
 Compositor-bound dispatches are logged by that session (its PID and memory),
 not by the short-lived CLI clients. Passing `--perf-log` to those clients is
 an error; other backends retain one-shot dispatch logging.
@@ -157,7 +157,7 @@ The App prints runtime events once per change, never per retry:
 
 With non-terminal stdout, Linux and macOS notify about background problems, including tray mode; terminal and `--backend dry-run` sessions do not. Config errors and refused hotkeys notify at once; unavailable hotkeys notify after 20 seconds of continuous outage even if diagnostics change. Linux updates its notification in place, including a matching recovery notice. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
 
-One-shot `dispatch` prints its state and exits `0`, including dispatch errors (no binding, no focused window, adapter failure). Inspect `Dispatch state` and diagnostics rather than treating exit status as proof of movement. Sway/Hyprland dispatch clients still exit nonzero when their session-owned request fails.
+One-shot `dispatch` prints its state and exits `0`, including dispatch errors (no binding, no focused window, adapter failure). Inspect `Dispatch state` and diagnostics rather than treating exit status as proof of movement. Compositor-bound dispatch clients (Sway/Hyprland/COSMIC) exit nonzero when their session-owned request fails.
 
 ## Backend resolution
 
@@ -221,6 +221,61 @@ fractional-scale IPC; those exact-frame cases are not certified.
 ## Linux X11
 
 Placement uses the window frame (client origin translated to root coordinates plus `_NET_FRAME_EXTENTS`) and restores maximized windows before configuring. It waits for the WM's observed frame, not only X-server acknowledgement; constrained placement reports its actual partial frame so Restore remains available. RandR usable areas exclude effective current/all-desktop reservations, not withdrawn clients or another desktop's docks. Exclusive `XGrabKey` bindings follow keyboard/modifier remapping and actual lock slots. A failed remap releases obsolete grabs and reports unavailable capture; resolve the conflict and use `restart`.
+
+## COSMIC Wayland (custom compositor)
+
+Stock COSMIC exposes window observation and limited management, but not arbitrary
+window placement. This integration requires the compositor patch and bridge in
+`cosmic-comp/`; it is not an applet or loadable desktop plugin. Auto selection and
+`--backend wayland` report `cosmic-wayland`, with an explicit unavailable-bridge
+diagnostic on an unmodified desktop. There is no XWayland-only fallback.
+
+Build both programs locally:
+
+```bash
+cargo build --locked --bins
+CARGO_PROFILE_DEV_DEBUG=0 ./scripts/build-cosmic.sh
+./scripts/smoke.sh cosmic
+```
+
+The helper fetches the revision in `cosmic-comp/revision`, verifies a pristine or
+exactly patched checkout, and builds `target/cosmic-comp-build/debug/cosmic-comp`.
+Use `--release` for a release build. It never installs binaries, changes desktop
+settings, or restarts a session. Native compositor development dependencies are
+required in addition to the App's dependencies.
+
+Using the bridge in a login session is a separate deployment step: that session
+must deliberately launch the patched compositor with
+`WINDOW_ZONES_COSMIC_BRIDGE=1`. Setting this variable on `window_zones` cannot
+extend an already-running stock compositor. Preserve the distro compositor and
+a working login-session rollback path; do not replace or restart a desktop
+without its owner's approval.
+
+Inside that patched session, check `window_zones status` for the three COSMIC
+capabilities (`focused-window`, `displays`, `move-resize`), initialize the App's
+config if needed, then start `window_zones run` or `tui`. Create COSMIC
+custom-command shortcuts in Settings, using an absolute executable path:
+
+```text
+/absolute/path/window_zones dispatch Ctrl+Alt+Left
+```
+
+Use the same resolved config path for the runtime and its dispatch clients.
+COSMIC owns capture; there is no automatic GlobalShortcuts registration.
+App TOML reloads do not rewrite COSMIC's shortcut map. TUI hotkey capabilities
+remain `<none>` and its mode is `compositor-bound dispatch`.
+
+Moves use identified windows, global logical frame coordinates, compositor
+usable areas, and committed client geometry. Tiled/maximized windows are made
+floating/restored before placement. Fullscreen, minimized, stacked/grouped,
+fixed-size, busy, and locked-session requests are refused before changes;
+constrained partial placements retain the observed frame for Restore.
+Restart Window Zones after replacing its compositor/bridge; it will not redirect
+captured IDs to another bus owner or silently adopt a replaced display socket.
+
+The native smoke runs a private nested COSMIC on the current Wayland display.
+Its evidence is not a seated release gate, physical-keyboard, multi-display,
+fractional-scale, XWayland, or tray certification; see the testing runbook.
 
 ## KDE Plasma Wayland
 

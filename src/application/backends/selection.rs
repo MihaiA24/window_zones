@@ -96,6 +96,7 @@ fn resolve_wayland_runtime_backend() -> Result<RuntimeBackend, String> {
     match window_zones::resolve_wayland_backend().map_err(|error| error.to_string())? {
         WaylandBackend::Gnome => Ok(RuntimeBackend::Gnome),
         WaylandBackend::Kde => Ok(RuntimeBackend::Kde),
+        WaylandBackend::Cosmic => Ok(RuntimeBackend::Cosmic),
         WaylandBackend::Sway => Ok(RuntimeBackend::Wayland(ScriptedCompositor::Sway)),
         WaylandBackend::Hyprland => Ok(RuntimeBackend::Wayland(ScriptedCompositor::Hyprland)),
     }

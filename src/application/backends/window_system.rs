@@ -2,9 +2,11 @@
 use window_zones::MacOSWindowSystem;
 #[cfg(target_os = "windows")]
 use window_zones::WindowsWindowSystem;
-use window_zones::{DisplayGeometry, FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
 #[cfg(target_os = "linux")]
-use window_zones::{GnomeWindowSystem, KwinWindowSystem, WaylandWindowSystem, X11WindowSystem};
+use window_zones::{
+    CosmicWindowSystem, GnomeWindowSystem, KwinWindowSystem, WaylandWindowSystem, X11WindowSystem,
+};
+use window_zones::{DisplayGeometry, FocusedWindow, WindowMove, WindowSystem, WindowSystemError};
 
 use super::RuntimeBackend;
 use super::dry_run::DryRunWindowSystem;
@@ -20,6 +22,8 @@ pub(in crate::application) enum RuntimeWindowSystem {
     Gnome(GnomeWindowSystem),
     #[cfg(target_os = "linux")]
     Kde(KwinWindowSystem),
+    #[cfg(target_os = "linux")]
+    Cosmic(CosmicWindowSystem),
     #[cfg(target_os = "windows")]
     Windows(WindowsWindowSystem),
     #[cfg(target_os = "macos")]
@@ -39,6 +43,8 @@ macro_rules! with_window_system {
             RuntimeWindowSystem::Gnome($system) => $body,
             #[cfg(target_os = "linux")]
             RuntimeWindowSystem::Kde($system) => $body,
+            #[cfg(target_os = "linux")]
+            RuntimeWindowSystem::Cosmic($system) => $body,
             #[cfg(target_os = "windows")]
             RuntimeWindowSystem::Windows($system) => $body,
             #[cfg(target_os = "macos")]
@@ -61,6 +67,8 @@ impl RuntimeWindowSystem {
             RuntimeBackend::Gnome => Self::Gnome(GnomeWindowSystem::new()),
             #[cfg(target_os = "linux")]
             RuntimeBackend::Kde => Self::Kde(KwinWindowSystem::new()),
+            #[cfg(target_os = "linux")]
+            RuntimeBackend::Cosmic => Self::Cosmic(CosmicWindowSystem::new()),
             #[cfg(target_os = "windows")]
             RuntimeBackend::Windows => Self::Windows(WindowsWindowSystem::new()),
             #[cfg(target_os = "macos")]
@@ -87,6 +95,8 @@ impl RuntimeWindowSystem {
             Self::Gnome(_) => "gnome-wayland",
             #[cfg(target_os = "linux")]
             Self::Kde(_) => "kde-wayland",
+            #[cfg(target_os = "linux")]
+            Self::Cosmic(_) => "cosmic-wayland",
             #[cfg(target_os = "windows")]
             Self::Windows(_) => "windows",
             #[cfg(target_os = "macos")]
@@ -107,6 +117,11 @@ impl RuntimeWindowSystem {
             #[cfg(target_os = "linux")]
             Self::Kde(system) => Some((
                 "KDE",
+                system.capabilities().map_err(|error| error.to_string()),
+            )),
+            #[cfg(target_os = "linux")]
+            Self::Cosmic(system) => Some((
+                "COSMIC",
                 system.capabilities().map_err(|error| error.to_string()),
             )),
             #[allow(unreachable_patterns)]
