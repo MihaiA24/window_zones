@@ -50,9 +50,9 @@ def parser(workspace):
                                   "intentional failures must expect 'Last error: dispatch: …'.")
     interactive.add_argument("--quit", choices=("quit", "q", "exit", "eof"), default="quit", help="Exit/cancel entry point, including terminal Ctrl-D.")
     native = drivers.add_parser("smoke", help="Run existing synthetic compositor gate, keeping assertions, logs and screenshots.",
-                               epilog="gnome is seatless; kde-live is nested despite its name. Neither proves seated accelerator behavior. "
+                               epilog="gnome is seatless; kde-live and cosmic are nested. COSMIC requires an accessible parent Wayland session and a locally built patched compositor. These do not prove seated accelerator behavior. "
                                "gnome-live is deliberately excluded: it attaches to a shared user session.")
-    native.add_argument("gate", choices=("x11", "gnome", "kde-live"))
+    native.add_argument("gate", choices=("x11", "gnome", "kde-live", "cosmic"))
     drivers.add_parser("tests", help="Run the repository's existing scripts/test.sh, not a parallel test framework.")
     for child in (config, cli, interactive, native, drivers.choices["tests"]):
         child.add_argument("--dry-run", action="store_true", help="Print the planned drive; do not mutate config, move windows, build, or start processes.")

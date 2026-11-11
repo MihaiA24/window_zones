@@ -1,8 +1,20 @@
 #!/usr/bin/env -S gjs -m
-// Exercise the real service dispatcher without a Shell session or session bus.
+// Exercise the real dispatcher and bus-name lifecycle without a Shell session.
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {display, makeWindow, Main, Meta, settings, Shell, St, TestActor} from './stubs.js';
+import System from 'system';
+import {animationSettings, display, makeWindow, Main, Meta, settings, Shell, St, TestActor} from './stubs.js';
+
+// GIO/GVfs can cache the session bus during imports. Isolate the process,
+// rather than changing its bus address after that connection already exists.
+if (ARGV[0] !== '--private-bus') {
+    const child = Gio.Subprocess.new([
+        'dbus-run-session', '--', 'env', 'GIO_USE_VFS=local', 'gjs', '-m',
+        GLib.filename_from_uri(import.meta.url)[0], '--private-bus',
+    ], Gio.SubprocessFlags.NONE);
+    child.wait_check(null);
+    System.exit(0);
+}
 
 const here = Gio.File.new_for_uri(import.meta.url).get_parent();
 const source = here.get_parent().get_child('extension.js');
@@ -14,7 +26,6 @@ const redirected = new TextDecoder().decode(bytes)
     .replace(/^import Meta from 'gi:\/\/Meta';$/m, `import {Meta} from '${stubs}';`)
     .replace(/^import Shell from 'gi:\/\/Shell';$/m, `import {Shell} from '${stubs}';`)
     .replace(/^import \* as Main from 'resource:.*$/m, `import {Main} from '${stubs}';`)
-    .replace(/^import \{WINDOW_ANIMATION_TIME\} from 'resource:.*$/m, `import {WINDOW_ANIMATION_TIME} from '${stubs}';`)
     .replace(/^import \{Extension\} from 'resource:.*$/m, `import {Extension} from '${stubs}';`);
 const [fd, copy] = GLib.file_open_tmp('window-zones-contract-XXXXXX.js');
 GLib.close(fd);
@@ -72,7 +83,7 @@ const connection = {
             new GLib.Variant('(sss)', [sender, sender, '']));
     },
 };
-const service = new WindowZonesService();
+const service = new WindowZonesService(animationSettings);
 service.export(connection);
 
 async function call(name, args = [], sender = ':1.42', expectedError = null) {
@@ -208,6 +219,14 @@ for (const [animations, reducedMotion, x] of [[false, 0, 30], [true, 1, 50], [tr
 }
 settings.enable_animations = true;
 settings.reducedMotion = 0;
+for (const [duration, x, lower, upper] of [[0, 90, 0, 100], [150, 110, 120, 250], [400, 130, 350, 600]]) {
+    animationSettings.duration = duration;
+    await call('MoveWindow', [window.id, x, 40, 600, 700]);
+    metrics = await call('GetLastTransitionMetrics');
+    equal(metrics[1] >= lower && metrics[1] < upper, true,
+        `live app animation duration ${duration} ms controls completed placement`);
+}
+animationSettings.duration = 250;
 window.actor = null;
 for (const discovery of ['GetFocusedWindow', 'GetDisplays']) {
     await call('MoveWindow', [window.id, 80, 40, 600, 700]);
@@ -347,4 +366,128 @@ equal(failure.observed, [50, 60, 600, 700], 'companion teardown preserves the ch
 equal(failure.message, 'companion disabled during transition', 'teardown retains its failure reason');
 equal(display.grabbed.size, 0, 'destroy releases every grab');
 equal(display.handler, null, 'destroy disconnects accelerator listener');
+
+async function busCall(busConnection, destination, path, interfaceName, method, parameters = null, replyType = null) {
+    return new Promise((resolve, reject) => busConnection.call(
+        destination, path, interfaceName, method, parameters,
+        replyType === null ? null : new GLib.VariantType(replyType),
+        Gio.DBusCallFlags.NONE, 1000, null,
+        (caller, result) => {
+            try {
+                resolve(caller.call_finish(result).deep_unpack());
+            } catch (error) {
+                reject(error);
+            }
+        }));
+}
+
+function busMethod(busConnection, method, parameters, replyType) {
+    return busCall(busConnection, 'org.freedesktop.DBus', '/org/freedesktop/DBus',
+        'org.freedesktop.DBus', method, parameters, replyType);
+}
+
+async function waitFor(predicate, description) {
+    let ready = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (await predicate()) {
+            ready = true;
+            break;
+        }
+        await delay(10);
+    }
+    equal(ready, true, description);
+}
+
+// Never contend with or replace the user's companion.
+const extension = new companion.default();
+let incumbent = null;
+let shellConnection = null;
+try {
+    const address = GLib.getenv('DBUS_SESSION_BUS_ADDRESS');
+    incumbent = Gio.DBusConnection.new_for_address_sync(
+        address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        null, null);
+    shellConnection = Gio.bus_get_sync(Gio.BusType.SESSION, null);
+    shellConnection.set_exit_on_close(false);
+    equal(shellConnection.get_guid(), incumbent.get_guid(),
+        'companion lifecycle uses the isolated session bus');
+    const name = 'org.window_zones.Gnome';
+    const requestName = () => busMethod(incumbent, 'RequestName',
+        new GLib.Variant('(su)', [name, 0]), '(u)');
+    const releaseName = () => busMethod(incumbent, 'ReleaseName',
+        new GLib.Variant('(s)', [name]), '(u)');
+    const queued = async () => {
+        const [owners] = await busMethod(incumbent, 'ListQueuedOwners',
+            new GLib.Variant('(s)', [name]), '(as)');
+        return owners.includes(shellConnection.get_unique_name());
+    };
+    const unowned = async () => {
+        const [owned] = await busMethod(incumbent, 'NameHasOwner',
+            new GLib.Variant('(s)', [name]), '(b)');
+        return !owned;
+    };
+    const available = async destination => {
+        try {
+            const capabilities = await busCall(incumbent, destination, '/org/window_zones/Gnome',
+                info.name, 'GetCapabilities', null, '(as)');
+            equal(capabilities, [['focused-window', 'displays', 'move-resize', 'hotkeys', 'transition-metrics']],
+                'owned service retains all five capabilities');
+            return true;
+        } catch (error) {
+            if ([
+                'org.freedesktop.DBus.Error.UnknownMethod',
+                'org.freedesktop.DBus.Error.UnknownObject',
+                'org.freedesktop.DBus.Error.ServiceUnknown',
+                'org.freedesktop.DBus.Error.NameHasNoOwner',
+            ].includes(Gio.DBusError.get_remote_error(error)))
+                return false;
+            throw error;
+        }
+    };
+    const register = () => busCall(incumbent, name, '/org/window_zones/Gnome',
+        info.name, 'RegisterHotkeys', new GLib.Variant('(as)', [['ctrl+cmd+left']]), '()');
+
+    equal(await requestName(), [1], 'incumbent owns the private companion name');
+    extension.enable();
+    await waitFor(queued, 'enabled companion queues behind the incumbent');
+    equal(await available(shellConnection.get_unique_name()), false, 'queued companion exports no object');
+    equal(display.handler, null, 'queued companion installs no accelerator listener');
+    equal(await releaseName(), [1], 'incumbent releases the private companion name');
+    await waitFor(() => available(name), 'queued companion exports after the incumbent exits');
+    await register();
+    equal(display.grabbed.size, 1, 'recovered companion accepts real hotkey calls');
+
+    extension.disable();
+    extension.disable();
+    equal(display.grabbed.size, 0, 'disable releases recovered hotkeys exactly once');
+    equal(display.handler, null, 'disable disconnects the recovered listener');
+    equal(await available(shellConnection.get_unique_name()), false, 'disable unexports the owned object');
+    await waitFor(unowned, 'disable relinquishes the bus name');
+
+    equal(await requestName(), [1], 'incumbent can own the name again');
+    extension.enable();
+    await waitFor(queued, 're-enabled companion can queue again');
+    extension.disable();
+    extension.disable();
+    equal(await releaseName(), [1], 'incumbent exits after queued disable');
+    await waitFor(unowned, 'disable cancels queued ownership');
+    equal(await available(shellConnection.get_unique_name()), false, 'canceled ownership cannot re-export');
+
+    extension.enable();
+    await waitFor(() => available(name), 'companion can acquire after disable and re-enable');
+    await register();
+    shellConnection.close_sync(null);
+    await waitFor(() => display.handler === null, 'bus loss destroys the owned service');
+    equal(display.grabbed.size, 0, 'bus loss releases the registered hotkeys');
+    extension.disable();
+    extension.disable();
+} finally {
+    extension.disable();
+    if (shellConnection !== null && !shellConnection.is_closed())
+        shellConnection.close_sync(null);
+    if (incumbent !== null && !incumbent.is_closed())
+        incumbent.close_sync(null);
+}
+
 print(`GNOME companion contract: ${checks} checks passed`);

@@ -272,11 +272,23 @@ def smoke(workspace, options):
                 "gnome": ["gnome-shell", "dbus-daemon", "/usr/bin/python3", "gst-launch-1.0",
                           "gst-inspect-1.0", "pw-dump", "pw-link", "gsettings", "Xwayland"],
                 "kde-live": ["kwin_wayland", "kpackagetool6", "kwriteconfig6", "busctl", "gjs", "xdotool",
-                             "xprop", "dbus-run-session", "python", "setsid", "gnome-text-editor"]}
+                             "xprop", "dbus-run-session", "python", "setsid", "gnome-text-editor"],
+                "cosmic": ["dbus-run-session", "/usr/bin/python3", "cc", "pkg-config"]}
     missing = [tool for tool in required[options.gate] if not shutil.which(tool)]
     if missing:
         fail(f"Missing {', '.join(missing)}. Install the prerequisites in docs/runbooks/testing.md; do not substitute a fake compositor.")
     resources = gnome_resource_environment() if options.gate == "gnome" else {}
+    if options.gate == "cosmic":
+        display = os.environ.get("WAYLAND_DISPLAY")
+        if not display:
+            fail("COSMIC smoke requires an accessible parent Wayland display for its nested compositor.")
+        parent = Path(display)
+        if not parent.is_absolute():
+            runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+            if not runtime.is_absolute():
+                fail("COSMIC smoke requires an absolute parent XDG_RUNTIME_DIR.")
+            parent = runtime / parent
+        resources = {"WINDOW_ZONES_SMOKE_COSMIC_PARENT_DISPLAY": str(parent)}
     environment = workspace.env()
     environment.update(resources)
     label = options.gate + "-" + str(time.time_ns())

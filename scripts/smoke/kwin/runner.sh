@@ -9,10 +9,7 @@ EOF
 kde_live_tui_lifecycle() {
     local tui_log="$KDE_ROOT/tui.log" rc=0
     write_five_bindings_config
-    start_fifo_app tui auto "$tui_log"
-    wait_for_text "$tui_log" 'Window Zones TUI' 15 || true
-    assert_text 'KDE TUI starts' 'Window Zones TUI' "$(cat "$tui_log" 2>/dev/null || true)"
-    tui_control_checks "$tui_log" 'KDE'
+    tui_begin auto KDE "$tui_log"
     kde_live_activate_window || true
     kde_live_dispatch 'KDE TUI baseline' alt+ctrl+up
     kde_live_refresh_targets
@@ -53,6 +50,7 @@ run_kde_live() {
     KDE_CONFLICT_SCRIPT_ID='-1'
     KDE_SERVICE_PID=''
     KDE_KWIN_PID=''
+    KDE_KWIN_START=''
     KDE_EDITOR_PID=''
     APP_PID=''
     APP_FD=''
@@ -116,7 +114,7 @@ run_kde_live() {
         return 0
     fi
     local kwin_alive=0
-    kill -0 "$KDE_KWIN_PID" 2>/dev/null && kwin_alive=1
+    owned_process alive "$KDE_KWIN_PID" "$KDE_KWIN_START" && kwin_alive=1
     assert_eq 'KDE nested KWin fixture starts' 1 "$kwin_alive"
     kde_live_prepare_environment
     local xdisplay_ok=0
@@ -157,13 +155,7 @@ run_kde_live() {
     log "KDE nested KWin script diagnostics: ${kwin_diagnostics:-none}"
     write_five_bindings_config
     local auto_backend_output=''
-    auto_backend_output=$(env -u GNOME_DESKTOP_SESSION_ID -u SWAYSOCK \
-        -u HYPRLAND_INSTANCE_SIGNATURE DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
-        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
-        XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
-        XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 "$BIN_PATH" --backend auto --config "$CONFIG_PATH" status 2>&1 || true)
+    auto_backend_output=$("$BIN_PATH" --backend auto --config "$CONFIG_PATH" status 2>&1 || true)
     assert_text 'KDE --backend auto resolves kde-wayland' \
         'Using runtime window backend: kde-wayland' "$auto_backend_output"
 
@@ -213,13 +205,8 @@ PY
 
 
     local editor_log="$KDE_ROOT/editor.log" editor_alive=0 window_found=0
-    start_group KDE_EDITOR_PID "$editor_log" env \
-        DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
-        XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
-        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
-        XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
-        XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 gnome-text-editor --standalone
+    start_group KDE_EDITOR_PID "$editor_log" env GDK_BACKEND=x11 \
+        gnome-text-editor --standalone
     kill -0 "$KDE_EDITOR_PID" 2>/dev/null && editor_alive=1
     assert_eq 'KDE test editor process starts' 1 "$editor_alive"
     XON_DISPLAY="$KDE_XDISPLAY"
@@ -345,10 +332,7 @@ PY
     service_stopped=$service_owner_gone
     log "KDE service stop: owner gone=$service_owner_gone pid alive=$(kill -0 "$old_service_pid" 2>/dev/null && printf 1 || printf 0)"
     assert_eq 'KDE Rust service stops independently' 1 "$service_stopped"
-    start_group KDE_SERVICE_PID "$restart_log" env -u KDEHOME DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" \
-        HOME="$KDE_HOME" XDG_CONFIG_HOME="$KDE_CONFIG" XDG_DATA_HOME="$KDE_DATA" \
-        XDG_CACHE_HOME="$KDE_CACHE" XDG_STATE_HOME="$KDE_STATE" XDG_RUNTIME_DIR="$KDE_RUNTIME" \
-        XDG_DATA_DIRS="$KDE_DATA_DIRS" "$KDE_COMPANION_BIN"
+    start_group KDE_SERVICE_PID "$restart_log" "$KDE_COMPANION_BIN"
     wait_for_text "$restart_log" 'KWin companion service started' 12 || true
     assert_text 'KDE Rust service restarts' 'KWin companion service started' \
         "$(cat "$restart_log" 2>/dev/null || true)"

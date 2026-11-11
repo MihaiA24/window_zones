@@ -8,11 +8,11 @@ function available() {
         Gio.DBusCallFlags.NONE, 5000, null).deep_unpack()[0];
 }
 
-function waitResult(id, label) {
+function waitResult(request, label) {
     let result = [false, '', ''];
-    for (let attempt = 0; attempt < 100; attempt++) {
+    while (GLib.get_monotonic_time() < request.deadline) {
         try {
-            result = requestResult(id);
+            result = requestResult(request);
             if (result[0])
                 break;
         } catch (_) {

@@ -5,6 +5,8 @@
 
 pub mod actions;
 pub mod config;
+#[cfg(target_os = "linux")]
+pub mod cosmic_integration;
 pub mod dispatcher;
 pub mod display_movement;
 pub mod executor;
@@ -31,6 +33,10 @@ pub use actions::{Action, Binding, Direction};
 pub use config::{
     AppConfig, BindingValidationError, ConfigError, parse_config, starter_config,
     validate_and_normalize_app_config, validate_and_normalize_bindings,
+};
+#[cfg(target_os = "linux")]
+pub use cosmic_integration::{
+    COSMIC_INTERFACE, COSMIC_OBJECT_PATH, COSMIC_SERVICE_NAME, CosmicWindowSystem,
 };
 pub use dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 pub use display_movement::move_window_to_display;

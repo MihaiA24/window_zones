@@ -1,8 +1,8 @@
 function register(keys, label) {
-    const id = request(keys);
+    const pending = request(keys);
     let result = [false, '', ''];
-    for (let attempt = 0; attempt < 100; attempt++) {
-        result = requestResult(id);
+    while (GLib.get_monotonic_time() < pending.deadline) {
+        result = requestResult(pending);
         if (result[0])
             break;
         GLib.usleep(100000);

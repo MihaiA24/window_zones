@@ -5,7 +5,6 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import {WINDOW_ANIMATION_TIME} from 'resource:///org/gnome/shell/ui/windowManager.js';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -149,10 +148,10 @@ function canonicalAccelerator(hotkey) {
 
 
 export class WindowZonesService {
-    constructor() {
+    constructor(animationSettings) {
+        this._animationSettings = animationSettings;
         this._accelerators = new Map();
         this._hotkeysByAction = new Map();
-        this._allowedKeybindings = new Map();
         this._controllerSender = null;
         this._connection = null;
         this._registrationId = 0;
@@ -341,8 +340,9 @@ export class WindowZonesService {
             x: oldFrame.x, y: oldFrame.y, width: oldFrame.width, height: oldFrame.height,
         };
         const settings = St.Settings.get();
+        const animationDuration = this._animationSettings.get_uint('animation-duration-ms');
         let clone = null;
-        if (actor && settings.enable_animations
+        if (animationDuration > 0 && actor && settings.enable_animations
             && (!St.ReducedMotion || settings.reducedMotion !== St.ReducedMotion.REDUCE)
             && (restoring || oldFrame.x !== x || oldFrame.y !== y || oldFrame.width !== width || oldFrame.height !== height)) {
             // One compositor snapshot; do not send a resize request on every animation frame.
@@ -465,7 +465,7 @@ export class WindowZonesService {
                                 scale_x: width / oldFrame.width,
                                 scale_y: height / oldFrame.height,
                                 opacity: 0,
-                                duration: WINDOW_ANIMATION_TIME,
+                                duration: animationDuration,
                                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                                 onStopped: completed => move.finish(completed ? null
                                     : dbusError('org.window_zones.Gnome.Error.InvalidWindowState', 'animation interrupted')),
@@ -475,7 +475,7 @@ export class WindowZonesService {
                                 scale_y: 1,
                                 translation_x: 0,
                                 translation_y: 0,
-                                duration: WINDOW_ANIMATION_TIME,
+                                duration: animationDuration,
                                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                             });
                             if (frozen) {
@@ -556,7 +556,6 @@ export class WindowZonesService {
                 grabbed.push(action);
                 const bindingName = Meta.external_binding_name_for_action(action);
                 Main.wm.allowKeybinding(bindingName, Shell.ActionMode.NORMAL);
-                this._allowedKeybindings.set(action, bindingName);
                 next.set(hotkey, action);
             }
         } catch (error) {
@@ -577,11 +576,7 @@ export class WindowZonesService {
     }
 
     _ungrabAccelerator(action) {
-        const bindingName = this._allowedKeybindings.get(action);
-        if (bindingName) {
-            Main.wm.allowKeybinding(bindingName, Shell.ActionMode.NONE);
-            this._allowedKeybindings.delete(action);
-        }
+        Main.wm.allowKeybinding(Meta.external_binding_name_for_action(action), Shell.ActionMode.NONE);
         global.display.ungrab_accelerator(action);
     }
 
@@ -635,13 +630,13 @@ export default class WindowZonesExtension extends Extension {
             Gio.BusType.SESSION,
             SERVICE_NAME,
             Gio.BusNameOwnerFlags.NONE,
+            null,
             connection => {
                 if (this._service)
                     this._service.destroy();
-                this._service = new WindowZonesService();
+                this._service = new WindowZonesService(this.getSettings());
                 this._service.export(connection);
             },
-            () => {},
             () => {
                 if (this._service) {
                     this._service.destroy();

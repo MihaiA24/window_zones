@@ -16,6 +16,7 @@ Maintained source for user-facing verification journeys. `docs/runbooks/testing.
 - Follow [Drive](../SKILL.md#drive) for CLI/PTY commands, flag/config variants, deadlines and isolated config mutations.
 - Choose maintained [Checks](../SKILL.md#checks) before individual recipes; `check e2e` already owns X11 smoke. Use individual drives only for uncovered paths or diagnosis.
 - Seated GNOME/Windows/macOS and a real tray host are separate required environments when affected, not covered by synthetic gates.
+- COSMIC's `drive smoke cosmic` requires the locally built patched compositor and an accessible parent Wayland display. Its private nested session is separate from the user's installed desktop; deployment/login restart requires approval.
 
 ## Proof and skip reporting
 

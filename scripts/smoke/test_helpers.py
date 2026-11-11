@@ -106,6 +106,68 @@ pathlib.Path(sys.argv[1]).write_text(str(replacement.pid))
                 owned_process.signal_identity(foreign.pid, foreign_start, signal.SIGKILL)
                 foreign.wait(timeout=5)
 
+    def test_cleanup_keeps_published_identity_when_orphan_environment_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, publication, ready = (root / name for name in ("pids", "child.pid", "ready"))
+            registry.touch(mode=0o600)
+            owner = str(root)
+            foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            foreign_start = owned_process.process(foreign.pid)[0]
+            child_code = '''
+import ctypes, os, pathlib, subprocess, sys, time
+registry, owner, publication, ready, helper = sys.argv[1:]
+subprocess.run([sys.executable, helper, "publish", registry, owner, "0",
+                str(os.getpid()), publication], check=True)
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_DUMPABLE")
+pathlib.Path(ready).touch()
+time.sleep(60)
+'''
+            launcher = subprocess.Popen(
+                [sys.executable, "-c", '''
+import pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", *sys.argv[1:]])
+ready = pathlib.Path(sys.argv[-2])
+deadline = time.monotonic() + 5
+while not ready.exists():
+    if child.poll() is not None or time.monotonic() >= deadline:
+        raise RuntimeError("owned child did not publish its protected identity")
+    time.sleep(0.01)
+''', child_code, str(registry), owner, str(publication), str(ready),
+                 str(SCRIPTS / "smoke/owned_process.py")],
+                env={**os.environ, "WINDOW_ZONES_SMOKE_OWNER": owner},
+            )
+            try:
+                self.assertEqual(launcher.wait(timeout=10), 0)
+                pid, start = map(int, publication.read_text().split())
+                self.assertEqual(owned_process.records(registry)[pid], start)
+                self.assertFalse(owned_process.has_owner(pid, owner))
+                self.assertTrue(owned_process.is_alive(pid, start))
+                for expected, status in ((start, 0), (start + 1, 1)):
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPTS / "smoke/owned_process.py"), "alive",
+                         str(registry), owner, "0", str(pid), str(expected)],
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                owned_process.signal_identity(pid, start + 1, signal.SIGTERM)
+                self.assertTrue(owned_process.is_alive(pid, start))
+                with registry.open("a") as stream:
+                    stream.write(f"{foreign.pid} {foreign_start + 1}\n")
+                with self.assertRaisesRegex(RuntimeError, "unowned smoke process"):
+                    owned_process.register(registry, owner, 0, foreign.pid)
+                owned_process.cleanup(registry, owner, os.getpid())
+                self.assertFalse(owned_process.is_alive(pid, start))
+                self.assertIsNone(foreign.poll())
+            finally:
+                if launcher.poll() is None:
+                    launcher.terminate()
+                    launcher.wait(timeout=5)
+                owned_process.cleanup(registry, owner, os.getpid())
+                owned_process.signal_identity(foreign.pid, foreign_start, signal.SIGKILL)
+                foreign.wait(timeout=5)
+
     def test_nested_cleanup_preserves_outer_owner_and_rescues_private_orphans(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -307,6 +369,49 @@ build_seam_helper regression
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((root / "build-target").read_text().strip(), str(persistent / "smoke-seam-helper"))
             self.assertFalse((scratch / "smoke-seam-helper").exists())
+
+    def test_cosmic_build_rejects_overlay_changes_before_publishing_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, overlay, tools, target = (root / name for name in ("source", "overlay", "tools", "target"))
+            subprocess.run(["git", "clone", "--quiet", "--shared", str(SCRIPTS.parent), str(source)],
+                           check=True, capture_output=True, timeout=15)
+            revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+            (source / "src/dbus").mkdir(exist_ok=True)
+            overlay.mkdir()
+            (overlay / "revision").write_text(revision + "\n")
+            (overlay / "bridge.patch").write_text(
+                "diff --git a/build-probe b/build-probe\nnew file mode 100644\n"
+                "--- /dev/null\n+++ b/build-probe\n@@ -0,0 +1 @@\n+probe\n")
+            (overlay / "window_zones.rs").write_text("original bridge source\n")
+            tools.mkdir()
+            cargo = tools / "cargo"
+            cargo.write_text("#!" + sys.executable + "\n" + '''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+source = Path(args[args.index("--manifest-path") + 1]).parent
+binary = Path(args[args.index("--target-dir") + 1]) / "debug/cosmic-comp"
+binary.parent.mkdir(parents=True, exist_ok=True)
+binary.write_bytes((source / "src/dbus/window_zones.rs").read_bytes())
+if os.environ.get("CHANGE_OVERLAY"):
+    Path(os.environ["BRIDGE_OVERLAY"]).write_text("edited bridge source\\n")
+print(json.dumps({"reason": "compiler-artifact", "executable": str(binary),
+                  "target": {"name": "cosmic-comp", "kind": ["bin"]}}))
+''')
+            cargo.chmod(0o755)
+            env = {**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                   "BRIDGE_OVERLAY": str(overlay / "window_zones.rs"), "CHANGE_OVERLAY": ""}
+            command = ["bash", str(SCRIPTS / "build-cosmic.sh"), "--source", str(source),
+                       "--target-dir", str(target), "--overlay", str(overlay)]
+            stable = subprocess.run(command, env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(stable.returncode, 0, stable.stderr)
+            stamp = target / "debug/cosmic-comp.window-zones.json"
+            original_stamp = stamp.read_bytes()
+            changed = subprocess.run(command, env={**env, "CHANGE_OVERLAY": "1"},
+                                     text=True, capture_output=True, timeout=15)
+            self.assertNotEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+            self.assertEqual(stamp.read_bytes(), original_stamp)
 
 
 if __name__ == "__main__":

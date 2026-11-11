@@ -19,11 +19,19 @@ What this verifies:
 - module-aware Node syntax checks for JavaScript fixtures under `scripts/` and `src/`
 - Python parsing of every `scripts/**/*.py` file, including extracted smoke fixtures
 - Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness after nested Rust/shell/fixture additions, edits and removals, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
-- Linux only: `python3 scripts/smoke/test_helpers.py` (owned-window selection, PID-reuse/orphan cleanup, signal exit, non-vacuous TUI responses and persistent helper build storage).
+- Linux only: `python3 scripts/smoke/test_helpers.py` (owned-window selection, PID-reuse/orphan cleanup, signal exit, non-vacuous TUI responses, persistent helper build storage and COSMIC build source-drift refusal).
 
 The GNOME and KDE adapter contract tests use fake compositor services on private
 `dbus-daemon` instances; KWin controller ownership is also checked through the real
 Rust dispatcher. Neither requires a running compositor session.
+
+Windows/macOS keycode coverage shares one canonical mapping table; reload tests
+retain binding equality and subsequent dispatch checks. Their CI jobs share a
+non-fail-fast matrix while retaining the `windows` and `macos` check names.
+
+The KWin Node harness and Rust-launched captured-frame fixture share
+`kwin-script/tests/clock.js`. Verifier cleanup and native smoke share
+`scripts/smoke/owned_process.py` for PID/start-checked pidfd signalling.
 
 Verifier `drive tests` uses persistent `target/verification-tests` Cargo output.
 It must not overwrite the App binaries pinned by `launch`; test-only dependency
@@ -45,6 +53,15 @@ For direct smoke-runner integrations, `WINDOW_ZONES_BINARY` pins the app binary,
 `WINDOW_ZONES_SMOKE_DISPLAY` selects a free X11 display number. An occupied
 display is rejected rather than attached to; retain proof with `--keep-logs`.
 
+The `cosmic` dispatcher uses `scripts/cosmic-smoke.py`, with a private nested
+compositor, D-Bus, HOME/XDG, custom shortcuts and owned native GTK windows. Only
+the nested compositor connects to the explicitly selected parent Wayland socket.
+`WINDOW_ZONES_COSMIC_COMPOSITOR` selects a prebuilt patched binary; the verifier
+passes the parent through `WINDOW_ZONES_SMOKE_COSMIC_PARENT_DISPLAY`. Captures
+always retain their raw buffer orientation and transform metadata. The shared
+GTK fixture's `--test-window-fixed` option establishes fixed size before its
+first native commit, without changing the existing GNOME fixture mode.
+
 X11 and KDE discover visible editor windows through the shared PID-owned lookup;
 a matching title alone is not enough. Fixture copies retain their original paths
 and permissions without separate copy-only wrappers.
@@ -63,19 +80,36 @@ This runbook defines V1 Release gates and how to reproduce them. Report results,
 |---|---|---|
 | GNOME Wayland and TUI lifecycle | blocking | Synthetic session and expanded seated run with the upgraded `Gnome2` companion |
 | Linux X11 and TUI lifecycle | blocking | Xvfb/Openbox run, including identified moves, exclusive hotkey rollback and TUI lifecycle |
-| KDE Plasma Wayland | deferred, non-blocking | Seated KWin 6.x run with the protocol-3 script and companion; a nested pass cannot close this gate |
+| KDE Plasma Wayland | deferred, non-blocking | Seated KWin 6.x run with the protocol-4 script and companion; a nested pass cannot close this gate |
 | Windows | deferred, non-blocking | Manual Windows run |
 
-Release gate status is exactly one of `pending`, `blocking - pass`, `blocking - fail`, or `deferred - unverified`. macOS, Sway, and Hyprland are ungated integrations. Linux Smoke runs report `Smoke assertions (<gate>): N; passed: P; failed: F; skipped: S`.
+Release gate status is exactly one of `pending`, `blocking - pass`, `blocking - fail`, or `deferred - unverified`. macOS, Sway, Hyprland, and patched COSMIC are ungated integrations. Linux Smoke runs report `Smoke assertions (<gate>): N; passed: P; failed: F; skipped: S`.
 
-Run the GNOME Wayland or Linux X11 Smoke run with:
+Run the applicable native Smoke run with:
 ```bash
 ./scripts/smoke.sh gnome       # isolated real GNOME: interactive GTK Wayland/XWayland windows, native input, all zones, monitors, CLI/TUI/tray, recovery, screenshots
 ./scripts/smoke.sh gnome-live  # seated live GNOME session: focused window, placement, real accelerator capture, Companion disconnect/recovery, TUI lifecycle
 ./scripts/smoke.sh kde-live    # nested KWin 6.x Synthetic session: the same checks against a real KWin, never seated evidence
+./scripts/smoke.sh cosmic      # private nested patched COSMIC; build it first as described below
 ./scripts/smoke.sh x11
 ```
 The TUI lifecycle Smoke runs cover launch, reload, dispatch, restart, and quit in each corresponding Synthetic or seated session.
+
+COSMIC requires the [locally built patched compositor](running.md#cosmic-wayland-custom-compositor),
+an accessible parent Wayland display, `/usr/bin/python3` with PyGObject/GTK 4/Gio,
+`dbus-daemon`, libxkbcommon, and working Mesa/EGL. It needs neither GNOME Shell,
+PipeWire nor Xvfb. The build helper selects Cargo's actual executable artifact
+and stamps its bridge sources and binary; native smoke refuses unstamped/stale
+compositors rather than accepting an old binary as current proof.
+
+The current COSMIC gate checks one panel-free nested output at scale 1:
+routing/bridge ownership, native placement/center/Restore, partial-move history,
+tiled/maximized restoration, fullscreen/fixed-size refusal, captured-window
+identity after focus changes, closed IDs, compositor custom-command input,
+CLI/TUI lifecycle and config persistence. Public COSMIC geometry, native GTK
+dimensions, rendered screenshots and dispatch receipts are independent evidence.
+It does not certify seated capture, real monitor reservations, multiple outputs,
+fractional scales, decorations, XWayland or tray.
 
 Native smoke helpers require Python 3.9+ and Linux pidfd support for safe process
 signaling. The GNOME gates require `gnome-shell`, `dbus-daemon`,

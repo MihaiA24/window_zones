@@ -6,7 +6,7 @@ has two parts:
 - `kwin-script/` — a KWin JavaScript script that reads KWin window/output state,
   moves an identified window, and owns global shortcut registration;
 - `window_zones_kwin` — a Rust companion process that exposes the narrow
-  `org.window_zones.KWin3` D-Bus contract on the user session bus.
+  `org.window_zones.KWin4` D-Bus contract on the user session bus.
 
 The KDE path never routes native Wayland windows through X11.
 
@@ -48,10 +48,10 @@ Scripts**. If the script was already installed, disable and re-enable it after
 an update so KWin reloads `main.js`. Binding removal during normal operation
 releases its native accelerator without reloading the script.
 
-Protocol 3 is a clean cutover: upgrade the script package with
+Protocol 4 is a clean cutover: upgrade the script package with
 `kpackagetool6 --type=KWin/Script --upgrade ./kwin-script`, reload the script,
-and restart `window_zones_kwin` after installing the matching binary. Older
-scripts and companions are incompatible; there is no protocol-2 fallback.
+and restart both `window_zones_kwin` and the App after installing the matching
+binaries. Older scripts and companions are incompatible; there is no fallback.
 
 Start the companion before launching Window Zones:
 
@@ -86,7 +86,7 @@ Inspect the service and its advertised capabilities from the same user session:
 
 ```bash
 qdbus6 org.window_zones.KWin /org/window_zones/KWin \
-  org.window_zones.KWin3.GetCapabilities
+  org.window_zones.KWin4.GetCapabilities
 busctl --user introspect org.window_zones.KWin /org/window_zones/KWin
 ```
 
@@ -94,7 +94,7 @@ Expected service identity:
 
 - name: `org.window_zones.KWin`;
 - object: `/org/window_zones/KWin`;
-- interface: `org.window_zones.KWin3` (protocol major 3).
+- interface: `org.window_zones.KWin4` (protocol major 4).
 
 If the service is absent, start `window_zones_kwin` and retry. If the script is
 absent or disabled, reload the KWin script and check the KWin journal/log for
@@ -106,7 +106,7 @@ A KDE signal with `DISPLAY` set still selects the native KDE Wayland backend.
 It does not permit an implicit X11 fallback. Missing, incompatible, or denied
 KWin integration is reported as an explicit runtime error with remediation.
 
-### Protocol 3 window requests
+### Protocol 4 window requests
 
 `GetFocusedWindow` returns `(present, window_id, x, y, width, height)`. The
 identity is KWin's `String(window.internalId)`, stable for that Window's lifetime,
@@ -114,6 +114,15 @@ not a Display identity. Coordinates and dimensions describe the global Window
 frame; `GetDisplays` continues to report each output's usable `MaximizeArea`.
 `MoveWindow(window_id, x, y, width, height)` queues a move to that identity even
 if focus changes before the script receives it.
+
+`MoveWindow`, `RefreshDisplays` and `RegisterHotkeys` return
+`(request_id: uint32, timeout_ms: uint64)`. The companion allocates one one-second
+slot per pending request, including claimed work and the new request, while
+holding the enqueue lock. Completed requests no longer consume a slot, even
+when their result has not been collected. Later enqueues do not extend a
+request's budget. The App uses this finite budget for completion while each
+individual D-Bus round trip retains its one-second timeout. Concurrent callers
+can therefore wait through earlier frame observations without a false timeout.
 
 Before reading `GetDisplays`, the App queues `RefreshDisplays` and waits for the
 script to publish fresh `MaximizeArea` rectangles. Panel/reservation changes are
@@ -133,6 +142,12 @@ maximize/restore transition to clear that mode before placement, as implemented
 in [KWin 6.0's maximize handling](https://github.com/KDE/kwin/blob/v6.0.5/src/xdgshellwindow.cpp).
 [`Window.setMaximize(false, false)`](https://github.com/KDE/kwin/blob/Plasma/6.5/src/window.h)
 is script-invokable; `setQuickTileMode` is not.
+
+Placement waits for restoration acknowledgement or a client repaint before one
+final frame assignment. The script observes through its existing 750 ms deadline
+instead of completing on transient equality; a later constrained/restoration
+change becomes `PartialMove` with the observed frame. Completion is bounded,
+not a guarantee against changes after that observation window.
 
 The script-facing `NextRequest` returns
 `(request_id, kind, window_id, x, y, width, height, hotkeys_json)`.

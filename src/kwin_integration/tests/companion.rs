@@ -1,5 +1,3 @@
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,72 +11,75 @@ use super::super::protocol::{
     NextRequestPayload, REQUEST_MOVE, REQUEST_REGISTER_HOTKEYS, classify_dbus_error,
 };
 use super::super::server::run_kwin_companion_service;
-use super::super::test_bus::{FakeBus, FakeServiceState};
+use super::super::test_bus::{FakeBus, FakeServiceState, RealBus};
 use super::{COMPANION_HEARTBEAT_TIMEOUT, CompanionState, NEXT_REQUEST_WAIT};
 
 #[test]
+fn enqueue_budgets_count_pending_work_but_not_uncollected_results() {
+    let bus = RealBus::new();
+    let script = Connection::new_address(&bus.address).unwrap();
+    let script_proxy = script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    script_proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "RegisterCompanion",
+            (KWIN_PROTOCOL_MAJOR.to_string(), true),
+        )
+        .unwrap();
+    let client = Connection::new_address(&bus.address).unwrap();
+    let proxy = client.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    let first: (u32, u64) = proxy
+        .method_call(
+            KWIN_INTERFACE,
+            "MoveWindow",
+            ("window-1", -10_i32, 20_i32, 800_u32, 600_u32),
+        )
+        .unwrap();
+    let refresh: (u32, u64) = proxy
+        .method_call(KWIN_INTERFACE, "RefreshDisplays", ())
+        .unwrap();
+    let hotkeys: (u32, u64) = proxy
+        .method_call(KWIN_INTERFACE, "RegisterHotkeys", ("[]",))
+        .unwrap();
+    assert_eq!((first.1, refresh.1, hotkeys.1), (1000, 2000, 3000));
+    assert_ne!(first.0, refresh.0);
+    assert_ne!(refresh.0, hotkeys.0);
+    let claimed: NextRequestPayload = script_proxy
+        .method_call(KWIN_INTERFACE, "NextRequest", ())
+        .unwrap();
+    assert_eq!(claimed.0, first.0);
+    // A claimed request still occupies its queue slot.
+    let while_claimed: (u32, u64) = proxy
+        .method_call(KWIN_INTERFACE, "RefreshDisplays", ())
+        .unwrap();
+    assert_eq!(while_claimed.1, 4000);
+    script_proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "CompleteRequest",
+            (first.0.to_string(), true, String::new(), String::new()),
+        )
+        .unwrap();
+    // Do not consume GetRequestResult: completion alone frees the queue slot.
+    let after_completion: (u32, u64) = proxy
+        .method_call(KWIN_INTERFACE, "RefreshDisplays", ())
+        .unwrap();
+    assert_eq!(after_completion.1, 4000);
+    let result: (bool, String, String) = proxy
+        .method_call(KWIN_INTERFACE, "GetRequestResult", (first.0.to_string(),))
+        .unwrap();
+    assert_eq!(result, (true, String::new(), String::new()));
+}
+
+#[test]
 fn real_service_hotkey_polling_never_claims_controller() {
-    const CHILD_ENV: &str = "WINDOW_ZONES_KWIN_SERVICE_TEST_CHILD";
-    if std::env::var_os(CHILD_ENV).is_some() {
+    if std::env::var_os("WINDOW_ZONES_KWIN_SERVICE_TEST_CHILD").is_some() {
         run_kwin_companion_service().unwrap();
         return;
     }
 
-    struct Process(Child);
-    impl Drop for Process {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut daemon = Process(
-        Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address=1"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("dbus-daemon must be installed for KDE contract tests"),
-    );
-    let mut address = String::new();
-    BufReader::new(daemon.0.stdout.take().unwrap())
-        .read_line(&mut address)
-        .unwrap();
-    let address = address.trim();
-    assert!(!address.is_empty());
-    let mut service = Process(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "kwin_integration::companion::tests::real_service_hotkey_polling_never_claims_controller",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .env("DBUS_SESSION_BUS_ADDRESS", address)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let script = Connection::new_address(address).unwrap();
-    let bus = script.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_secs(1),
-    );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let (owned,): (bool,) = bus
-            .method_call("org.freedesktop.DBus", "NameHasOwner", (KWIN_SERVICE_NAME,))
-            .unwrap();
-        if owned {
-            break;
-        }
-        assert!(
-            service.0.try_wait().unwrap().is_none(),
-            "real KWin companion exited before owning its bus name"
-        );
-        assert!(Instant::now() < deadline, "real KWin service never started");
-        thread::sleep(Duration::from_millis(10));
-    }
+    let bus = RealBus::new();
+    let script = Connection::new_address(&bus.address).unwrap();
     let proxy = script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
     proxy
         .method_call::<(), _, _, _>(
@@ -87,10 +88,10 @@ fn real_service_hotkey_polling_never_claims_controller() {
             (KWIN_PROTOCOL_MAJOR.to_string(), true),
         )
         .unwrap();
-    let old = Connection::new_address(address).unwrap();
-    let new = Connection::new_address(address).unwrap();
+    let old = Connection::new_address(&bus.address).unwrap();
+    let new = Connection::new_address(&bus.address).unwrap();
     let register = |connection: &Connection, hotkeys: &[&str]| {
-        let (id,): (u32,) = connection
+        let (id, _timeout_ms): (u32, u64) = connection
             .with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT)
             .method_call(
                 KWIN_INTERFACE,

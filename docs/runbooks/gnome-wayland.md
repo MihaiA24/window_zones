@@ -16,13 +16,11 @@ Record observed pass/fail results, exact Shell versions and synthetic/seated lim
 
 For an upgrade, stop the App and disable the already-installed companion with
 `gnome-extensions disable window-zones@mihai-a24` before replacing its files.
-From the repository root:
+From the repository root, use the installer so the companion's native settings
+schema is installed and compiled alongside its code and metadata:
 
 ```bash
-extension_dir="$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24"
-mkdir -p "$extension_dir"
-install -m 0644 gnome-extension/metadata.json "$extension_dir/metadata.json"
-install -m 0644 gnome-extension/extension.js "$extension_dir/extension.js"
+./scripts/install.sh --prefix "$HOME/.local" --gnome-extension
 ```
 
 After a new manual installation or source/metadata upgrade, log out and back in
@@ -80,6 +78,12 @@ the App can reconnect and re-register its current hotkeys without restarting.
 An empty hotkey set or the active controller's session-bus disconnect also
 releases its grabs and ownership of the registered set. Other App instances
 cannot replace a live controller's nonempty set.
+
+The companion exports its object only while it owns the service name. If an
+incumbent owns the name at enable time, queued acquisition exports the service
+when that incumbent leaves. A compatible but degraded companion lacking hotkey
+capture remains retryable; replacing it with the complete companion recovers
+without editing bindings. Actual shortcut conflicts remain transactional rejections.
 
 The companion owns:
 
@@ -149,9 +153,11 @@ remain rejected without changing their state.
 Repeated left/right-half placement crosses to the nearest physically
 left/right display and lands on the half nearest the source. With no
 neighbour it stays at the outer edge; explicit next/previous-display actions
-still wrap. Normal, maximized, and tiled placements use a single 250 ms
-compositor transition, respecting disabled animations. GNOME 51's reduced-motion
-preference is optional; its absent API does not disable GNOME 50 placement.
+still wrap. Normal, maximized, and tiled placements use a single compositor
+transition, defaulting to 150 ms with the native
+[placement animation setting](#placement-animation-duration-gnome-only).
+Disabled GNOME animations and GNOME 51's reduced-motion preference take
+precedence; the absent reduced-motion API does not disable GNOME 50 placement.
 Use [`--perf-log PATH`](running.md#performance-logging) to record per-move
 request/completion times and Linux App-process memory.
 
@@ -203,6 +209,38 @@ $HOME/.local/bin/window_zones --backend auto tui
 ```
 
 Use `--config ./path/to/config.toml` when testing an isolated file.
+
+### Placement animation duration (GNOME only)
+
+After installing/upgrading the companion with `--gnome-extension` and logging
+out and back in, configure its native per-extension GSettings schema:
+
+```bash
+# Default: 150 ms. Accepted unsigned range: 0..1000 ms.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  set org.gnome.shell.extensions.window-zones animation-duration-ms 150
+
+# No custom Window Zones placement animation.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  set org.gnome.shell.extensions.window-zones animation-duration-ms 0
+
+# Restore the schema default of 150 ms.
+gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/window-zones@mihai-a24/schemas" \
+  reset org.gnome.shell.extensions.window-zones animation-duration-ms
+```
+
+Use another value in 0..1000, such as 300, for a custom duration. Out-of-range
+values are rejected and leave the previous accepted setting intact. The
+companion reads the setting for each move: the next move uses the new value
+without App restart, TOML reload or companion reload; an in-progress move
+keeps its selected duration.
+
+This is not a TOML field or an App CLI option and does not change other
+backends. GNOME's global `org.gnome.desktop.interface enable-animations`
+and GNOME 51 reduced-motion preference remain dominant: a nonzero duration
+cannot force animation when those preferences suppress it. Zero skips only
+Window Zones' custom compositor animation; placement still waits for the
+actual frame to settle, and GNOME's own restoration effects remain separate.
 
 ## Manual smoke checklist
 
@@ -271,7 +309,7 @@ Run the seated GNOME checks with `./scripts/smoke.sh gnome-live` from the reposi
 8. Re-enable the extension. Verify the runtime reconnects, re-registers the current bindings, and emits one recovery diagnostic rather than repeating identical errors every retry.
 9. Restart the application and repeat one zone move and one display move.
 10. Repeat Ctrl+Super+Left/Right at a matching half. Verify crossing to the neighbouring display's nearest half, different-size destinations, and no directional wrap at the outer edge.
-11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Restore desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
+11. Start `tui` with `--perf-log PATH`; press Right twice rapidly and verify both moves complete and have distinct successful records. Repeat from maximization, with animations disabled, and with reduced motion. Separately save the extension duration, reset it to observe 150 ms, set 0 and 300, reject 1001 without losing 300, and reset live to 150; require exact geometry, completed native timings and an unchanged App PID. Restore the saved setting and desktop preferences afterwards; check pointer interaction after completion. Memory fields describe only the App process, not Shell/GPU use.
 12. On a disposable client with controllable minimum size, force a zone placement to apply only partially and confirm Restore still reaches its pre-placement frame. Also snap a small window to a larger zone, set a minimum width below that placement but above its original width, and Restore: after removing the constraint, retrying Restore must reach the original frame rather than the partially restored one.
 
 The `gnome-live` gate mechanically runs the [identified-window and hotkey-rollback checks](testing.md#v1-verification-matrix) on disposable Text Editor windows; its refused replacement must retain four bindings and the previous accelerator.
@@ -330,6 +368,17 @@ and compositor screenshots through Mutter's RemoteDesktop and ScreenCast APIs.
 Capture explicitly links only the private stream and owned consumer; it does
 not depend on automatic session-manager linking. It does not need `/dev/uinput`,
 change the seated extension settings, or bypass Shell security.
+
+The private companion schemas are copied and compiled with
+`glib-compile-schemas --strict` before launching Shell. The keyfile selects
+250 ms for the pre-existing animation assertions and captures; the separate
+native duration journey proves the 150 ms default, 0/custom values,
+out-of-range retention and live reset without restarting the App.
+`animation-duration.jsonl` retains the public setting commands/readbacks and
+links each case to its actual keyboard-dispatch row in `transitions.jsonl`,
+observed geometry and PID; category-labelled logs separate this feature proof
+from baseline timing and global-preference checks.
+
 GNOME 50 skips only its unavailable reduced-motion preference, not the
 enabled/disabled animation cases. See [testing prerequisites](testing.md#v1-verification-matrix).
 

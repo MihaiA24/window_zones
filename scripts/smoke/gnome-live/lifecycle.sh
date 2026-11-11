@@ -310,12 +310,11 @@ run_gnome_live() {
         run_gnome_live_dispatch next-display "$GNOME_SAFE_NEXT_HOTKEY"
         gnome_live_assert_geometry 'GNOME live cross-display move' \
             "$GNOME_LIVE_NEXT_TWO_THIRDS"
-        if (( GNOME_LIVE_DISPLAY_TOTAL == 2 )); then
-            # Two displays wrap, so a second move returns the window and leaves the later checks
-            # on the display they were computed for.
-            run_gnome_live_dispatch next-display-wrap "$GNOME_SAFE_NEXT_HOTKEY"
-            gnome_live_assert_geometry 'GNOME live cross-display move wraps back' "$GNOME_LIVE_TWO_THIRDS"
-        fi
+        local return_move
+        for ((return_move=1; return_move<GNOME_LIVE_DISPLAY_TOTAL; return_move++)); do
+            run_gnome_live_dispatch "next-display-return-$return_move" "$GNOME_SAFE_NEXT_HOTKEY"
+        done
+        gnome_live_assert_geometry 'GNOME live cross-display move wraps back' "$GNOME_LIVE_TWO_THIRDS"
     else
         skip_assert 'GNOME live cross-display move' \
             "not exercised: live session reports $display_count display"

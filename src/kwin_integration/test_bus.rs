@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use dbus::blocking::LocalConnection;
+use dbus::blocking::{Connection, LocalConnection};
 use dbus::channel::Sender;
 use dbus_tree::Factory;
 use parking_lot::Mutex;
@@ -16,9 +16,9 @@ use crate::Rect;
 
 use super::companion::CompanionState;
 use super::protocol::{
-    DISPLAYS_CAPABILITY, DisplayPayload, FOCUSED_WINDOW_CAPABILITY, HOTKEYS_CAPABILITY,
-    KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_SERVICE_NAME, MOVE_RESIZE_CAPABILITY, parse_hotkeys,
-    parse_u32_argument, sender_name,
+    CALL_TIMEOUT, DISPLAYS_CAPABILITY, DisplayPayload, FOCUSED_WINDOW_CAPABILITY,
+    HOTKEYS_CAPABILITY, KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_SERVICE_NAME,
+    MOVE_RESIZE_CAPABILITY, parse_hotkeys, parse_u32_argument, sender_name,
 };
 
 #[derive(Debug)]
@@ -83,6 +83,79 @@ impl FakeServiceState {
             events: VecDeque::from(["alt+ctrl+left".to_string()]),
             next_request_id: 1,
             script_state: CompanionState::default(),
+        }
+    }
+}
+
+pub(super) struct Process(pub(super) Child);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+pub(super) struct RealBus {
+    pub(super) address: String,
+    _service: Process,
+    _daemon: Process,
+}
+
+impl RealBus {
+    pub(super) fn new() -> Self {
+        let mut daemon = Process(
+            Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for KDE contract tests"),
+        );
+        let mut address = String::new();
+        BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim().to_string();
+        assert!(!address.is_empty());
+        let mut service = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "kwin_integration::companion::tests::real_service_hotkey_polling_never_claims_controller",
+                    "--nocapture",
+                ])
+                .env("WINDOW_ZONES_KWIN_SERVICE_TEST_CHILD", "1")
+                .env("DBUS_SESSION_BUS_ADDRESS", &address)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let connection = Connection::new_address(&address).unwrap();
+        let proxy = connection.with_proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            CALL_TIMEOUT,
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (owned,): (bool,) = proxy
+                .method_call("org.freedesktop.DBus", "NameHasOwner", (KWIN_SERVICE_NAME,))
+                .unwrap();
+            if owned {
+                break;
+            }
+            assert!(
+                service.0.try_wait().unwrap().is_none(),
+                "real KWin companion exited before owning its bus name"
+            );
+            assert!(Instant::now() < deadline, "real KWin service never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Self {
+            address,
+            _service: service,
+            _daemon: daemon,
         }
     }
 }
@@ -242,7 +315,11 @@ impl FakeBus {
                                         request_id,
                                         FakeRequest::RefreshDisplays { seen: false },
                                     );
-                                    Ok(vec![method.msg.method_return().append1(request_id)])
+                                    let timeout_ms = state.pending.len() as u64
+                                        * CALL_TIMEOUT.as_millis() as u64;
+                                    Ok(vec![
+                                        method.msg.method_return().append2(request_id, timeout_ms),
+                                    ])
                                 }))
                                 .add_m(factory.method("MoveWindow", (), move |method| {
                                     let (window, x, y, width, height): (
@@ -266,7 +343,11 @@ impl FakeBus {
                                             seen: false,
                                         },
                                     );
-                                    Ok(vec![method.msg.method_return().append1(request_id)])
+                                    let timeout_ms = state.pending.len() as u64
+                                        * CALL_TIMEOUT.as_millis() as u64;
+                                    Ok(vec![
+                                        method.msg.method_return().append2(request_id, timeout_ms),
+                                    ])
                                 }))
                                 .add_m(factory.method("RegisterHotkeys", (), move |method| {
                                     let payload: String = method.msg.read1()?;
@@ -281,7 +362,11 @@ impl FakeBus {
                                             seen: false,
                                         },
                                     );
-                                    Ok(vec![method.msg.method_return().append1(request_id)])
+                                    let timeout_ms = state.pending.len() as u64
+                                        * CALL_TIMEOUT.as_millis() as u64;
+                                    Ok(vec![
+                                        method.msg.method_return().append2(request_id, timeout_ms),
+                                    ])
                                 }))
                                 .add_m(factory.method("GetRequestResult", (), move |method| {
                                     let request_id_raw: String = method.msg.read1()?;

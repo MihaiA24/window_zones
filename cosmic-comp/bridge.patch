@@ -1,0 +1,160 @@
+diff --git a/src/dbus/mod.rs b/src/dbus/mod.rs
+index 7c3791c..3dcc3d0 100644
+--- a/src/dbus/mod.rs
++++ b/src/dbus/mod.rs
+@@ -20,6 +20,7 @@ pub mod ei;
+ pub mod logind;
+ mod name_owners;
+ mod power;
++mod window_zones;
+ 
+ #[derive(Clone, Debug)]
+ pub struct DBusState(Rc<DBusStateInner>);
+@@ -36,7 +37,7 @@ struct DBusStateInner {
+ }
+ 
+ impl DBusState {
+-    pub fn init(evlh: &LoopHandle<'static, State>) -> Self {
++    pub fn init(evlh: &LoopHandle<'static, State>, socket: &std::ffi::OsStr) -> Self {
+         let (source, executor) = calloop::futures::executor().unwrap();
+         let session_conn = futures_executor::block_on(zbus::Connection::session());
+         let system_conn = futures_executor::block_on(zbus::Connection::system());
+@@ -50,6 +51,7 @@ impl DBusState {
+             ei_sender: Arc::new(Mutex::new(None)),
+         }));
+         evlh.insert_source(source, |_, _, _| {}).unwrap();
++        window_zones::init(evlh, &state.0.executor, socket);
+         let state_clone = state.clone();
+         state.spawn(async move {
+             if let Err(err) = init_session(&state_clone).await {
+diff --git a/src/shell/element/mod.rs b/src/shell/element/mod.rs
+index c7e799b..c2e7ddf 100644
+--- a/src/shell/element/mod.rs
++++ b/src/shell/element/mod.rs
+@@ -340,6 +340,10 @@ impl CosmicMapped {
+         window.is_resizing(pending)
+     }
+ 
++    pub(crate) fn has_pending_resize(&self) -> bool {
++        self.resize_state.lock().unwrap().is_some()
++    }
++
+     pub fn set_tiled(&self, tiled: bool) {
+         match &self.element {
+             CosmicMappedInternal::Stack(s) => s.set_tiled(tiled),
+diff --git a/src/shell/element/surface.rs b/src/shell/element/surface.rs
+index 58cdd8b..516fa04 100644
+--- a/src/shell/element/surface.rs
++++ b/src/shell/element/surface.rs
+@@ -291,6 +291,13 @@ impl CosmicSurface {
+             .unwrap()
+     }
+ 
++    /// Update public observation without sending another configure. In
++    /// particular, a bridge configure target is not evidence of a client resize.
++    pub(crate) fn observe_geometry(&self, frame: Rectangle<i32, Global>) {
++        *self.0.user_data().get_or_insert_threadsafe(GlobalGeometry::default)
++            .0.lock().unwrap() = Some(frame);
++    }
++
+     pub fn set_geometry(&self, geo: Rectangle<i32, Global>, ssd_height: u32) {
+         {
+             let mut geo = geo;
+diff --git a/src/shell/layout/floating/mod.rs b/src/shell/layout/floating/mod.rs
+index da54445..e7f4eeb 100644
+--- a/src/shell/layout/floating/mod.rs
++++ b/src/shell/layout/floating/mod.rs
+@@ -24,7 +24,7 @@ use smithay::{
+     desktop::{PopupKind, Space, WindowSurfaceType, layer_map_for_output, space::SpaceElement},
+     input::Seat,
+     output::Output,
+-    utils::{IsAlive, Logical, Point, Rectangle, Scale, Size},
++    utils::{IsAlive, Logical, Point, Rectangle, Scale, Serial, Size},
+     wayland::seat::WaylandFocus,
+ };
+ 
+@@ -789,6 +789,29 @@ impl FloatingLayout {
+         self.space.element_geometry(elem).map(RectExt::as_local)
+     }
+ 
++    /// Absolute frame placement without animation or spawn-position heuristics.
++    /// Keep the client configure and compositor-owned space location in sync.
++    pub(crate) fn place_window(
++        &mut self,
++        mapped: &CosmicMapped,
++        frame: Rectangle<i32, Global>,
++    ) -> Option<Serial> {
++        let output = self.space.outputs().next().unwrap().clone();
++        self.animations.remove(mapped);
++        mapped.moved_since_mapped.store(true, Ordering::SeqCst);
++        mapped.set_bounds(layer_map_for_output(&output).non_exclusive_zone().size);
++        mapped.set_geometry(frame);
++        let serial = mapped.configure();
++        self.space.map_element(
++            mapped.clone(),
++            frame.loc.to_local(&output).as_logical(),
++            false,
++        );
++        *mapped.last_geometry.lock().unwrap() = Some(frame.to_local(&output));
++        self.space.refresh();
++        serial
++    }
++
+     pub fn popup_element_under(
+         &self,
+         location: Point<f64, Local>,
+diff --git a/src/state.rs b/src/state.rs
+index e3d170b..7d25913 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -764,7 +764,7 @@ impl State {
+ 
+         let a11y_state = A11yState::new::<State, _>(dh, client_not_sandboxed);
+ 
+-        let dbus_state = DBusState::init(&handle);
++        let dbus_state = DBusState::init(&handle, &socket);
+ 
+         let session_lock_layer_state =
+             SessionLockLayerState::new::<State, _>(dh, client_not_sandboxed);
+diff --git a/src/wayland/handlers/compositor.rs b/src/wayland/handlers/compositor.rs
+index ed40448..eb6a3f3 100644
+--- a/src/wayland/handlers/compositor.rs
++++ b/src/wayland/handlers/compositor.rs
+@@ -10,7 +10,7 @@ use smithay::{
+             utils::{on_commit_buffer_handler, with_renderer_surface_state},
+         },
+     },
+-    desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output},
++    desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output, space::SpaceElement},
+     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
+     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
+     wayland::{
+@@ -355,6 +355,16 @@ impl CompositorHandler for State {
+                     element.clone(),
+                     &mut shell,
+                 );
++                // A configure target is not the client's committed frame. Keep
++                // public toplevel geometry correct after client-side resizes too.
++                if element.is_window()
++                    && let Some(mut frame) = shell.element_geometry(&element)
++                {
++                    frame.size = element.geometry().size.as_global();
++                    if frame.size.w > 0 && frame.size.h > 0 {
++                        element.active_window().observe_geometry(frame);
++                    }
++                }
+             }
+         }
+ 
+diff --git a/src/wayland/protocols/toplevel_info.rs b/src/wayland/protocols/toplevel_info.rs
+index 3146adc..5445e90 100644
+--- a/src/wayland/protocols/toplevel_info.rs
++++ b/src/wayland/protocols/toplevel_info.rs
+@@ -619,6 +619,7 @@ where
+                     changed = true;
+                 } else if geometry_changed && let Some(geo) = geometry {
+                     instance.geometry(&wl_output, geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
++                    changed = true;
+                 }
+             }
+         }

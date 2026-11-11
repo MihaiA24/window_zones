@@ -103,3 +103,32 @@ fn dry_run_runtime_crosses_displays_and_restores_the_simulated_window() {
         ]
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_surface_ends_the_session_before_queued_actions_run() {
+    let config_path = temp_path("failed_surface.toml");
+    fs::write(&config_path, starter_config("Ctrl+Alt")).unwrap();
+    let mut runtime =
+        Runtime::new(Some(config_path.clone()), RuntimeBackend::DryRun, None).unwrap();
+    let (tx, instructions) = mpsc::channel();
+    for instruction in [
+        RuntimeInstruction::SurfaceFailed("tray host disconnected".to_string()),
+        RuntimeInstruction::Dispatch("Ctrl+Alt+Left".to_string()),
+        RuntimeInstruction::Quit,
+    ] {
+        tx.send(instruction.into()).unwrap();
+    }
+    let exit = run_runtime(
+        &mut runtime,
+        &mut CliSurface {
+            prompt: false,
+            notifier: None,
+        },
+        instructions,
+        true,
+    );
+    assert_eq!(exit, std::process::ExitCode::FAILURE);
+    assert!(runtime.window_system.last_move().is_none());
+    fs::remove_file(config_path).unwrap();
+}

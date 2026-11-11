@@ -13,25 +13,25 @@ COMMAND=""
 for arg in "$@"; do
     case "$arg" in
         --keep-logs) KEEP_LOGS=1 ;;
-        gnome|gnome-live|kde-live|x11|all)
+        cosmic|gnome|gnome-live|kde-live|x11|all)
             if [[ -n "$COMMAND" ]]; then
-                printf 'Usage: %s [--keep-logs] {gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}" >&2
+                printf 'Usage: %s [--keep-logs] {cosmic|gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}" >&2
                 exit 2
             fi
             COMMAND="$arg"
             ;;
         -h|--help)
-            printf 'Usage: %s [--keep-logs] {gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}"
+            printf 'Usage: %s [--keep-logs] {cosmic|gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}"
             exit 0
             ;;
         *)
-            printf 'Unknown argument: %s\nUsage: %s [--keep-logs] {gnome|gnome-live|kde-live|x11|all}\n' "$arg" "${BASH_SOURCE[0]}" >&2
+            printf 'Unknown argument: %s\nUsage: %s [--keep-logs] {cosmic|gnome|gnome-live|kde-live|x11|all}\n' "$arg" "${BASH_SOURCE[0]}" >&2
             exit 2
             ;;
     esac
 done
 if [[ -z "$COMMAND" ]]; then
-    printf 'Usage: %s [--keep-logs] {gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}" >&2
+    printf 'Usage: %s [--keep-logs] {cosmic|gnome|gnome-live|kde-live|x11|all}\n' "${BASH_SOURCE[0]}" >&2
     exit 2
 fi
 
@@ -44,6 +44,14 @@ if [[ -z "$BIN_PATH" ]]; then
         exit 1
     fi
     BIN_PATH="$TARGET_DIR/debug/window_zones"
+fi
+
+if [[ "$COMMAND" == cosmic ]]; then
+    ARGS=(--binary "$BIN_PATH")
+    [[ -z "${WINDOW_ZONES_COSMIC_COMPOSITOR:-}" ]] || ARGS+=(--compositor "$WINDOW_ZONES_COSMIC_COMPOSITOR")
+    [[ -z "${WINDOW_ZONES_SMOKE_ROOT:-}" ]] || ARGS+=(--evidence-dir "$WINDOW_ZONES_SMOKE_ROOT")
+    [[ -z "${WINDOW_ZONES_SMOKE_COSMIC_PARENT_DISPLAY:-}" ]] || ARGS+=(--parent-wayland "$WINDOW_ZONES_SMOKE_COSMIC_PARENT_DISPLAY")
+    exec /usr/bin/python3 "$SCRIPT_DIR/cosmic-smoke.py" "${ARGS[@]}"
 fi
 
 umask 077

@@ -1343,59 +1343,6 @@ action = { type = "move-to-zone", zone = "left-half" }
     }
 
     #[test]
-    fn reload_config_from_path_replaces_bindings_on_success() {
-        let config = TestConfig::new("main_reload_success");
-        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
-        let mut app = App::start_at(&config.path);
-        let mut hotkeys = FakeHotkeySystem::default();
-        assert_eq!(
-            app.config().bindings,
-            vec![Binding {
-                hotkey: "alt+ctrl+left".to_string(),
-                action: left_half(),
-            }]
-        );
-
-        config.write(
-            "[[bindings]]\nhotkey = \"Shift+Alt+Right\"\naction = { type = \"move-to-next-display\" }\n",
-        );
-        app.reload(&mut hotkeys, Instant::now());
-
-        assert!(matches!(app.config_state(), ConfigState::Loaded));
-        assert_eq!(
-            app.config().bindings,
-            vec![Binding {
-                hotkey: "alt+shift+right".to_string(),
-                action: Action::MoveToNextDisplay {},
-            }]
-        );
-    }
-
-    #[test]
-    fn reload_config_keeps_last_valid_bindings_after_parse_error() {
-        let config = TestConfig::new("main_reload_parse_error");
-        config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
-        let mut app = App::start_at(&config.path);
-        let mut hotkeys = FakeHotkeySystem::default();
-        config.write("bindings = [");
-        app.reload(&mut hotkeys, Instant::now());
-
-        match app.config_state() {
-            ConfigState::Error(ConfigLoadError::Parse { path, .. }) => {
-                assert_eq!(path, &config.path);
-            }
-            state => panic!("expected parse error, got {state:?}"),
-        }
-        assert_eq!(
-            app.config().bindings,
-            vec![Binding {
-                hotkey: "alt+ctrl+left".to_string(),
-                action: left_half(),
-            }]
-        );
-    }
-
-    #[test]
     fn reload_config_keeps_last_valid_bindings_after_validation_error() {
         let config = TestConfig::new("main_reload_validation_error");
         config.write(&zone_binding("Ctrl+Alt+Left", "left-half"));
@@ -1486,6 +1433,13 @@ action = { type = "move-to-zone", zone = "left-half" }
             }
             state => panic!("expected parse error, got {state:?}"),
         }
+        assert_eq!(
+            app.config().bindings,
+            vec![Binding {
+                hotkey: "alt+ctrl+left".to_string(),
+                action: left_half(),
+            }]
+        );
         assert_eq!(
             app.dispatch_hotkey("Ctrl+Alt+Left", &mut windows),
             &DispatchState::Succeeded

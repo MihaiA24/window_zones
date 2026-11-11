@@ -15,7 +15,7 @@ const proxy = Gio.DBusProxy.new_sync(
     null,
     'org.window_zones.KWin',
     '/org/window_zones/KWin',
-    'org.window_zones.KWin3',
+    'org.window_zones.KWin4',
     null);
 
 function request(keys) {
@@ -25,13 +25,14 @@ function request(keys) {
         Gio.DBusCallFlags.NONE,
         5000,
         null);
-    return reply.deep_unpack()[0];
+    const [id, timeoutMs] = reply.deep_unpack();
+    return {id, deadline: GLib.get_monotonic_time() + timeoutMs * 1000};
 }
 
-function requestResult(id) {
+function requestResult(request) {
     const reply = proxy.call_sync(
         'GetRequestResult',
-        new GLib.Variant('(s)', [String(id)]),
+        new GLib.Variant('(s)', [String(request.id)]),
         Gio.DBusCallFlags.NONE,
         5000,
         null);
