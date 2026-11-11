@@ -240,6 +240,8 @@ CARGO_PROFILE_DEV_DEBUG=0 ./scripts/build-cosmic.sh
 
 The helper fetches the revision in `cosmic-comp/revision`, verifies a pristine or
 exactly patched checkout, and builds `target/cosmic-comp-build/debug/cosmic-comp`.
+It records bridge input hashes before staging and refuses to publish a build
+stamp if those inputs change during the build; rebuild after finishing edits.
 Use `--release` for a release build. It never installs binaries, changes desktop
 settings, or restarts a session. Native compositor development dependencies are
 required in addition to the App's dependencies.

@@ -41,6 +41,14 @@ REV=$(tr -d '\n\r' < "$OVERLAY/revision")
 [[ -s "$OVERLAY/bridge.patch" && -s "$OVERLAY/window_zones.rs" ]] || {
     echo 'Missing durable bridge.patch or window_zones.rs overlay' >&2; exit 1;
 }
+# Capture provenance before any source is staged or compiled.
+INPUTS="$(/usr/bin/python3 -c '
+import hashlib, json, sys
+from pathlib import Path
+overlay = Path(sys.argv[1])
+print(json.dumps({name: hashlib.sha256((overlay / name).read_bytes()).hexdigest()
+                  for name in ("revision", "bridge.patch", "window_zones.rs")}))
+' "$OVERLAY")"
 mkdir -p -- "$(dirname -- "$SOURCE")" "$TARGET"
 # The lock is outside SOURCE, so even a fresh clone is exclusive.
 exec 9>"$SOURCE.window-zones.lock"
@@ -107,8 +115,11 @@ if len(paths) != 1:
     sys.exit(f"Expected one Cargo executable for cosmic-comp, found {len(paths)}")
 binary = Path(paths.pop()).resolve()
 overlay = Path(sys.argv[1])
-inputs = {name: hashlib.sha256((overlay / name).read_bytes()).hexdigest()
-          for name in ("revision", "bridge.patch", "window_zones.rs")}
+inputs = json.loads(sys.argv[3])
+current_inputs = {name: hashlib.sha256((overlay / name).read_bytes()).hexdigest()
+                  for name in ("revision", "bridge.patch", "window_zones.rs")}
+if current_inputs != inputs:
+    sys.exit("Bridge sources changed during build; rebuild before publishing provenance")
 proof = {"revision": sys.argv[2], "inputs": inputs,
          "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
 stamp = binary.with_name(binary.name + ".window-zones.json")
@@ -116,6 +127,6 @@ temporary = stamp.with_name(stamp.name + ".tmp")
 temporary.write_text(json.dumps(proof, indent=2) + "\n")
 temporary.replace(stamp)
 print(binary)
-' "$OVERLAY" "$REV")"
+' "$OVERLAY" "$REV" "$INPUTS")"
 printf '\nLocal custom compositor: %s\n' "$BINARY"
 printf '%s\n' 'Opt in only for an intentionally launched test session: WINDOW_ZONES_COSMIC_BRIDGE=1'

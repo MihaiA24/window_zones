@@ -370,6 +370,49 @@ build_seam_helper regression
             self.assertEqual((root / "build-target").read_text().strip(), str(persistent / "smoke-seam-helper"))
             self.assertFalse((scratch / "smoke-seam-helper").exists())
 
+    def test_cosmic_build_rejects_overlay_changes_before_publishing_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, overlay, tools, target = (root / name for name in ("source", "overlay", "tools", "target"))
+            subprocess.run(["git", "clone", "--quiet", "--shared", str(SCRIPTS.parent), str(source)],
+                           check=True, capture_output=True, timeout=15)
+            revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+            (source / "src/dbus").mkdir(exist_ok=True)
+            overlay.mkdir()
+            (overlay / "revision").write_text(revision + "\n")
+            (overlay / "bridge.patch").write_text(
+                "diff --git a/build-probe b/build-probe\nnew file mode 100644\n"
+                "--- /dev/null\n+++ b/build-probe\n@@ -0,0 +1 @@\n+probe\n")
+            (overlay / "window_zones.rs").write_text("original bridge source\n")
+            tools.mkdir()
+            cargo = tools / "cargo"
+            cargo.write_text("#!" + sys.executable + "\n" + '''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+source = Path(args[args.index("--manifest-path") + 1]).parent
+binary = Path(args[args.index("--target-dir") + 1]) / "debug/cosmic-comp"
+binary.parent.mkdir(parents=True, exist_ok=True)
+binary.write_bytes((source / "src/dbus/window_zones.rs").read_bytes())
+if os.environ.get("CHANGE_OVERLAY"):
+    Path(os.environ["BRIDGE_OVERLAY"]).write_text("edited bridge source\\n")
+print(json.dumps({"reason": "compiler-artifact", "executable": str(binary),
+                  "target": {"name": "cosmic-comp", "kind": ["bin"]}}))
+''')
+            cargo.chmod(0o755)
+            env = {**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                   "BRIDGE_OVERLAY": str(overlay / "window_zones.rs"), "CHANGE_OVERLAY": ""}
+            command = ["bash", str(SCRIPTS / "build-cosmic.sh"), "--source", str(source),
+                       "--target-dir", str(target), "--overlay", str(overlay)]
+            stable = subprocess.run(command, env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(stable.returncode, 0, stable.stderr)
+            stamp = target / "debug/cosmic-comp.window-zones.json"
+            original_stamp = stamp.read_bytes()
+            changed = subprocess.run(command, env={**env, "CHANGE_OVERLAY": "1"},
+                                     text=True, capture_output=True, timeout=15)
+            self.assertNotEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+            self.assertEqual(stamp.read_bytes(), original_stamp)
+
 
 if __name__ == "__main__":
     unittest.main()

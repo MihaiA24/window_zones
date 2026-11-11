@@ -671,7 +671,7 @@ class Smoke:
                    [list(display) for display in displays] == [[output['name'], 0, 0, width, height]], displays)
         area = [0, 0, width, height]
         left = [0, 0, width // 2, height]
-        right = [width // 2, 0, width // 2, height]
+        right = [width - width // 2, 0, width // 2, height]
         for backend, explicit in (('auto', True), ('wayland', False)):
             _, status = self.cli(env, 'status-' + backend, ['status'], backend, explicit)
             self.check('status ' + backend + ' capabilities/config', 'Using runtime window backend: cosmic-wayland' in status

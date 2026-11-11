@@ -19,7 +19,7 @@ What this verifies:
 - module-aware Node syntax checks for JavaScript fixtures under `scripts/` and `src/`
 - Python parsing of every `scripts/**/*.py` file, including extracted smoke fixtures
 - Linux only: `python3 .agents/skills/verify-window-zones/test_verify.py` (verifier ownership, completed-child observation, native-runtime cleanup, dry-run, freshness after nested Rust/shell/fixture additions, edits and removals, evidence retention, TUI dispatch errors, JSON mismatches, median/spread, and application-only clock scope). Other platforms explicitly skip this Linux harness and continue the Cargo checks.
-- Linux only: `python3 scripts/smoke/test_helpers.py` (owned-window selection, PID-reuse/orphan cleanup, signal exit, non-vacuous TUI responses and persistent helper build storage).
+- Linux only: `python3 scripts/smoke/test_helpers.py` (owned-window selection, PID-reuse/orphan cleanup, signal exit, non-vacuous TUI responses, persistent helper build storage and COSMIC build source-drift refusal).
 
 The GNOME and KDE adapter contract tests use fake compositor services on private
 `dbus-daemon` instances; KWin controller ownership is also checked through the real
