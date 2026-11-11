@@ -152,7 +152,6 @@ export class WindowZonesService {
         this._animationSettings = animationSettings;
         this._accelerators = new Map();
         this._hotkeysByAction = new Map();
-        this._allowedKeybindings = new Map();
         this._controllerSender = null;
         this._connection = null;
         this._registrationId = 0;
@@ -557,7 +556,6 @@ export class WindowZonesService {
                 grabbed.push(action);
                 const bindingName = Meta.external_binding_name_for_action(action);
                 Main.wm.allowKeybinding(bindingName, Shell.ActionMode.NORMAL);
-                this._allowedKeybindings.set(action, bindingName);
                 next.set(hotkey, action);
             }
         } catch (error) {
@@ -578,11 +576,7 @@ export class WindowZonesService {
     }
 
     _ungrabAccelerator(action) {
-        const bindingName = this._allowedKeybindings.get(action);
-        if (bindingName) {
-            Main.wm.allowKeybinding(bindingName, Shell.ActionMode.NONE);
-            this._allowedKeybindings.delete(action);
-        }
+        Main.wm.allowKeybinding(Meta.external_binding_name_for_action(action), Shell.ActionMode.NONE);
         global.display.ungrab_accelerator(action);
     }
 

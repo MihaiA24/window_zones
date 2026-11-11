@@ -1,12 +1,6 @@
 kde_live_dispatch() {
     local label=$1 hotkey=$2 out="$KDE_ROOT/dispatch-$1.log" rc=0
-    env DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" \
-        XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
-        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
-        XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
-        XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 "$BIN_PATH" --backend auto --config "$CONFIG_PATH" \
-        dispatch "$hotkey" >"$out" 2>&1 || rc=$?
+    "$BIN_PATH" --backend auto --config "$CONFIG_PATH" dispatch "$hotkey" >"$out" 2>&1 || rc=$?
     cat "$out" >>"$ASSERT_LOG"
     assert_eq "$label dispatch exit" 0 "$rc"
     assert_text "$label dispatch state" 'Dispatch state: Succeeded' "$(cat "$out" 2>/dev/null || true)"
@@ -73,13 +67,8 @@ kde_live_adr9_window_checks() {
     IFS='|' read -r present a_id rest <<<"$(kde_live_get_focused)"
     assert_text 'KDE captures the test window id' 'captured' "${a_id:+captured}"
     kde_live_move "$a_id" "$KDE_CENTER_THIRD" >/dev/null
-    start_group b_pid "$KDE_ROOT/editor-b.log" env \
-        DISPLAY="$KDE_XDISPLAY" XAUTHORITY="$KDE_XAUTHORITY" GDK_BACKEND=x11 \
-        XDG_RUNTIME_DIR="$KDE_RUNTIME" WAYLAND_DISPLAY="$KDE_SOCKET" \
-        DBUS_SESSION_BUS_ADDRESS="$KDE_BUS" XDG_CONFIG_HOME="$KDE_CONFIG" \
-        XDG_DATA_HOME="$KDE_DATA" HOME="$KDE_HOME" XDG_SESSION_TYPE=wayland \
-        XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma \
-        KDE_SESSION_VERSION=6 gnome-text-editor --standalone
+    start_group b_pid "$KDE_ROOT/editor-b.log" env GDK_BACKEND=x11 \
+        gnome-text-editor --standalone
     b=$(xwindow_for_pid "$b_pid" 25 || true)
     assert_text 'KDE second test window maps' 'mapped' "${b:+mapped}"
     if [[ -z "$b" || -z "$a_id" ]]; then

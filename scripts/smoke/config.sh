@@ -1,4 +1,4 @@
-write_valid_config() {
+write_five_bindings_config() {
     cat >"$CONFIG_PATH" <<'EOF'
 [[bindings]]
 hotkey = "Alt+Ctrl+Left"
@@ -15,12 +15,6 @@ action = { type = "move-to-zone", zone = "left-two-thirds" }
 [[bindings]]
 hotkey = "Alt+Ctrl+Down"
 action = { type = "move-to-next-display" }
-EOF
-}
-
-write_five_bindings_config() {
-    write_valid_config
-    cat >>"$CONFIG_PATH" <<'EOF'
 
 [[bindings]]
 hotkey = "Alt+Ctrl+Shift+Right"

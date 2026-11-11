@@ -214,12 +214,7 @@ EOF
 run_gnome_live_tui_lifecycle() {
     local tui_log="$GNOME_ROOT/live-tui.log" rc=0
     write_gnome_live_valid_config
-    start_fifo_app tui wayland "$tui_log"
-    wait_for_text "$tui_log" 'Window Zones TUI' 15 || true
-    assert_text 'GNOME live TUI starts' 'Window Zones TUI' \
-        "$(cat "$tui_log" 2>/dev/null || true)"
-
-    tui_control_checks "$tui_log" 'GNOME live'
+    tui_begin wayland 'GNOME live' "$tui_log"
 
     run_gnome_live_dispatch tui-baseline "$GNOME_SAFE_CENTER_HOTKEY"
     gnome_live_assert_geometry 'GNOME live TUI baseline' "$GNOME_LIVE_CENTER_THIRD"

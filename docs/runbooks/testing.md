@@ -25,6 +25,10 @@ The GNOME and KDE adapter contract tests use fake compositor services on private
 `dbus-daemon` instances; KWin controller ownership is also checked through the real
 Rust dispatcher. Neither requires a running compositor session.
 
+Windows/macOS keycode coverage shares one canonical mapping table; reload tests
+retain binding equality and subsequent dispatch checks. Their CI jobs share a
+non-fail-fast matrix while retaining the `windows` and `macos` check names.
+
 The KWin Node harness and Rust-launched captured-frame fixture share
 `kwin-script/tests/clock.js`. Verifier cleanup and native smoke share
 `scripts/smoke/owned_process.py` for PID/start-checked pidfd signalling.

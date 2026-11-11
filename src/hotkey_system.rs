@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_letter_digit_and_function_key() {
+    fn maps_canonical_keys_to_native_codes() {
         for (token, _windows, _macos) in [
             ("a", 65, Some(0)),
             ("b", 66, Some(11)),
@@ -613,32 +613,6 @@ mod tests {
             ("f22", 133, None),
             ("f23", 134, None),
             ("f24", 135, None),
-        ] {
-            #[cfg(target_os = "windows")]
-            let expected = Some(_windows);
-            #[cfg(target_os = "macos")]
-            let expected = _macos;
-            assert_eq!(key_token_to_code(token), expected, "{token}");
-            if let Some(code) = expected {
-                assert_eq!(canonical_binding(token).unwrap().0, (0, code), "{token}");
-            } else {
-                assert!(
-                    matches!(
-                        canonical_binding(token),
-                        Err(HotkeySystemError::Rejected(_))
-                    ),
-                    "{token}"
-                );
-            }
-        }
-        for token in ["", "A", "aa", "00", "f0", "f01", "f25"] {
-            assert_eq!(key_token_to_code(token), None, "{token}");
-        }
-    }
-
-    #[test]
-    fn maps_named_keys_to_native_codes() {
-        for (token, _windows, _macos) in [
             ("space", 32, Some(49)),
             ("tab", 9, Some(48)),
             ("backspace", 8, Some(51)),
@@ -687,6 +661,9 @@ mod tests {
                     "{token}"
                 );
             }
+        }
+        for token in ["", "A", "aa", "00", "f0", "f01", "f25"] {
+            assert_eq!(key_token_to_code(token), None, "{token}");
         }
     }
 
@@ -865,21 +842,6 @@ mod tests {
     fn windows_function_keys_above_f12_use_native_virtual_key_codes() {
         assert_eq!(canonical_binding("ctrl+f13").unwrap().0, (MOD_CTRL, 124));
         assert_eq!(canonical_binding("f24").unwrap().0, (0, 135));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_extended_keys_use_native_key_codes() {
-        assert_eq!(canonical_binding("f20").unwrap().0, (0, 90));
-        assert_eq!(canonical_binding("delete").unwrap().0, (0, 117));
-        assert!(matches!(
-            canonical_binding("f24"),
-            Err(HotkeySystemError::Rejected(_))
-        ));
-        assert!(matches!(
-            canonical_binding("printscreen"),
-            Err(HotkeySystemError::Rejected(_))
-        ));
     }
 
     #[test]

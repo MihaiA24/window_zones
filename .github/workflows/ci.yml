@@ -15,19 +15,14 @@ jobs:
       - name: Run maintained checks
         run: PATH="/usr/lib/qt6/bin:$PATH" bash scripts/test.sh
 
-  # Manual Windows smoke verification is deferred; this job only proves the cfg(windows) code compiles and unit-tests.
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run tests
-        run: cargo test --locked
-      - name: Run clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-  # Manual macOS smoke verification is out of scope; this job only proves the cfg(target_os = "macos") code compiles and unit-tests.
-  macos:
-    runs-on: macos-latest
+  # Native Windows smoke is deferred; native macOS smoke is out of scope.
+  desktop:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows, macos]
     steps:
       - uses: actions/checkout@v4
       - name: Run tests

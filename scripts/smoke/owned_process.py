@@ -20,11 +20,7 @@ def process(pid):
 
 
 def records(path):
-    result = {}
-    for line in Path(path).read_text().splitlines():
-        pid, start = map(int, line.split())
-        result[pid] = start
-    return result
+    return dict(tuple(map(int, line.split())) for line in Path(path).read_text().splitlines())
 
 
 def is_alive(pid, start):
