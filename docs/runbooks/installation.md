@@ -75,7 +75,7 @@ On KDE, the installer also starts and supervises `window_zones_kwin` when
 | `--gnome-extension` | Linux only: install the GNOME Shell companion and attempt to enable it. Refused on macOS. |
 | `--kwin-script` | Linux only: install/upgrade the KWin script and install `window_zones_kwin` alongside the selected binary. Refused on macOS. |
 | `--init-config` | Run the installed App's non-overwriting `init` command. Requires `--binary window_zones`. |
-| `--autostart` | Linux: install the App's systemd user unit, or XDG login entry when user systemd is unreachable. An installed KWin companion is started and supervised too. macOS: install and load a per-user LaunchAgent. Requires `--binary window_zones`. |
+| `--autostart` | Linux: install the App's systemd user unit, or an XDG login entry when the user manager or graphical session target is inactive. An installed KWin companion is started and supervised too. macOS: install and load a per-user LaunchAgent. Requires `--binary window_zones`. |
 | `--uninstall` | Remove installations recorded for the chosen prefix; preserve the user config. No build is performed. |
 | `-h, --help` | Show usage. |
 
@@ -211,10 +211,9 @@ starts at the next login instead of retrying until then. Re-running the
 installer without `--autostart` also restarts active services only when their
 installed executable paths still belong to the selected prefix.
 
-It removes a previous `window_zones.desktop` fallback to avoid two autostart
-launchers. The unit participates in the graphical session lifecycle: it starts
-with the desktop session and stops at logout. The `run` command continues when
-stdin is closed or is not a terminal, and writes logs to stdout/stderr, captured
+The unit participates in the graphical session lifecycle: it starts with the
+desktop session and stops at logout. The `run` command continues when stdin
+is closed or is not a terminal, and writes logs to stdout/stderr, captured
 by the user journal:
 
 ```bash
@@ -229,10 +228,10 @@ For KDE, use the same commands with `window-zones-kwin` to manage the companion
 and `journalctl --user -u window-zones-kwin -f` for its logs. Both units stop at
 graphical logout. Stop the App first when deliberately shutting down both.
 
-While the service runs, problems also appear as one desktop notification that is
-updated in place: config errors and refused hotkeys at once, and an unavailable
-companion only after it has been unreachable for 20 seconds, so the login race
-and companion restarts stay silent.
+While the service runs, it uses one desktop notification that updates in place.
+It sends config errors and refused hotkeys immediately, and waits through 20
+seconds of continuous outage before reporting an unavailable companion. If
+delivery fails, it retries while the notice is still relevant.
 
 The App's single-instance lock rejects a second listener with exit status **75**
 (`EX_TEMPFAIL`). `RestartPreventExitStatus=75` stops systemd retrying that exit,
@@ -257,11 +256,18 @@ Installs from earlier commits of this unpublished branch must be stopped and
 uninstalled with that revision before reinstalling; legacy KDE state is not
 migrated.
 
-To switch from XDG to systemd, re-run `--autostart` inside a desktop with an
-active graphical target. The installer validates the previous prefix's desktop
-entry, ownership record and KDE launcher marker before stopping its session and
-removing the fallback, including when the new prefix differs. Unowned entries
-are preserved; config is never replaced.
+To switch from XDG to systemd, re-run the installer with `--autostart` inside a
+desktop with an active graphical target. If an owned KDE XDG launcher exists
+and the selected prefix has no recorded KWin companion, run with
+`--kwin-script --autostart` or uninstall the old setup first. Otherwise the
+installer refuses the switch before making changes.
+
+The installer checks the previous prefix's desktop entries, ownership record,
+and KDE launcher marker. It stops the owned KDE launcher and removes the owned
+XDG entries only after writing the replacement units, reloading user systemd,
+and enabling all the replacement units. A failure in those steps leaves the
+XDG entries and running launcher in place. Unowned or malformed desktop
+entries are preserved. The switch does not replace the user config.
 
 ### macOS LaunchAgent
 

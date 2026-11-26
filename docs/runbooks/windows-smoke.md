@@ -176,12 +176,13 @@ Get-WzWindowRect $target.MainWindowHandle
 `WorkingArea` is the Win32 usable area, excluding reserved taskbar/dock space.
 `Get-WzWindowRect` uses DWM extended frame bounds: the **visible** window frame
 in physical desktop pixels. `Get-WzWindowRect $target.MainWindowHandle -Outer`
-uses `GetWindowRect`, which can also include invisible resize borders. The App
-requests per-monitor-v2 process DPI awareness at adapter construction; an
-already-set awareness context is retained. It compensates the invisible borders
-before `SetWindowPos` so the visible frame, not the larger outer rectangle, lands
-on the zone, including across monitors with different scale factors. Record all
-`DeviceName`, `X`, `Y`, `Width`, and `Height` values, including negative coordinates.
+uses `GetWindowRect`, which can also include invisible resize borders. If
+`$previousDpiContext` is zero, stop: the observer cannot reliably compare the two
+frames. The App requires per-monitor-v2 DPI awareness on the thread that reads
+and moves windows. It compensates for invisible borders so the visible frame
+lands on the zone, including across monitors with different scale factors.
+Record all `DeviceName`, `X`, `Y`, `Width`, and `Height` values, including
+negative coordinates.
 
 For a work area `(x, y, w, h)`, the exact expected built-in zone rectangles
 are:
@@ -249,6 +250,11 @@ successful geometry check, outside the repository.
    The adapter also restores a minimized HWND captured before minimization.
    A fresh action does not select an already-minimized window; this manual
    checklist does not evidence the query/minimize race.
+   The App requests restore and placement asynchronously and checks both
+   within a shared deadline. An unresponsive target reports an error without
+   blocking the runtime indefinitely. Windows may still apply a queued request
+   after the deadline. If the observed frame stays unchanged and misses the
+   target, the App does not record a new Restore point.
 
    **Fullscreen boundary:** with a borderless fullscreen window covering its
    full monitor, dispatch must report `leave fullscreen first` without moving
@@ -361,12 +367,12 @@ successful geometry check, outside the repository.
    & $bin --backend windows --config $config --tray run
    ```
 
-   Record `Tray menu started`. Open the Window Zones tray menu and exercise
-   `Show status`, `Reload`, `Restart`, and `Quit`. Confirm status output reflects
-   the current config, reload and restart return to a live tray session, and
-   `Quit` prints `Session closed.` and exits. Record whether the icon is visible,
-   the exact menu labels, each observed result, and any Windows notification or
-   shell error.
+   Record `Tray menu started`. Open the Window Zones menu from the stock
+   Windows application icon and exercise `Show status`, `Reload`, `Restart`,
+   and `Quit`. Confirm status output reflects the current config, reload and
+   restart return to a live tray session, and `Quit` prints `Session closed.`
+   and exits. Record whether the icon is visible, the exact menu labels, each
+   observed result, and any Windows notification or shell error.
 
 When a check fails, preserve the command output, the exact monitor layout,
 the observed/expected rectangles, and an external screenshot. Do not change

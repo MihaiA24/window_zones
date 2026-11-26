@@ -86,13 +86,13 @@ const connection = {
 const service = new WindowZonesService(animationSettings);
 service.export(connection);
 
-async function call(name, args = [], sender = ':1.42', expectedError = null) {
+async function call(name, args = [], sender = ':1.42', expectedError = null, timeoutMs = 1000) {
     const method = methods.get(name);
     const inSignature = `(${(method.in_args ?? []).map(arg => arg.signature).join('')})`;
     const outSignature = `(${(method.out_args ?? []).map(arg => arg.signature).join('')})`;
     let replies = 0;
     const reply = await new Promise(resolve => {
-        const timeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+        const timeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, timeoutMs, () => {
             resolve(null);
             return GLib.SOURCE_REMOVE;
         });
@@ -109,7 +109,7 @@ async function call(name, args = [], sender = ':1.42', expectedError = null) {
                 return_dbus_error(errorName, message) { respond({errorName, message}); },
             });
     });
-    equal(replies, 1, `${name} returns exactly one reply within one second`);
+    equal(replies, 1, `${name} returns exactly one reply within ${timeoutMs} ms`);
     if (reply.variant) {
         equal(expectedError, null, `${name} must not succeed`);
         equal(reply.variant.get_type_string(), outSignature, `${name} reply matches XML out args`);
@@ -226,6 +226,13 @@ for (const [duration, x, lower, upper] of [[0, 90, 0, 100], [150, 110, 120, 250]
     equal(metrics[1] >= lower && metrics[1] < upper, true,
         `live app animation duration ${duration} ms controls completed placement`);
 }
+settings.slow_down_factor = 3;
+animationSettings.duration = 1000;
+window.maximizeFlags = 3;
+await call('MoveWindow', [window.id, 150, 40, 600, 700], ':1.42', null, 2000);
+equal([actor.animationDuration, global.window_group.children.at(-1).animationDuration], [1000, 1000],
+    'Shell slowdown caps both animations without missing the App deadline');
+settings.slow_down_factor = 1;
 animationSettings.duration = 250;
 window.actor = null;
 for (const discovery of ['GetFocusedWindow', 'GetDisplays']) {
@@ -447,6 +454,21 @@ try {
     };
     const register = () => busCall(incumbent, name, '/org/window_zones/Gnome',
         info.name, 'RegisterHotkeys', new GLib.Variant('(as)', [['ctrl+cmd+left']]), '()');
+
+    const schemaError = new Error('missing settings schema');
+    extension.getSettings = () => { throw schemaError; };
+    let enableError;
+    try {
+        extension.enable();
+    } catch (error) {
+        enableError = error;
+    }
+    equal(enableError === schemaError, true, 'missing schema fails enable synchronously');
+    equal(await unowned(), true, 'missing schema does not claim the bus name');
+    equal(await available(shellConnection.get_unique_name()), false, 'missing schema exports no object');
+    extension.disable();
+    equal(display.handler, null, 'failed enable leaves no accelerator listener');
+    delete extension.getSettings;
 
     equal(await requestName(), [1], 'incumbent owns the private companion name');
     extension.enable();

@@ -2,15 +2,119 @@
 
 use std::cell::RefCell;
 use std::fmt::{self, Write as _};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Writes a diagnostic best-effort; an unavailable stderr must not panic or
 /// replace the operation's actual exit status.
 pub fn diagnostic(message: fmt::Arguments<'_>) {
     let _ = writeln!(io::stderr().lock(), "{message}");
+}
+
+/// Prevents an explicit append-only sink from modifying the config.
+pub fn check_log_path(log: &Path, config: &Path) -> io::Result<()> {
+    if log == config
+        || same_file(log, config)
+        || canonical_destination(log, 0)
+            .ok()
+            .zip(canonical_destination(config, 0).ok())
+            .is_some_and(|(log, config)| {
+                log == config
+                    || (cfg!(windows)
+                        && log.to_string_lossy().to_uppercase()
+                            == config.to_string_lossy().to_uppercase())
+            })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} refers to the config file {}",
+                log.display(),
+                config.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (left.metadata(), right.metadata()) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (left, right);
+    false
+}
+
+fn canonical_destination(path: &Path, links: u8) -> io::Result<PathBuf> {
+    let error = match path.canonicalize() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => error,
+        result => return result,
+    };
+    let parent = path.parent().ok_or(error)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let mut target = canonical_destination(parent, links)?;
+    match path.components().next_back() {
+        Some(Component::Normal(name)) => target.push(name),
+        Some(Component::ParentDir) => {
+            target.pop();
+        }
+        _ => return Ok(target),
+    }
+    // A dangling symlink is also an alias when the sink creates its target.
+    if links < 40
+        && let Ok(link) = fs::read_link(&target)
+    {
+        return canonical_destination(&target.with_file_name(link), links + 1);
+    }
+    Ok(target)
+}
+
+pub(crate) fn open_checked(
+    path: &Path,
+    options: &mut OpenOptions,
+    check: impl Fn(&Metadata) -> io::Result<()>,
+) -> io::Result<File> {
+    match path.metadata() {
+        Ok(metadata) => check(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let file = options.open(path)?;
+    check(&file.metadata()?)?;
+    Ok(file)
+}
+
+pub(crate) fn open_append_log(path: &Path) -> io::Result<File> {
+    open_checked(
+        path,
+        OpenOptions::new().create(true).append(true),
+        |metadata| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if metadata.file_type().is_fifo() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "log path must not be a FIFO",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = metadata;
+            Ok(())
+        },
+    )
 }
 
 /// Session event sink. Sink failures warn once on stderr and never stop the app.
@@ -74,7 +178,7 @@ fn open_log_file(path: &Path) -> Option<File> {
     let opened = path
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|()| OpenOptions::new().create(true).append(true).open(path));
+        .and_then(|()| open_append_log(path));
     match opened {
         Ok(file) => Some(file),
         Err(error) => {
@@ -259,6 +363,35 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&blocker).unwrap(), "");
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_path_cannot_alias_existing_or_missing_config() {
+        use std::os::unix::fs::symlink;
+
+        let directory = test_directory("config_alias");
+        fs::create_dir_all(directory.join("real")).unwrap();
+        symlink("real", directory.join("alias")).unwrap();
+        let config = directory.join("real/config.toml");
+        let dangling = directory.join("dangling.log");
+        symlink("real/config.toml", &dangling).unwrap();
+        for log in [
+            directory.join("alias/config.toml"),
+            directory.join("uncreated/../real/config.toml"),
+            dangling,
+        ] {
+            let error = super::check_log_path(&log, &config).unwrap_err();
+            assert!(error.to_string().contains("refers to the config file"));
+        }
+        assert!(!config.exists());
+
+        fs::write(&config, "# config\n").unwrap();
+        let hard_link = directory.join("hard-link.log");
+        fs::hard_link(&config, &hard_link).unwrap();
+        assert!(super::check_log_path(&hard_link, &config).is_err());
+        assert!(super::check_log_path(&directory.join("separate.log"), &config).is_ok());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]

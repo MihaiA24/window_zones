@@ -170,6 +170,8 @@ elif name == 'systemctl':
         sys.exit(1)
     log('systemctl')
     action, unit = args[0], args[-1]
+    if ' '.join(args) == os.environ.get('WZI_SYSTEMD_FAIL'):
+        sys.exit('fixture systemctl failure: ' + ' '.join(args))
     if action == 'enable':
         link = config / 'systemd/user/graphical-session.target.wants' / unit
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -307,14 +309,15 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
             time.sleep(0.05)
         raise AssertionError(description)
 
-    def command(arguments, *, environment=None):
+    def command(arguments, *, environment=None, expect_exit=0):
         result = subprocess.run(arguments, env=env if environment is None else environment, text=True, capture_output=True)
-        if result.returncode:
-            raise AssertionError(f'{arguments!r}: exit {result.returncode}\n{result.stdout}\n{result.stderr}')
+        if result.returncode != expect_exit:
+            raise AssertionError(f'{arguments!r}: exit {result.returncode}, expected {expect_exit}\n{result.stdout}\n{result.stderr}')
         return result
 
-    def install(location, *options):
-        return command(['/bin/bash', str(root / 'scripts/install.sh'), '--prefix', str(location), *options])
+    def install(location, *options, expect_exit=0):
+        return command(['/bin/bash', str(root / 'scripts/install.sh'), '--prefix', str(location), *options],
+                       expect_exit=expect_exit)
 
     def ctl(*args):
         return command([str(tools / 'systemctl'), '--user', *args])
@@ -581,6 +584,8 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         print('PASS inactive-target/unreachable fallback, stale identity, launcher crash, timezone, companion duplicate')
 
         env['WZI_VERSION'] = 'xdg-old-prefix'
+        install(prefix, '--autostart')
+        app_desktop = config / 'autostart/window_zones.desktop'
         install(fallback, '--kwin-script', '--autostart')
         previous_launcher = launch_desktop(desktop)
         wait_for(lambda: starts('window_zones', 'xdg-old-prefix'),
@@ -589,6 +594,34 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
                          for role in ('window_zones', 'window_zones_kwin')}
         env['WZI_SYSTEMD'] = env['WZI_GRAPHICAL'] = '1'
         env['WZI_VERSION'] = 'systemd-new-prefix'
+        desktop_contents = {file: file.read_bytes() for file in (desktop, app_desktop)}
+
+        def require_old_autostart():
+            for file, contents in desktop_contents.items():
+                assert file.is_file() and file.read_bytes() == contents, f'cutover changed {file}'
+            assert previous_launcher.poll() is None and all(identity(pid) for pid in previous_pids), \
+                'cutover stopped live XDG autostart before enabling the replacement'
+
+        refused_prefix = base / 'no-kwin'
+        result = install(refused_prefix, '--autostart', expect_exit=1)
+        assert '--kwin-script --autostart' in result.stderr and 'uninstall the old setup first' in result.stderr
+        assert not refused_prefix.exists(), 'refused cutover created the new prefix'
+        require_old_autostart()
+        print('PASS XDG-to-systemd cutover without a replacement KWin companion is refused before installation')
+
+        app_unit = config / 'systemd/user/window-zones.service'
+        app_unit.mkdir(parents=True)
+        result = install(replacement, '--kwin-script', '--autostart', expect_exit=1)
+        assert str(app_unit) in result.stderr, 'installer failed before the expected unit write'
+        require_old_autostart()
+        app_unit.rmdir()
+        for failure in ('daemon-reload', 'enable window-zones.service'):
+            env['WZI_SYSTEMD_FAIL'] = failure
+            result = install(replacement, '--kwin-script', '--autostart', expect_exit=1)
+            assert f'fixture systemctl failure: {failure}' in result.stderr
+            require_old_autostart()
+        env.pop('WZI_SYSTEMD_FAIL')
+        print('PASS failing systemd unit write, daemon-reload, or enable preserves XDG entries and session')
         install(replacement, '--kwin-script', '--autostart')
         previous_launcher.wait(timeout=8)
         wait_for(lambda: previous_pids <= {item.get('pid') for item in events() if item['kind'] == 'exit'},
@@ -596,10 +629,21 @@ with tempfile.TemporaryDirectory(prefix='window-zones-installer-') as temporary:
         wait_for(lambda: starts('window_zones', 'systemd-new-prefix', replacement / 'bin/window_zones'),
                  'new-prefix systemd App did not start')
         assert not desktop.exists(), 'prefix/systemd cutover left the old login launcher active'
+        assert not app_desktop.exists(), 'prefix/systemd cutover left the old App login entry active'
         install(fallback, '--uninstall')
+        install(prefix, '--uninstall')
         assert witness.read_text() == 'user config witness\n'
         install(replacement, '--uninstall')
         print('PASS XDG-to-systemd cutover stops the previous prefix and preserves config')
+
+        malformed = b'[Desktop Entry]\nExec=/usr/bin/true\nExec=/usr/bin/false\n'
+        app_desktop.write_bytes(malformed)
+        result = install(replacement, '--kwin-script', '--autostart')
+        assert 'Installation complete' in result.stdout and app_desktop.read_bytes() == malformed
+        install(replacement, '--uninstall')
+        assert app_desktop.read_bytes() == malformed
+        app_desktop.unlink()
+        print('PASS malformed unowned XDG desktop entry is preserved without aborting systemd autostart')
 
         # A reachable manager with a failed dbus service must not claim it is running.
         env['WZI_SYSTEMD'] = env['WZI_GRAPHICAL'] = '1'

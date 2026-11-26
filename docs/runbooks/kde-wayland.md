@@ -120,9 +120,10 @@ if focus changes before the script receives it.
 slot per pending request, including claimed work and the new request, while
 holding the enqueue lock. Completed requests no longer consume a slot, even
 when their result has not been collected. Later enqueues do not extend a
-request's budget. The App uses this finite budget for completion while each
-individual D-Bus round trip retains its one-second timeout. Concurrent callers
-can therefore wait through earlier frame observations without a false timeout.
+request's budget. The script cannot claim a request after its budget expires.
+A request the script already claimed may still finish. The App uses the
+advertised budget for completion; each D-Bus round trip retains its one-second
+timeout. Concurrent callers can wait through earlier frame observations.
 
 Before reading `GetDisplays`, the App queues `RefreshDisplays` and waits for the
 script to publish fresh `MaximizeArea` rectangles. Panel/reservation changes are
@@ -166,6 +167,10 @@ Geometry updates connect once per Window and disconnect when it is removed.
 `CompleteRequest(request_id_string, ok, error_name, message)` preserves the
 failure class. `GetRequestResult(request_id_string)` returns
 `(complete, error_name, message)`, with empty error fields on success.
+Only the client that queued a request can retrieve its result. When a client
+disconnects, the companion discards that client's work and results without
+affecting other clients. An in-flight request cannot receive a result from a
+replacement companion, even if it reuses the request ID.
 `org.window_zones.KWin.Error.WindowGone` carries the missing Window identity
 and maps to the App's `WindowGone`; shortcut conflicts and non-canonical keys
 use `Unsupported` and map to `Rejected` without replacing the previous set.
@@ -178,8 +183,10 @@ event, and a different active controller is rejected without consuming events.
 If a script reset interrupts hotkey capture, the owning controller's
 `GetNextHotkey` returns `Unavailable` until a registration completes successfully,
 including while automatic restoration is pending or after it fails. The App
-invalidates its registered-key cache and uses its existing registration recovery;
-a refused normal replacement still keeps the previous active set.
+invalidates its registered-key cache and retries registration. Restarting the
+companion also invalidates the registration, even if the replacement is ready
+before the App next polls. A refused normal replacement still keeps the
+previous active set.
 
 An absent Window is `(false, "", 0, 0, 0, 0)`; an absent hotkey event is
 `(false, "")`. Presence flags and their default payload fields remain on the wire.

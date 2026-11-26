@@ -33,6 +33,69 @@ fn tui_skips_idle_frames_and_redraws_runtime_events() {
 }
 
 #[test]
+fn tui_keeps_pending_config_visible_until_capture_accepts_it() {
+    struct Capture {
+        unavailable: bool,
+    }
+
+    impl HotkeySystem for Capture {
+        fn register_hotkeys(&mut self, _: &[String]) -> Result<(), HotkeySystemError> {
+            if self.unavailable {
+                return Err(HotkeySystemError::Unavailable(
+                    "capture is offline".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
+            Ok(None)
+        }
+    }
+
+    let path = temp_path("pending_tui_config.toml");
+    let mut runtime = Runtime::new(Some(path.clone()), RuntimeBackend::DryRun, None).unwrap();
+    let mut capture = Capture { unavailable: false };
+    let now = Instant::now();
+    let mut surface = TuiSurface::new();
+    runtime.app.tick(&mut capture, now);
+    fs::write(
+        &path,
+        "[[bindings]]\nhotkey = \"Ctrl+Alt+Left\"\naction = { type = \"move-to-zone\", zone = \"left-half\" }\n",
+    )
+    .unwrap();
+
+    capture.unavailable = true;
+    for event in runtime.app.reload(&mut capture, now) {
+        surface.report(&runtime, Report::Event(event));
+    }
+    surface.refresh(&runtime, now, false);
+    assert!(
+        surface
+            .snapshot
+            .contains("Config reload pending: capture is offline")
+    );
+    assert!(
+        surface
+            .snapshot
+            .contains("Last event: Hotkey registration failed")
+    );
+    assert!(surface.snapshot.contains("Bindings:\n  <none>"));
+
+    capture.unavailable = false;
+    for event in runtime
+        .app
+        .reload(&mut capture, now + window_zones::HOTKEY_RETRY_INTERVAL)
+    {
+        surface.report(&runtime, Report::Event(event));
+    }
+    surface.refresh(&runtime, now, false);
+    assert!(!surface.snapshot.contains("Config reload pending:"));
+    assert!(surface.snapshot.contains("  alt+ctrl+left ->"));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn tui_capability_status_distinguishes_complete_degraded_and_unavailable_companions() {
     let complete = tui_capability_status_from(Some(Ok(vec![
         "focused-window".to_string(),

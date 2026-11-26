@@ -182,14 +182,13 @@ pub(super) fn parse_u32_argument(raw: &str, message: &'static str) -> Result<u32
         .map_err(|_| method_error("org.window_zones.KWin.Error.Invalid", message))
 }
 
-pub(super) fn sender_name(message: &dbus::Message) -> Result<String, MethodErr> {
-    message
-        .sender()
-        .map(|sender| sender.to_string())
-        .ok_or_else(|| {
-            method_error(
-                "org.window_zones.KWin.Error.Denied",
-                "D-Bus request has no sender identity",
-            )
-        })
+pub(super) fn sender_name(
+    message: &dbus::Message,
+) -> Result<dbus::strings::BusName<'_>, MethodErr> {
+    message.sender().ok_or_else(|| {
+        method_error(
+            "org.window_zones.KWin.Error.Denied",
+            "D-Bus request has no sender identity",
+        )
+    })
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
@@ -79,7 +80,7 @@ impl Session {
                 Some(&runtime_log),
             )
             .unwrap();
-            run_runtime(
+            let exit = run_runtime(
                 &mut runtime,
                 &mut CliSurface {
                     prompt: false,
@@ -88,6 +89,7 @@ impl Session {
                 receiver,
                 false,
             );
+            assert_eq!(exit, ExitCode::SUCCESS);
             runtime.window_system.last_move().unwrap().target
         });
         Self {
@@ -460,6 +462,46 @@ fn socket_lifecycle_rejects_symlinks_and_preserves_replacements() {
             .is_symlink()
     );
     assert!(witness.is_dir());
+}
+
+#[test]
+fn dispatch_client_reclaims_only_its_stale_socket() {
+    let dir = TestDirectory::new();
+    let id = 0;
+    let (path, address) = OwnedSocket::client_address(&dir.0, id).unwrap();
+    let bind = || OwnedSocket::bind_client(path.clone(), &address);
+    fs::write(&path, "keep").unwrap();
+    assert!(bind().is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "keep");
+    fs::remove_file(&path).unwrap();
+
+    let stale = UnixDatagram::bind(&path).unwrap();
+    drop(stale);
+    let client = bind().unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    assert!(bind().is_err());
+    let sender = UnixDatagram::unbound().unwrap();
+    sender.send_to(b"ok", &path).unwrap();
+    let mut bytes = [0; 2];
+    assert_eq!(client.socket.recv(&mut bytes).unwrap(), 2);
+    assert_eq!(&bytes, b"ok");
+}
+
+#[test]
+fn dispatch_client_reports_an_overlong_socket_path() {
+    let dir = TestDirectory::new();
+    let lock_path = dir.0.join(format!("{}.lock", "x".repeat(108)));
+    let identity =
+        Identity::new("sway", &dir.0.join("sway.sock"), &dir.0.join("config.toml")).unwrap();
+    let error = dispatch(&lock_path, identity, "Ctrl+Alt+Left").unwrap_err();
+    assert!(
+        error.starts_with(&format!(
+            "Unix socket path {}/c-{}-",
+            directory(&lock_path).display(),
+            std::process::id()
+        )) && error.ends_with(".sock is too long"),
+        "{error}"
+    );
 }
 
 #[test]

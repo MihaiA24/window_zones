@@ -5,15 +5,15 @@ Users keep the background utility alive through a line-oriented CLI, ANSI dashbo
 ## Sub-features
 
 - `runtime-cli`: `run` accepts status/help/reload/restart/dispatch and remains responsive.
-- `runtime-tui`: the dashboard exposes backend/capabilities/config/bindings/action/error and accepts status/refresh aliases.
+- `runtime-tui`: the dashboard exposes backend/capabilities/config/bindings/action/error and accepts status/refresh aliases. A pending config reload remains visible separately from the last event until it resolves.
 - `runtime-exit`: `quit`, `q`, `exit` and terminal EOF end plain interactive sessions without stranded listeners. Plain non-terminal `run` survives stdin EOF; TUI exits on any EOF. Supported tray mode has no stdin reader and uses menu Quit.
-- `runtime-tray`: Linux/Windows tray menu exposes Show status, Reload, Restart and Quit. Linux waits for successful StatusNotifier/AppIndicator registration before announcing readiness; missing/refusing hosts fail startup, and watcher/worker loss ends the runtime with exit 1. Unsupported platforms warn and continue without tray.
-- `runtime-init`: `init` writes starter bindings once; `--force` explicitly replaces an existing file.
+- `runtime-tray`: Linux/Windows tray menu exposes Show status, Reload, Restart and Quit. Windows uses the stock application icon. Linux waits for successful StatusNotifier/AppIndicator registration before announcing readiness; missing/refusing hosts fail startup, and watcher/worker loss ends the runtime with exit 1. Unsupported platforms warn and continue without tray.
+- `runtime-init`: `init` writes starter bindings once. `--force` replaces an existing file only after the replacement has been written successfully.
 - `runtime-owner`: native `run`/`tui` own one session lock; a second exits 75. Unix lock/PID/dispatch files live in an owned private directory; stale PID symlinks cannot overwrite their targets.
-- `runtime-notify`: plain CLI and tray runtime problems notify on Linux/macOS when stdout is not a terminal and the backend is native. Config problems/refused hotkeys notify immediately; unavailable hotkeys wait twenty seconds without resetting grace for changed diagnostics. Missing config alone is silent; TUI has no notifier.
+- `runtime-notify`: plain CLI and tray runtime problems notify on Linux/macOS when stdout is not a terminal and the backend is native. Config problems/refused hotkeys are eligible immediately; unavailable hotkeys wait twenty seconds without resetting grace for changed diagnostics. Failed delivery is retried while the notice is still relevant. Missing config alone is silent; TUI has no notifier.
 - `runtime-perf`: opt-in JSONL logging records dispatch outcomes and available native metrics, persists through restart and disables visibly on write failure.
-- `runtime-logging`: explicit `--log-file` appends timestamped session/config/hotkey/dispatch events, stays open across restart and closes on normal Quit. File/diagnostic sink errors do not replace operation exit codes.
-- `runtime-install`: installer ownership survives reinstall/uninstall, duplicate exit 75, inactive graphical-session targets and KDE launcher crashes without changing user config.
+- `runtime-logging`: explicit `--log-file` appends timestamped session/config/hotkey/dispatch events, stays open across restart and closes on normal Quit. File or diagnostic sink errors do not replace operation exit codes. Neither log option can target the config file or open a FIFO.
+- `runtime-install`: installer ownership survives reinstall/uninstall, duplicate exit 75, inactive graphical-session targets and KDE launcher crashes without changing user config. Linux systemd autostart keeps the old XDG entries and KDE launcher running until the replacement units are enabled. A cutover without a replacement for an owned KDE launcher is refused before installation. Malformed desktop entries are left untouched.
 
 ## How to get to it (user POV)
 

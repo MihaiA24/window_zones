@@ -10,7 +10,8 @@ mod test_support;
 
 use std::process::ExitCode;
 
-use window_zones::logging::Logger;
+use window_zones::default_config_path;
+use window_zones::logging::{Logger, check_log_path};
 
 use backends::{RuntimeWindowSystem, resolve_runtime_backend};
 use cli::{Command, ParseStatus, execute_init, parse_args, print_help};
@@ -32,6 +33,19 @@ pub(super) fn run() -> ExitCode {
         }
         ParseStatus::Ok(args) => args,
     };
+    if let Some(log) = &args.log_file_path {
+        let discovered = if args.config_path.is_none() {
+            default_config_path().ok()
+        } else {
+            None
+        };
+        if let Some(config) = args.config_path.as_ref().or(discovered.as_ref())
+            && let Err(error) = check_log_path(log, config)
+        {
+            window_zones::logging::diagnostic(format_args!("Error: --log-file {error}"));
+            return ExitCode::FAILURE;
+        }
+    }
     let logger = args.log_file_path.as_ref().map(|path| {
         let session = match &args.command {
             Command::Status => "status",

@@ -91,15 +91,29 @@ impl X11WindowSystem {
         }
     }
 
-    fn frame_extents(conn: &RustConnection, window: Window) -> Result<[u32; 4], WindowSystemError> {
-        let atom = intern_atom(conn, "_NET_FRAME_EXTENTS")?;
+    fn frame_extents(
+        conn: &RustConnection,
+        window: Window,
+    ) -> Result<FrameExtents, WindowSystemError> {
+        Ok(FrameExtents {
+            wm: Self::read_frame_extents(conn, window, "_NET_FRAME_EXTENTS")?,
+            gtk: Self::read_frame_extents(conn, window, "_GTK_FRAME_EXTENTS")?,
+        })
+    }
+
+    fn read_frame_extents(
+        conn: &RustConnection,
+        window: Window,
+        name: &str,
+    ) -> Result<[u32; 4], WindowSystemError> {
+        let atom = intern_atom(conn, name)?;
         let reply = conn
             .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 4)
             .map_err(|error| {
-                WindowSystemError::Platform(format!("failed to query frame extents: {error}"))
+                WindowSystemError::Platform(format!("failed to query {name}: {error}"))
             })?
             .reply()
-            .map_err(|error| window_reply_error(window, "read frame extents", error))?;
+            .map_err(|error| window_reply_error(window, &format!("read {name}"), error))?;
 
         if reply.type_ == u32::from(AtomEnum::NONE) {
             return Ok([0; 4]);
@@ -119,12 +133,19 @@ impl X11WindowSystem {
                     values.next()?,
                 ])
             })
-            .ok_or_else(|| {
-                WindowSystemError::Platform("invalid _NET_FRAME_EXTENTS property".to_string())
-            })
+            .ok_or_else(|| WindowSystemError::Platform(format!("invalid {name} property")))
     }
 
     fn focused_window_geometry(
+        conn: &RustConnection,
+        window: Window,
+        root: Window,
+    ) -> Result<Rect, WindowSystemError> {
+        let client = Self::client_geometry(conn, window, root)?;
+        Self::frame_extents(conn, window)?.visible_frame(client)
+    }
+
+    fn client_geometry(
         conn: &RustConnection,
         window: Window,
         root: Window,
@@ -144,22 +165,11 @@ impl X11WindowSystem {
             })?
             .reply()
             .map_err(|error| window_reply_error(window, "read window origin", error))?;
-        let [left, right, top, bottom] = Self::frame_extents(conn, window)?;
-        let invalid_frame =
-            || WindowSystemError::Platform("window frame geometry is out of range".to_string());
-
         Ok(Rect::new(
-            i32::try_from(i64::from(origin.dst_x) - i64::from(left))
-                .map_err(|_| invalid_frame())?,
-            i32::try_from(i64::from(origin.dst_y) - i64::from(top)).map_err(|_| invalid_frame())?,
-            u32::from(geometry.width)
-                .checked_add(left)
-                .and_then(|width| width.checked_add(right))
-                .ok_or_else(invalid_frame)?,
-            u32::from(geometry.height)
-                .checked_add(top)
-                .and_then(|height| height.checked_add(bottom))
-                .ok_or_else(invalid_frame)?,
+            i32::from(origin.dst_x),
+            i32::from(origin.dst_y),
+            u32::from(geometry.width),
+            u32::from(geometry.height),
         ))
     }
 }
@@ -230,10 +240,11 @@ impl WindowSystem for X11WindowSystem {
                 "cannot move a non-resizable X11 window".to_string(),
             ));
         }
-        let mut size = frame_target_size(window_move.target, Self::frame_extents(&conn, window)?)?;
+        let extents = Self::frame_extents(&conn, window)?;
+        let mut request = extents.configure_rect(window_move.target)?;
         let restore_states = [maximized_horz, maximized_vert, shaded];
         let restoring = states.iter().any(|atom| restore_states.contains(atom));
-        let before = Self::focused_window_geometry(&conn, window, root)?;
+        let before = extents.visible_frame(Self::client_geometry(&conn, window, root)?)?;
         let result = (|| {
             if restoring {
                 for removed in [[maximized_horz, maximized_vert], [shaded, 0]] {
@@ -270,15 +281,14 @@ impl WindowSystem for X11WindowSystem {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                size = frame_target_size(window_move.target, Self::frame_extents(&conn, window)?)?;
+                request = Self::frame_extents(&conn, window)?.configure_rect(window_move.target)?;
             }
 
-            let (width, height) = size;
             let values = xproto::ConfigureWindowAux::new()
-                .x(window_move.target.x)
-                .y(window_move.target.y)
-                .width(width)
-                .height(height)
+                .x(request.x)
+                .y(request.y)
+                .width(request.width)
+                .height(request.height)
                 .border_width(0);
 
             // The server acknowledgement only queues the WM's ConfigureRequest.
@@ -348,25 +358,45 @@ fn observe_placement(
     }
 }
 
-fn frame_target_size(
-    target: Rect,
-    [left, right, top, bottom]: [u32; 4],
-) -> Result<(u32, u32), WindowSystemError> {
-    let invalid_size =
-        || WindowSystemError::Platform("target size does not contain the window frame".to_string());
-    let width = target
-        .width
-        .checked_sub(left)
-        .and_then(|width| width.checked_sub(right))
-        .filter(|width| *width > 0)
-        .ok_or_else(invalid_size)?;
-    let height = target
-        .height
-        .checked_sub(top)
-        .and_then(|height| height.checked_sub(bottom))
-        .filter(|height| *height > 0)
-        .ok_or_else(invalid_size)?;
-    Ok((width, height))
+struct FrameExtents {
+    wm: [u32; 4],
+    gtk: [u32; 4],
+}
+
+impl FrameExtents {
+    fn visible_frame(&self, client: Rect) -> Result<Rect, WindowSystemError> {
+        let [left, right, top, bottom] = self.visible_extents();
+        offset_frame(client, -left, -top, left + right, top + bottom).ok_or_else(|| {
+            WindowSystemError::Platform("window frame geometry is out of range".to_string())
+        })
+    }
+
+    fn configure_rect(&self, target: Rect) -> Result<Rect, WindowSystemError> {
+        let [left, right, top, bottom] = self.visible_extents();
+        // ConfigureRequest positions the WM frame but sizes the X client.
+        offset_frame(
+            target,
+            -i64::from(self.gtk[0]),
+            -i64::from(self.gtk[2]),
+            -left - right,
+            -top - bottom,
+        )
+        .ok_or_else(|| {
+            WindowSystemError::Platform("target size does not contain the window frame".to_string())
+        })
+    }
+
+    fn visible_extents(&self) -> [i64; 4] {
+        std::array::from_fn(|i| i64::from(self.wm[i]) - i64::from(self.gtk[i]))
+    }
+}
+
+fn offset_frame(rect: Rect, dx: i64, dy: i64, dw: i64, dh: i64) -> Option<Rect> {
+    let x = i32::try_from(i64::from(rect.x) + dx).ok()?;
+    let y = i32::try_from(i64::from(rect.y) + dy).ok()?;
+    let width = u32::try_from(i64::from(rect.width) + dw).ok()?;
+    let height = u32::try_from(i64::from(rect.height) + dh).ok()?;
+    (width > 0 && height > 0).then_some(Rect::new(x, y, width, height))
 }
 
 fn is_fixed_size(hints: &[u32]) -> bool {
@@ -667,6 +697,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn x11_gtk_shadow_is_excluded_from_observed_and_requested_frames() {
+        let target = Rect::new(0, 0, 960, 1080);
+        let extents = FrameExtents {
+            wm: [2, 3, 24, 4],
+            gtk: [8, 12, 10, 16],
+        };
+        assert_eq!(
+            extents.configure_rect(target).unwrap(),
+            Rect::new(-8, -10, 975, 1078)
+        );
+        // The WM places the X client inside its frame by adding its left and top decorations.
+        assert_eq!(
+            extents.visible_frame(Rect::new(-6, 14, 975, 1078)).unwrap(),
+            target
+        );
+        assert!(extents.visible_frame(Rect::new(0, 0, 15, 10)).is_err());
+    }
+
+    #[test]
     fn x11_placement_waits_for_the_identified_frame_and_keeps_constraints() {
         let before = Rect::new(100, 100, 800, 600);
         let target = Rect::new(0, 0, 960, 1080);
@@ -876,10 +925,12 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn x11_frame_target_keeps_decoration_space_and_rejects_empty_content() {
-    assert_eq!(
-        frame_target_size(Rect::new(50, 60, 800, 600), [2, 2, 24, 2]).unwrap(),
-        (796, 574)
-    );
-    assert!(frame_target_size(Rect::new(0, 0, 4, 600), [2, 2, 24, 2]).is_err());
-    assert!(frame_target_size(Rect::new(0, 0, 800, 25), [2, 2, 24, 2]).is_err());
+    let extents = FrameExtents {
+        wm: [2, 2, 24, 2],
+        gtk: [0; 4],
+    };
+    let rect = extents.configure_rect(Rect::new(50, 60, 800, 600)).unwrap();
+    assert_eq!((rect.width, rect.height), (796, 574));
+    assert!(extents.configure_rect(Rect::new(0, 0, 4, 600)).is_err());
+    assert!(extents.configure_rect(Rect::new(0, 0, 800, 25)).is_err());
 }

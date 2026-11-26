@@ -53,22 +53,22 @@ pub struct ZoneDefinition {
 
 impl ZoneDefinition {
     pub fn rect_in_area(&self, usable_area: Rect) -> Rect {
-        let x = percent_to_pixel(self.x, usable_area.width);
-        let y = percent_to_pixel(self.y, usable_area.height);
-        let right = percent_to_pixel(self.x + self.width, usable_area.width);
-        let bottom = percent_to_pixel(self.y + self.height, usable_area.height);
-
-        let left = (usable_area.x + x as i32).clamp(usable_area.x, usable_area.right());
-        let top = (usable_area.y + y as i32).clamp(usable_area.y, usable_area.bottom());
-        let right = (usable_area.x + right as i32).clamp(left, usable_area.right());
-        let bottom = (usable_area.y + bottom as i32).clamp(top, usable_area.bottom());
-
-        Rect::new(left, top, (right - left) as u32, (bottom - top) as u32)
+        let (x, width) = percent_span(self.x, self.width, usable_area.width);
+        let (y, height) = percent_span(self.y, self.height, usable_area.height);
+        Rect::new(
+            usable_area.x.saturating_add_unsigned(x),
+            usable_area.y.saturating_add_unsigned(y),
+            width,
+            height,
+        )
     }
 }
 
-fn percent_to_pixel(percent: u32, dimension: u32) -> u32 {
-    dimension.saturating_mul(percent) / 100
+fn percent_span(start: u32, length: u32, dimension: u32) -> (u32, u32) {
+    let to_pixel = |percent: u32| (u64::from(dimension) * u64::from(percent.min(100)) / 100) as u32;
+    let end = to_pixel(start.saturating_add(length));
+    let start = to_pixel(start).min(dimension.saturating_sub(1));
+    (start, (end - start).max(dimension.min(1)))
 }
 
 pub fn built_in_zone_from_name(name: &str) -> Option<BuiltInZone> {
@@ -95,6 +95,7 @@ pub fn built_in_zone_from_name(name: &str) -> Option<BuiltInZone> {
 ///
 /// Rounding is deterministic and edge-preserving: right/bottom anchored zones
 /// end exactly on the usable area's outer edge, and maximize equals usable area.
+/// A zone is at least one pixel wide and high inside a nonempty usable area.
 pub fn rect_for_zone(
     zone: &str,
     usable_area: Rect,
@@ -129,20 +130,22 @@ pub fn rect_for_built_in_zone(zone: BuiltInZone, usable_area: Rect) -> Rect {
 }
 
 fn left_fraction(area: Rect, denominator: u32) -> Rect {
-    Rect::new(area.x, area.y, area.width / denominator, area.height)
+    let width = (area.width / denominator).max(area.width.min(1));
+    Rect::new(area.x, area.y, width, area.height)
 }
 
 fn right_fraction(area: Rect, denominator: u32) -> Rect {
-    let width = area.width / denominator;
+    let width = (area.width / denominator).max(area.width.min(1));
     Rect::new(area.right() - width as i32, area.y, width, area.height)
 }
 
 fn top_half(area: Rect) -> Rect {
-    Rect::new(area.x, area.y, area.width, area.height / 2)
+    let height = (area.height / 2).max(area.height.min(1));
+    Rect::new(area.x, area.y, area.width, height)
 }
 
 fn bottom_half(area: Rect) -> Rect {
-    let height = area.height / 2;
+    let height = (area.height / 2).max(area.height.min(1));
     Rect::new(area.x, area.bottom() - height as i32, area.width, height)
 }
 
@@ -214,6 +217,33 @@ mod tests {
         };
 
         assert_eq!(zone.rect_in_area(area), Rect::new(20, 24, 55, 20));
+    }
+
+    #[test]
+    fn custom_zone_spans_at_least_one_pixel_per_axis() {
+        let area = Rect::new(-10, 20, 80, 80);
+        let custom = BTreeMap::from([(
+            "tiny".to_string(),
+            ZoneDefinition {
+                x: 95,
+                y: 95,
+                width: 1,
+                height: 1,
+            },
+        )]);
+
+        assert_eq!(
+            rect_for_zone("tiny", area, &custom),
+            Some(Rect::new(66, 96, 1, 1))
+        );
+    }
+
+    #[test]
+    fn built_in_zones_fit_a_one_pixel_usable_area() {
+        let area = Rect::new(-10, 20, 1, 1);
+        for zone in ALL_BUILT_IN_ZONES {
+            assert_eq!(rect_for_built_in_zone(zone, area), area, "{zone:?}");
+        }
     }
 
     #[test]

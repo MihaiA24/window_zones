@@ -340,9 +340,9 @@ export class WindowZonesService {
             x: oldFrame.x, y: oldFrame.y, width: oldFrame.width, height: oldFrame.height,
         };
         const settings = St.Settings.get();
-        const animationDuration = this._animationSettings.get_uint('animation-duration-ms');
+        const configuredDuration = this._animationSettings.get_uint('animation-duration-ms');
         let clone = null;
-        if (animationDuration > 0 && actor && settings.enable_animations
+        if (configuredDuration > 0 && actor && settings.enable_animations
             && (!St.ReducedMotion || settings.reducedMotion !== St.ReducedMotion.REDUCE)
             && (restoring || oldFrame.x !== x || oldFrame.y !== y || oldFrame.width !== width || oldFrame.height !== height)) {
             // One compositor snapshot; do not send a resize request on every animation frame.
@@ -456,6 +456,8 @@ export class WindowZonesService {
                         && Math.abs(frame.width - width) <= 2 && Math.abs(frame.height - height) <= 2) {
                         sourceId = 0;
                         if (clone) {
+                            // Shell scales duration; leave room for frame restoration before the App's 2 s deadline.
+                            const animationDuration = Math.min(configuredDuration, 1000 / settings.slow_down_factor);
                             actor.translation_x = oldFrame.x - x;
                             actor.translation_y = oldFrame.y - y;
                             actor.scale_x = oldFrame.width / width;
@@ -625,6 +627,7 @@ export class WindowZonesService {
 
 export default class WindowZonesExtension extends Extension {
     enable() {
+        const animationSettings = this.getSettings();
         this._service = null;
         this._ownerId = Gio.bus_own_name(
             Gio.BusType.SESSION,
@@ -634,7 +637,7 @@ export default class WindowZonesExtension extends Extension {
             connection => {
                 if (this._service)
                     this._service.destroy();
-                this._service = new WindowZonesService(this.getSettings());
+                this._service = new WindowZonesService(animationSettings);
                 this._service.export(connection);
             },
             () => {

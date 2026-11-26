@@ -11,10 +11,12 @@ use serde_json::{Value, json};
 use super::super::protocol::{
     CALL_TIMEOUT, DISPLAYS_CAPABILITY, KWIN_INTERFACE, KWIN_OBJECT_PATH, KWIN_PROTOCOL_MAJOR,
     KWIN_SERVICE_NAME, KwinIntegrationError, MOVE_RESIZE_CAPABILITY, NextRequestPayload,
-    classify_dbus_error,
+    REQUEST_REGISTER_HOTKEYS, classify_dbus_error,
 };
 use super::super::test_bus::{FakeBus, FakeServiceState, Process, RealBus};
-use super::{KwinHotkeySystem, KwinWindowSystem, require_capability};
+use super::{
+    KwinHotkeySystem, KwinWindowSystem, companion_owner, require_capability, wait_for_request,
+};
 use crate::{
     DisplayGeometry, FocusedWindow, HotkeyEvent, HotkeySystem, HotkeySystemError, Rect, WindowId,
     WindowMove, WindowSystem, WindowSystemError,
@@ -245,6 +247,99 @@ fn stalled_script_completion_remains_bounded() {
             && message.contains("timed out waiting for KWin request")),
         "stalled completion must return the existing unavailable error: {error}"
     );
+}
+
+#[test]
+fn restarted_companion_cannot_inherit_registration_or_inflight_move() {
+    let mut bus = RealBus::new();
+    let script = Connection::new_address(&bus.address).unwrap();
+    let script_proxy = script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    let register_script = || {
+        script_proxy
+            .method_call::<(), _, _, _>(
+                KWIN_INTERFACE,
+                "RegisterCompanion",
+                (KWIN_PROTOCOL_MAJOR.to_string(), true),
+            )
+            .unwrap();
+    };
+    let next = || {
+        script_proxy
+            .method_call::<NextRequestPayload, _, _, _>(KWIN_INTERFACE, "NextRequest", ())
+            .unwrap()
+    };
+    let complete = |id: u32| {
+        script_proxy
+            .method_call::<(), _, _, _>(
+                KWIN_INTERFACE,
+                "CompleteRequest",
+                (id.to_string(), true, "", ""),
+            )
+            .unwrap();
+    };
+    let register = |system: &mut KwinHotkeySystem, keys: &[String]| {
+        thread::scope(|scope| {
+            let job = scope.spawn(move || system.register_hotkeys(keys));
+            let request = next();
+            assert_eq!(request.1, REQUEST_REGISTER_HOTKEYS);
+            assert_eq!(request.7, serde_json::to_string(keys).unwrap());
+            complete(request.0);
+            job.join().unwrap().unwrap();
+        });
+    };
+    register_script();
+    let keys = ["alt+ctrl+left".to_string()];
+    let mut hotkeys = KwinHotkeySystem::with_bus_address(bus.address.clone());
+    register(&mut hotkeys, &keys);
+    assert_eq!(hotkeys.next_hotkey().unwrap(), None);
+
+    let client = Connection::new_address(&bus.address).unwrap();
+    let old_owner = companion_owner(&client).unwrap();
+    let old_proxy = client.with_proxy(old_owner.as_str(), KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    let enqueue = |proxy: &dbus::blocking::Proxy<'_, &Connection>, window: &str| {
+        proxy
+            .method_call::<(u32, u64), _, _, _>(
+                KWIN_INTERFACE,
+                "MoveWindow",
+                (window, 10_i32, 20_i32, 800_u32, 600_u32),
+            )
+            .unwrap()
+    };
+    let (old_id, old_budget) = enqueue(&old_proxy, "old-window");
+    bus.restart_companion();
+    register_script();
+
+    assert!(matches!(
+        hotkeys.next_hotkey(),
+        Err(HotkeySystemError::Unavailable(_))
+    ));
+    register(&mut hotkeys, &keys);
+    script_proxy
+        .method_call::<(), _, _, _>(KWIN_INTERFACE, "HotkeyPressed", (keys[0].as_str(),))
+        .unwrap();
+    assert_eq!(
+        hotkeys.next_hotkey().unwrap(),
+        Some(HotkeyEvent::Pressed {
+            hotkey: keys[0].clone()
+        })
+    );
+
+    let new_owner = companion_owner(&client).unwrap();
+    assert_ne!(old_owner, new_owner);
+    let new_proxy = client.with_proxy(new_owner.as_str(), KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    let (new_id, new_budget) = enqueue(&new_proxy, "new-window");
+    assert_eq!(
+        new_id, old_id,
+        "the replacement must reuse the in-flight ID"
+    );
+    assert_eq!(next().0, new_id);
+    complete(new_id);
+    assert!(matches!(
+        wait_for_request(&old_proxy, old_id, old_budget),
+        Err(KwinIntegrationError::Unavailable { .. })
+    ));
+    wait_for_request(&new_proxy, new_id, new_budget).unwrap();
+    register(&mut hotkeys, &[]);
 }
 
 #[test]

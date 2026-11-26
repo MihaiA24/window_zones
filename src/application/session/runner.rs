@@ -162,6 +162,7 @@ pub(super) fn run_runtime(
 
 #[cfg(test)]
 mod tests {
+    use std::process::ExitCode;
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -201,7 +202,10 @@ mod tests {
             closed: false,
             finished: false,
         };
-        run_runtime(&mut runtime, &mut surface, instructions, true);
+        assert_eq!(
+            run_runtime(&mut runtime, &mut surface, instructions, true),
+            ExitCode::SUCCESS
+        );
         assert!(surface.closed);
         assert!(surface.finished);
     }

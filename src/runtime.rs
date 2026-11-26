@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ use crate::config::{
 use crate::dispatcher::{DispatchHotkeyError, dispatch_hotkey};
 use crate::executor::WindowHistory;
 use crate::hotkey_system::{HotkeyEvent, HotkeySystem, HotkeySystemError};
-use crate::logging::Logger;
+use crate::logging::{Logger, check_log_path, open_append_log, open_checked};
 use crate::window_system::{TransitionMetrics, WindowSystem};
 const CONFIG_DIRECTORY: &str = "window_zones";
 const CONFIG_FILE: &str = "config.toml";
@@ -34,10 +34,7 @@ struct PerfLog {
 
 impl PerfLog {
     fn open(path: &Path) -> io::Result<Self> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = open_append_log(path)?;
         let mut log = Self {
             path: path.to_owned(),
             writer: BufWriter::new(file),
@@ -324,7 +321,11 @@ impl App {
     /// Opens an append-only JSONL log and records this process's initial memory.
     /// A startup write failure is returned before any actions are dispatched.
     pub fn enable_perf_log(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.perf_log = Some(PerfLog::open(path.as_ref())?);
+        let path = path.as_ref();
+        if let Some(config) = self.config_path() {
+            check_log_path(path, config)?;
+        }
+        self.perf_log = Some(PerfLog::open(path)?);
         self.perf_log_error = None;
         Ok(())
     }
@@ -769,7 +770,21 @@ fn hotkeys_of(config: &AppConfig) -> Vec<String> {
 }
 
 fn read_config(path: &Path) -> Result<Option<String>, ConfigLoadError> {
-    match fs::read_to_string(path) {
+    let input = (|| {
+        let mut file = open_checked(path, fs::OpenOptions::new().read(true), |metadata| {
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "config must be a regular file",
+                ));
+            }
+            Ok(())
+        })?;
+        let mut input = String::new();
+        file.read_to_string(&mut input)?;
+        Ok::<_, io::Error>(input)
+    })();
+    match input {
         Ok(input) => Ok(Some(input)),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(ConfigLoadError::Read {
@@ -1194,6 +1209,47 @@ action = { type = "move-to-zone", zone = "left-half" }
         assert!(app.perf_log.is_none());
         #[cfg(target_os = "linux")]
         assert!(app.enable_perf_log("/dev/full").is_err());
+    }
+
+    #[test]
+    fn performance_log_never_creates_or_appends_to_the_config() {
+        let config = TestConfig::new("perf_log_config_alias");
+        for contents in [None, Some("# user config\n")] {
+            if let Some(contents) = contents {
+                config.write(contents);
+            }
+            let mut app = App::start_at(&config.path);
+            let error = app.enable_perf_log(&config.path).unwrap_err();
+            assert!(error.to_string().contains("refers to the config file"));
+            assert_eq!(fs::read_to_string(&config.path).ok().as_deref(), contents);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_and_log_sinks_reject_fifos() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::symlink;
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        let config = TestConfig::new("fifo");
+        let log = config.directory.join("pipe.log");
+        symlink(format!("/proc/self/fd/{}", reader.as_raw_fd()), &log).unwrap();
+        assert!(!crate::logging::Logger::new(&log, "status").is_active());
+        let mut app = App::start_at(&config.path);
+        let error = app.enable_perf_log(&log).unwrap_err();
+        assert!(error.to_string().contains("log path must not be a FIFO"));
+
+        symlink(&log, &config.path).unwrap();
+        let events = app.tick(&mut FakeHotkeySystem::default(), Instant::now());
+        assert!(
+            matches!(events.first(), Some(RuntimeEvent::ConfigFailed { message })
+            if message.contains("config must be a regular file"))
+        );
+        assert!(matches!(App::start_at(&config.path).config_state(),
+            ConfigState::Error(ConfigLoadError::Read { source, .. })
+            if source.to_string().contains("config must be a regular file")));
     }
 
     #[cfg(target_os = "linux")]

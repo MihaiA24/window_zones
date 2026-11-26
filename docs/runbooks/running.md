@@ -32,6 +32,10 @@ Value-taking options reject another option token instead of treating it as a
 pathname or value. For example, `--log-file --dry-run status` fails before
 backend startup; use `./--dry-run` for a literal filename beginning with `--`.
 
+Conflicting backend selections fail before startup, including `--dry-run`
+combined with a different `--backend` value. Repeating the same selection is
+allowed.
+
 ## First run
 
 ```bash
@@ -40,9 +44,15 @@ window_zones init --chord "Ctrl+Alt"   # pick another modifier chord
 window_zones init --force              # replace an existing config
 ```
 
-`init` never overwrites an existing config without `--force`. The default chord is `Ctrl+Super` on GNOME (GNOME binds `Ctrl+Alt+arrows` to workspaces and `Super+arrows` to tiling), `Ctrl+Alt+Super` on KDE Plasma, and `Ctrl+Alt` elsewhere.
+`init` never overwrites an existing config without `--force`. With `--force`,
+it writes the replacement before swapping it in, so a failed write leaves the
+existing config intact. The default chord is `Ctrl+Super` on GNOME (GNOME binds
+`Ctrl+Alt+arrows` to workspaces and `Super+arrows` to tiling), `Ctrl+Alt+Super`
+on KDE Plasma, and `Ctrl+Alt` elsewhere.
 
 ## Config reference
+
+The config path must point to a regular file, not a directory or named pipe.
 
 ```toml
 [zones]                                  # optional custom zones, percent of the usable area
@@ -54,6 +64,8 @@ action = { type = "move-to-zone", zone = "left-half" }
 ```
 
 Actions: `move-to-zone` (`zone = NAME`), `move-to-next-display`, `move-to-previous-display`, `move-to-display` (`direction = "left" | "right" | "up" | "down"`), `center` (keeps the size, shrinks to fit), `restore` (returns the window to its geometry before the App first moved it). Built-in zones: `left-half`, `right-half`, `top-half`, `bottom-half`, `top-left`, `top-right`, `bottom-left`, `bottom-right`, `left-third`, `center-third`, `right-third`, `left-two-thirds`, `right-two-thirds`, `maximize`. Repeated left/right halves use the directional crossing behavior below, not width cycling. Explicit next/previous display actions follow the left-to-right, top-to-bottom layout, wrap, and do nothing with one display. Unknown fields anywhere, including on actions, are rejected.
+
+Zones stay inside the display's usable area and are at least one pixel wide and high. `move-to-display` requires a destination at or beyond the current usable area's edge in the requested direction. If there is no such display, the action reports an error without moving or wrapping.
 
 Moves target the window identity captured at discovery, not a newly focused window; a closed target fails as `WindowGone`. Maximized and tiled windows are restored before they are placed; fullscreen and non-resizable windows are refused. `restore` history remembers windows within one `run`/`tui` session; a window you move by hand starts over.
 
@@ -88,6 +100,9 @@ Records have RFC 3339 UTC timestamps and escaped control characters. They includ
 File open/write failures disable the file sink and warn best-effort; even unwritable stderr does not abort the command. Genuine CLI/startup errors retain their failure exit status. No default session file is created.
 
 This is distinct from `--perf-log` JSONL below. Both may be enabled with separate destinations. For full Sway/Hyprland/COSMIC runtime events, enable session logging on the persistent `run`/`tui`; an optional dispatch-client log contains that client's lifecycle and forwarded result.
+
+Both log options reject the config file as a destination, including symlinks
+and Unix hard links to that file. Named pipes are not accepted as log destinations.
 
 ## Performance logging
 
@@ -137,7 +152,7 @@ is performed; `--log-file` remains an independent opt-in sink.
 
 ## Running in the background
 
-Start the listener with `window_zones run`; it keeps serving hotkeys when stdin is closed. `./scripts/install.sh --autostart` installs the Linux `window-zones` systemd user service or the macOS `org.window_zones.run` LaunchAgent. Only one live `run`/`tui` session owns the hotkeys: a second exits with status `75` and names the owning pid. Do not stop someone else's session to run a smoke check.
+Start the listener with `window_zones run`; it keeps serving hotkeys when stdin is closed. For login startup, see the [installer options](installation.md#installer-options). Linux uses systemd or an XDG login entry, and macOS uses a LaunchAgent. Only one live `run`/`tui` session owns the hotkeys: a second exits with status `75` and names the owning pid. Do not stop someone else's session to run a smoke check.
 
 On Unix, the lock directory must be owned by the current effective UID, non-symlinked, and private (`0700`). Linux uses `XDG_RUNTIME_DIR` when set; otherwise Unix uses `<temporary-directory>/window_zones-<uid>/`. Lock/PID/dispatch files share that directory. PID sidecars are recreated without following stale symlinks.
 
@@ -155,7 +170,10 @@ The App prints runtime events once per change, never per retry:
 - `Hotkey registration failed: ...; retrying` — the companion is absent or busy; retried every second.
 - `Dispatch failed for <hotkey>: ...` — once per press.
 
-With non-terminal stdout, Linux and macOS notify about background problems, including tray mode; terminal and `--backend dry-run` sessions do not. Config errors and refused hotkeys notify at once; unavailable hotkeys notify after 20 seconds of continuous outage even if diagnostics change. Linux updates its notification in place, including a matching recovery notice. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
+The TUI displays a pending config reload separately from the last event until
+the reload succeeds or fails.
+
+With non-terminal stdout, Linux and macOS notify about background problems, including tray mode; terminal and `--backend dry-run` sessions do not. Config errors and refused hotkeys are eligible immediately; unavailable hotkeys wait for 20 seconds of continuous outage even if diagnostics change. If delivery fails, the runtime retries while the notice is still relevant. Linux updates its notification in place, including a matching recovery notice. macOS sends separate problem/recovery notices through Standard Additions; visibility follows [macOS notification preferences](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
 
 One-shot `dispatch` prints its state and exits `0`, including dispatch errors (no binding, no focused window, adapter failure). Inspect `Dispatch state` and diagnostics rather than treating exit status as proof of movement. Compositor-bound dispatch clients (Sway/Hyprland/COSMIC) exit nonzero when their session-owned request fails.
 
@@ -212,15 +230,18 @@ can remove its stale socket, but refuses foreign files and symlinks.
 Window and display state come from `swaymsg`/`hyprctl`; both integrations are ungated (no Smoke run on record).
 
 Hyprland cross-output placement transfers the captured window to the destination
-output's active regular workspace before resizing/moving, then verifies native
-monitor/workspace ownership. Same-output and off-screen targets keep their
-workspace. Its existing surface-coordinate and reported-scale geometry remains
-approximate for grouped/plugin decorations, some XWayland frames and older
-fractional-scale IPC; those exact-frame cases are not certified.
+output's active regular workspace before resizing and moving it. Readback
+confirms that the window is still on the destination output's current active
+workspace, floating, and ungrouped. A failed check reports a partial move if
+the frame changed, so Restore remains available. Same-output and off-screen
+targets keep their workspace. Geometry remains approximate for grouped or
+plugin decorations, some XWayland frames, and older fractional-scale IPC.
 
 ## Linux X11
 
-Placement uses the window frame (client origin translated to root coordinates plus `_NET_FRAME_EXTENTS`) and restores maximized windows before configuring. It waits for the WM's observed frame, not only X-server acknowledgement; constrained placement reports its actual partial frame so Restore remains available. RandR usable areas exclude effective current/all-desktop reservations, not withdrawn clients or another desktop's docks. Exclusive `XGrabKey` bindings follow keyboard/modifier remapping and actual lock slots. A failed remap releases obsolete grabs and reports unavailable capture; resolve the conflict and use `restart`.
+X11 placement includes window-manager decorations (`_NET_FRAME_EXTENTS`) and excludes invisible GTK shadows (`_GTK_FRAME_EXTENTS`). It restores maximized windows before applying the target and waits for the window manager's observed visible frame. Constrained placement reports the actual partial frame so Restore remains available. RandR usable areas exclude effective current/all-desktop reservations, not withdrawn clients or another desktop's docks.
+
+Exclusive `XGrabKey` bindings use XKB modifier state and follow keyboard and modifier remapping. Mapped Caps Lock, Num Lock, and Scroll Lock do not affect a chord. Holding a chord does not repeat its action, and releasing the key that started capture does not suppress the next press of another binding. A failed remap releases obsolete grabs and reports unavailable capture; resolve the conflict and use `restart`.
 
 ## COSMIC Wayland (custom compositor)
 

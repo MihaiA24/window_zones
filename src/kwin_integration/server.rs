@@ -53,12 +53,13 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
 
     let state = Arc::new(Mutex::new(CompanionState::default()));
     let owner_state = Arc::clone(&state);
-    let owner_rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+    let owner_rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
+        .with_sender("org.freedesktop.DBus");
     connection
         .add_match(
             owner_rule,
             move |(name, _old_owner, new_owner): (String, String, String), _, _| {
-                if new_owner.is_empty() {
+                if name.starts_with(':') && new_owner.is_empty() {
                     owner_state.lock().owner_lost(&name);
                 }
                 true
@@ -101,7 +102,7 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             let sender = sender_name(method.msg)?;
                             let pending_reply = register_state.lock().mark_ready(
                                 protocol_major,
-                                sender,
+                                sender.to_string(),
                                 reset_state,
                             )?;
                             let reply = method.msg.method_return();
@@ -140,11 +141,9 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                         .add_m(factory.method("RefreshDisplays", (), move |method| {
                             let mut state = refresh_displays_state.lock();
                             state.ensure_ready()?;
-                            let request_id = state.enqueue_refresh_displays();
-                            Ok(vec![method
-                                .msg
-                                .method_return()
-                                .append2(request_id, state.request_timeout_ms())])
+                            let (id, timeout_ms) = state
+                                .enqueue_refresh_displays(sender_name(method.msg)?.to_string());
+                            Ok(vec![method.msg.method_return().append2(id, timeout_ms)])
                         }))
                         .add_m(factory.method("SetShortcut", (), move |method| {
                             let (hotkey, key): (String, i32) = method.msg.read2()?;
@@ -164,11 +163,10 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             }
                             let mut state = move_state.lock();
                             state.ensure_ready()?;
-                            let request_id = state.enqueue_move(window, x, y, width, height);
-                            Ok(vec![method
-                                .msg
-                                .method_return()
-                                .append2(request_id, state.request_timeout_ms())])
+                            let sender = sender_name(method.msg)?.to_string();
+                            let (id, timeout_ms) =
+                                state.enqueue_move(sender, window, x, y, width, height);
+                            Ok(vec![method.msg.method_return().append2(id, timeout_ms)])
                         }))
                         .add_m(factory.method("RegisterHotkeys", (), move |method| {
                             let payload: String = method.msg.read1()?;
@@ -176,12 +174,9 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             let sender = sender_name(method.msg)?;
                             let mut state = register_hotkeys_state.lock();
                             state.ensure_ready()?;
-                            state.authorize_controller(sender)?;
-                            let request_id = state.enqueue_hotkeys(hotkeys);
-                            Ok(vec![method
-                                .msg
-                                .method_return()
-                                .append2(request_id, state.request_timeout_ms())])
+                            let (id, timeout_ms) =
+                                state.enqueue_hotkeys(sender.to_string(), hotkeys)?;
+                            Ok(vec![method.msg.method_return().append2(id, timeout_ms)])
                         }))
                         .add_m(factory.method("NextRequest", (), move |method| {
                             next_request_state.lock().poll_next_request(method.msg)
@@ -207,7 +202,7 @@ pub fn run_kwin_companion_service() -> Result<(), KwinCompanionServiceError> {
                             )?;
                             let mut state = request_result_state.lock();
                             state.ensure_ready()?;
-                            let result = state.request_result(request_id);
+                            let result = state.request_result(&sender_name(method.msg)?, request_id);
                             let mut reply = method.msg.method_return();
                             reply.append_all(result);
                             Ok(vec![reply])

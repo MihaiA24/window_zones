@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -152,6 +152,45 @@ struct OwnedSocket {
 impl OwnedSocket {
     fn bind(path: PathBuf) -> io::Result<Self> {
         let socket = UnixDatagram::bind(&path)?;
+        Self::from_bound(path, socket)
+    }
+
+    fn client_address(dir: &Path, id: u64) -> io::Result<(PathBuf, SocketAddr)> {
+        let path = dir.join(format!("c-{}-{id}.sock", std::process::id()));
+        let address = SocketAddr::from_pathname(&path).map_err(|error| {
+            let reason = if path.as_os_str().as_encoded_bytes().contains(&0) {
+                "contains a NUL byte"
+            } else {
+                "is too long"
+            };
+            io::Error::new(
+                error.kind(),
+                format!("Unix socket path {} {reason}", path.display()),
+            )
+        })?;
+        Ok((path, address))
+    }
+
+    fn bind_client(path: PathBuf, address: &SocketAddr) -> io::Result<Self> {
+        let socket = match UnixDatagram::bind_addr(address) {
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                let metadata = socket_metadata(&path)?;
+                // A PID can be visible in multiple namespaces sharing this directory.
+                if !matches!(
+                    UnixDatagram::unbound()?.connect_addr(address),
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused
+                ) {
+                    return Err(error);
+                }
+                remove_same_socket(&path, &metadata);
+                UnixDatagram::bind_addr(address)?
+            }
+            result => result?,
+        };
+        Self::from_bound(path, socket)
+    }
+
+    fn from_bound(path: PathBuf, socket: UnixDatagram) -> io::Result<Self> {
         let metadata = socket_metadata(&path)?;
         let owned = Self {
             socket,
@@ -332,18 +371,16 @@ pub(super) fn dispatch(
             "cannot reach compositor-bound session: {error}; start `window_zones run` (or `tui`) with the same --backend and --config"
         )
     };
+    let (client, address) =
+        OwnedSocket::client_address(&dir, CLIENT_ID.fetch_add(1, Ordering::Relaxed))
+            .map_err(|error| error.to_string())?;
     validate_directory(&dir).map_err(missing)?;
     let server = dir.join("dispatch.sock");
     let metadata = socket_metadata(&server).map_err(missing)?;
     if metadata.mode() & 0o777 != 0o600 {
         return Err("refusing dispatch socket without mode 0600".to_string());
     }
-    let client = dir.join(format!(
-        "c-{}-{}.sock",
-        std::process::id(),
-        CLIENT_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let owned = OwnedSocket::bind(client).map_err(missing)?;
+    let owned = OwnedSocket::bind_client(client, &address).map_err(missing)?;
     owned.socket.connect(server).map_err(missing)?;
     let request = serde_json::to_vec(&Request {
         identity,

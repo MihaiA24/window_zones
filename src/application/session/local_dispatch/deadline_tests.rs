@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,7 @@ fn expired_queued_dispatch_does_not_run_an_action() {
         })
         .unwrap();
     instructions.send(RuntimeInstruction::Quit.into()).unwrap();
-    run_runtime(
+    let exit = run_runtime(
         &mut runtime,
         &mut CliSurface {
             prompt: false,
@@ -46,6 +47,7 @@ fn expired_queued_dispatch_does_not_run_an_action() {
         receiver,
         true,
     );
+    assert_eq!(exit, ExitCode::SUCCESS);
     let response = response.recv().unwrap();
     assert!(!response.success);
     assert!(response.output.contains("no action was run"));
@@ -82,7 +84,7 @@ fn a_compositor_replaced_after_queueing_cannot_receive_the_action() {
     fs::remove_file(&socket_path).unwrap();
     let replacement = UnixDatagram::bind(&socket_path).unwrap();
     instructions.send(RuntimeInstruction::Quit.into()).unwrap();
-    run_runtime(
+    let exit = run_runtime(
         &mut runtime,
         &mut CliSurface {
             prompt: false,
@@ -91,6 +93,7 @@ fn a_compositor_replaced_after_queueing_cannot_receive_the_action() {
         receiver,
         true,
     );
+    assert_eq!(exit, ExitCode::SUCCESS);
     let response = response.recv().unwrap();
     assert!(!response.success);
     assert!(
@@ -109,7 +112,6 @@ fn a_compositor_replaced_after_queueing_cannot_receive_the_action() {
 fn interactive_dispatch_refuses_a_replaced_compositor_even_after_restart() {
     use std::fs;
     use std::os::unix::net::UnixDatagram;
-    use std::process::ExitCode;
 
     use crate::application::test_support::temp_path;
 
