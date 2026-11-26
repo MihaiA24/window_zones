@@ -1,6 +1,6 @@
 x11_geometry() {
     local geometry key value x='' y='' width='' height=''
-    local extents left=0 right=0 top=0 bottom=0
+    local extents sign left=0 right=0 top=0 bottom=0
     geometry=$(xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null || true)
     while IFS='=' read -r key value; do
         case "$key" in
@@ -10,16 +10,19 @@ x11_geometry() {
             HEIGHT) height=$value ;;
         esac
     done <<<"$geometry"
-    extents=$(xprop -id "$WINDOW_ID" _NET_FRAME_EXTENTS 2>/dev/null || true)
-    if [[ "$extents" =~ =[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+) ]]; then
-        left=${BASH_REMATCH[1]}
-        right=${BASH_REMATCH[2]}
-        top=${BASH_REMATCH[3]}
-        bottom=${BASH_REMATCH[4]}
-    fi
+    while IFS= read -r extents; do
+        if [[ "$extents" =~ ^(_NET_FRAME_EXTENTS|_GTK_FRAME_EXTENTS)\(CARDINAL\)[[:space:]]*=[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+)$ ]]; then
+            sign=1
+            [[ "${BASH_REMATCH[1]}" != _GTK_FRAME_EXTENTS ]] || sign=-1
+            left=$((left + sign * BASH_REMATCH[2]))
+            right=$((right + sign * BASH_REMATCH[3]))
+            top=$((top + sign * BASH_REMATCH[4]))
+            bottom=$((bottom + sign * BASH_REMATCH[5]))
+        fi
+    done < <(xprop -id "$WINDOW_ID" _NET_FRAME_EXTENTS _GTK_FRAME_EXTENTS 2>/dev/null || true)
     if [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ \
         && "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
-        # xdotool reports client root geometry; all gate targets describe the frame.
+        # xdotool reports client root geometry; the target adds WM borders and excludes GTK shadows.
         printf '%s,%s,%s,%s' "$((x - left))" "$((y - top))" \
             "$((width + left + right))" "$((height + top + bottom))"
     else

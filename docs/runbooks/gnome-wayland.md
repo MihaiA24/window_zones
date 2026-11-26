@@ -65,6 +65,10 @@ affects all user extensions, not just Window Zones. `OUT OF DATE` calls for
 compatible files and a new login, not repeated enable calls. Report extension
 errors rather than bypassing validation.
 
+A missing or uncompiled settings schema makes Shell report an activation
+error before the companion requests its D-Bus name. Reinstall with
+`--gnome-extension`, then log out and back in.
+
 Disable the loaded companion immediately with:
 
 ```bash
@@ -233,7 +237,9 @@ Use another value in 0..1000, such as 300, for a custom duration. Out-of-range
 values are rejected and leave the previous accepted setting intact. The
 companion reads the setting for each move: the next move uses the new value
 without App restart, TOML reload or companion reload; an in-progress move
-keeps its selected duration.
+keeps its configured value. The companion caps the animation at 1000 ms
+after Shell applies its slowdown factor, leaving time for frame restoration
+and the D-Bus reply.
 
 This is not a TOML field or an App CLI option and does not change other
 backends. GNOME's global `org.gnome.desktop.interface enable-animations`
@@ -353,6 +359,8 @@ gjs -m gnome-extension/tests/run.js
 ```
 
 The private fake-service tests cover names/signatures, capability gating and caching, connection reuse, negative coordinates, focused-window absence, identified move payloads, partial-placement and partial-Restore history, malformed/foreign-window partial errors, `WindowGone`, hotkey transport draining, atomic rejection, Busy, incompatible/denied responses, and disconnect/reconnect. The GJS harness invokes the actual `_methodCall` dispatcher with real GLib variants and isolated Shell stubs; it checks reply signatures, focus-change identity, restore-before-move, failed/unchanged/unreadable frame reporting, rejected states, canonical hotkeys, rollback, and owner-vanish cleanup without touching the live desktop.
+The GJS tests also cover schema failure before D-Bus export and the animation
+cap under Shell slowdown.
 
 For real interactive Wayland and XWayland windows on an isolated GNOME 51
 compositor, run:

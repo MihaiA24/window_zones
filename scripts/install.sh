@@ -105,32 +105,18 @@ if [[ "$UNINSTALL" -eq 0 && "$OS" == Darwin && ( "$GNOME_EXTENSION" -eq 1 || "$K
   exit 1
 fi
 
-if [[ "$UNINSTALL" -eq 0 ]]; then
-  mkdir -p -- "$INSTALL_PREFIX"
-fi
-if [[ -d "$INSTALL_PREFIX" ]]; then
-  INSTALL_PREFIX="$(cd -- "$INSTALL_PREFIX" && pwd -P)"
-fi
-
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 [[ "$CONFIG_HOME" == /* ]] || CONFIG_HOME="$HOME/.config"
 APP_CONFIG="$CONFIG_HOME/window_zones/config.toml"
 [[ "$OS" != Darwin ]] || APP_CONFIG="$HOME/Library/Application Support/window_zones/config.toml"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 [[ "$DATA_HOME" == /* ]] || DATA_HOME="$HOME/.local/share"
-INSTALL_DIR="$INSTALL_PREFIX/bin"
 INSTALL_RECORD="$INSTALL_PREFIX/share/window-zones/install-record"
 UNIT_DIR="$CONFIG_HOME/systemd/user"
 UNIT_FILE="$UNIT_DIR/window-zones.service"
 AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones.desktop"
 KWIN_UNIT_FILE="$UNIT_DIR/window-zones-kwin.service"
 KWIN_AUTOSTART_FILE="$CONFIG_HOME/autostart/window_zones_kwin.desktop"
-KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
-KDE_SESSION_KEY=''
-if [[ "$OS" == Linux ]]; then
-  KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
-  KDE_SESSION_KEY="${KDE_SESSION_KEY%% *}"
-fi
 GNOME_ID='window-zones@mihai-a24'
 GNOME_DIR="$DATA_HOME/gnome-shell/extensions/$GNOME_ID"
 KWIN_ID='window-zones'
@@ -292,7 +278,7 @@ stop_kde_session() {
   fi
 }
 
-retire_xdg_autostart() (
+xdg_autostart_owner() (
   local file="$1" kind="$2"
   [[ -f "$file" && ! -L "$file" && -O "$file" ]] || exit 0
   INSTALL_PREFIX="$(python3 -c '
@@ -303,8 +289,11 @@ import shlex
 import sys
 
 config = configparser.ConfigParser(interpolation=None)
-config.read(sys.argv[1])
-value = config.get("Desktop Entry", "Exec", fallback="")
+try:
+    config.read(sys.argv[1], encoding="utf-8")
+    value = config.get("Desktop Entry", "Exec", fallback="")
+except (configparser.Error, UnicodeError):
+    sys.exit(0)
 value = re.sub(r"\\([\\sntr])", lambda match: {
     "\\": "\\", "s": " ", "n": "\n", "t": "\t", "r": "\r"
 }[match[1]], value)
@@ -331,12 +320,23 @@ elif len(args) == 2 and args[1] == "run":
     KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
     grep -Fqx kwin-autostart "$INSTALL_RECORD" && kde_launcher_owned \
       && desktop_owned "$file" /bin/bash "\"$(desktop_escape "$KDE_LAUNCHER")\"" || exit 0
-    KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
-    KDE_SESSION_KEY="${KDE_SESSION_KEY%% *}"
-    stop_kde_session
   else
     grep -Fqx autostart "$INSTALL_RECORD" \
       && desktop_owned "$file" "$INSTALL_DIR/window_zones" run || exit 0
+  fi
+  printf '%s\n' "$INSTALL_PREFIX"
+)
+
+retire_xdg_autostart() (
+  local file="$1" kind="$2"
+  INSTALL_PREFIX="$(xdg_autostart_owner "$file" "$kind")" || exit 1
+  [[ -n "$INSTALL_PREFIX" ]] || exit 0
+  if [[ "$kind" == kwin ]]; then
+    INSTALL_DIR="$INSTALL_PREFIX/bin"
+    KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
+    KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
+    KDE_SESSION_KEY="${KDE_SESSION_KEY%% *}"
+    stop_kde_session
   fi
   rm -f -- "$file"
 )
@@ -407,6 +407,46 @@ launch_agent_owned() {
   [[ -f "$LAUNCH_AGENT" ]] \
     && [[ "$(plutil -extract ProgramArguments.0 raw -o - "$LAUNCH_AGENT" 2>/dev/null)" == "$INSTALL_DIR/window_zones" ]]
 }
+
+if [[ "$UNINSTALL" -eq 0 ]] && ! command -v python3 >/dev/null 2>&1; then
+  echo 'python3 is required to read Cargo build metadata.' >&2
+  exit 1
+fi
+
+KDE_AUTOSTART=0
+USE_GRAPHICAL_SYSTEMD=0
+if [[ "$UNINSTALL" -eq 0 && "$AUTOSTART" -eq 1 && "$OS" != Darwin ]]; then
+  if [[ "$OS" == Linux ]]; then
+    if [[ "$KWIN_SCRIPT" -eq 1 ]] || { recorded kwin-script && recorded binary:window_zones_kwin; }; then
+      KDE_AUTOSTART=1
+    fi
+  fi
+  if graphical_systemd_available; then
+    USE_GRAPHICAL_SYSTEMD=1
+    if [[ "$KDE_AUTOSTART" -eq 0 ]]; then
+      previous_kwin_prefix="$(xdg_autostart_owner "$KWIN_AUTOSTART_FILE" kwin)"
+      if [[ -n "$previous_kwin_prefix" ]]; then
+        printf 'KDE XDG autostart is installed from %s. Re-run with --kwin-script --autostart or uninstall the old setup first.\n' "$previous_kwin_prefix" >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+if [[ "$UNINSTALL" -eq 0 ]]; then
+  mkdir -p -- "$INSTALL_PREFIX"
+fi
+if [[ -d "$INSTALL_PREFIX" ]]; then
+  INSTALL_PREFIX="$(cd -- "$INSTALL_PREFIX" && pwd -P)"
+fi
+INSTALL_DIR="$INSTALL_PREFIX/bin"
+INSTALL_RECORD="$INSTALL_PREFIX/share/window-zones/install-record"
+KDE_LAUNCHER="$INSTALL_PREFIX/share/window-zones/kde-session"
+KDE_SESSION_KEY=''
+if [[ "$OS" == Linux ]]; then
+  KDE_SESSION_KEY="$(printf '%s' "$INSTALL_DIR" | sha256sum)"
+  KDE_SESSION_KEY="${KDE_SESSION_KEY%% *}"
+fi
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
   if recorded kwin-autostart; then
@@ -491,10 +531,6 @@ fi
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo 'cargo is required to build Window Zones; install the Rust toolchain and re-run this script.' >&2
-  exit 1
-fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo 'python3 is required to read Cargo build metadata.' >&2
   exit 1
 fi
 if [[ "$GNOME_EXTENSION" -eq 1 ]] && ! command -v glib-compile-schemas >/dev/null 2>&1; then
@@ -593,11 +629,6 @@ if [[ "$INIT_CONFIG" -eq 1 ]]; then
   "$INSTALL_DIR/window_zones" init || warn 'Starter config could not be initialized; run window_zones init and resolve the reported error.'
 fi
 
-KDE_AUTOSTART=0
-if [[ "$OS" == Linux ]] && recorded kwin-script && recorded binary:window_zones_kwin; then
-  KDE_AUTOSTART=1
-fi
-
 if [[ "$AUTOSTART" -eq 1 && "$OS" == Darwin ]]; then
   mkdir -p "$(dirname -- "$LAUNCH_AGENT")" "$(dirname -- "$LAUNCH_LOG")"
   xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
@@ -658,8 +689,6 @@ elif [[ "$AUTOSTART" -eq 1 ]]; then
     echo 'The recorded KWin companion is missing; reinstall with --kwin-script --autostart.' >&2
     exit 1
   fi
-  USE_GRAPHICAL_SYSTEMD=0
-  if graphical_systemd_available; then USE_GRAPHICAL_SYSTEMD=1; fi
   if [[ "$KDE_AUTOSTART" -eq 1 && "$USE_GRAPHICAL_SYSTEMD" -eq 0 ]] \
     && ! command -v busctl >/dev/null 2>&1 && ! command -v dbus-send >/dev/null 2>&1; then
     echo 'KDE XDG autostart needs busctl or dbus-send to wait for the companion session bus name.' >&2
@@ -672,10 +701,8 @@ elif [[ "$AUTOSTART" -eq 1 ]]; then
   record_install autostart
   if [[ "$KDE_AUTOSTART" -eq 1 ]]; then record_install kwin-autostart; fi
   if [[ "$USE_GRAPHICAL_SYSTEMD" -eq 1 ]]; then
-  retire_xdg_autostart "$KWIN_AUTOSTART_FILE" kwin
-  retire_xdg_autostart "$AUTOSTART_FILE" app
-  mkdir -p "$UNIT_DIR"
-  cat >"$UNIT_FILE" <<EOF
+    mkdir -p "$UNIT_DIR"
+    cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=Window Zones hotkey listener
 PartOf=graphical-session.target
@@ -692,8 +719,8 @@ RestartPreventExitStatus=75
 [Install]
 WantedBy=graphical-session.target
 EOF
-  if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
-    cat >"$KWIN_UNIT_FILE" <<EOF
+    if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
+      cat >"$KWIN_UNIT_FILE" <<EOF
 [Unit]
 Description=Window Zones KWin companion
 PartOf=graphical-session.target
@@ -710,15 +737,21 @@ RestartPreventExitStatus=75
 [Install]
 WantedBy=graphical-session.target
 EOF
-  fi
+    fi
     systemctl --user daemon-reload
     if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
-      stop_kde_session
       systemctl --user enable window-zones-kwin.service
+    fi
+    systemctl --user enable window-zones.service
+    if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
+      retire_xdg_autostart "$KWIN_AUTOSTART_FILE" kwin
+      stop_kde_session
+    fi
+    retire_xdg_autostart "$AUTOSTART_FILE" app
+    if [[ "$KDE_AUTOSTART" -eq 1 ]]; then
       systemctl --user restart window-zones-kwin.service || warn 'Could not start the owned KWin companion.'
       report_systemd_start window-zones-kwin.service "$KWIN_UNIT_FILE"
     fi
-    systemctl --user enable window-zones.service
     if [[ ":${XDG_CURRENT_DESKTOP:-}:" == *:GNOME:* ]] \
       && ! busctl --user status org.window_zones.Gnome >/dev/null 2>&1; then
       # Starting now would only retry until GNOME Shell loads the companion at login.
@@ -880,7 +913,7 @@ Terminal=false
 EOF
       printf 'Graphical user systemd is unavailable; using XDG autostart: %s\n' "$AUTOSTART_FILE"
     fi
-    echo 'To switch to systemd later, re-run the installer with --autostart.'
+    echo 'To switch to systemd later, re-run the installer with --autostart from this prefix.'
   fi
 fi
 

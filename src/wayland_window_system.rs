@@ -119,6 +119,7 @@ struct HyprWindow {
     monitor: i64,
     workspace: HyprWorkspace,
     floating: bool,
+    grouped: Vec<serde::de::IgnoredAny>,
     fullscreen: u32,
     #[serde(rename = "fullscreenClient")]
     fullscreen_client: u32,
@@ -433,7 +434,7 @@ fn move_window_hypr(window_move: &WindowMove) -> Result<(), WindowSystemError> {
 
 fn move_window_hypr_with(
     window_move: &WindowMove,
-    read_monitors: impl FnOnce() -> Result<Vec<HyprMonitor>, WindowSystemError>,
+    mut read_monitors: impl FnMut() -> Result<Vec<HyprMonitor>, WindowSystemError>,
     mut read_clients: impl FnMut() -> Result<Vec<HyprWindow>, WindowSystemError>,
     run_command: impl FnOnce(&str, &WindowId) -> Result<(), WindowSystemError>,
 ) -> Result<(), WindowSystemError> {
@@ -442,26 +443,55 @@ fn move_window_hypr_with(
     let destination = hypr_destination(&monitors, window_move.target)?;
     let (command, initial, transfers_workspace) =
         hypr_move_command(&clients, destination, window_move)?;
-    let mut result = run_command(&command, &window_move.window);
-    let observed = read_clients().and_then(|clients| {
-        let window = clients
-            .iter()
+    let result = run_command(&command, &window_move.window);
+    let window = read_clients().and_then(|clients| {
+        clients
+            .into_iter()
             .find(|window| window.address == window_move.window.as_str())
-            .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))?;
-        if result.is_ok()
-            && let Some(destination) = destination
-            && (window.monitor != destination.id
-                || (transfers_workspace
-                    && !window
-                        .workspace
-                        .same_workspace(&destination.active_workspace)))
+            .ok_or_else(|| WindowSystemError::WindowGone(window_move.window.clone()))
+    });
+    let window = match window {
+        Ok(window) => window,
+        Err(error) => return finish_scripted_move(window_move, initial, result, Err(error)),
+    };
+    let observed = checked_scripted_frame(window.geometry(), &window_move.window);
+    let result = result.and_then(|()| {
+        let Some(destination) = destination else {
+            return Ok(());
+        };
+        let current_monitors;
+        let destination = if transfers_workspace {
+            current_monitors = read_monitors()?;
+            current_monitors
+                .iter()
+                .find(|monitor| monitor.id == destination.id && !monitor.disabled)
+                .ok_or_else(|| {
+                    WindowSystemError::Platform(format!(
+                        "Hyprland destination monitor {} is no longer available",
+                        destination.name
+                    ))
+                })?
+        } else {
+            destination
+        };
+        if window.monitor != destination.id
+            || (transfers_workspace
+                && !window
+                    .workspace
+                    .same_workspace(&destination.active_workspace))
         {
-            result = Err(WindowSystemError::Platform(format!(
-                "Hyprland did not transfer window {} to monitor {} workspace {}",
-                window_move.window, destination.name, destination.active_workspace.name
+            return Err(WindowSystemError::Platform(format!(
+                "Hyprland did not transfer window {} to active workspace {} on monitor {}",
+                window_move.window, destination.active_workspace.name, destination.name
             )));
         }
-        checked_scripted_frame(window.geometry(), &window_move.window)
+        if transfers_workspace && (!window.floating || !window.grouped.is_empty()) {
+            return Err(WindowSystemError::Platform(format!(
+                "Hyprland did not leave window {} floating and ungrouped after transfer",
+                window_move.window
+            )));
+        }
+        Ok(())
     });
     finish_scripted_move(window_move, initial, result, observed)
 }
@@ -1450,37 +1480,65 @@ mod tests {
          "reserved":[0,0,0,0],"disabled":false}
     ]"#;
 
+    const HYPR_PLACED_CLIENTS_JSON: &str = r#"[{
+        "address":"0x55e0ed70afc0","at":[-2560,-100],"size":[1280,720],
+        "monitor":1,"workspace":{"id":5,"name":"5"},"floating":true,
+        "grouped":[],"fullscreen":0,"fullscreenClient":0
+    }]"#;
+
+    fn hypr_cross_output_move_from_snapshots(
+        target: &WindowMove,
+        clients_after: &str,
+        monitors_after: &str,
+    ) -> Result<(), WindowSystemError> {
+        let initial = format!("[{}]", hypr_window_json());
+        let batch_ran = std::cell::Cell::new(false);
+        move_window_hypr_with(
+            target,
+            || {
+                let json = if batch_ran.get() {
+                    monitors_after
+                } else {
+                    HYPR_MONITORS_JSON
+                };
+                Ok(serde_json::from_str(json).unwrap())
+            },
+            || {
+                let json = if batch_ran.get() {
+                    clients_after
+                } else {
+                    &initial
+                };
+                Ok(serde_json::from_str(json).unwrap())
+            },
+            |command, window| {
+                assert_eq!(window, &target.window);
+                assert!(command.split(';').any(|dispatch| dispatch.trim()
+                    == "dispatch movetoworkspacesilent 5,address:0x55e0ed70afc0"));
+                assert!(!command.contains("focus"));
+                batch_ran.set(true);
+                validate_hypr_batch_reply("ok\n\n\nok\n\n\nok", command.split(';').count(), window)
+            },
+        )
+    }
+
     #[test]
     fn hypr_cross_output_move_transfers_captured_client_and_checks_native_ownership() {
         let target = WindowMove::new(
             WindowId::new("0x55e0ed70afc0"),
             Rect::new(-2560, -100, 1280, 720),
         );
-        let initial = format!("[{}]", hypr_window_json());
         // Native clients readback: surface position alone cannot establish
         // monitor/workspace ownership.
-        let placed = r#"[{
-            "address":"0x55e0ed70afc0","at":[-2560,-100],"size":[1280,720],
-            "monitor":1,"workspace":{"id":5,"name":"5"},"floating":true,
-            "fullscreen":0,"fullscreenClient":0
-        }]"#;
         for (monitor, workspace, accepted) in [(1, 5, true), (0, 5, false), (1, 4, false)] {
-            let mut after: serde_json::Value = serde_json::from_str(placed).unwrap();
+            let mut after: serde_json::Value =
+                serde_json::from_str(HYPR_PLACED_CLIENTS_JSON).unwrap();
             after[0]["monitor"] = monitor.into();
             after[0]["workspace"]["id"] = workspace.into();
-            let after = after.to_string();
-            let mut snapshots = [initial.as_str(), after.as_str()].into_iter();
-            let result = move_window_hypr_with(
+            let result = hypr_cross_output_move_from_snapshots(
                 &target,
-                || Ok(serde_json::from_str(HYPR_MONITORS_JSON).unwrap()),
-                || Ok(serde_json::from_str(snapshots.next().unwrap()).unwrap()),
-                |command, window| {
-                    assert_eq!(window, &target.window);
-                    assert!(command.split(';').any(|dispatch| dispatch.trim()
-                        == "dispatch movetoworkspacesilent 5,address:0x55e0ed70afc0"));
-                    assert!(!command.contains("focus"));
-                    Ok(())
-                },
+                &after.to_string(),
+                HYPR_MONITORS_JSON,
             );
             if accepted {
                 assert_eq!(result, Ok(()));
@@ -1489,6 +1547,69 @@ mod tests {
                     result,
                     Err(WindowSystemError::PartialMove { observed, message })
                         if observed == target.target && message.contains("did not transfer")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn hypr_cross_output_move_rejects_a_workspace_that_is_no_longer_active() {
+        let target = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(-2560, -100, 1280, 720),
+        );
+        let mut monitors: serde_json::Value = serde_json::from_str(HYPR_MONITORS_JSON).unwrap();
+        monitors[1]["activeWorkspace"] = serde_json::json!({"id":6,"name":"6"});
+        let result = hypr_cross_output_move_from_snapshots(
+            &target,
+            HYPR_PLACED_CLIENTS_JSON,
+            &monitors.to_string(),
+        );
+        assert!(matches!(
+            result,
+            Err(WindowSystemError::PartialMove { observed, message })
+                if observed == target.target && message.contains("active workspace 6")
+        ));
+    }
+
+    #[test]
+    fn hypr_cross_output_move_rejects_a_tiled_or_grouped_client() {
+        let target = WindowMove::new(
+            WindowId::new("0x55e0ed70afc0"),
+            Rect::new(-2560, -100, 1280, 720),
+        );
+        let initial = Rect::new(1320, 680, 600, 400);
+        let mut after: serde_json::Value = serde_json::from_str(HYPR_PLACED_CLIENTS_JSON).unwrap();
+        for (floating, grouped, frame) in [
+            (false, true, target.target),
+            (true, true, target.target),
+            (false, false, target.target),
+            (false, true, initial),
+        ] {
+            after[0]["floating"] = floating.into();
+            after[0]["grouped"] = if grouped {
+                serde_json::json!(["0x1234", "0x55e0ed70afc0"])
+            } else {
+                serde_json::json!([])
+            };
+            after[0]["at"] = serde_json::json!([frame.x, frame.y]);
+            after[0]["size"] = serde_json::json!([frame.width, frame.height]);
+            let result = hypr_cross_output_move_from_snapshots(
+                &target,
+                &after.to_string(),
+                HYPR_MONITORS_JSON,
+            );
+            if frame == initial {
+                assert!(matches!(
+                    result,
+                    Err(WindowSystemError::Platform(message))
+                        if message.contains("floating and ungrouped")
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(WindowSystemError::PartialMove { observed, message })
+                        if observed == frame && message.contains("floating and ungrouped")
                 ));
             }
         }
@@ -1548,7 +1669,7 @@ mod tests {
         let after = r#"[{
             "address":"0x55e0ed70afc0","at":[-2560,-100],"size":[1280,720],
             "monitor":0,"workspace":{"id":4,"name":"em₄"},"floating":true,
-            "fullscreen":0,"fullscreenClient":0
+            "grouped":[],"fullscreen":0,"fullscreenClient":0
         }]"#;
         let mut snapshots = [initial.as_str(), after].into_iter();
         let target = WindowMove::new(target.window, Rect::new(-2560, -100, 1280, 720));

@@ -1,8 +1,9 @@
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use window_zones::{default_config_path, parse_config, starter_config};
 
@@ -43,15 +44,14 @@ fn write_starter_config(path: &Path, chord: &str, force: bool) -> Result<InitOut
         fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
-    let mut file = match File::options()
-        .write(true)
-        .create(force)
-        .create_new(!force)
-        .truncate(force)
-        .open(path)
-    {
+    if force {
+        replace_config(path, contents.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        return Ok(InitOutcome::Written);
+    }
+    let mut file = match File::options().write(true).create_new(true).open(path) {
         Ok(file) => file,
-        Err(error) if !force && error.kind() == io::ErrorKind::AlreadyExists => {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return Ok(InitOutcome::AlreadyExists);
         }
         Err(error) => return Err(format!("cannot write {}: {error}", path.display())),
@@ -59,6 +59,67 @@ fn write_starter_config(path: &Path, chord: &str, force: bool) -> Result<InitOut
     file.write_all(contents.as_bytes())
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     Ok(InitOutcome::Written)
+}
+
+fn replace_config(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let (target, permissions) = match path.canonicalize() {
+        Ok(target) => {
+            if !target.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "config must be a regular file",
+                ));
+            }
+            // Replacing the directory entry must not bypass write permission on the config.
+            let permissions = File::options()
+                .write(true)
+                .open(&target)?
+                .metadata()?
+                .permissions();
+            (target, Some(permissions))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Ok(link) = fs::read_link(path) {
+                return replace_config(&path.with_file_name(link), contents);
+            }
+            (path.to_owned(), None)
+        }
+        Err(error) => return Err(error),
+    };
+
+    static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if permissions.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (temporary, mut file) = loop {
+        let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temporary = target.with_file_name(format!(
+            ".window-zones-init-{}-{id}.tmp",
+            std::process::id()
+        ));
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let staged = (|| {
+        file.write_all(contents)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()
+    })();
+    drop(file);
+    let result = staged.and_then(|()| fs::rename(&temporary, &target));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(in crate::application) fn execute_init(
@@ -128,6 +189,42 @@ mod tests {
         assert!(bad_chord.unwrap_err().contains("Ctrl+Hyper"));
         assert_eq!(forced, Ok(InitOutcome::Written));
         assert_eq!(forced_config.bindings[0].hotkey, "alt+ctrl+left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_replaces_the_config_instead_of_overwriting_its_contents_in_place() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = temp_path("atomic_init");
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("user.toml");
+        let path = directory.join("config.toml");
+        fs::write(&target, "# user edits\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink("user.toml", &path).unwrap();
+        let previous = directory.join("previous.toml");
+        fs::hard_link(&target, &previous).unwrap();
+
+        assert_eq!(
+            write_starter_config(&path, "Ctrl+Alt", true),
+            Ok(InitOutcome::Written)
+        );
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&previous).unwrap(), "# user edits\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640,
+        );
+        assert_eq!(
+            parse_config(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .bindings[0]
+                .hotkey,
+            "alt+ctrl+left",
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -98,7 +98,7 @@ impl Drop for Process {
 
 pub(super) struct RealBus {
     pub(super) address: String,
-    _service: Process,
+    service: Process,
     _daemon: Process,
 }
 
@@ -118,6 +118,22 @@ impl RealBus {
             .unwrap();
         let address = address.trim().to_string();
         assert!(!address.is_empty());
+        let service = Self::start_companion(&address);
+        Self {
+            address,
+            service,
+            _daemon: daemon,
+        }
+    }
+
+    pub(super) fn restart_companion(&mut self) {
+        self.service.0.kill().unwrap();
+        self.service.0.wait().unwrap();
+        Self::wait_for_owner(&self.address, false, None);
+        self.service = Self::start_companion(&self.address);
+    }
+
+    fn start_companion(address: &str) -> Process {
         let mut service = Process(
             Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -126,12 +142,17 @@ impl RealBus {
                     "--nocapture",
                 ])
                 .env("WINDOW_ZONES_KWIN_SERVICE_TEST_CHILD", "1")
-                .env("DBUS_SESSION_BUS_ADDRESS", &address)
+                .env("DBUS_SESSION_BUS_ADDRESS", address)
                 .stdout(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
-        let connection = Connection::new_address(&address).unwrap();
+        Self::wait_for_owner(address, true, Some(&mut service));
+        service
+    }
+
+    fn wait_for_owner(address: &str, present: bool, mut service: Option<&mut Process>) {
+        let connection = Connection::new_address(address).unwrap();
         let proxy = connection.with_proxy(
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
@@ -142,20 +163,20 @@ impl RealBus {
             let (owned,): (bool,) = proxy
                 .method_call("org.freedesktop.DBus", "NameHasOwner", (KWIN_SERVICE_NAME,))
                 .unwrap();
-            if owned {
+            if owned == present {
                 break;
             }
             assert!(
-                service.0.try_wait().unwrap().is_none(),
+                service
+                    .as_mut()
+                    .is_none_or(|service| service.0.try_wait().unwrap().is_none()),
                 "real KWin companion exited before owning its bus name"
             );
-            assert!(Instant::now() < deadline, "real KWin service never started");
+            assert!(
+                Instant::now() < deadline,
+                "real KWin bus name did not change"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        Self {
-            address,
-            _service: service,
-            _daemon: daemon,
         }
     }
 }
@@ -250,7 +271,7 @@ impl FakeBus {
                                     let pending_reply =
                                         companion_state.lock().script_state.mark_ready(
                                             protocol.parse().unwrap(),
-                                            sender_name(method.msg)?,
+                                            sender_name(method.msg)?.to_string(),
                                             reset,
                                         )?;
                                     let reply = method.msg.method_return();

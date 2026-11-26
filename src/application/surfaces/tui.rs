@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 
-use window_zones::{App, ConfigState, DispatchState, HotkeyRegistrationState};
+use window_zones::{App, ConfigState, DispatchState, HotkeyRegistrationState, RuntimeEvent};
 
 use super::{Report, Surface};
 use crate::application::backends::{RuntimeBackend, RuntimeWindowSystem};
@@ -121,12 +121,13 @@ fn tui_frame(
     runtime: &Runtime,
     capabilities: &TuiCapabilityStatus,
     last_event: Option<&str>,
+    pending_config: Option<&str>,
 ) -> String {
     let app = &runtime.app;
     let mut frame = format!(
         "\x1b[2J\x1b[HWindow Zones TUI\n================\n\
          Window backend: {}\nWindow capabilities: {}\nHotkey mode: {}\n\
-         Hotkey capabilities: {}\nHotkey state: {:?}\nConfig: {} ({:?})\nBindings:\n",
+         Hotkey capabilities: {}\nHotkey state: {:?}\nConfig: {} ({:?})\n",
         runtime.window_system.name(),
         capabilities.window,
         tui_hotkey_mode(runtime.backend),
@@ -137,6 +138,12 @@ fn tui_frame(
             .unwrap_or_else(|| "<unresolved>".to_string()),
         app.config_state(),
     );
+    if let Some(message) = pending_config
+        && Some(message) != last_event
+    {
+        writeln!(frame, "{message}").expect("write TUI frame");
+    }
+    frame.push_str("Bindings:\n");
     if app.config().bindings.is_empty() {
         frame.push_str("  <none>\n");
     } else {
@@ -163,6 +170,7 @@ pub(in crate::application) struct TuiSurface {
     capabilities: TuiCapabilityStatus,
     capabilities_due: Instant,
     last_event: Option<String>,
+    pending_config: Option<String>,
     dirty: bool,
 }
 
@@ -173,12 +181,18 @@ impl TuiSurface {
             capabilities: tui_capability_status_from(None),
             capabilities_due: Instant::now(),
             last_event: None,
+            pending_config: None,
             dirty: true,
         }
     }
 
     fn draw(&mut self, runtime: &Runtime, force: bool) {
-        let frame = tui_frame(runtime, &self.capabilities, self.last_event.as_deref());
+        let frame = tui_frame(
+            runtime,
+            &self.capabilities,
+            self.last_event.as_deref(),
+            self.pending_config.as_deref(),
+        );
         if force || frame != self.snapshot {
             print!("{frame}");
             let _ = io::stdout().flush();
@@ -198,7 +212,20 @@ impl Surface for TuiSurface {
     fn report(&mut self, _runtime: &Runtime, report: Report) {
         self.dirty = true;
         match report {
-            Report::Event(event) => self.last_event = Some(event.to_string()),
+            Report::Event(event) => {
+                let message = event.to_string();
+                match event {
+                    RuntimeEvent::ConfigPending { .. } => {
+                        self.pending_config = Some(message.clone());
+                    }
+                    RuntimeEvent::ConfigLoaded { .. }
+                    | RuntimeEvent::ConfigMissing { .. }
+                    | RuntimeEvent::ConfigFailed { .. }
+                    | RuntimeEvent::ConfigRejected { .. } => self.pending_config = None,
+                    _ => {}
+                }
+                self.last_event = Some(message);
+            }
             Report::Unknown(message) => {
                 self.last_event = Some(format!("unknown command: {message}"));
             }

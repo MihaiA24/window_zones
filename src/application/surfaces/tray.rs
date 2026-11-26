@@ -9,6 +9,8 @@ use linux::LinuxTray;
 #[cfg(target_os = "windows")]
 use tray_item::{IconSource, TrayItem};
 use window_zones::{ConfigState, DispatchState, HotkeyRegistrationState};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{IDI_APPLICATION, LoadIconW};
 
 use super::{CliSurface, Report, Surface};
 use crate::application::notifications::Notifier;
@@ -67,7 +69,9 @@ impl TraySurface {
         let tray = LinuxTray::new(labels.clone(), tx)?;
         #[cfg(target_os = "windows")]
         let (tray, label_ids) = {
-            let mut tray = TrayItem::new("Window Zones", IconSource::Resource(""))
+            let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }
+                .map_err(|error| format!("failed to load Windows tray icon: {error}"))?;
+            let mut tray = TrayItem::new("Window Zones", IconSource::RawIcon(icon.0 as isize))
                 .map_err(|error| error.to_string())?;
             let mut label_ids = Vec::with_capacity(labels.len());
             for line in &labels {

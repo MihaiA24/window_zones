@@ -316,8 +316,8 @@ fn distance_squared(area: Rect, x: i64, y: i64) -> i64 {
     dx * dx + dy * dy
 }
 
-/// The nearest display whose center lies in `direction` from the current
-/// display's center, preferring displays that share the perpendicular span.
+/// The nearest display beyond the current display's edge in `direction`,
+/// preferring displays that share the perpendicular span.
 fn display_in_direction(
     displays: &[DisplayGeometry],
     current_index: usize,
@@ -333,29 +333,29 @@ fn display_in_direction(
         .filter_map(|(index, display)| {
             let area = display.usable_area;
             let (x, y) = center(area);
-            let (primary, perpendicular, shares_span) = match direction {
+            let (gap, perpendicular, shares_span) = match direction {
                 Direction::Left => (
-                    current_x - x,
+                    i64::from(current.x) - (i64::from(area.x) + i64::from(area.width)),
                     (y - current_y).abs(),
                     spans_overlap_y(current, area),
                 ),
                 Direction::Right => (
-                    x - current_x,
+                    i64::from(area.x) - (i64::from(current.x) + i64::from(current.width)),
                     (y - current_y).abs(),
                     spans_overlap_y(current, area),
                 ),
                 Direction::Up => (
-                    current_y - y,
+                    i64::from(current.y) - (i64::from(area.y) + i64::from(area.height)),
                     (x - current_x).abs(),
                     spans_overlap_x(current, area),
                 ),
                 Direction::Down => (
-                    y - current_y,
+                    i64::from(area.y) - (i64::from(current.y) + i64::from(current.height)),
                     (x - current_x).abs(),
                     spans_overlap_x(current, area),
                 ),
             };
-            (primary > 0).then_some((index, (!shares_span, primary, perpendicular)))
+            (gap >= 0).then_some((index, (!shares_span, gap, perpendicular)))
         })
         .min_by_key(|(_, score)| *score)
         .map(|(index, _)| index)
@@ -787,6 +787,47 @@ mod tests {
                 direction: Direction::Left
             }
         );
+    }
+
+    #[test]
+    fn right_move_does_not_pick_a_wider_display_above() {
+        let mut fake = fake_with_focus(Rect::new(0, 1080, 960, 1080));
+        fake.displays = Ok(vec![
+            DisplayGeometry::new("lower", Rect::new(0, 1080, 1920, 1080)),
+            DisplayGeometry::new("upper", Rect::new(0, 0, 2560, 1080)),
+        ]);
+
+        assert_eq!(
+            execute(
+                &mut fake,
+                &Action::MoveToDisplay {
+                    direction: Direction::Right,
+                },
+            ),
+            Err(ExecuteActionError::NoDisplayInDirection {
+                direction: Direction::Right,
+            })
+        );
+        assert!(fake.moves.is_empty());
+    }
+
+    #[test]
+    fn right_move_crosses_the_shared_edge_between_unequal_displays() {
+        let mut fake = fake_with_focus(Rect::new(0, 0, 960, 1080));
+        fake.displays = Ok(vec![
+            DisplayGeometry::new("left", Rect::new(0, 0, 1920, 1080)),
+            DisplayGeometry::new("right", Rect::new(1920, 0, 2560, 1440)),
+        ]);
+
+        execute(
+            &mut fake,
+            &Action::MoveToDisplay {
+                direction: Direction::Right,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fake.moves, vec![moved_to(Rect::new(1920, 0, 1280, 1440))]);
     }
 
     #[test]

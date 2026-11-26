@@ -4,10 +4,10 @@ Users edit TOML bindings/zones, reload without losing the last valid configurati
 
 ## Sub-features
 
-- `config-path`: explicit `--config` and platform config discovery select the startup file.
+- `config-path`: explicit `--config` and platform config discovery select the startup file. The config must be a regular file.
 - `config-replace`: a valid rewrite replaces bindings only after capture accepts it; watcher polling and `reload` expose acceptance.
 - `config-retain`: malformed TOML/validation/read failures expose errors while retaining the last valid runtime config.
-- `config-pending`: unavailable capture retains the active config and reports a pending replacement; an explicit reload reports its outcome even during an unchanged outage.
+- `config-pending`: unavailable capture retains the active config and reports a pending replacement. The TUI keeps that notice visible until the reload resolves, even after subsequent hotkey events. An explicit reload reports its outcome even during an unchanged outage.
 - `config-empty`: missing file and empty TOML are distinct states with zero bindings.
 - `config-persist`: restart and a new process reload the on-disk file; runtime last action is not durable.
 - `config-gnome-animation`: GNOME's native per-extension GSettings key `org.gnome.shell.extensions.window-zones animation-duration-ms` is separate from TOML. It defaults to 150 ms, accepts unsigned 0..1000 ms, and uses 0 for no custom Window Zones animation.
@@ -47,4 +47,4 @@ Preconditions:
 - The reload journey exercises explicit reload; the watcher journey independently waits for file-change transitions without sending reload. Keep their evidence distinct.
 - Permission/read-error, duplicate/unknown-zone validation, relative-XDG fallback and explicit-over-discovered precedence need their own real file/environment conditions when affected. The seeds provide TOML parse failure, not every validation/read failure. Missing such preconditions is a failure, not an alternate passing row.
 - Tray reload/restart requires a real host: the GNOME synthetic smoke provides AppIndicator menu actions; the baseline CLI/PTY fixtures do not. CLI reload alone is not tray evidence.
-- This GNOME-only setting is read on the next move without TOML watcher/reload, App restart or companion reload; a move already in progress keeps its selected duration. Disabled GNOME animations and GNOME 51 reduced motion override nonzero values. Deploy source/schema upgrades with the installer and start a fresh login first; copying source into a running Shell does not activate the new setting.
+- This GNOME-only setting is read on the next move without TOML watcher/reload, App restart or companion reload; a move already in progress keeps its configured value. The companion caps animation at 1000 ms after Shell's slowdown factor. Disabled GNOME animations and GNOME 51 reduced motion override nonzero values. Deploy source/schema upgrades with the installer and start a fresh login first; copying source into a running Shell does not activate the new setting.

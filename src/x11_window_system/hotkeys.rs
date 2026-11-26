@@ -28,6 +28,8 @@ enum Command {
 
 type Grabs = BTreeMap<(u8, u16), String>;
 
+const LOCK_KEYSYMS: &[u32] = &[0xffe5, 0xff7f, 0xff14]; // Caps, Num, Scroll Lock.
+
 impl X11HotkeySystem {
     pub fn new() -> Self {
         Self::with_display(None)
@@ -140,10 +142,11 @@ fn run_listener(
     let (conn, screen) =
         x11rb::connect(display).map_err(|error| unavailable(format!("open display: {error}")))?;
     let root = conn.setup().roots[screen].root;
-    enable_detectable_repeat(&conn)?;
+    enable_xkb(&conn)?;
     let mut grabs = Grabs::new();
     let mut accepted = Vec::new();
     let mut pressed = [false; 256];
+    let mut grabbing_key = None;
     loop {
         match commands.recv_timeout(Duration::from_millis(5)) {
             Ok(Command::Register(hotkeys, response)) => {
@@ -173,6 +176,7 @@ fn run_listener(
         {
             match event {
                 Event::KeyPress(event) => {
+                    grabbing_key.get_or_insert(event.detail);
                     if std::mem::replace(&mut pressed[usize::from(event.detail)], true) {
                         continue;
                     }
@@ -184,7 +188,13 @@ fn run_listener(
                     }
                 }
                 Event::KeyRelease(event) => {
-                    pressed[usize::from(event.detail)] = false;
+                    if grabbing_key == Some(event.detail) {
+                        // Other held keys may be released after X ends this grab.
+                        pressed.fill(false);
+                        grabbing_key = None;
+                    } else {
+                        pressed[usize::from(event.detail)] = false;
+                    }
                 }
                 event if keyboard_mapping_changed(&event) => {
                     // A rejected remap cannot retain grabs for the old physical keys.
@@ -219,32 +229,33 @@ fn keyboard_mapping_changed(event: &Event) -> bool {
     }
 }
 
-fn enable_detectable_repeat(conn: &RustConnection) -> Result<(), HotkeySystemError> {
+fn enable_xkb(conn: &RustConnection) -> Result<(), HotkeySystemError> {
     let extension = conn
         .xkb_use_extension(1, 0)
         .map_err(|error| unavailable(format!("enable XKB: {error}")))?
         .reply()
         .map_err(|error| unavailable(format!("enable XKB: {error}")))?;
     if !extension.supported {
-        return Err(unavailable(
-            "enable XKB detectable auto-repeat (XKB 1.0 is required)",
-        ));
+        return Err(unavailable("enable XKB (XKB 1.0 is required)"));
     }
-    let repeat = xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT;
+    let flags =
+        xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT | xkb::PerClientFlag::GRABS_USE_XKB_STATE;
     let reply = conn
         .xkb_per_client_flags(
             u16::from(xkb::ID::USE_CORE_KBD),
-            repeat,
-            repeat,
+            flags,
+            flags,
             xkb::BoolCtrl::default(),
             xkb::BoolCtrl::default(),
             xkb::BoolCtrl::default(),
         )
-        .map_err(|error| unavailable(format!("enable detectable auto-repeat: {error}")))?
+        .map_err(|error| unavailable(format!("set XKB client flags: {error}")))?
         .reply()
-        .map_err(|error| unavailable(format!("enable detectable auto-repeat: {error}")))?;
-    if reply.value & repeat != repeat {
-        return Err(unavailable("enable XKB detectable auto-repeat"));
+        .map_err(|error| unavailable(format!("set XKB client flags: {error}")))?;
+    if reply.supported & flags != flags || reply.value & flags != flags {
+        return Err(unavailable(
+            "enable XKB detectable auto-repeat and XKB grab state",
+        ));
     }
     let map = xkb::MapPart::KEY_TYPES
         | xkb::MapPart::KEY_SYMS
@@ -330,7 +341,7 @@ fn grabs_for_mapping(
         .types_rtrn
         .as_deref()
         .ok_or_else(|| unavailable("read XKB key types"))?;
-    let locks = modifier_mask(min_keycode, symbols, modifier_keycodes, &[0xffe5, 0xff7f]);
+    let locks = modifier_mask(min_keycode, symbols, modifier_keycodes, LOCK_KEYSYMS);
     let mut grabs = Grabs::new();
     for hotkey in hotkeys {
         let (keysym, modifiers) = parse_hotkey(hotkey)?;
@@ -726,6 +737,18 @@ mod tests {
     }
 
     #[test]
+    fn x11_hotkeys_ignore_the_mapped_scroll_lock_slot() {
+        let mapping = keyboard_map(1, &[&[0x61], &[0xffe3], &[0xff14]]);
+        let modifier_codes = [0, 0, 9, 0, 0, 0, 0, 10];
+        let grabs =
+            grabs_for_mapping(&["ctrl+a".to_string()], 8, &mapping, 0, &modifier_codes).unwrap();
+        assert_eq!(
+            grabs.keys().copied().collect::<Vec<_>>(),
+            [(8, 4), (8, 132)]
+        );
+    }
+
+    #[test]
     fn x11_hotkeys_rebuild_keycodes_and_locks_without_changing_accepted_bindings() {
         let accepted = ["ctrl+y".to_string()];
         let before = grabs_for_mapping(
@@ -919,7 +942,7 @@ mod tests {
         assert_ne!(display, ":0", "never test on the user's desktop");
         let (observer, screen) = x11rb::connect(Some(&display)).unwrap();
         let root = observer.setup().roots[screen].root;
-        enable_detectable_repeat(&observer).unwrap();
+        enable_xkb(&observer).unwrap();
         let (competitor, _) = x11rb::connect(Some(&display)).unwrap();
         let window = observer.generate_id().unwrap();
         observer
@@ -984,7 +1007,7 @@ mod tests {
             keyboard.first_key_sym,
             symbols,
             &modifiers.keycodes,
-            &[0xffe5, 0xff7f],
+            LOCK_KEYSYMS,
         );
         let ctrl = keyboard.first_key_sym
             + u8::try_from(
@@ -1029,19 +1052,21 @@ mod tests {
         thread::sleep(Duration::from_millis(900)); // Exercise server-generated auto-repeat too.
         inject(x11rb::protocol::xproto::KEY_RELEASE_EVENT, f8);
         inject(x11rb::protocol::xproto::KEY_RELEASE_EVENT, ctrl);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let event = loop {
-            if let Some(event) = listener.next_hotkey().unwrap() {
-                break event;
+        let next_pressed = |listener: &mut X11HotkeySystem| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(event) = listener.next_hotkey().unwrap() {
+                    return event;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "grabbed XTEST key did not reach listener"
+                );
+                thread::sleep(Duration::from_millis(5));
             }
-            assert!(
-                Instant::now() < deadline,
-                "grabbed XTEST key did not reach listener"
-            );
-            thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(
-            event,
+            next_pressed(&mut listener),
             HotkeyEvent::Pressed {
                 hotkey: "ctrl+f8".to_string()
             }
@@ -1063,6 +1088,28 @@ mod tests {
             )
             .unwrap();
         }
+
+        listener
+            .register_hotkeys(&["ctrl+f8".to_string(), "ctrl+f9".to_string()])
+            .unwrap();
+        use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
+        inject(KEY_PRESS_EVENT, ctrl);
+        inject(KEY_PRESS_EVENT, f8);
+        inject(KEY_PRESS_EVENT, f9);
+        inject(KEY_RELEASE_EVENT, f8); // Ends the active grab before F9 is released.
+        inject(KEY_RELEASE_EVENT, f9);
+        inject(KEY_PRESS_EVENT, f9);
+        inject(KEY_RELEASE_EVENT, f9);
+        inject(KEY_RELEASE_EVENT, ctrl);
+        for hotkey in ["ctrl+f8", "ctrl+f9", "ctrl+f9"] {
+            assert_eq!(
+                next_pressed(&mut listener),
+                HotkeyEvent::Pressed {
+                    hotkey: hotkey.to_string()
+                }
+            );
+        }
+
         listener.register_hotkeys(&["ctrl+f9".to_string()]).unwrap();
         for modifiers in lock_variants(4, locks) {
             grab(&competitor, f8, modifiers).unwrap(); // Replacing a set released old grabs.
@@ -1181,7 +1228,7 @@ mod tests {
             std::env::var("WZ_X11_TEST_DISPLAY").expect("supply an isolated test DISPLAY");
         assert_ne!(display, ":0", "never change the user's keyboard mapping");
         let (observer, screen) = x11rb::connect(Some(&display)).unwrap();
-        enable_detectable_repeat(&observer).unwrap();
+        enable_xkb(&observer).unwrap();
         let (competitor, _) = x11rb::connect(Some(&display)).unwrap();
         let root = observer.setup().roots[screen].root;
         let min = observer.setup().min_keycode;
@@ -1223,7 +1270,7 @@ mod tests {
             xkb_mapping.first_key_sym,
             symbols,
             &saved.modifiers.keycodes,
-            &[0xffe5, 0xff7f],
+            LOCK_KEYSYMS,
         );
         let grab = |keycode, modifiers: u16| {
             competitor
@@ -1492,7 +1539,7 @@ mod tests {
             xkb_mapping.first_key_sym,
             symbols,
             &modifier_codes,
-            &[0xffe5, 0xff7f],
+            LOCK_KEYSYMS,
         );
         for modifiers in lock_variants(4, locks & !new_locks).filter(|state| *state != 4) {
             let deadline = Instant::now() + Duration::from_secs(2);

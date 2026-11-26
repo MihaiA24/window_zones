@@ -22,7 +22,7 @@ pub const GNOME_OBJECT_PATH: &str = "/org/window_zones/Gnome";
 pub const GNOME_INTERFACE: &str = "org.window_zones.Gnome2";
 const HOTKEY_SIGNAL: &str = "HotkeyPressed";
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
-// The companion permits up to 1 s of animation after bounded frame restoration.
+// The companion caps Shell-scaled animation at 1 s, in addition to bounded frame restoration.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FOCUSED_WINDOW_CAPABILITY: &str = "focused-window";

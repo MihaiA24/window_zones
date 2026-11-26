@@ -8,7 +8,7 @@ Users inspect the resolved backend, loaded configuration, bindings and recent ru
 - `status-runtime`: interactive status and TUI refresh show the running instance rather than a fresh process.
 - `status-routing`: auto/explicit X11 or Wayland routing identifies the real backend; missing companions remain visible without X11 fallback.
 - `status-dry-run`: `--backend dry-run` and `--dry-run` provide a safe core-only status path.
-- `status-options`: missing option values fail before backend startup; an option token cannot become a config/log pathname.
+- `status-options`: missing option values and conflicting backend selections fail before backend startup. An option token cannot become a config or log path.
 
 ## How to get to it (user POV)
 
@@ -39,6 +39,7 @@ Preconditions:
 - A new `status` process cannot prove another runtime's last action. Use that runtime's `status` before quitting.
 - The helper deliberately removes seated display/session addresses; dry-run cannot establish native backend health or companion absence behavior.
 - The GNOME companion declares Shell 50/51 compatibility. Synthetic Shell 51 proof covers companion discovery, capabilities, displays and runtime controls, not seated focus or accelerator capture.
+- A missing or uncompiled companion settings schema makes GNOME Shell report an activation error before the companion requests its D-Bus name.
 - The no-argument launcher default, tray `Show status`, unavailable-companion routing and platform-specific flags are distinct entry points. Existing synthetic gates do not prove all of them. If affected, record the missing seated/tray/platform precondition and obtain real surface evidence; do not claim a dry-run replacement pass.
 - A backend label is selection, not health: X11 status does not connect to X11, while GNOME/KDE status probes companion capabilities. A TUI banner proves redraw, not correct dashboard state; inspect its post-action fields and diagnostics.
 - Unsupported hosts reject native `auto` selection during backend resolution, not through an unsupported runtime adapter. Preserve the existing diagnostic and parser/help/initialization precedence; dry-run remains a separate supported path.

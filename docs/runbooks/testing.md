@@ -14,7 +14,7 @@ What this verifies:
 - `bash -n` for every `scripts/**/*.sh` file, including sourced smoke modules and shell fixtures
 - `node --check gnome-extension/extension.js`
 - `gjs -m gnome-extension/tests/run.js` (GNOME Companion contract harness, only if `gjs` is installed)
-- Linux only: `bash scripts/test-install.sh` (isolated installer/service ownership and lifecycle, plus literal-prefix PATH suggestions for installed bash/zsh/fish). Other hosts explicitly skip this `/proc`-dependent fixture and continue the remaining checks; native macOS installation remains a separate verification path.
+- Linux only: `bash scripts/test-install.sh` (isolated installer and service ownership, XDG-to-systemd cutover and failure paths, and literal-prefix PATH suggestions for installed bash, zsh, and fish). Other hosts explicitly skip this `/proc`-dependent fixture and continue the remaining checks; native macOS installation remains a separate verification path.
 - `node kwin-script/tests/run.js` and `qmllint kwin-script/contents/code/main.js` when available (native Qt syntax)
 - module-aware Node syntax checks for JavaScript fixtures under `scripts/` and `src/`
 - Python parsing of every `scripts/**/*.py` file, including extracted smoke fixtures
@@ -152,11 +152,13 @@ an observed-state wait, followed by captured-window identity and frame checks.
 The virtual pointer is created before leaving startup Overview because creating
 that device can reopen it.
 
-The X11 adapter owns exclusive `XGrabKey` accelerators (including CapsLock/NumLock variants); `xdotool` XTEST injection reaches these grabs without delivering the accelerator to the focused application. It does not require XRecord. The owned Openbox fixture uses an empty keyboard map so distro defaults do not preempt the test chords; a separate competing client proves real grab refusal.
+The X11 adapter owns exclusive `XGrabKey` accelerators. Mapped Caps Lock, Num Lock, and Scroll Lock do not affect the chord. `xdotool` XTEST injection reaches these grabs without delivering the accelerator to the focused application. It does not require XRecord. The owned Openbox fixture uses an empty keyboard map so distro defaults do not preempt the test chords; a separate competing client proves real grab refusal.
 
 Pure X11 checks run with `cargo test --lib x11`. The ignored `x11_real_server_grabs_are_exclusive_atomic_and_released` test requires `WZ_X11_TEST_DISPLAY` and, when authentication is enabled, `XAUTHORITY` for an isolated X server, never the user's desktop. Use Xvfb or a separate rootful `Xwayland -geometry 800x600 -shm` on an isolated headless compositor, without `-enable-ei-portal`. Run it with `cargo test --lib x11_real_server_grabs_are_exclusive_atomic_and_released -- --ignored`.
 The gate runs both `x11_real_server*` tests serially on its own display,
-including remapping and a nonstandard NumLock slot. It also temporarily
+including overlapping chords, auto-repeat, remapping, and a nonstandard Num Lock
+slot. The gate adds nonzero GTK shadow extents to the owned editor and checks
+that placement aligns the visible frame. It also temporarily
 constrains its owned client's minimum size, requires a partial-frame error,
 and observes exact Restore before restoring the original hints and baseline.
 

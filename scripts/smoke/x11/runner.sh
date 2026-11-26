@@ -310,6 +310,15 @@ EOF
     stop_app_cleanly 'X11 run quits cleanly' "$run_log"
 
     run_x11_tui_lifecycle
+
+    # Openbox does not composite, so install a shadow property on the owned GTK fixture.
+    xprop -id "$WINDOW_ID" -f _GTK_FRAME_EXTENTS 32c -set _GTK_FRAME_EXTENTS '13, 19, 0, 0'
+    run_x11_dispatch gtk-shadow alt+ctrl+up
+    x11_assert_geometry 'X11 GTK client visible frame excludes shadow' '640,0,640,1080'
+    assert_text 'X11 GTK fixture still has nonzero shadow extents' \
+        '_GTK_FRAME_EXTENTS(CARDINAL) = 13, 19, 0, 0' \
+        "$(xprop -id "$WINDOW_ID" _GTK_FRAME_EXTENTS)"
+
     stop_pid "$editor_pid"
     stop_pid "$openbox_pid"
     stop_pid "$xvfb_pid"

@@ -1,9 +1,12 @@
 #[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "windows")]
 use crate::{DisplayGeometry, FocusedWindow, WindowId, WindowMove, WindowSystem};
 use crate::{Rect, WindowSystemError};
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{BOOL, E_ACCESSDENIED, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 #[cfg(target_os = "windows")]
@@ -15,16 +18,30 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow, IsZoomed,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
-    WS_CAPTION, WS_THICKFRAME,
+    GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, IsHungAppWindow, IsIconic,
+    IsWindow, IsZoomed, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetWindowPos, ShowWindowAsync, WS_CAPTION, WS_THICKFRAME,
 };
 #[cfg(target_os = "windows")]
 use windows::core::{s, w};
+
+#[cfg(target_os = "windows")]
+const PLACEMENT_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[cfg(target_os = "windows")]
+fn wait_for_next_observation(deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    true
+}
 
 #[cfg(target_os = "windows")]
 fn window_is_arranged(hwnd: HWND) -> Option<bool> {
@@ -42,28 +59,41 @@ fn window_is_arranged(hwnd: HWND) -> Option<bool> {
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Debug)]
-pub struct WindowsWindowSystem {
-    dpi_error: Option<String>,
+struct PerMonitorDpi(DPI_AWARENESS_CONTEXT);
+
+#[cfg(target_os = "windows")]
+impl PerMonitorDpi {
+    fn enter() -> Result<Self, WindowSystemError> {
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.0.is_null() {
+            return Err(WindowSystemError::Platform(
+                "failed to enable per-monitor-v2 DPI awareness on the Windows geometry thread"
+                    .to_string(),
+            ));
+        }
+        Ok(Self(previous))
+    }
 }
+
+#[cfg(target_os = "windows")]
+impl Drop for PerMonitorDpi {
+    fn drop(&mut self) {
+        unsafe { SetThreadDpiAwarenessContext(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct WindowsWindowSystem;
 
 #[cfg(target_os = "windows")]
 impl WindowsWindowSystem {
     pub fn new() -> Self {
-        let dpi_error =
-            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
-                .err()
-                // Windows returns access denied when a manifest or earlier call set awareness.
-                .filter(|error| error.code() != E_ACCESSDENIED)
-                .map(|error| format!("failed to enable per-monitor-v2 DPI awareness: {error}"));
-        Self { dpi_error }
-    }
-
-    fn dpi_status(&self) -> Result<(), WindowSystemError> {
-        match &self.dpi_error {
-            Some(error) => Err(WindowSystemError::Platform(error.clone())),
-            None => Ok(()),
-        }
+        // The process default is for native UI; geometry requires its own thread context.
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        Self
     }
 
     fn window_error(hwnd: HWND, id: &WindowId, message: String) -> WindowSystemError {
@@ -72,6 +102,17 @@ impl WindowsWindowSystem {
         } else {
             WindowSystemError::WindowGone(id.clone())
         }
+    }
+
+    fn require_responsive(hwnd: HWND, id: &WindowId) -> Result<(), WindowSystemError> {
+        if unsafe { IsHungAppWindow(hwnd) }.as_bool() {
+            return Err(Self::window_error(
+                hwnd,
+                id,
+                "Windows window is not responding".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn frame_rect(hwnd: HWND, id: &WindowId, visible: bool) -> Result<Rect, WindowSystemError> {
@@ -137,7 +178,7 @@ impl WindowsWindowSystem {
                 target.y,
                 width,
                 height,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
             )
         }
         .map_err(|error| Self::window_error(hwnd, id, format!("SetWindowPos failed: {error}")))
@@ -154,7 +195,7 @@ impl Default for WindowsWindowSystem {
 #[cfg(target_os = "windows")]
 impl WindowSystem for WindowsWindowSystem {
     fn focused_window(&self) -> Result<Option<FocusedWindow>, WindowSystemError> {
-        self.dpi_status()?;
+        let _dpi = PerMonitorDpi::enter()?;
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
             return Ok(None);
@@ -165,7 +206,7 @@ impl WindowSystem for WindowsWindowSystem {
     }
 
     fn displays(&self) -> Result<Vec<DisplayGeometry>, WindowSystemError> {
-        self.dpi_status()?;
+        let _dpi = PerMonitorDpi::enter()?;
         let mut displays = Vec::<DisplayGeometry>::new();
 
         let result = unsafe {
@@ -187,7 +228,7 @@ impl WindowSystem for WindowsWindowSystem {
     }
 
     fn move_window(&mut self, window_move: &WindowMove) -> Result<(), WindowSystemError> {
-        self.dpi_status()?;
+        let _dpi = PerMonitorDpi::enter()?;
         let id = &window_move.window;
         let value = id.as_str().parse::<usize>().map_err(|_| {
             WindowSystemError::Platform("invalid Windows window identity".to_string())
@@ -196,6 +237,7 @@ impl WindowSystem for WindowsWindowSystem {
         if !unsafe { IsWindow(hwnd) }.as_bool() {
             return Err(WindowSystemError::WindowGone(id.clone()));
         }
+        Self::require_responsive(hwnd, id)?;
 
         let before = Self::frame_rect(hwnd, id, true)?;
         let maximized = unsafe { IsZoomed(hwnd) }.as_bool();
@@ -210,46 +252,93 @@ impl WindowSystem for WindowsWindowSystem {
                 "cannot move a non-resizable Windows window".to_string(),
             ));
         }
+        let target = window_move.target;
+        let deadline = Instant::now() + PLACEMENT_TIMEOUT;
         let result = (|| {
-            // Older Windows cannot report the snapped state. Restoring a
-            // normal window is harmless, and keeps snapped placement working.
-            if maximized || minimized || window_is_arranged(hwnd).unwrap_or(true) {
-                // SW_RESTORE activates a captured window even if focus changed
-                // since dispatch. This restores it without stealing focus.
-                let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+            // Older Windows cannot report a snap. Request a restore when the frame needs moving.
+            let needs_restore =
+                maximized || minimized || window_is_arranged(hwnd).unwrap_or(before != target);
+            let visible = if needs_restore {
+                // SW_RESTORE would activate the captured window even if focus changed.
+                if !unsafe { ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE) }.as_bool() {
+                    return Err(Self::window_error(
+                        hwnd,
+                        id,
+                        "ShowWindowAsync could not restore the Windows window".to_string(),
+                    ));
+                }
+                while unsafe { IsZoomed(hwnd).as_bool() || IsIconic(hwnd).as_bool() }
+                    || window_is_arranged(hwnd).unwrap_or(false)
+                {
+                    Self::require_responsive(hwnd, id)?;
+                    if !wait_for_next_observation(deadline) {
+                        return Err(WindowSystemError::Platform(
+                            "Windows window did not restore before the placement deadline"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Self::frame_rect(hwnd, id, true)?
+            } else {
+                before
+            };
+            if visible == target || Instant::now() >= deadline {
+                return Ok(visible);
             }
-
             let outer = Self::frame_rect(hwnd, id, false)?;
-            let visible = Self::frame_rect(hwnd, id, true)?;
-            let target = compensate_invisible_borders(window_move.target, outer, visible)?;
-            Self::set_frame(hwnd, id, target)?;
+            let outer_target = compensate_invisible_borders(target, outer, visible)?;
+            Self::require_responsive(hwnd, id)?;
+            Self::set_frame(hwnd, id, outer_target)?;
 
-            // Crossing DPI boundaries can change invisible borders during SetWindowPos.
-            let mut visible = Self::frame_rect(hwnd, id, true)?;
-            if visible != window_move.target {
-                let outer = Self::frame_rect(hwnd, id, false)?;
-                let target = compensate_invisible_borders(window_move.target, outer, visible)?;
-                Self::set_frame(hwnd, id, target)?;
-                visible = Self::frame_rect(hwnd, id, true)?;
+            let mut last_frames = None;
+            let mut corrected = false;
+            loop {
+                Self::require_responsive(hwnd, id)?;
+                let observed = Self::frame_rect(hwnd, id, true)?;
+                if observed == target || Instant::now() >= deadline {
+                    return Ok(observed);
+                }
+
+                if corrected || observed != visible {
+                    // DWM can lag the outer frame. Require two matching pairs
+                    // before deciding whether the borders need correction.
+                    let outer = if corrected {
+                        None
+                    } else {
+                        Some(Self::frame_rect(hwnd, id, false)?)
+                    };
+                    if last_frames.replace((outer, observed)) == Some((outer, observed)) {
+                        let Some(outer) = outer else {
+                            return Ok(observed);
+                        };
+                        let adjusted = compensate_invisible_borders(target, outer, observed)?;
+                        if adjusted == outer_target {
+                            return Ok(observed);
+                        }
+                        Self::set_frame(hwnd, id, adjusted)?;
+                        corrected = true;
+                        last_frames = None;
+                    }
+                } else {
+                    last_frames = None;
+                }
+                if !wait_for_next_observation(deadline) {
+                    return Ok(observed);
+                }
             }
-            verify_placement(window_move.target, visible)
         })();
-        result.map_err(|error| {
-            if matches!(
-                error,
-                WindowSystemError::WindowGone(_) | WindowSystemError::PartialMove { .. }
-            ) {
-                return error;
-            }
-            match Self::frame_rect(hwnd, id, true) {
+        match result {
+            Ok(observed) => verify_placement(before, target, observed),
+            Err(error @ WindowSystemError::WindowGone(_)) => Err(error),
+            Err(error) => Err(match Self::frame_rect(hwnd, id, true) {
                 Ok(observed) if observed != before => WindowSystemError::PartialMove {
                     observed,
                     message: error.to_string(),
                 },
                 Err(gone @ WindowSystemError::WindowGone(_)) => gone,
                 _ => error,
-            }
-        })
+            }),
+        }
     }
 }
 
@@ -314,31 +403,74 @@ fn compensate_invisible_borders(
     ))
 }
 
-fn verify_placement(target: Rect, observed: Rect) -> Result<(), WindowSystemError> {
-    if observed != target {
-        return Err(WindowSystemError::PartialMove {
-            observed,
-            message: format!(
-                "window constrained placement: requested {target:?}, observed {observed:?}"
-            ),
-        });
+fn verify_placement(before: Rect, target: Rect, observed: Rect) -> Result<(), WindowSystemError> {
+    if observed == target {
+        return Ok(());
     }
-    Ok(())
+    let message = format!(
+        "Windows window did not apply placement: requested {target:?}, observed {observed:?}"
+    );
+    Err(if observed != before {
+        WindowSystemError::PartialMove { observed, message }
+    } else {
+        WindowSystemError::Platform(message)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn geometry_uses_per_monitor_dpi_and_restores_the_callers_context() {
+        use windows::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_UNAWARE,
+            GetThreadDpiAwarenessContext,
+        };
+
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
+        assert!(!previous.0.is_null());
+        let _restore = PerMonitorDpi(previous);
+        {
+            let _dpi = PerMonitorDpi::enter().unwrap();
+            assert!(unsafe {
+                AreDpiAwarenessContextsEqual(
+                    GetThreadDpiAwarenessContext(),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                )
+                .as_bool()
+            });
+        }
+        assert!(unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_UNAWARE,
+            )
+            .as_bool()
+        });
+    }
+
     #[test]
     fn constrained_placement_reports_observed_frame_instead_of_success() {
+        let before = Rect::new(120, 100, 800, 600);
         let target = Rect::new(-1920, 0, 480, 1080);
         let observed = Rect::new(-1920, 0, 640, 1080);
         assert!(matches!(
-            verify_placement(target, observed),
+            verify_placement(before, target, observed),
             Err(WindowSystemError::PartialMove { observed: frame, .. }) if frame == observed
         ));
-        assert_eq!(verify_placement(target, target), Ok(()));
+        assert_eq!(verify_placement(before, target, target), Ok(()));
+    }
+
+    #[test]
+    fn unchanged_frame_is_refused_instead_of_reported_as_a_partial_move() {
+        let before = Rect::new(120, 100, 800, 600);
+        let target = Rect::new(-1920, 0, 480, 1080);
+        assert!(matches!(
+            verify_placement(before, target, before),
+            Err(WindowSystemError::Platform(_))
+        ));
     }
 
     #[test]

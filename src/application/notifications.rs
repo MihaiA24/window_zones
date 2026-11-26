@@ -17,6 +17,9 @@ use super::backends::RuntimeBackend;
 const HOTKEY_OUTAGE_GRACE: Duration = Duration::from_secs(20);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+const DELIVERY_RETRY: Duration = Duration::from_secs(1);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProblemKind {
     Config,
@@ -25,9 +28,20 @@ enum ProblemKind {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 enum Notification {
     Problem(String),
     Resolved(String),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Notification {
+    fn text(&self) -> (&'static str, &str) {
+        match self {
+            Self::Problem(body) => ("Window Zones needs attention", body),
+            Self::Resolved(body) => ("Window Zones", body),
+        }
+    }
 }
 
 /// Decides which runtime events become desktop notifications. Config problems
@@ -38,12 +52,15 @@ enum Notification {
 #[derive(Debug, Default)]
 struct NotificationPolicy {
     pending_outage: Option<(Instant, String)>,
+    pending_config: Option<(Instant, Notification)>,
+    pending_hotkeys: Option<(Instant, Notification)>,
+    in_flight: Option<ProblemKind>,
     shown: Option<ProblemKind>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NotificationPolicy {
-    fn event(&mut self, event: &RuntimeEvent, now: Instant) -> Option<Notification> {
+    fn event(&mut self, event: &RuntimeEvent, now: Instant) {
         let resolved = match event {
             RuntimeEvent::HotkeysUnavailable { .. } => {
                 let since = self
@@ -51,45 +68,77 @@ impl NotificationPolicy {
                     .as_ref()
                     .map_or(now, |(since, _)| *since);
                 self.pending_outage = Some((since, event.to_string()));
-                return None;
+                return;
             }
             RuntimeEvent::ConfigFailed { .. }
             | RuntimeEvent::ConfigPending { .. }
             | RuntimeEvent::ConfigRejected { .. } => {
-                return Some(self.problem(ProblemKind::Config, event));
+                self.pending_config = Some((now, Notification::Problem(event.to_string())));
+                return;
             }
             RuntimeEvent::HotkeysRejected { .. } => {
                 self.pending_outage = None;
-                return Some(self.problem(ProblemKind::Hotkeys, event));
+                self.pending_hotkeys = Some((now, Notification::Problem(event.to_string())));
+                return;
             }
             RuntimeEvent::ConfigLoaded { .. } => ProblemKind::Config,
             RuntimeEvent::HotkeysRegistered { .. } | RuntimeEvent::HotkeysRecovered { .. } => {
                 self.pending_outage = None;
                 ProblemKind::Hotkeys
             }
-            RuntimeEvent::ConfigMissing { .. } => return None,
+            RuntimeEvent::ConfigMissing { .. } => {
+                self.pending_config = None;
+                if self.in_flight == Some(ProblemKind::Config) {
+                    self.in_flight = None;
+                }
+                return;
+            }
         };
-        if self.shown == Some(resolved) {
-            self.shown = None;
-            return Some(Notification::Resolved(event.to_string()));
-        }
-        None
+        let relevant = self.shown == Some(resolved) || self.in_flight == Some(resolved);
+        *self.pending(resolved) =
+            relevant.then(|| (now, Notification::Resolved(event.to_string())));
     }
 
-    /// Shows an outage that has lasted past the grace period.
-    fn tick(&mut self, now: Instant) -> Option<Notification> {
+    fn pending(&mut self, kind: ProblemKind) -> &mut Option<(Instant, Notification)> {
+        match kind {
+            ProblemKind::Config => &mut self.pending_config,
+            ProblemKind::Hotkeys => &mut self.pending_hotkeys,
+        }
+    }
+
+    fn next(&mut self, now: Instant) -> Option<(ProblemKind, Notification)> {
+        let shown = self.shown;
+        for kind in [ProblemKind::Config, ProblemKind::Hotkeys] {
+            let pending = self.pending(kind);
+            if pending.as_ref().is_some_and(|(at, _)| now >= *at)
+                && let Some((_, notification)) = pending.take()
+                && (matches!(notification, Notification::Problem(_)) || shown == Some(kind))
+            {
+                self.in_flight = Some(kind);
+                return Some((kind, notification));
+            }
+        }
         let (since, _) = self.pending_outage.as_ref()?;
-        if now.duration_since(*since) < HOTKEY_OUTAGE_GRACE {
+        if self.pending_hotkeys.is_some() || now.duration_since(*since) < HOTKEY_OUTAGE_GRACE {
             return None;
         }
         let (_, message) = self.pending_outage.take()?;
-        self.shown = Some(ProblemKind::Hotkeys);
-        Some(Notification::Problem(message))
+        self.in_flight = Some(ProblemKind::Hotkeys);
+        Some((ProblemKind::Hotkeys, Notification::Problem(message)))
     }
 
-    fn problem(&mut self, kind: ProblemKind, event: &RuntimeEvent) -> Notification {
-        self.shown = Some(kind);
-        Notification::Problem(event.to_string())
+    fn complete(&mut self, kind: ProblemKind, notice: Notification, now: Instant, delivered: bool) {
+        let in_flight = self.in_flight.take();
+        if delivered {
+            self.shown = match notice {
+                Notification::Problem(_) => Some(kind),
+                Notification::Resolved(_) => None,
+            };
+        } else if in_flight == Some(kind) {
+            // An event received during delivery may have replaced or resolved this problem.
+            self.pending(kind)
+                .get_or_insert((now + DELIVERY_RETRY, notice));
+        }
     }
 }
 
@@ -102,6 +151,8 @@ pub(super) struct Notifier {
     connection: Option<dbus::blocking::Connection>,
     #[cfg(target_os = "linux")]
     notification_id: u32,
+    #[cfg(target_os = "macos")]
+    delivery: Option<thread::JoinHandle<(ProblemKind, Notification, bool)>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -116,32 +167,53 @@ impl Notifier {
             connection: None,
             #[cfg(target_os = "linux")]
             notification_id: 0,
+            #[cfg(target_os = "macos")]
+            delivery: None,
         })
     }
 
     pub(super) fn event(&mut self, event: &RuntimeEvent, now: Instant) {
-        if let Some(notification) = self.policy.event(event, now) {
-            self.show(notification);
-        }
+        self.policy.event(event, now);
+        self.tick(now);
     }
 
     pub(super) fn tick(&mut self, now: Instant) {
-        if let Some(notification) = self.policy.tick(now) {
-            self.show(notification);
+        #[cfg(target_os = "macos")]
+        if let Some(delivery) = self.delivery.as_ref() {
+            if !delivery.is_finished() {
+                return;
+            }
+            if let Ok((kind, notification, delivered)) = self.delivery.take().unwrap().join() {
+                self.policy.complete(kind, notification, now, delivered);
+            } else {
+                self.policy.in_flight = None;
+            }
+        }
+        if let Some((kind, notification)) = self.policy.next(now) {
+            #[cfg(target_os = "linux")]
+            {
+                let delivered = self.show(&notification);
+                self.policy.complete(kind, notification, now, delivered);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // Delivery runs off the hotkey thread and its child is always reaped.
+                self.delivery = Some(thread::spawn(move || {
+                    let delivered = Self::show(&notification);
+                    (kind, notification, delivered)
+                }));
+            }
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn show(&mut self, notification: Notification) {
-        let (summary, body) = match &notification {
-            Notification::Problem(body) => ("Window Zones needs attention", body),
-            Notification::Resolved(body) => ("Window Zones", body),
-        };
+    fn show(&mut self, notification: &Notification) -> bool {
+        let (summary, body) = notification.text();
         if self.connection.is_none() {
             self.connection = dbus::blocking::Connection::new_session().ok();
         }
         let Some(connection) = &self.connection else {
-            return;
+            return false;
         };
         let proxy = connection.with_proxy(
             "org.freedesktop.Notifications",
@@ -157,49 +229,48 @@ impl Notifier {
                 self.notification_id,
                 "preferences-system-windows",
                 summary,
-                body.as_str(),
+                body,
                 Vec::<String>::new(),
                 hints,
                 -1_i32,
             ),
         );
         match result {
-            Ok((id,)) => self.notification_id = id,
+            Ok((id,)) => {
+                self.notification_id = id;
+                true
+            }
             Err(error) => {
                 window_zones::logging::diagnostic(format_args!(
                     "Desktop notification failed: {error}"
                 ));
                 self.connection = None;
+                false
             }
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn show(&mut self, notification: Notification) {
-        let (summary, body) = match notification {
-            Notification::Problem(body) => ("Window Zones needs attention", body),
-            Notification::Resolved(body) => ("Window Zones", body),
-        };
+    fn show(notification: &Notification) -> bool {
+        let (summary, body) = notification.text();
         // argv transports user/config text without interpreting it as a script.
-        // Delivery runs off the hotkey thread and its child is always reaped.
-        thread::spawn(move || {
-            let result = std::process::Command::new("osascript")
-                .args([
-                    "-l", "JavaScript", "-e",
-                    "function run(argv) { const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification(argv[1], {withTitle: argv[0]}); }",
-                    "--", summary, &body,
-                ])
-                .status();
-            match result {
-                Ok(status) if status.success() => {}
-                Ok(status) => window_zones::logging::diagnostic(format_args!(
-                    "Desktop notification failed: {status}"
-                )),
-                Err(error) => window_zones::logging::diagnostic(format_args!(
-                    "Desktop notification failed: {error}"
-                )),
-            }
-        });
+        let result = std::process::Command::new("osascript")
+            .args([
+                "-l", "JavaScript", "-e",
+                "function run(argv) { const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification(argv[1], {withTitle: argv[0]}); }",
+                "--", summary, body,
+            ])
+            .status();
+        match result {
+            Ok(status) if status.success() => return true,
+            Ok(status) => window_zones::logging::diagnostic(format_args!(
+                "Desktop notification failed: {status}"
+            )),
+            Err(error) => window_zones::logging::diagnostic(format_args!(
+                "Desktop notification failed: {error}"
+            )),
+        }
+        false
     }
 }
 
@@ -223,7 +294,32 @@ mod tests {
 
     use window_zones::RuntimeEvent;
 
-    use super::{HOTKEY_OUTAGE_GRACE, Notification, NotificationPolicy};
+    use super::{DELIVERY_RETRY, HOTKEY_OUTAGE_GRACE, Notification, NotificationPolicy};
+
+    #[derive(Default)]
+    struct TestNotifier(NotificationPolicy);
+
+    impl TestNotifier {
+        fn event(&mut self, event: &RuntimeEvent, now: Instant) -> Option<Notification> {
+            self.0.event(event, now);
+            self.tick(now)
+        }
+
+        fn tick(&mut self, now: Instant) -> Option<Notification> {
+            self.deliver(now, |_| true)
+        }
+
+        fn deliver(
+            &mut self,
+            now: Instant,
+            notify: impl FnOnce(&Notification) -> bool,
+        ) -> Option<Notification> {
+            let (kind, notification) = self.0.next(now)?;
+            self.0
+                .complete(kind, notification.clone(), now, notify(&notification));
+            Some(notification)
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -235,7 +331,7 @@ mod tests {
         let start = Instant::now();
 
         // Login race: the companion appears a few seconds after the App.
-        let mut login = NotificationPolicy::default();
+        let mut login = TestNotifier::default();
         let login_notifications = [
             login.event(&RuntimeEvent::ConfigLoaded { bindings: 18 }, start),
             login.event(&unavailable, start),
@@ -245,7 +341,7 @@ mod tests {
         ];
 
         // The companion stays away: one notification, then its resolution.
-        let mut outage = NotificationPolicy::default();
+        let mut outage = TestNotifier::default();
         outage.event(&unavailable, start);
         let before_grace = outage.tick(start + HOTKEY_OUTAGE_GRACE - Duration::from_secs(1));
         let after_grace = outage.tick(start + HOTKEY_OUTAGE_GRACE);
@@ -268,7 +364,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn changing_outage_diagnostics_do_not_restart_the_grace_period() {
-        let mut policy = NotificationPolicy::default();
+        let mut policy = TestNotifier::default();
         let start = Instant::now();
         policy.event(
             &RuntimeEvent::HotkeysUnavailable {
@@ -292,7 +388,7 @@ mod tests {
 
     #[test]
     fn pending_config_notifies_and_only_acceptance_resolves_it() {
-        let mut policy = NotificationPolicy::default();
+        let mut policy = TestNotifier::default();
         let start = Instant::now();
         policy.event(
             &RuntimeEvent::HotkeysUnavailable {
@@ -329,7 +425,7 @@ mod tests {
             message: "ctrl+super+c is taken".to_string(),
         };
         let loaded = RuntimeEvent::ConfigLoaded { bindings: 18 };
-        let mut policy = NotificationPolicy::default();
+        let mut policy = TestNotifier::default();
 
         let config_problem = policy.event(&failed, start);
         let config_fixed = policy.event(&loaded, start);
@@ -352,5 +448,32 @@ mod tests {
         );
         assert_eq!(unrelated_reload, None);
         assert!(matches!(hotkeys_fixed, Some(Notification::Resolved(_))));
+    }
+
+    #[test]
+    fn undelivered_config_warning_retries_until_shown_or_fixed() {
+        let start = Instant::now();
+        let failed = RuntimeEvent::ConfigFailed {
+            message: "bad toml".into(),
+        };
+        let problem = Some(Notification::Problem(failed.to_string()));
+        let loaded = RuntimeEvent::ConfigLoaded { bindings: 18 };
+        let mut notifier = TestNotifier::default();
+
+        notifier.0.event(&failed, start);
+        assert_eq!(notifier.deliver(start, |_| false), problem);
+        assert_eq!(notifier.tick(start), None);
+        assert_eq!(notifier.tick(start + DELIVERY_RETRY), problem);
+        assert_eq!(notifier.tick(start + DELIVERY_RETRY * 2), None);
+        assert_eq!(
+            notifier.event(&loaded, start + DELIVERY_RETRY * 2),
+            Some(Notification::Resolved(loaded.to_string()))
+        );
+
+        let later = start + DELIVERY_RETRY * 3;
+        notifier.0.event(&failed, later);
+        assert_eq!(notifier.deliver(later, |_| false), problem);
+        assert_eq!(notifier.event(&loaded, later), None);
+        assert_eq!(notifier.tick(later + DELIVERY_RETRY), None);
     }
 }

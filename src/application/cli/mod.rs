@@ -51,7 +51,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
     let mut config_path = None;
     let mut perf_log_path = None;
     let mut log_file_path = None;
-    let mut backend = BackendPreference::Auto;
+    let mut backend = None;
     let mut show_tray = false;
     let mut chord = None;
     let mut force = false;
@@ -61,24 +61,38 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         let arg = &args[index];
 
         match arg.as_str() {
-            "--config" | "--perf-log" | "--log-file" | "--backend" | "--chord" => {
-                let Some(value) = args.get(index + 1).filter(|value| !value.starts_with('-'))
-                else {
-                    return ParseStatus::Err(format!("{arg} requires a value"));
+            "--config" | "--perf-log" | "--log-file" | "--backend" | "--chord" | "--dry-run" => {
+                let value = if arg == "--dry-run" {
+                    "dry-run"
+                } else {
+                    let Some(value) = args.get(index + 1).filter(|value| !value.starts_with('-'))
+                    else {
+                        return ParseStatus::Err(format!("{arg} requires a value"));
+                    };
+                    index += 1;
+                    value.as_str()
                 };
                 match arg.as_str() {
                     "--config" => config_path = Some(PathBuf::from(value)),
                     "--perf-log" => perf_log_path = Some(PathBuf::from(value)),
                     "--log-file" => log_file_path = Some(PathBuf::from(value)),
-                    "--backend" => match parse_backend_preference(value) {
-                        Ok(value) => backend = value,
-                        Err(message) => return ParseStatus::Err(message),
-                    },
-                    _ => chord = Some(value.clone()),
+                    "--backend" | "--dry-run" => {
+                        let preference = match parse_backend_preference(value) {
+                            Ok(preference) => preference,
+                            Err(message) => return ParseStatus::Err(message),
+                        };
+                        if let Some((previous, _)) = backend
+                            && previous != value
+                        {
+                            return ParseStatus::Err(format!(
+                                "conflicting backend selections: `{previous}` and `{value}`"
+                            ));
+                        }
+                        backend = Some((value, preference));
+                    }
+                    _ => chord = Some(value.to_owned()),
                 }
-                index += 1;
             }
-            "--dry-run" => backend = BackendPreference::DryRun,
             "--tray" => show_tray = true,
             "--force" => force = true,
             "status" | "dispatch" | "tui" | "run" | "init" => {
@@ -145,7 +159,7 @@ fn parse_args_from_inputs(args: &[String]) -> ParseStatus {
         config_path,
         perf_log_path,
         log_file_path,
-        backend,
+        backend: backend.map_or(BackendPreference::Auto, |(_, preference)| preference),
         show_tray,
         chord,
         force,
@@ -201,6 +215,34 @@ mod tests {
         assert!(matches!(
             args.backend,
             crate::application::backends::BackendPreference::DryRun
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_backends_in_either_order() {
+        for (first, second) in [
+            (&["--dry-run"][..], &["--backend", "auto"][..]),
+            (&["--backend", "dry-run"][..], &["--backend", "auto"][..]),
+            #[cfg(target_os = "linux")]
+            (&["--dry-run"][..], &["--backend", "x11"][..]),
+        ] {
+            for (left, right) in [(first, second), (second, first)] {
+                let inputs = [left, &["dispatch", "Ctrl+Alt+Left"], right].concat();
+                assert!(
+                    matches!(parse(&inputs), ParseStatus::Err(message)
+                        if message.contains("conflicting backend selections")
+                            && message.contains("dry-run")),
+                    "{inputs:?}"
+                );
+            }
+        }
+
+        assert!(matches!(
+            parse(&["--dry-run", "--backend", "dry-run", "status"]),
+            ParseStatus::Ok(CliArgs {
+                backend: crate::application::backends::BackendPreference::DryRun,
+                ..
+            })
         ));
     }
 

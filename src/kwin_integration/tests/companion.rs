@@ -72,6 +72,160 @@ fn enqueue_budgets_count_pending_work_but_not_uncollected_results() {
 }
 
 #[test]
+fn disconnected_controller_leaves_other_clients_work_and_results_intact() {
+    let bus = RealBus::new();
+    let script = Connection::new_address(&bus.address).unwrap();
+    let script_proxy = script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    script_proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "RegisterCompanion",
+            (KWIN_PROTOCOL_MAJOR.to_string(), true),
+        )
+        .unwrap();
+    let next = || {
+        script_proxy
+            .method_call::<NextRequestPayload, _, _, _>(KWIN_INTERFACE, "NextRequest", ())
+            .unwrap()
+    };
+    let complete = |id: u32| {
+        script_proxy
+            .method_call::<(), _, _, _>(
+                KWIN_INTERFACE,
+                "CompleteRequest",
+                (id.to_string(), true, "", ""),
+            )
+            .unwrap();
+    };
+    let enqueue = |connection: &Connection, window: &str| {
+        let (id, _): (u32, u64) = connection
+            .with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT)
+            .method_call(
+                KWIN_INTERFACE,
+                "MoveWindow",
+                (window, 10_i32, 20_i32, 800_u32, 600_u32),
+            )
+            .unwrap();
+        id
+    };
+    let result = |connection: &Connection, id: u32| {
+        connection
+            .with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT)
+            .method_call::<(bool, String, String), _, _, _>(
+                KWIN_INTERFACE,
+                "GetRequestResult",
+                (id.to_string(),),
+            )
+            .unwrap()
+    };
+
+    let controller = Connection::new_address(&bus.address).unwrap();
+    let (registration, _): (u32, u64) = controller
+        .with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT)
+        .method_call(KWIN_INTERFACE, "RegisterHotkeys", (r#"["alt+ctrl+left"]"#,))
+        .unwrap();
+    assert_eq!(next().0, registration);
+    complete(registration);
+
+    let dispatch = Connection::new_address(&bus.address).unwrap();
+    let applied = enqueue(&dispatch, "applied");
+    assert_eq!(next().0, applied);
+    complete(applied);
+    assert_eq!(
+        result(&controller, applied).1,
+        "org.window_zones.KWin.Error.Unavailable"
+    );
+    let claimed = enqueue(&dispatch, "claimed");
+    assert_eq!(next().0, claimed);
+    enqueue(&controller, "controller");
+    let abandoned = Connection::new_address(&bus.address).unwrap();
+    enqueue(&abandoned, "abandoned");
+    let queued = enqueue(&dispatch, "queued");
+    let disconnected = [
+        controller.unique_name().to_string(),
+        abandoned.unique_name().to_string(),
+    ];
+    drop(controller);
+    drop(abandoned);
+
+    let daemon = script.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        CALL_TIMEOUT,
+    );
+    let deadline = Instant::now() + CALL_TIMEOUT;
+    for owner in &disconnected {
+        loop {
+            let (present,): (bool,) = daemon
+                .method_call("org.freedesktop.DBus", "NameHasOwner", (owner.as_str(),))
+                .unwrap();
+            if !present {
+                break;
+            }
+            assert!(Instant::now() < deadline, "client did not disconnect");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    assert_eq!(
+        result(&dispatch, applied),
+        (true, String::new(), String::new())
+    );
+    assert_eq!(
+        result(&dispatch, claimed),
+        (false, String::new(), String::new())
+    );
+    complete(claimed);
+    assert_eq!(
+        result(&dispatch, claimed),
+        (true, String::new(), String::new())
+    );
+    assert_eq!(
+        next().0,
+        queued,
+        "the disconnected clients' moves must not be claimed"
+    );
+    let release = next();
+    assert_eq!(release.1, REQUEST_REGISTER_HOTKEYS);
+    assert_eq!(release.7, "[]");
+}
+
+#[test]
+fn script_cannot_claim_a_move_past_its_advertised_budget() {
+    let bus = RealBus::new();
+    let script = Connection::new_address(&bus.address).unwrap();
+    let script_proxy =
+        script.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, Duration::from_secs(3));
+    script_proxy
+        .method_call::<(), _, _, _>(
+            KWIN_INTERFACE,
+            "RegisterCompanion",
+            (KWIN_PROTOCOL_MAJOR.to_string(), true),
+        )
+        .unwrap();
+    let client = Connection::new_address(&bus.address).unwrap();
+    let proxy = client.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    let (id, timeout_ms): (u32, u64) = proxy
+        .method_call(
+            KWIN_INTERFACE,
+            "MoveWindow",
+            ("window-1", -10_i32, 20_i32, 800_u32, 600_u32),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(timeout_ms));
+    // Keep the enqueuing client connected so only the deadline can cancel the move.
+    let request: NextRequestPayload = script_proxy
+        .method_call(KWIN_INTERFACE, "NextRequest", ())
+        .unwrap();
+    assert_eq!(request.0, 0, "a timed-out move must not reach KWin");
+    let (complete, error, _): (bool, String, String) = proxy
+        .method_call(KWIN_INTERFACE, "GetRequestResult", (id.to_string(),))
+        .unwrap();
+    assert!(complete);
+    assert_eq!(error, "org.window_zones.KWin.Error.Unavailable");
+}
+
+#[test]
 fn real_service_hotkey_polling_never_claims_controller() {
     if std::env::var_os("WINDOW_ZONES_KWIN_SERVICE_TEST_CHILD").is_some() {
         run_kwin_companion_service().unwrap();
@@ -248,7 +402,15 @@ fn idle_next_request_waits_but_queued_move_wakes_it() {
             if state.script_state.pending_next_request.is_some() {
                 return state
                     .script_state
-                    .enqueue_move("window-1".to_string(), -1, 2, 800, 600);
+                    .enqueue_move(
+                        "client".to_string(),
+                        "window-1".to_string(),
+                        -1,
+                        2,
+                        800,
+                        600,
+                    )
+                    .0;
             }
             drop(state);
             assert!(
@@ -277,7 +439,14 @@ fn request_payloads_are_claimed_and_complete_atomically() {
     let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
-    let request_id = state.enqueue_move("window-1".to_string(), -123, 456, 777, 888);
+    let (request_id, _) = state.enqueue_move(
+        "client".to_string(),
+        "window-1".to_string(),
+        -123,
+        456,
+        777,
+        888,
+    );
 
     assert_eq!(
         state.next_request("kwin-script").unwrap(),
@@ -293,14 +462,14 @@ fn request_payloads_are_claimed_and_complete_atomically() {
         )
     );
     assert_eq!(
-        state.request_result(request_id),
+        state.request_result("client", request_id),
         (false, String::new(), String::new())
     );
     state
         .complete_request(request_id, true, String::new(), String::new())
         .unwrap();
     assert_eq!(
-        state.request_result(request_id),
+        state.request_result("client", request_id),
         (true, String::new(), String::new())
     );
 }
@@ -315,18 +484,21 @@ fn request_ids_start_at_one_wrap_and_survive_reconnection() {
         if expected == u32::MAX {
             state.last_request_id = u32::MAX - 1;
         }
-        assert_eq!(state.enqueue_refresh_displays(), expected);
+        assert_eq!(
+            state.enqueue_refresh_displays("client".to_string()).0,
+            expected
+        );
         assert_eq!(state.next_request("kwin-script").unwrap().0, expected);
         state
             .complete_request(expected, true, String::new(), String::new())
             .unwrap();
-        assert!(state.request_result(expected).0);
+        assert!(state.request_result("client", expected).0);
     }
 
     let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "replacement-script".to_string(), true)
         .unwrap();
-    assert_eq!(state.enqueue_refresh_displays(), 2);
+    assert_eq!(state.enqueue_refresh_displays("client".to_string()).0, 2);
     assert_eq!(state.next_request("replacement-script").unwrap().0, 2);
     assert_eq!(state.next_request("replacement-script").unwrap().0, 0);
 }
@@ -337,15 +509,19 @@ fn rejected_hotkey_registration_keeps_previous_set() {
     let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
-    let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+    let (first, _) = state
+        .enqueue_hotkeys("controller".to_string(), vec!["alt+ctrl+left".to_string()])
+        .unwrap();
     let _ = state.next_request("kwin-script").unwrap();
     state
         .complete_request(first, true, String::new(), String::new())
         .unwrap();
-    let _ = state.request_result(first);
+    let _ = state.request_result("controller", first);
     assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
 
-    let second = state.enqueue_hotkeys(vec!["alt+ctrl+right".to_string()]);
+    let (second, _) = state
+        .enqueue_hotkeys("controller".to_string(), vec!["alt+ctrl+right".to_string()])
+        .unwrap();
     let _ = state.next_request("kwin-script").unwrap();
     state
         .complete_request(
@@ -355,7 +531,10 @@ fn rejected_hotkey_registration_keeps_previous_set() {
             "KWin rejected shortcut".to_string(),
         )
         .unwrap();
-    assert_eq!(state.request_result(second).2, "KWin rejected shortcut");
+    assert_eq!(
+        state.request_result("controller", second).2,
+        "KWin rejected shortcut"
+    );
     assert_eq!(state.registered_hotkeys, vec!["alt+ctrl+left"]);
 }
 
@@ -368,7 +547,9 @@ fn empty_registration_releases_controller_after_completion() {
     state
         .authorize_controller("window-zones-1".to_string())
         .unwrap();
-    let request_id = state.enqueue_hotkeys(Vec::new());
+    let (request_id, _) = state
+        .enqueue_hotkeys("window-zones-1".to_string(), Vec::new())
+        .unwrap();
     let _ = state.next_request("kwin-script").unwrap();
     assert!(
         state
@@ -382,7 +563,12 @@ fn empty_registration_releases_controller_after_completion() {
     state
         .authorize_controller("window-zones-2".to_string())
         .unwrap();
-    let request_id = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+    let (request_id, _) = state
+        .enqueue_hotkeys(
+            "window-zones-2".to_string(),
+            vec!["alt+ctrl+left".to_string()],
+        )
+        .unwrap();
     let _ = state.next_request("kwin-script").unwrap();
     state
         .complete_request(request_id, true, String::new(), String::new())
@@ -397,14 +583,18 @@ fn disconnect_release_does_not_release_the_next_controllers_claim() {
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state.authorize_controller("old".to_string()).unwrap();
-    let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+    let (first, _) = state
+        .enqueue_hotkeys("old".to_string(), vec!["alt+ctrl+left".to_string()])
+        .unwrap();
     state.next_request("kwin-script").unwrap();
     state
         .complete_request(first, true, String::new(), String::new())
         .unwrap();
     state.owner_lost("old");
     state.authorize_controller("new".to_string()).unwrap();
-    let replacement = state.enqueue_hotkeys(vec!["alt+ctrl+right".to_string()]);
+    let (replacement, _) = state
+        .enqueue_hotkeys("new".to_string(), vec!["alt+ctrl+right".to_string()])
+        .unwrap();
 
     let release = state.next_request("kwin-script").unwrap();
     assert_eq!(release.7, "[]");
@@ -427,7 +617,9 @@ fn companion_reconnection_releases_keys_left_after_state_loss() {
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
     state.authorize_controller("old".to_string()).unwrap();
-    let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+    let (first, _) = state
+        .enqueue_hotkeys("old".to_string(), vec!["alt+ctrl+left".to_string()])
+        .unwrap();
     state.next_request("kwin-script").unwrap();
     state
         .complete_request(first, true, String::new(), String::new())
@@ -454,13 +646,15 @@ fn script_reset_makes_inflight_registration_retryable() {
         .authorize_controller("controller".to_string())
         .unwrap();
     let hotkeys = vec!["alt+ctrl+left".to_string()];
-    let interrupted = state.enqueue_hotkeys(hotkeys.clone());
+    let (interrupted, _) = state
+        .enqueue_hotkeys("controller".to_string(), hotkeys.clone())
+        .unwrap();
     assert_eq!(state.next_request("kwin-script").unwrap().0, interrupted);
 
     let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
         .unwrap();
-    let (complete, name, message) = state.request_result(interrupted);
+    let (complete, name, message) = state.request_result("controller", interrupted);
     assert!(complete);
     assert!(matches!(
         classify_dbus_error(dbus::Error::new_custom(&name, &message)).into_hotkey_error(),
@@ -468,7 +662,9 @@ fn script_reset_makes_inflight_registration_retryable() {
     ));
     assert!(state.registered_hotkeys.is_empty());
 
-    let retry = state.enqueue_hotkeys(hotkeys.clone());
+    let (retry, _) = state
+        .enqueue_hotkeys("controller".to_string(), hotkeys.clone())
+        .unwrap();
     assert_ne!(retry, interrupted);
     assert_eq!(state.next_request("kwin-script").unwrap().0, retry);
     assert!(
@@ -481,7 +677,7 @@ fn script_reset_makes_inflight_registration_retryable() {
         .complete_request(retry, true, String::new(), String::new())
         .unwrap();
     assert_eq!(
-        state.request_result(retry),
+        state.request_result("controller", retry),
         (true, String::new(), String::new())
     );
     assert_eq!(state.registered_hotkeys, hotkeys);
@@ -531,12 +727,17 @@ fn script_reset_requeues_registered_hotkeys_once() {
         .authorize_controller("window-zones-1".to_string())
         .unwrap();
 
-    let first = state.enqueue_hotkeys(vec!["alt+ctrl+left".to_string()]);
+    let (first, _) = state
+        .enqueue_hotkeys(
+            "window-zones-1".to_string(),
+            vec!["alt+ctrl+left".to_string()],
+        )
+        .unwrap();
     let _ = state.next_request("kwin-script").unwrap();
     state
         .complete_request(first, true, String::new(), String::new())
         .unwrap();
-    let _ = state.request_result(first);
+    let _ = state.request_result("window-zones-1", first);
 
     let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), true)
@@ -549,7 +750,6 @@ fn script_reset_requeues_registered_hotkeys_once() {
     state
         .complete_request(request_id, true, String::new(), String::new())
         .unwrap();
-    let _ = state.request_result(request_id);
 
     let _ = state
         .mark_ready(KWIN_PROTOCOL_MAJOR, "kwin-script".to_string(), false)

@@ -2,7 +2,7 @@
 import GLib from 'gi://GLib';
 
 // Shell 50 lacks the reduced-motion enum and setting; tests also exercise 51.
-export const settings = {enable_animations: true};
+export const settings = {enable_animations: true, slow_down_factor: 1};
 export const animationSettings = {duration: 250, get_uint() { return this.duration; }};
 export const Clutter = {AnimationMode: {EASE_OUT_QUAD: 0}};
 
@@ -26,8 +26,9 @@ export class TestActor {
     thaw() { this.frozen = false; }
     set_scale(x, y) { this.scale_x = x; this.scale_y = y; }
     ease(properties) {
+        this.animationDuration = Math.floor(properties.duration * settings.slow_down_factor);
         this.onStopped = properties.onStopped;
-        this.transition = GLib.timeout_add(GLib.PRIORITY_DEFAULT, properties.duration, () => {
+        this.transition = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this.animationDuration, () => {
             this.transition = 0;
             Object.assign(this, properties);
             properties.onStopped?.(true);

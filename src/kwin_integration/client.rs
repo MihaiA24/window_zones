@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbus::arg::{AppendAll, ReadAll};
-use dbus::blocking::Connection;
+use dbus::blocking::{Connection, Proxy};
 use parking_lot::Mutex;
 
 use crate::{
@@ -39,7 +39,10 @@ impl KwinWindowSystem {
     }
 
     pub fn capabilities(&self) -> Result<Vec<String>, KwinIntegrationError> {
-        self.with_connection(get_capabilities)
+        self.with_connection(|connection| {
+            let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+            get_capabilities(&proxy)
+        })
     }
 
     #[cfg(test)]
@@ -84,10 +87,8 @@ impl KwinWindowSystem {
         A: AppendAll,
     {
         self.with_connection(|connection| {
-            let capabilities = get_capabilities(connection)?;
-            require_capability(&capabilities, capability)?;
-
             let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+            require_capability(&get_capabilities(&proxy)?, capability)?;
             proxy
                 .method_call(KWIN_INTERFACE, method, args)
                 .map_err(classify_dbus_error)
@@ -165,23 +166,15 @@ impl KwinWindowSystem {
     where
         A: AppendAll,
     {
-        let (request_id, timeout_ms): (u32, u64) =
-            self.call_with_capability(capability, method, args)?;
-
-        let mut connection_slot = self.connection.lock();
-        let connection =
-            connection_slot
-                .as_ref()
-                .ok_or_else(|| KwinIntegrationError::Unavailable {
-                    message: "D-Bus connection was not established".to_string(),
-                })?;
-        let result = wait_for_request(connection, request_id, timeout_ms);
-        if let Err(error) = &result
-            && error.should_reconnect()
-        {
-            *connection_slot = None;
-        }
-        result
+        self.with_connection(|connection| {
+            let owner = companion_owner(connection)?;
+            let proxy = connection.with_proxy(owner.as_str(), KWIN_OBJECT_PATH, CALL_TIMEOUT);
+            require_capability(&get_capabilities(&proxy)?, capability)?;
+            let (request_id, timeout_ms) = proxy
+                .method_call(KWIN_INTERFACE, method, args)
+                .map_err(classify_dbus_error)?;
+            wait_for_request(&proxy, request_id, timeout_ms)
+        })
     }
 }
 
@@ -189,6 +182,7 @@ impl KwinWindowSystem {
 pub struct KwinHotkeySystem {
     bus_address: Option<String>,
     connection: Option<Connection>,
+    registered_owner: Option<String>,
 }
 
 impl fmt::Debug for KwinHotkeySystem {
@@ -211,6 +205,7 @@ impl KwinHotkeySystem {
         Self {
             bus_address: Some(bus_address.into()),
             connection: None,
+            registered_owner: None,
         }
     }
 
@@ -227,31 +222,27 @@ impl KwinHotkeySystem {
     }
 
     fn call_register_hotkeys(&mut self, hotkeys: &[String]) -> Result<(), KwinIntegrationError> {
-        let result = (|| {
+        let result: Result<_, KwinIntegrationError> = (|| {
             let connection = self.ensure_connection()?;
-            let capabilities = get_capabilities(connection)?;
-            require_capability(&capabilities, HOTKEYS_CAPABILITY)?;
-
-            let payload =
-                serde_json::to_string(hotkeys).map_err(|_| KwinIntegrationError::Invalid {
-                    message: "failed to encode hotkey request payload".to_string(),
-                })?;
-            let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
-            let (request_id, timeout_ms): (u32, u64) = proxy
-                .method_call(KWIN_INTERFACE, "RegisterHotkeys", (payload,))
-                .map_err(classify_dbus_error)?;
-            // The script preflights owners and SetShortcut verifies assignment before commit.
-            // A later sampler could refuse an already committed set without rolling it back.
-            wait_for_request(connection, request_id, timeout_ms)
+            let owner = companion_owner(connection)?;
+            let proxy = connection.with_proxy(owner.as_str(), KWIN_OBJECT_PATH, CALL_TIMEOUT);
+            register_hotkeys_on(&proxy, hotkeys)?;
+            Ok(owner)
         })();
 
-        if let Err(error) = &result
-            && error.should_reconnect()
-        {
-            self.connection = None;
+        match result {
+            Ok(owner) => {
+                self.registered_owner = (!hotkeys.is_empty()).then_some(owner);
+                Ok(())
+            }
+            Err(error) => {
+                if error.should_reconnect() {
+                    self.connection = None;
+                    self.registered_owner = None;
+                }
+                Err(error)
+            }
         }
-
-        result
     }
 }
 
@@ -262,19 +253,24 @@ impl HotkeySystem for KwinHotkeySystem {
     }
 
     fn next_hotkey(&mut self) -> Result<Option<HotkeyEvent>, HotkeySystemError> {
-        let result = (|| {
-            let connection = self
-                .ensure_connection()
-                .map_err(KwinIntegrationError::into_hotkey_error)?;
-            let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
-            let (present, hotkey): (bool, String) = proxy
-                .method_call(KWIN_INTERFACE, "GetNextHotkey", ())
-                .map_err(|error| classify_dbus_error(error).into_hotkey_error())?;
-            Ok(present.then_some(HotkeyEvent::Pressed { hotkey }))
-        })();
+        let Some(owner) = &self.registered_owner else {
+            return Ok(None);
+        };
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("registration has a connection");
+        let proxy = connection.with_proxy(owner.as_str(), KWIN_OBJECT_PATH, CALL_TIMEOUT);
+        let result = proxy
+            .method_call(KWIN_INTERFACE, "GetNextHotkey", ())
+            .map(|(present, hotkey): (bool, String)| {
+                present.then_some(HotkeyEvent::Pressed { hotkey })
+            })
+            .map_err(|error| classify_dbus_error(error).into_hotkey_error());
 
         if result.is_err() {
             self.connection = None;
+            self.registered_owner = None;
         }
 
         result
@@ -283,8 +279,9 @@ impl HotkeySystem for KwinHotkeySystem {
 
 impl Drop for KwinHotkeySystem {
     fn drop(&mut self) {
-        if self.connection.is_some() {
-            let _ = self.call_register_hotkeys(&[]);
+        if let (Some(connection), Some(owner)) = (&self.connection, &self.registered_owner) {
+            let proxy = connection.with_proxy(owner.as_str(), KWIN_OBJECT_PATH, CALL_TIMEOUT);
+            let _ = register_hotkeys_on(&proxy, &[]);
         }
     }
 }
@@ -300,8 +297,19 @@ fn connect(bus_address: Option<&str>) -> Result<Connection, KwinIntegrationError
     })
 }
 
-fn get_capabilities(connection: &Connection) -> Result<Vec<String>, KwinIntegrationError> {
-    let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+fn companion_owner(connection: &Connection) -> Result<String, KwinIntegrationError> {
+    connection
+        .with_proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            CALL_TIMEOUT,
+        )
+        .method_call("org.freedesktop.DBus", "GetNameOwner", (KWIN_SERVICE_NAME,))
+        .map(|(owner,): (String,)| owner)
+        .map_err(classify_dbus_error)
+}
+
+fn get_capabilities(proxy: &Proxy<'_, &Connection>) -> Result<Vec<String>, KwinIntegrationError> {
     proxy
         .method_call(KWIN_INTERFACE, "GetCapabilities", ())
         .map(|(capabilities,): (Vec<String>,)| capabilities)
@@ -322,8 +330,22 @@ fn require_capability(
     })
 }
 
+fn register_hotkeys_on(
+    proxy: &Proxy<'_, &Connection>,
+    hotkeys: &[String],
+) -> Result<(), KwinIntegrationError> {
+    require_capability(&get_capabilities(proxy)?, HOTKEYS_CAPABILITY)?;
+    let payload = serde_json::to_string(hotkeys).map_err(|_| KwinIntegrationError::Invalid {
+        message: "failed to encode hotkey request payload".to_string(),
+    })?;
+    let (request_id, timeout_ms) = proxy
+        .method_call(KWIN_INTERFACE, "RegisterHotkeys", (payload,))
+        .map_err(classify_dbus_error)?;
+    wait_for_request(proxy, request_id, timeout_ms)
+}
+
 fn wait_for_request(
-    connection: &Connection,
+    proxy: &Proxy<'_, &Connection>,
     request_id: u32,
     timeout_ms: u64,
 ) -> Result<(), KwinIntegrationError> {
@@ -336,15 +358,11 @@ fn wait_for_request(
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(timeout_ms))
         .ok_or_else(invalid_timeout)?;
-    let proxy = connection.with_proxy(KWIN_SERVICE_NAME, KWIN_OBJECT_PATH, CALL_TIMEOUT);
+    let id = request_id.to_string();
 
     loop {
         let (complete, error_name, message): (bool, String, String) = proxy
-            .method_call(
-                KWIN_INTERFACE,
-                "GetRequestResult",
-                (request_id.to_string(),),
-            )
+            .method_call(KWIN_INTERFACE, "GetRequestResult", (id.as_str(),))
             .map_err(classify_dbus_error)?;
         if complete {
             return if error_name.is_empty() && message.is_empty() {
