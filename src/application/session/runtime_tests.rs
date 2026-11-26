@@ -1,4 +1,5 @@
 use std::fs;
+use std::process::ExitCode;
 use std::sync::mpsc;
 
 use window_zones::{DispatchState, Rect, starter_config};
@@ -30,7 +31,7 @@ fn unified_runtime_keeps_performance_logging_through_restart() {
         tx.send(instruction.into()).unwrap();
     }
     drop(tx);
-    run_runtime(
+    let exit = run_runtime(
         &mut runtime,
         &mut CliSurface {
             prompt: false,
@@ -39,6 +40,7 @@ fn unified_runtime_keeps_performance_logging_through_restart() {
         instructions,
         true,
     );
+    assert_eq!(exit, ExitCode::SUCCESS);
     let rows: Vec<serde_json::Value> = fs::read_to_string(&log_path)
         .unwrap()
         .lines()
