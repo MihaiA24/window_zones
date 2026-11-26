@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
@@ -79,7 +80,7 @@ impl Session {
                 Some(&runtime_log),
             )
             .unwrap();
-            run_runtime(
+            let exit = run_runtime(
                 &mut runtime,
                 &mut CliSurface {
                     prompt: false,
@@ -88,6 +89,7 @@ impl Session {
                 receiver,
                 false,
             );
+            assert_eq!(exit, ExitCode::SUCCESS);
             runtime.window_system.last_move().unwrap().target
         });
         Self {
